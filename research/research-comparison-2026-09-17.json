@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-17",
+  "scope": "Two independent research routes on the same questions and sanitized sample. Researcher execution only; parent synthesis and publication excluded.",
+  "claude": {
+    "cli_version": "2.1.274",
+    "requested_model": "sonnet",
+    "observed_model": "claude-sonnet-5",
+    "requested_effort": "high",
+    "effort_verification": "CLI argument; no backend effort attestation",
+    "duration_seconds": 201.867,
+    "cost_usd": 0.7549138,
+    "cost_basis": "CLI list estimate, not subscription invoice",
+    "model_usage": {
+      "claude-haiku-4-5-20251001": {
+        "inputTokens": 163251,
+        "outputTokens": 4483,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 5,
+        "costUSD": 0.235666,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 0,
+        "canonicalModel": "claude-haiku-4-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      },
+      "claude-sonnet-5": {
+        "inputTokens": 16,
+        "outputTokens": 15646,
+        "cacheReadInputTokens": 360699,
+        "cacheCreationInputTokens": 72654,
+        "webSearchRequests": 0,
+        "costUSD": 0.5192478,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "thinkingTokens": 7039,
+        "canonicalModel": "claude-sonnet-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "status": "success"
+  },
+  "muse": {
+    "cli_version": "1.18.29",
+    "requested_model": "opencode/muse-spark-1.3-contributor-free",
+    "observed_model": "muse-spark-1.3-contributor-free",
+    "requested_effort": "xhigh",
+    "effort_verification": "Session metadata variant xhigh; not backend attestation",
+    "max_note": "max not advertised; user approved highest available xhigh",
+    "duration_seconds": 81.074,
+    "cost_usd": 0,
+    "cost_basis": "OpenCode reported free model route; no independent invoice or external tool-charge verification",
+    "native_tokens": {
+      "total": 416440,
+      "input": 96033,
+      "output": 5390,
+      "reasoning": 2177,
+      "cache_read": 312840,
+      "cache_write": 0
+    },
+    "normalized_input_including_cache": 408873,
+    "normalized_output_including_reasoning": 7567,
+    "status": "completed stop event"
+  },
+  "excluded_setup_attempt": {
+    "route": "Muse Contributor xhigh",
+    "reason": "Wrong effective working directory; stopped and relaunched with explicit --dir and PWD plus verified permissions.",
+    "reported_tokens_lower_bound": 24934,
+    "complete": false
+  },
+  "limitations": [
+    "One run per route; no general model ranking.",
+    "Different native harnesses and tool behavior; Sonnet route includes Haiku helper work.",
+    "Cancelled setup usage retained separately; not silently zeroed.",
+    "Model metadata verifies client routing only.",
+    "No raw private transcripts or credentials published."
+  ]
+}
