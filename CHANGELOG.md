@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-09-17
+
+### Added
+
+- Add a small Codex routing skill with one Markdown model table and bounded escalation; narrow project direction to Codex v1.
+
+- Add the Codex-only routing skill, canonical model policy, bounded recovery, native dispatch reference, package validation, and approved project direction.
+
 ## [0.1.0] - 2026-09-03
 
 ### Added

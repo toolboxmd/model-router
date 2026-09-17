@@ -1,52 +1,31 @@
 # Objective
 
-Ship the first trustworthy Model Router in which a supported host presents the
-strongest eligible model as the human-facing orchestrator and completes one
-authorized software task without asking the human to choose a provider, model,
-harness, reasoning effort, or established workflow step.
+Make Codex reliably route ordinary software work through one explicit,
+versioned policy, without requiring the human to select execution models or
+reasoning effort for each task.
 
 The Objective is complete when:
 
-- A versioned static policy ranks eligible human-facing and execution routes.
-  The highest-ranked available route becomes the human-facing orchestrator
-  without per-task human selection.
-- The orchestrator may select any eligible execution route. The static policy
-  supplies the default when the orchestrator does not request one, and the
-  router rejects every ineligible combination.
-- `dispatch(WorkRequest) -> TerminalReport` is the only external interface.
-  Routing, capacity checks, execution, proof, review, escalation, delivery
-  continuation, and event recording remain internal.
-- An immutable constitution owns Human Gates, proof requirements, success
-  definitions, review rules, retry and escalation ceilings, model allowlists,
-  and policy freeze conditions. No policy or orchestrator decision can weaken
-  it.
-- A Codex adapter supports eligible Spark, Luna, Terra, and Sol routes. A Grok
-  adapter supports Grok 4.6 through the established Grok Build CLI invocation
-  contract. Each adapter declares its supported model and reasoning-effort
-  combinations and rejects unsupported routes.
-- Every attempted task receives deterministic proof from the target project
-  and implementing-agent self-review. The implementing agent and human-facing
-  orchestrator cannot grade their own success.
-- Independent review is omitted for low-risk deterministic work, sampled for
-  ordinary work, and mandatory for high-risk work.
-- After normal correction inside the initial execution, the orchestrator may
-  authorize at most one useful cross-model escalation. The system does not
-  race duplicate attempts or enter retry loops.
-- Every already-authorized delivery step continues without returning control
-  to the human merely for workflow routing.
-- Every dispatch appends a passive event containing policy version, route,
-  adapter, reasoning effort, proof, review, escalation, delivery states,
-  terminal outcome, elapsed time, human interruption, delayed-outcome handles,
-  and quota evidence that is measured or explicitly unknown.
-- Deterministic tests exercise the Dispatch interface with fake agent and proof
-  adapters across acceptance, ineligible routes, unavailable capacity, unknown
-  quota, proof failure, escalation, timeout, cancellation, and Human Gate
-  outcomes.
-- Bounded real software tasks complete through both production adapters using
-  their target projects' actual proof, without rebuilding or rerunning the old
-  benchmark matrix.
+- A concise routing contract and Codex-specific reference guide native
+  subagent execution from the existing human-facing conversation.
+- One canonical policy selects Sol 5.6 high for implementation and debugging,
+  and Luna 5.6 max for clear, bounded prose edits and independent review.
+- Task classification considers behavioral consequences, not file extensions.
+- Implementation may escalate once to Astra medium after bounded recovery
+  fails, with evidence of the failure, attempted correction, and stopped
+  progress. External blockers do not trigger model escalation.
+- Routing preserves target-project authority, proof, independent review,
+  exclusive ownership, and authorized delivery continuation.
+- AgentsMD references Model Router for model selection without duplicating
+  its policy or transferring workflow ownership.
+- Deterministic checks verify policy consistency and supported configuration.
+  Real work supplies evidence of route selection, recovery, review, and
+  completion. Unobserved behavior remains explicitly unverified.
+- Outcome records identify the policy, actual model and effort, escalation,
+  proof, elapsed time, rework, and available usage. Missing measurements remain
+  unknown.
+- The versioned contract is distributed, installed, and verified through its
+  supported path under explicit delivery authority.
 
-A learned router, automatic policy rewriting, a routing dashboard, hidden
-benchmark verifiers, duplicate model runs, mandatory Grok evaluation,
-gpt-reserve, and Claude Code or OpenBot execution adapters are outside this
-Objective.
+Other hosts, a generic dispatch runtime, automatic policy rewriting, dashboards,
+benchmark matrices, and speculative hooks remain outside this milestone.
