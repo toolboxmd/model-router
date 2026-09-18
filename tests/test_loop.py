@@ -113,16 +113,80 @@ assert "--fork-session" not in argv, "must never fork planner"
 print("Approved as written.")
 """ % PLANNER_SID
 
-FAKE_OPENCODE = """#!/usr/bin/env python3
-import json, os, sys
+FAKE_OPENCODE = r'''#!/usr/bin/env python3
+import json, os, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 state = Path(os.environ["DURABLE_FAKE_STATE"])
 state.mkdir(parents=True, exist_ok=True)
 log = state / "opencode.log"
 argv = sys.argv[1:]
 with open(log, "a", encoding="utf-8") as f:
-    f.write(json.dumps(argv) + "\\n")
-assert argv and argv[0] == "run", f"must use opencode run, got {argv!r}"
+    f.write(json.dumps(argv) + "\n")
+SESSION = "''' + OC_SESSION + r'''"
+PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
+
+if argv and argv[0] == "serve":
+    assert "--pure" in argv, "serve must use --pure"
+    assert "--hostname" in argv and "127.0.0.1" in argv, "serve must bind loopback"
+    assert "--port" in argv, "serve must pass --port"
+    assert PASSWORD, "serve password must arrive via environment, not argv"
+    assert "password" not in " ".join(argv).lower()
+    class H(BaseHTTPRequestHandler):
+        def _auth(self):
+            got = self.headers.get("Authorization") or ""
+            return got == "Bearer " + PASSWORD
+        def _json(self, code, obj):
+            data = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def do_GET(self):
+            if not self._auth():
+                return self._json(401, {"error": "unauthorized"})
+            parsed = urlparse(self.path)
+            if parsed.path == "/session/status":
+                qs = parse_qs(parsed.query)
+                sid = (qs.get("session") or [SESSION])[0]
+                self._json(200, {"session": sid, "status": "idle"})
+                return
+            self._json(404, {"error": "missing"})
+        def do_POST(self):
+            if not self._auth():
+                return self._json(401, {"error": "unauthorized"})
+            length = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except ValueError:
+                body = {}
+            path = urlparse(self.path).path
+            if path == "/session":
+                self._json(200, {"id": SESSION})
+                return
+            if path.endswith("/prompt"):
+                (state / "opencode-prompt.jsonl").open("a").write(json.dumps(body) + "\n")
+                self._json(200, {"ok": True, "session": SESSION})
+                return
+            if path == "/session/abort":
+                self._json(200, {"ok": True})
+                return
+            self._json(404, {"error": "missing"})
+        def log_message(self, *args):
+            return
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    print(f"listening on http://127.0.0.1:{port}", flush=True)
+    try:
+        srv.serve_forever(poll_interval=0.05)
+    except KeyboardInterrupt:
+        pass
+    sys.exit(0)
+
+assert argv and argv[0] == "run", f"must use opencode run or serve, got {argv!r}"
 assert "--format" in argv and "json" in argv, "must use --format json"
 assert "--pure" in argv, "must use --pure"
 assert "--dir" in argv, "must use --dir"
@@ -131,8 +195,8 @@ assert "--variant" in argv and "xhigh" in argv, "must use --variant xhigh"
 assert "--agent" in argv and "build" in argv, "must use --agent build"
 assert "--effort" not in argv, "must not use --effort"
 assert "--cd" not in argv, "must not use --cd"
-print(json.dumps({"opencode_session_id": "%s", "ok": True}))
-""" % OC_SESSION
+print(json.dumps({"opencode_session_id": SESSION, "ok": True}))
+'''
 
 
 def kill_pid(pid):
@@ -144,7 +208,7 @@ def kill_pid(pid):
 
 class TestPublicLoopProof(unittest.TestCase):
     def test_submit_start_drives_full_durable_loop(self):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
         sd = str(base / "state")
@@ -221,13 +285,29 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("--resume", claude_calls[0])
         self.assertIn(PLANNER_SID, claude_calls[0])
 
-        # One Muse invocation with free model + xhigh + --dir.
-        self.assertEqual(len(oc_calls), 1, oc_calls)
-        oc = oc_calls[0]
-        self.assertIn("opencode/muse-spark-1.3-contributor-free", oc)
-        self.assertIn("xhigh", oc)
-        self.assertIn("--dir", oc)
-        self.assertIn(str(ws), oc)
+        # Owned ephemeral OpenCode serve (public path) or run (fallback).
+        self.assertGreaterEqual(len(oc_calls), 1, oc_calls)
+        serve_calls = [c for c in oc_calls if c and c[0] == "serve"]
+        run_calls = [c for c in oc_calls if c and c[0] == "run"]
+        self.assertTrue(serve_calls or run_calls, oc_calls)
+        if serve_calls:
+            sc = serve_calls[0]
+            self.assertIn("--pure", sc)
+            self.assertIn("127.0.0.1", sc)
+            self.assertIn("--port", sc)
+            self.assertNotIn("password", " ".join(sc).lower())
+            prompt_log = fake_state / "opencode-prompt.jsonl"
+            self.assertTrue(prompt_log.exists(), "owned server must prompt the saved session")
+            prompts = [json.loads(l) for l in prompt_log.read_text().splitlines() if l.strip()]
+            self.assertTrue(prompts)
+            self.assertIn("opencode/muse-spark-1.3-contributor-free",
+                          json.dumps(prompts))
+        else:
+            oc = run_calls[0]
+            self.assertIn("opencode/muse-spark-1.3-contributor-free", oc)
+            self.assertIn("xhigh", oc)
+            self.assertIn("--dir", oc)
+            self.assertIn(str(ws), oc)
 
         # Durable question then answer then completion.
         qs = core.list_questions(sd, req, only_pending=False)
@@ -249,7 +329,8 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("codex_dispatch", kinds)
         self.assertIn("codex_resume", kinds)
         self.assertIn("claude_callback", kinds)
-        self.assertIn("opencode_run", kinds)
+        self.assertTrue("opencode_run" in kinds or "opencode_control" in kinds
+                        or "opencode_serve" in kinds, kinds)
 
         # Recover/restart must not fork a second planner session or writer.
         n_claude_before = len(claude_calls)
@@ -281,7 +362,7 @@ class TestPublicLoopProof(unittest.TestCase):
         refuse to fork a second Codex. This is the exact unsafe ownership bug
         reproduced by reproduce-controller-crash.py.
         """
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
         sd = str(base / "state")
@@ -408,7 +489,7 @@ time.sleep(60)
         terminal. A same-workspace replacement must not start until the first
         writer is gone, so two fake Codex processes are never alive together.
         """
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
         sd = str(base / "state")

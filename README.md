@@ -55,8 +55,10 @@ free exhaustion, `--session` resumes the saved session).
 `--no-start` keeps deterministic tests offline; `--start`/`start`
 uses the built-ins with no injection required. OpenCode control uses
 an owned ephemeral per-job `opencode serve --pure --hostname
-127.0.0.1 --port 0` process (fresh in-memory password, never logged)
-or the injectable equivalent.
+127.0.0.1 --port 0` process (fresh in-memory password in the child
+environment, never logged, never in argv/DB) or the injectable
+equivalent. Deterministic tests prove that path with fake serve/HTTP
+fixtures, not live quota.
 
 Controller flow: Luna returns `planner_question`, `implementation`, or
 `completion`. Questions persist before Claude `--resume`; answers persist

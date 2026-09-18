@@ -263,39 +263,56 @@ def parse_luna_envelope_from_texts(*blobs: str | None) -> dict | None:
     """Parse the structured action envelope from stdout + last-message.
 
     The envelope is the JSON object with a valid ``action`` emitted as
-    the completed agent message / output-last-message payload.
+    the completed agent message / output-last-message payload, including
+    Codex ``item.completed`` ``agent_message.text``.
     """
-    # Import here to avoid a cycle (policy imports nothing from adapters).
     from . import policy as _policy
-    for blob in blobs:
-        if not blob or not blob.strip():
-            continue
-        text = blob.strip()
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
+
+    def _from_obj(obj, _depth=0):
+        if _depth > 8 or obj is None:
+            return None
+        if isinstance(obj, dict):
+            if obj.get("action") in _policy.VALID_ACTIONS:
                 return obj
-            if isinstance(obj, dict):
-                for key in ("result", "data", "final", "message", "last_message",
-                            "lastMessage", "output", "response"):
-                    nested = obj.get(key)
-                    if isinstance(nested, dict) and nested.get("action") in _policy.VALID_ACTIONS:
-                        return nested
-                    if isinstance(nested, str):
-                        try:
-                            inner = json.loads(nested)
-                        except ValueError:
-                            continue
-                        if isinstance(inner, dict) and inner.get("action") in _policy.VALID_ACTIONS:
-                            return inner
-        except ValueError:
-            pass
-    # JSON-lines scan, last matching envelope wins (deterministic).
+            # Codex item.completed agent_message text, plus common wrappers.
+            for key in ("text", "result", "data", "final", "message",
+                        "last_message", "lastMessage", "output", "response",
+                        "item", "payload", "content"):
+                if key in obj:
+                    found = _from_obj(obj.get(key), _depth + 1)
+                    if found:
+                        return found
+            for v in obj.values():
+                found = _from_obj(v, _depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(obj, str):
+            raw = obj.strip()
+            if not raw:
+                return None
+            try:
+                return _from_obj(json.loads(raw), _depth + 1)
+            except ValueError:
+                return None
+        if isinstance(obj, (list, tuple)):
+            found = None
+            for v in obj:
+                got = _from_obj(v, _depth + 1)
+                if got:
+                    found = got
+            return found
+        return None
+
     found = None
     for blob in blobs:
-        if not blob:
+        if not blob or not str(blob).strip():
             continue
-        for line in blob.splitlines():
+        text = blob.strip()
+        got = _from_obj(text)
+        if got:
+            found = got
+        for line in text.splitlines():
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -303,21 +320,9 @@ def parse_luna_envelope_from_texts(*blobs: str | None) -> dict | None:
                 obj = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
-                found = obj
-                continue
-            if isinstance(obj, dict):
-                # e.g. {"type":"item.completed","payload":{"action":...}}
-                for v in obj.values():
-                    if isinstance(v, dict) and v.get("action") in _policy.VALID_ACTIONS:
-                        found = v
-                    if isinstance(v, str):
-                        try:
-                            inner = json.loads(v)
-                        except ValueError:
-                            continue
-                        if isinstance(inner, dict) and inner.get("action") in _policy.VALID_ACTIONS:
-                            found = inner
+            got = _from_obj(obj)
+            if got:
+                found = got
     return found
 
 
@@ -440,6 +445,102 @@ def redact_nested(obj):
 def generate_control_password(nbytes: int = 24) -> str:
     """Random localhost control password held in process, never logged."""
     return secrets.token_hex(nbytes)
+
+
+def build_opencode_serve_cmd(hostname: str = "127.0.0.1", port: str | int = 0) -> list[str]:
+    """Owned ephemeral serve argv. Password is environment-only, never argv."""
+    if hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("ephemeral serve allows localhost only")
+    return [OPENCODE_BIN, "serve", "--pure", "--hostname", hostname, "--port", str(port)]
+
+
+def parse_serve_url(output_text: str) -> str | None:
+    """Parse a loopback URL from serve stdout. None if absent."""
+    import re as _re
+    if not output_text:
+        return None
+    m = _re.search(r"https?://(?:127\.0\.0\.1|localhost|\[::1\]|::1):\d+", output_text)
+    if not m:
+        return None
+    url = m.group(0)
+    _ensure_localhost(url)
+    return url
+
+
+class OpenCodeClient:
+    """Authenticated loopback client. Password stays in memory."""
+
+    def __init__(self, base_url: str, password: str | None, request_func=None):
+        if not base_url:
+            raise ValueError("missing control base_url")
+        _ensure_localhost(base_url)
+        if request_func is None and not password:
+            raise ValueError(
+                "missing control password: refusing to invent one for "
+                "a server this job does not own")
+        self._base_url = base_url.rstrip("/")
+        self._password = password or ""
+        self._request_func = request_func
+
+    def _http(self, method: str, path: str, body: dict | None = None) -> dict:
+        if self._request_func is not None:
+            return dict(self._request_func(method, path, body or {}))
+        url = self._base_url + path
+        data = None
+        headers = {"Authorization": "Bearer " + self._password,
+                   "Content-Type": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            return {"raw": raw}
+
+    def create_session(self) -> dict:
+        return self._http("POST", "/session", {})
+
+    def session_id_from(self, payload: dict) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("id", "session_id", "sessionId"):
+            val = payload.get(key)
+            if isinstance(val, str) and val:
+                return val
+        sess = payload.get("session")
+        if isinstance(sess, dict):
+            for key in ("id", "session_id", "sessionId"):
+                val = sess.get(key)
+                if isinstance(val, str) and val:
+                    return val
+        if isinstance(sess, str) and sess:
+            return sess
+        return None
+
+    def prompt(self, session_id: str, text: str, model: str | None = None,
+               variant: str | None = None) -> dict:
+        if not session_id:
+            raise ValueError("missing saved OpenCode session ID")
+        body = {"session": session_id, "parts": [{"type": "text", "text": text}]}
+        if model:
+            body["model"] = model
+        if variant:
+            body["variant"] = variant
+        return self._http("POST", f"/session/{urllib.parse.quote(session_id)}/prompt", body)
+
+    def session_status(self, session_id: str) -> dict:
+        return OpenCodeControl(self._base_url, self._password, session_id,
+                               request_func=self._request_func).session_status()
+
+    def abort(self, session_id: str) -> dict:
+        return OpenCodeControl(self._base_url, self._password, session_id,
+                               request_func=self._request_func).abort()
+
+    def ensure_idle_ownership(self, session_id: str) -> dict:
+        return OpenCodeControl(self._base_url, self._password, session_id,
+                               request_func=self._request_func).ensure_idle_ownership()
 
 
 def _ensure_localhost(base_url: str) -> urllib.parse.ParseResult:

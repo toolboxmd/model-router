@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS invocations (
   owner_token TEXT NOT NULL,
   pid INTEGER,
   pgid INTEGER,
+  process_start TEXT,
+  supervisor_pid INTEGER,
+  supervisor_pgid INTEGER,
   stdout_path TEXT NOT NULL,
   stderr_path TEXT NOT NULL,
   started_at TEXT NOT NULL,
@@ -109,7 +112,18 @@ CREATE TABLE IF NOT EXISTS invocations (
   session_id TEXT,
   session_kind TEXT,
   task_json TEXT,
-  ended_at TEXT
+  ended_at TEXT,
+  result_json TEXT,
+  consumed_at TEXT,
+  timeout_secs INTEGER,
+  meta_json TEXT
+);
+CREATE TABLE IF NOT EXISTS capacity (
+  route TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  evidence_json TEXT,
+  reset_at TEXT,
+  updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
@@ -188,6 +202,18 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     ):
         if _col not in cols:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {_col} {_ddl}")
+    inv_cols = {r["name"] for r in con.execute("PRAGMA table_info(invocations)").fetchall()}
+    for _col, _ddl in (
+        ("process_start", "TEXT"),
+        ("supervisor_pid", "INTEGER"),
+        ("supervisor_pgid", "INTEGER"),
+        ("result_json", "TEXT"),
+        ("consumed_at", "TEXT"),
+        ("timeout_secs", "INTEGER"),
+        ("meta_json", "TEXT"),
+    ):
+        if _col not in inv_cols:
+            con.execute(f"ALTER TABLE invocations ADD COLUMN {_col} {_ddl}")
     if first:
         try:
             os.chmod(db, 0o600)

@@ -33,8 +33,11 @@ rejected. A second active job on the same workspace is rejected. With
 built-in adapters after persist; `--no-start` keeps deterministic tests
 offline. Manual `launch` spawns a detached worker (`start_new_session`,
 stdio to /dev/null) and persists the attempt before and after ack.
-`recover` reconciles without spawning and resumes saved IDs without
-forking.
+`recover` reconciles durable records with live ownership. It consumes
+finished child output exactly once, adopts a live child, and blocks on
+unresolved NULL-pid ownership. After a public `answer` on a saved Luna
+task, `recover` resumes a detached controller instead of clearing the
+lease and stalling. It never forks the planner or Luna session.
 
 ## State
 
@@ -81,20 +84,30 @@ artifact/output. Busy planner or callback failure becomes durable
 `blocked` with a reason; questions stay pending for `answer` + `recover`.
 
 OpenCode quota uses an owned ephemeral per-job `opencode serve --pure
---hostname 127.0.0.1 --port 0` process (fresh in-memory password, URL
-parsed from its output, never logged, never a shared service) or an
-injectable equivalent. Never invent a random password for a server the
-job does not own. Only the saved session status is observed. Free to Go
-needs the exact vendor class `FreeUsageLimitError` (including decoded
-`responseBody` JSON) or a retry with reason `free_tier_limit` and
-provider `opencode` for the saved session. The old free session aborts
-before transfer, ownership/idle confirms, artifacts preserve. Route,
-adapter, model, effort, session IDs, attempts, and redacted provider
-evidence persist without secrets. Full task content is passed to Luna
-and adapters without silent clipping; the Luna action envelope persists
-before its side effect. Durable child invocation records + file output
-preserve session IDs across a controller crash; a live recorded PID
-without a fresh handshake stays claimed and blocks duplicates.
+--hostname 127.0.0.1 --port 0` process (fresh in-memory password in the
+child environment, URL parsed from durable stdout, never logged, never a
+shared service) or an injectable equivalent. The public controller path
+creates/saves the session on that server before prompting and observes
+only that session's status. Never invent a random password for a server
+the job does not own. Free to Go needs the exact vendor class
+`FreeUsageLimitError` (including decoded `responseBody` JSON) or a retry
+with reason `free_tier_limit` and provider `opencode` for the saved
+session. The old free session aborts before transfer, ownership/idle
+confirms, artifacts preserve. Route, adapter, model, effort, session IDs,
+attempts, and redacted provider evidence persist without secrets. Full
+task content is passed to Luna and adapters without silent clipping; the
+Luna action envelope persists before its side effect.
+
+Each model spawn persists immutable invocation intent (NULL pid/pgid)
+before Popen. An independent supervisor process group waits on the child,
+captures IDs from file-backed output, and writes rc/result. Killing only
+the controller does not destroy that output. A NULL PID/PGID or start-
+identity mismatch is unresolved ownership, never proof of death.
+`recover` consumes finished output exactly once and will not rerun a
+completed child. Cancellation and timeout signal every child and
+supervisor process group and keep the workspace claimed until they are
+confirmed dead. These seams are proved with fake executables, not live
+model CLIs.
 
 ## Ownership
 
@@ -108,19 +121,29 @@ a possible duplicate.
 ## Policy
 
 `runner/policy.py` (`durable-runner-policy-v1`): Luna max dispatch;
-Muse Spark 1.3 Contributor xhigh free-first then the same model on Go
-included allowance only after explicit `FREE_ALLOWANCE_EXHAUSTED`
-`confirmed:true`, exact vendor `FreeUsageLimitError` (including decoded
-`responseBody` JSON), or retry `free_tier_limit` + provider `opencode`;
+Terra only as recorded fallback after demonstrated Luna coordination
+failure (no live-exercised adapter); Muse Spark 1.3 Contributor xhigh
+free-first then the same model on Go included allowance only after
+explicit `FREE_ALLOWANCE_EXHAUSTED` `confirmed:true`, exact vendor
+`FreeUsageLimitError` (including decoded `responseBody` JSON), or retry
+`free_tier_limit` + provider `opencode`; Go DeepSeek V4.1 Flash -> GLM
+5.3 Flash -> MiniMax M3 then MiMo 2.5 / LongCat 2.0 as recorded capacity
+(precise blocker if not operational); Kimi K2.7 Code only after the
+initial worker plus one bounded correction (not operational here);
 independent Luna max review; Opus 5 high combined review; planning
-Fable 5.1 max / Astra max; recovery Grok 4.6 medium (Grok Build) then
-Astra medium then Opus 5 high; `sonnet/medium` live-test override only.
-Generic 429, `RateLimitError`/`rate_limit`, timeout, permission/consent,
-invalid-plan, `DataPolicyError`, `RegionError`, `AuthError`, and
-`GoUsageLimitError`/`account_rate_limit` never switch quota. No text-only
-429 matching. Zen overflow and direct paid APIs are off.
-`make_action`/`make_result` carry implementation, planner-question, review,
-and completion envelopes with artifact and failure evidence.
+Fable 5.1 max / Astra max (the production fable-5.1 slug is not
+live-verified; Claude help advertises `claude-fable-5`); recovery Grok
+4.6 medium (Grok Build) then Astra medium then Opus 5 high (named
+recovery adapters are not live-exercised); `sonnet/medium` is the
+explicit `claude-sonnet-5` / `medium` live-test override only. Cross-job
+capacity memory persists exhausted routes until trusted provider reset
+evidence; unknown reset stays unknown and is never invented as a daily
+timer. Generic 429, `RateLimitError`/`rate_limit`, timeout,
+permission/consent, invalid-plan, `DataPolicyError`, `RegionError`,
+`AuthError`, and `GoUsageLimitError`/`account_rate_limit` never switch
+quota. No text-only 429 matching. Zen overflow and direct paid APIs are
+off. `make_action`/`make_result` carry implementation, planner-question,
+review, and completion envelopes with artifact and failure evidence.
 
 ## Tests
 
@@ -135,12 +158,16 @@ Fault injection uses real detached fake processes for duplicate submits,
 workspace clashes, launch races, controller death, worker death with
 same-session recovery, partial logs, question replay, cancel/timeout,
 quota-vs-other-errors, unsupported routes, missing permissions, unknown
-ownership, and bounded recovery. Bridge tests add default command
-construction, missing planner session, adapter session persistence,
-planner resume/no-fork, built-in controller lifecycle seams, exact
+ownership, bounded recovery, live-child adopt, completion-before-recover
+consume-once, NULL-pid unresolved ownership, and answer+recover
+continuation. Bridge tests add default command construction, missing
+planner session, adapter session persistence, planner resume/no-fork,
+built-in controller lifecycle seams, exact
 `FreeUsageLimitError`/`responseBody`/retry classification, fake HTTP
-provider-envelope + control-path checks, and callback failure/busy
-persistence. All offline; no live model CLIs.
+provider-envelope + owned-serve control-path checks, capacity blockers,
+and callback failure/busy persistence. All offline; no live model CLIs.
+Named recovery adapters and live OpenCode quota transfers are not
+claimed from this suite.
 
 Live check: `fixtures/LIVE_RECIPE.md` plus `fixtures/live_sequence.json`.
 Real live verification is external.

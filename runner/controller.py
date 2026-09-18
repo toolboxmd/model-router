@@ -38,7 +38,7 @@ MAX_LOOP_STEPS = 8
 
 
 def default_run_cmd(cmd: list[str], cwd: str | None = None,
-                    timeout: int = 120) -> tuple[int, str, str]:
+                    timeout: int = 120, **_kwargs) -> tuple[int, str, str]:
     """Run a built-in adapter command (stdlib subprocess, no secrets logged)."""
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -432,7 +432,8 @@ def _route_allowance(route: str) -> str:
 def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                        payload: dict | None = None, run_cmd=None,
                        control_request_func=None, control_base_url: str | None = None,
-                       control_password: str | None = None) -> dict:
+                       control_password: str | None = None,
+                       use_owned_server: bool = False) -> dict:
     """Run the OpenCode adapter carrying the saved artifact/output.
 
     Uses the installed CLI contract (``--format json --pure --dir``,
@@ -462,7 +463,23 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     cmd = adapters.build_opencode_cmd(workspace, prompt,
                                       allowance=allowance,
                                       session_id=saved_session)
-    rc, out, err = run_cmd(cmd, workspace)
+    recorded_kind = "opencode_run"
+    recorded_cmd = cmd
+    if use_owned_server and control_request_func is None:
+        serve_cmd = adapters.build_opencode_serve_cmd()
+        meta = {"prompt": prompt, "allowance": allowance,
+                "session_id": saved_session, "model": adapters.opencode_model_for_allowance(allowance)}
+        recorded_kind = "opencode_control"
+        recorded_cmd = serve_cmd
+        try:
+            rc, out, err = run_cmd(serve_cmd, workspace, 120,
+                                   kind="opencode_control", meta=meta)
+        except TypeError:
+            recorded_kind = "opencode_run"
+            recorded_cmd = cmd
+            rc, out, err = run_cmd(cmd, workspace)
+    else:
+        rc, out, err = run_cmd(cmd, workspace)
     combined = (out or "") + "\n" + (err or "")
     # Try to extract a provider-shaped envelope from stdout/stderr.
     envelope: object = combined
@@ -503,7 +520,7 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
             _save_opencode_session(state_dir, request_id, session_id, route)
         except Exception:
             pass
-    _record_child(state_dir, request_id, "opencode_run", cmd, rc,
+    _record_child(state_dir, request_id, recorded_kind, recorded_cmd, rc,
                   session_id=(session_id or saved_session), output_text=combined)
     if rc == 0:
         # Persist session/artifact/output evidence before resume/finish.
@@ -586,6 +603,12 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
             raise
         finally:
             con.close()
+        try:
+            core.record_capacity(state_dir, "muse-spark-xhigh-free", "exhausted",
+                                 envelope if isinstance(envelope, dict) else {"source": "opencode"},
+                                 reset_at=core._trusted_reset_at(envelope if isinstance(envelope, dict) else None))
+        except Exception:
+            pass
         return {"action": "transferred_to_go", "route": "muse-spark-xhigh-go"}
     # Generic failures/blockers never select Go.
     low = combined.lower()
@@ -697,7 +720,8 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
 def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
                                   run_cmd, control_request_func=None,
                                   control_base_url=None,
-                                  control_password=None) -> dict:
+                                  control_password=None,
+                                  use_owned_server: bool = False) -> dict:
     """One bounded implementation transition: OpenCode then Luna resume."""
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
@@ -705,7 +729,8 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
                               payload=payload, run_cmd=run_cmd,
                               control_request_func=control_request_func,
                               control_base_url=control_base_url,
-                              control_password=control_password)
+                              control_password=control_password,
+                              use_owned_server=use_owned_server)
     if impl.get("action") != "implementation_ok":
         # transferred_to_go or blocked: next loop retries on the new route
         # or waits; never fork a second writer here.
@@ -722,7 +747,8 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
 def step(state_dir, request_id: str, run_cmd=None,
          control_request_func=None, control_base_url: str | None = None,
          control_password: str | None = None,
-         token: str | None = None) -> dict:
+         token: str | None = None,
+         use_owned_server: bool = False) -> dict:
     """Advance exactly one useful bounded controller transition."""
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -768,7 +794,8 @@ def step(state_dir, request_id: str, run_cmd=None,
                     state_dir, request_id, nxt, run_cmd,
                     control_request_func=control_request_func,
                     control_base_url=control_base_url,
-                    control_password=control_password)
+                    control_password=control_password,
+                    use_owned_server=use_owned_server)
             if isinstance(nxt, dict) and nxt.get("action") == "completion":
                 return _complete_job(state_dir, request_id, token,
                                      str(nxt.get("output") or "done"),
@@ -790,7 +817,8 @@ def step(state_dir, request_id: str, run_cmd=None,
             state_dir, request_id, last, run_cmd,
             control_request_func=control_request_func,
             control_base_url=control_base_url,
-            control_password=control_password)
+            control_password=control_password,
+            use_owned_server=use_owned_server)
     if action_name == "completion":
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
@@ -868,7 +896,8 @@ def run_controller_process(state_dir: str, request_id: str, token: str,
     durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
     for _ in range(MAX_LOOP_STEPS):
         try:
-            res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token)
+            res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token,
+                       use_owned_server=True)
         except Exception:
             break
         try:

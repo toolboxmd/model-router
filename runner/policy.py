@@ -75,17 +75,89 @@ SUPPORTED_ROUTES = {
         "effort": "medium",
         "role": "recovery",
     },
-    # Bounded live integration test override only.
+    # Bounded live integration test override only. Exact slug is
+    # claude-sonnet-5 with medium; this is not a production default.
     "sonnet/medium": {
-        "model": "sonnet",
+        "model": "claude-sonnet-5",
         "effort": "medium",
         "role": "live-test-override",
+        "operational": False,
+        "blocker": "sonnet/medium is the explicit live-test override only; deterministic tests never call it",
+    },
+    # Luna coordination fallback. Recorded policy; no named adapter is
+    # live-exercised in this runner.
+    "terra/max": {
+        "model": "gpt-5.6-terra",
+        "effort": "max",
+        "role": "dispatch-fallback",
+        "operational": False,
+        "blocker": "Terra fallback is recorded after demonstrated Luna coordination failure; no named adapter is live-exercised",
+    },
+    # Go included capacity after trusted free exhaustion + Go Muse.
+    "go-deepseek-v4.1-flash": {
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "role": "implementation",
+        "allowance": "go-included",
+        "operational": False,
+        "blocker": "Go DeepSeek V4.1 Flash has no live-exercised adapter in this runner",
+    },
+    "go-glm-5.3-flash": {
+        "model": "opencode-go/glm-5.3-flash",
+        "role": "implementation",
+        "allowance": "go-included",
+        "operational": False,
+        "blocker": "Go GLM 5.3 Flash has no live-exercised adapter in this runner",
+    },
+    "go-minimax-m3": {
+        "model": "opencode-go/minimax-m3",
+        "role": "implementation",
+        "allowance": "go-included",
+        "operational": False,
+        "blocker": "Go MiniMax M3 has no live-exercised adapter in this runner",
+    },
+    "mimo-2.5": {
+        "model": "mimo-2.5",
+        "role": "implementation",
+        "operational": False,
+        "blocker": "MiMo 2.5 is supplemental capacity with no live-exercised adapter",
+    },
+    "longcat-2.0": {
+        "model": "longcat-2.0",
+        "role": "implementation",
+        "operational": False,
+        "blocker": "LongCat 2.0 is supplemental capacity with no live-exercised adapter",
+    },
+    # After the initial worker plus one bounded correction.
+    "kimi-k2.7-code": {
+        "model": "kimi-k2.7-code",
+        "role": "implementation-correction",
+        "operational": False,
+        "blocker": "Kimi K2.7 Code is eligible only after the initial worker plus one bounded correction; no named adapter is live-exercised",
     },
 }
 
 # Agreed orders.
 IMPLEMENTATION_ORDER = ["muse-spark-xhigh-free", "muse-spark-xhigh-go"]
+GO_CAPACITY_ORDER = [
+    "muse-spark-xhigh-go",
+    "go-deepseek-v4.1-flash",
+    "go-glm-5.3-flash",
+    "go-minimax-m3",
+]
+SUPPLEMENTAL_CAPACITY_ORDER = ["mimo-2.5", "longcat-2.0"]
+IMPLEMENTATION_CAPACITY_ORDER = (
+    ["muse-spark-xhigh-free"] + GO_CAPACITY_ORDER + SUPPLEMENTAL_CAPACITY_ORDER
+)
 RECOVERY_ORDER = ["grok-4.6/medium", "astra/medium", "opus-5/high"]
+# Adapters actually driven on the public CLI path (fake or live).
+# Recovery/review names are policy-recorded; they are not live-exercised
+# by this runner and must not be claimed operational.
+OPERATIONAL_ROUTES = {
+    "luna/max",
+    "muse-spark-xhigh-free",
+    "muse-spark-xhigh-go",
+    "fable-5.1/max",
+}
 
 # Only this explicit code proves free-quota exhaustion and permits the
 # free -> Go transition. Everything else must not switch quota.
@@ -110,6 +182,50 @@ def validate_route(route: str) -> dict:
     if route not in SUPPORTED_ROUTES:
         raise ValueError(f"unsupported route: {route!r}")
     return SUPPORTED_ROUTES[route]
+
+
+def is_operational(route: str) -> bool:
+    spec = SUPPORTED_ROUTES.get(route) or {}
+    if spec.get("operational") is False:
+        return False
+    return route in OPERATIONAL_ROUTES
+
+
+def route_blocker(route: str) -> str | None:
+    """Precise blocker for an unavailable eligible route, else None."""
+    if route not in SUPPORTED_ROUTES:
+        return f"unsupported route: {route!r}"
+    spec = SUPPORTED_ROUTES[route]
+    if spec.get("operational") is False:
+        return str(spec.get("blocker") or f"route {route} is not operational")
+    if route not in OPERATIONAL_ROUTES:
+        role = spec.get("role") or "route"
+        return (
+            f"{route} ({role}) is recorded policy with no live-exercised adapter"
+        )
+    return None
+
+
+def next_capacity_route(current: str | None, exhausted: set[str] | None = None) -> tuple[str | None, str | None]:
+    """Next eligible implementation route, skipping known-exhausted ones.
+
+    Returns (route, blocker). blocker is set when the next eligible
+    route exists in policy but is not operational. Never waits on an
+    exhausted route when another authorized route remains.
+    """
+    exhausted = exhausted or set()
+    order = IMPLEMENTATION_CAPACITY_ORDER
+    start = 0
+    if current in order:
+        start = order.index(current) + 1
+    for route in order[start:]:
+        if route in exhausted:
+            continue
+        blocker = route_blocker(route)
+        if blocker:
+            return route, blocker
+        return route, None
+    return None, None
 
 
 def _decoded_response_bodies(obj):
