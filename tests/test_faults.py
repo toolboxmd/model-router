@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import core, policy, store  # noqa: E402
+from runner import controller, core, policy, store  # noqa: E402
+from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, write_fake  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
@@ -189,38 +190,7 @@ print(json.dumps(env), flush=True)
         (bindir / "claude").write_text(
             "#!" + PY + "\nimport sys,time\ntime.sleep(0.2)\nsys.exit(1)\n")
         (bindir / "claude").chmod(0o700)
-        (bindir / "opencode").write_text("#!" + PY + "\n" + r"""
-import json, os, sys, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
-from pathlib import Path
-argv = sys.argv[1:]
-Path(os.environ["FAKE_STATE"], "opencode.log").open("a").write(json.dumps(argv)+"\n")
-if argv and argv[0] == "serve":
-    pwd = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
-    class H(BaseHTTPRequestHandler):
-        def _json(self, code, obj):
-            data = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        def do_GET(self):
-            self._json(200, {"session": "oc-ar", "status": "idle"})
-        def do_POST(self):
-            path = urlparse(self.path).path
-            if path == "/session":
-                return self._json(200, {"id": "oc-ar"})
-            self._json(200, {"ok": True, "session": "oc-ar"})
-        def log_message(self, *a):
-            return
-    srv = HTTPServer(("127.0.0.1", 0), H)
-    print("http://127.0.0.1:%s" % srv.server_address[1], flush=True)
-    srv.serve_forever(poll_interval=0.05)
-print(json.dumps({"opencode_session_id": "oc-ar", "ok": True}))
-""")
-        (bindir / "opencode").chmod(0o700)
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
         env = dict(os.environ)
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
         env["FAKE_STATE"] = str(fake_state)
@@ -302,94 +272,279 @@ class TestCapacityPolicy(unittest.TestCase):
 
 
 class TestOwnedOpenCodeServe(unittest.TestCase):
-    def test_fake_serve_creates_session_without_leaking_password(self):
+    """Owned ``opencode serve`` against a fake of the real server API."""
+
+    def _setup(self, mode, timeout_secs=None):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
-        sd = str(base / "state")
-        ws = base / "ws"
-        ws.mkdir()
+        self.sd = str(base / "state")
+        self.ws = base / "ws"
+        self.ws.mkdir()
         bindir = base / "bin"
         bindir.mkdir()
-        fake_state = base / "fakestate"
-        fake_state.mkdir()
-        (bindir / "opencode").write_text("#!" + PY + "\n" + r"""
-import json, os, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
-from pathlib import Path
-argv = sys.argv[1:]
-st = Path(os.environ["FAKE_STATE"])
-st.mkdir(exist_ok=True)
-(st / "argv.jsonl").open("a").write(json.dumps(argv) + "\n")
-assert argv[0] == "serve"
-assert "password" not in " ".join(argv).lower()
-pwd = os.environ["OPENCODE_SERVER_PASSWORD"]
-(st / "pwd-in-argv").write_text("yes" if pwd in " ".join(argv) else "no")
-class H(BaseHTTPRequestHandler):
-    def _json(self, code, obj):
-        data = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-    def do_GET(self):
-        auth = self.headers.get("Authorization") or ""
-        if auth != "Bearer " + pwd:
-            return self._json(401, {"error": "unauthorized"})
-        self._json(200, {"session": "oc-owned", "status": "idle",
-                         "action": {"reason": "free_tier_limit", "provider": "opencode"}})
-    def do_POST(self):
-        auth = self.headers.get("Authorization") or ""
-        if auth != "Bearer " + pwd:
-            return self._json(401, {"error": "unauthorized"})
-        path = urlparse(self.path).path
-        if path == "/session":
-            return self._json(200, {"id": "oc-owned"})
-        if path == "/session/abort":
-            (st / "aborted").write_text("1")
-            return self._json(200, {"ok": True})
-        return self._json(200, {"ok": True})
-    def log_message(self, *a):
-        return
-srv = HTTPServer(("127.0.0.1", 0), H)
-print("http://127.0.0.1:%s" % srv.server_address[1], flush=True)
-srv.serve_forever(poll_interval=0.05)
-""")
-        (bindir / "opencode").chmod(0o700)
-        old_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = str(bindir) + os.pathsep + old_path
-        os.environ["FAKE_STATE"] = str(fake_state)
-        self.addCleanup(lambda: os.environ.__setitem__("PATH", old_path))
-        core.submit(sd, "oc1", {"goal": "owned serve"}, str(ws), "planner")
-        job = core.get_job(sd, "oc1")
-        run = core.make_durable_run_cmd(sd, "oc1", job.get("owner_token") or "tok")
-        from runner import adapters
-        rc, out, err = run(adapters.build_opencode_serve_cmd(), str(ws), 20,
-                           kind="opencode_control",
-                           meta={"prompt": "implement", "allowance": "free"})
-        blob = out + err
-        self.assertNotIn("OPENCODE_SERVER_PASSWORD", blob)
-        con = store.connect(sd)
-        try:
-            db = json.dumps([dict(r) for r in con.execute("SELECT * FROM invocations").fetchall()])
-            ev = json.dumps([dict(r) for r in con.execute("SELECT * FROM events").fetchall()])
-        finally:
-            con.close()
-        self.assertNotIn("OPENCODE_SERVER_PASSWORD", db + ev)
-        self.assertNotIn("Bearer ", db + ev)
-        self.assertIn("oc-owned", (core.get_job(sd, "oc1").get("opencode_session_id") or "") + blob)
-        argv = json.loads((fake_state / "argv.jsonl").read_text().splitlines()[0])
-        self.assertNotIn("password", " ".join(argv).lower())
-        self.assertEqual((fake_state / "pwd-in-argv").read_text().strip(), "no")
-        for inv in core._list_invocations(sd, "oc1"):
+        self.fake_state = base / "fakestate"
+        self.fake_state.mkdir()
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_STATE", "FAKE_OC_MODE")}
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        os.environ["PATH"] = str(bindir) + os.pathsep + (saved["PATH"] or "")
+        os.environ["FAKE_STATE"] = str(self.fake_state)
+        os.environ["FAKE_OC_MODE"] = mode
+        core.submit(self.sd, "oc1", {"goal": "owned serve"}, str(self.ws), "planner")
+        self.addCleanup(self._kill_groups)
+        run = core.make_durable_run_cmd(self.sd, "oc1", "tok")
+
+        def timed_run(cmd, cwd=None, timeout=None, **kw):
+            return run(cmd, cwd, timeout_secs or timeout, **kw)
+        return timed_run
+
+    def _kill_groups(self):
+        for inv in core._list_invocations(self.sd, "oc1"):
             for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
                 if pg:
                     try:
                         os.killpg(int(pg), signal.SIGKILL)
                     except Exception:
                         pass
+
+    def _requests(self):
+        f = self.fake_state / "opencode-requests.jsonl"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def _no_secret_leak(self):
+        con = store.connect(self.sd)
+        try:
+            db = json.dumps([dict(r) for r in con.execute("SELECT * FROM invocations").fetchall()])
+            db += json.dumps([dict(r) for r in con.execute("SELECT * FROM events").fetchall()])
+            db += json.dumps([dict(r) for r in con.execute("SELECT * FROM jobs").fetchall()])
+        finally:
+            con.close()
+        self.assertNotIn("OPENCODE_SERVER_PASSWORD", db)
+        self.assertNotIn("Basic ", db)
+        self.assertEqual((self.fake_state / "pwd-in-argv").read_text(), "no")
+
+    def test_success_saves_session_before_prompt_and_stops_server(self):
+        run = self._setup("ok")
+        res = controller.run_implementation(self.sd, "oc1", artifact="a.txt",
+                                            run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "implementation_ok", core.get_job(self.sd, "oc1"))
+        self.assertIn("IMPLEMENTED", res["output"])
+        job = core.get_job(self.sd, "oc1")
+        self.assertTrue(job["opencode_session_id"].startswith("ses_"))
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        reqs = self._requests()
+        order = [r["path"].rsplit("/", 1)[-1] for r in reqs if r["method"] == "POST"]
+        self.assertEqual(order, ["session", "prompt_async"])
+        self.assertTrue(all(r["auth_ok"] for r in reqs))
+        events = [e["kind"] for e in core.status_view(self.sd, "oc1")["recent_events"]]
+        self.assertIn("invocation_session_captured", events)
+        inv = core._list_invocations(self.sd, "oc1")[0]
+        self.assertTrue(wait_for(lambda: not core._is_pgid_alive(inv["pgid"]), 10))
+        self._no_secret_leak()
+
+    def test_free_limit_status_aborts_confirms_idle_then_go(self):
+        run = self._setup("free_limit")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "transferred_to_go")
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "muse-spark-xhigh-go")
+        self.assertTrue((self.fake_state / "aborted").exists())
+        self.assertIn("free_tier_limit", job["last_error_json"])
+        self.assertIn('"idle_confirmed": true', job["last_error_json"])
+        self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+        # Same saved session continues on Go with the Go model.
+        free_session = job["opencode_session_id"]
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res2["action"], "implementation_ok")
+        prompts = [r for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual([p["body"]["model"]["providerID"] for p in prompts],
+                         ["opencode", "opencode-go"])
+        self.assertEqual(core.get_job(self.sd, "oc1")["opencode_session_id"], free_session)
+        self._no_secret_leak()
+
+    def test_provider_api_error_body_is_trusted_free_evidence(self):
+        run = self._setup("api_free_error")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "transferred_to_go")
+
+    def test_generic_rate_limit_never_transfers(self):
+        run = self._setup("rate_limit")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "blocked")
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+
+    def test_model_authored_text_is_not_provider_evidence(self):
+        run = self._setup("model_text")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "implementation_ok")
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        self.assertNotEqual(job["status"], "succeeded")
+        self.assertIsNone(controller._load_controller_state(job).get("last_action"))
+
+    def test_hung_turn_times_out_with_abort(self):
+        run = self._setup("hang", timeout_secs=3)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "blocked")
+        self.assertTrue((self.fake_state / "aborted").exists())
+        job = core.get_job(self.sd, "oc1")
+        self.assertIn("timed out", job["block_reason"] + job["last_error_json"])
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+
+
+FAKE_LUNA = r"""
+import json, os, sys
+from pathlib import Path
+st = Path(os.environ["FAKE_STATE"])
+argv = sys.argv[1:]
+with open(st / "codex.log", "a") as f:
+    f.write(json.dumps(argv) + "\n")
+tid = "impl-crash-thread"
+n_f = st / "codex_n"
+n = int(n_f.read_text()) + 1 if n_f.exists() else 1
+n_f.write_text(str(n))
+ask = os.environ.get("FAKE_LUNA_ASK") == "1"
+impl = {"action": "implementation", "artifact": "fix.txt",
+        "payload": {"instructions": "write fix.txt"}}
+if argv[:2] != ["exec", "resume"]:
+    env = {"action": "planner_question", "qid": "q1", "prompt": "Which order?"} if ask else impl
+elif ask and n == 2:
+    env = impl
+else:
+    env = {"action": "completion", "output": "IMPL_CRASH_DONE"}
+lp = argv[argv.index("--output-last-message") + 1]
+Path(lp).write_text(json.dumps(env))
+for obj in ({"type": "thread.started", "thread_id": tid},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(env)}},
+            {"type": "turn.completed", "usage": {}}):
+    print(json.dumps(obj), flush=True)
+"""
+
+
+class TestImplementationBoundaryFaults(unittest.TestCase):
+    def _setup(self, delay, extra_env=None, wait_kind="opencode_control"):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        self.sd = str(base / "state")
+        self.ws = base / "ws"
+        self.ws.mkdir()
+        bindir = base / "bin"
+        bindir.mkdir()
+        self.fs = base / "fakestate"
+        self.fs.mkdir()
+        write_fake(bindir, "codex", FAKE_LUNA, PY)
+        write_fake(bindir, "claude", FAKE_CLAUDE, PY)
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        env = dict(os.environ)
+        env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
+                   FAKE_STATE=str(self.fs), FAKE_OC_DELAY=str(delay),
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+        env.update(extra_env or {})
+        self.env = env
+        self.addCleanup(self._cleanup)
+        rc, out, err = cli(self.sd, "submit", "--request-id", "ib1",
+                           "--task", '{"goal":"implementation boundary"}',
+                           "--workspace", str(self.ws), "--planner-session", "p-ib",
+                           "--start", env=env)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(wait_for(lambda: any(
+            i["kind"] == wait_kind and i.get("pid")
+            and (wait_kind != "opencode_control"
+                 or core.get_job(self.sd, "ib1").get("opencode_session_id"))
+            for i in core._list_invocations(self.sd, "ib1")), 15))
+        return [i for i in core._list_invocations(self.sd, "ib1")
+                if i["kind"] == wait_kind][0]
+
+    def _cleanup(self):
+        job = core.get_job(self.sd, "ib1")
+        if job.get("owner_pid"):
+            kill_pid(job["owner_pid"])
+        for inv in core._list_invocations(self.sd, "ib1"):
+            for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
+                if pg:
+                    try:
+                        os.killpg(int(pg), signal.SIGKILL)
+                    except Exception:
+                        pass
+
+    def _lines(self, name):
+        f = self.fs / name
+        return f.read_text().splitlines() if f.exists() else []
+
+    def test_controller_killed_during_implementation_adopts_without_second_worker(self):
+        inv = self._setup(delay=3.0)
+        kill_pid(core.get_job(self.sd, "ib1")["owner_pid"])
+        rc, rec, err = cli(self.sd, "recover", "--request-id", "ib1", env=self.env)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec.get("action"), "adopted-live-invocation", rec)
+        self.assertTrue(rec.get("pid"))
+        self.assertTrue(wait_for(lambda: core.get_job(self.sd, "ib1")["status"]
+                                 in ("succeeded", "failed", "blocked"), 25))
+        job = core.get_job(self.sd, "ib1")
+        self.assertEqual(job["status"], "succeeded", job.get("block_reason"))
+        self.assertIn("IMPL_CRASH_DONE", job["result_json"])
+        self.assertEqual(len(self._lines("opencode.log")), 1, "one owned server only")
+        prompts = [l for l in self._lines("opencode-requests.jsonl") if "prompt_async" in l]
+        self.assertEqual(len(prompts), 1, "one implementation turn only")
+        self.assertEqual(len(self._lines("codex.log")), 2, "dispatch plus one resume")
+        kinds = [i["kind"] for i in core._list_invocations(self.sd, "ib1")]
+        self.assertEqual(kinds.count("opencode_control"), 1)
+        reused = [e for e in core.status_view(self.sd, "ib1")["recent_events"]
+                  if e["kind"] == "invocation_reused"]
+        self.assertTrue(reused, "the adopting controller reused the finished turn")
+        self.assertEqual(job["codex_task_id"], "impl-crash-thread")
+        self.assertFalse(core._is_pgid_alive(inv["pgid"]))
+
+    def test_controller_killed_during_planner_callback_asks_once(self):
+        self._setup(delay=0.2, extra_env={"FAKE_LUNA_ASK": "1", "FAKE_CLAUDE_DELAY": "2",
+                                          "FAKE_CLAUDE_ANSWER": "Descending."},
+                    wait_kind="claude_callback")
+        kill_pid(core.get_job(self.sd, "ib1")["owner_pid"])
+        rc, rec, err = cli(self.sd, "recover", "--request-id", "ib1", env=self.env)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec.get("action"), "adopted-live-invocation", rec)
+        self.assertTrue(wait_for(lambda: core.get_job(self.sd, "ib1")["status"]
+                                 in ("succeeded", "failed", "blocked"), 25))
+        job = core.get_job(self.sd, "ib1")
+        self.assertEqual(job["status"], "succeeded", job.get("block_reason"))
+        self.assertEqual(len(self._lines("claude.log")), 1, "the planner is asked once")
+        qs = core.list_questions(self.sd, "ib1", only_pending=False)
+        self.assertEqual([(q["qid"], q["status"], q["answer"]) for q in qs],
+                         [("q1", "answered", "Descending.")])
+        resumes = [json.loads(l) for l in self._lines("codex.log") if '"resume"' in l]
+        self.assertEqual(len(resumes), 2)
+        self.assertIn("Descending.", resumes[0][-1])
+
+    def test_supervisor_killed_stops_orphaned_server_and_blocks(self):
+        inv = self._setup(delay=30.0)
+        kill_pid(core.get_job(self.sd, "ib1")["owner_pid"])
+        os.kill(int(inv["supervisor_pid"]), signal.SIGKILL)
+        self.assertTrue(wait_for(lambda: not alive(inv["supervisor_pid"]), 5))
+        self.assertTrue(core._is_pgid_alive(inv["pgid"]), "server outlives its supervisor")
+        cur = [i for i in core._list_invocations(self.sd, "ib1") if i["invocation_id"] == inv["invocation_id"]][0]
+        self.assertEqual(core._invocation_ownership(cur), "orphaned")
+        rc, out, err = cli(self.sd, "start", "--request-id", "ib1", env=self.env)
+        self.assertNotEqual(rc, 0, "an orphaned server blocks a new controller")
+        rc, rec, err = cli(self.sd, "recover", "--request-id", "ib1", env=self.env)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(core._is_pgid_alive(inv["pgid"]), "recover stops the orphaned server")
+        self.assertTrue(wait_for(lambda: core.get_job(self.sd, "ib1")["status"]
+                                 in ("succeeded", "failed", "blocked"), 15))
+        job = core.get_job(self.sd, "ib1")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("implementation_failed", job["block_reason"])
+        self.assertEqual(len(self._lines("opencode.log")), 1, "the interrupted turn is not replayed")
 
 
 class TestCancelTimeoutOwnChildren(unittest.TestCase):

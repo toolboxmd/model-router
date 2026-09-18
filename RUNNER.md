@@ -1,18 +1,22 @@
 # Durable local runner
 
-Small production-shaped runner. Python standard library only. No services,
-plugins, dependencies, credentials, or network listeners.
+A small local runner that accepts prepared work from a Claude planner, hands
+it to a persistent Codex Luna dispatcher, and returns questions and
+completion without depending on the planner process staying open. Python
+standard library only. No services, plugins, dependencies, or network
+listeners beyond one owned loopback OpenCode server per implementation turn.
 
-Project direction (`VISION.md`, `MISSION.md`, `OBJECTIVE.md`) and `VERSION`
-are unchanged. AgentsMD owns workflow, authority, and proof; this runner
-only persists handoff, owns process leases, and tracks explicit routes.
+AgentsMD and the target project own workflow, authority, proof, and review.
+The runner persists the handoff, owns child processes, and follows one
+versioned route policy. It cannot grant new authority.
 
 ## Public CLI
 
 ```
-python -m runner --state-dir DIR submit --request-id ID --task JSON|--task-file F \
-  --workspace PATH --planner-session SID [--route R] [--max-attempts N] [--timeout-secs S] \
-  [--planner-model M] [--planner-effort E] [--start|--no-start]
+python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
+  --workspace PATH --planner-session SID [--planner-cwd PATH] \
+  [--planner-model M] [--planner-effort E] [--route R] [--max-attempts N] \
+  [--timeout-secs S] [--start | --no-start]
 python -m runner --state-dir DIR start --request-id ID
 python -m runner --state-dir DIR status --request-id ID
 python -m runner --state-dir DIR questions --request-id ID [--all]
@@ -21,153 +25,142 @@ python -m runner --state-dir DIR cancel --request-id ID
 python -m runner --state-dir DIR recover (--request-id ID | --all)
 ```
 
-Worker-internal helpers (no new authority): `launch`, `post-question`,
-`complete --token`, `fail --token --error JSON`.
+`submit` commits the task, workspace claim, policy identity, planner session,
+planner model, effort, and directory before it acknowledges. The same ID and
+payload return the existing job. A changed payload conflicts. A second active
+job on the same workspace is rejected. `--start` launches a detached
+controller after the commit. `--planner-cwd` is the directory where the
+planner session was started, because Claude stores sessions per project
+directory; it defaults to the workspace.
 
-`submit` persists policy identity, workspace ownership, planner/Claude
-session ID, planner model/effort defaults, task metadata, output path,
-and a `submitted` event in one SQLite transaction before ack. Same ID
-plus identical payload returns the existing job; conflicting reuse is
-rejected. A second active job on the same workspace is rejected. With
-`--start` (or separate `start`), a detached controller spawns with
-built-in adapters after persist; `--no-start` keeps deterministic tests
-offline. Manual `launch` spawns a detached worker (`start_new_session`,
-stdio to /dev/null) and persists the attempt before and after ack.
-`recover` reconciles durable records with live ownership. It consumes
-finished child output exactly once, adopts a live child, and blocks on
-unresolved NULL-pid ownership. After a public `answer` on a saved Luna
-task, `recover` resumes a detached controller instead of clearing the
-lease and stalling. It never forks the planner or Luna session.
+`launch`, `post-question`, `complete`, and `fail` are worker-internal helpers
+used by the offline lease tests.
+
+## Flow
+
+1. Dispatch: `codex exec --json --output-last-message PATH --model
+   gpt-5.6-luna -c model_reasoning_effort="max" --sandbox read-only --cd WS`.
+   The first `thread.started` ID is saved as the Luna task. Luna's action is
+   read only from its own final `item.completed` `agent_message` text, or
+   the last-message file. Command output is never parsed for actions.
+2. Luna replies with one envelope: `planner_question`, `implementation`, or
+   `completion`. The envelope is saved before its effect.
+3. `planner_question`: the question is saved, then the original planner is
+   resumed with `claude --resume SID --model M --effort E --output-format
+   json --tools "" -p PROMPT` in the planner directory. The answer counts
+   only when the JSON result is a success from the same session ID. A running
+   `claude` process that names the session in its arguments is a busy
+   planner. Busy, failed, or mismatched callbacks block the job with a
+   reason; the question stays pending for `answer` plus `recover`.
+4. The answer is saved, then the same Luna task resumes with `codex exec
+   resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
+   sandbox_mode="read-only"`. A resume that reports another thread blocks.
+5. `implementation`: one Muse turn runs on an owned `opencode serve --pure
+   --hostname 127.0.0.1 --port 0`. See below. The worker report returns to
+   the same Luna task.
+6. `completion`: the terminal result is saved before acknowledgment.
+
+The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
+but cannot edit. The controller runs at most 12 transitions per launch and
+then blocks with a reason instead of spinning.
+
+## Implementation worker
+
+Each turn starts a fresh `opencode serve` with a random password in its
+environment only. The supervisor authenticates with Basic auth
+(`opencode:<password>`) and scopes every call with `directory=<workspace>`.
+It creates or reuses the saved session and saves the session ID before the
+model request. The session gets permission rules that deny access outside the
+workspace, subagents, interactive questions, doom-loop prompts, and web
+access. OpenCode does not confine Bash at the OS level; that remains a known
+limit.
+
+The prompt goes through `POST /session/{id}/prompt_async` with model
+`opencode/muse-spark-1.3-contributor-free`, variant `xhigh`, agent `build`.
+The supervisor polls `GET /session/status` for that session only and reads
+the new assistant messages when it is idle. The server group stops after
+every turn.
+
+Free to Go needs trusted provider evidence for the owned session:
+
+- a `retry` status with `action.reason` `free_tier_limit` and
+  `action.provider` `opencode`, or
+- an assistant `APIError` whose provider `responseBody` names
+  `FreeUsageLimitError`.
+
+On status evidence the session is aborted and confirmed idle before the
+route changes. The same session then continues on
+`opencode-go/muse-spark-1.3-contributor` with the same effort. Exhausted free
+capacity is remembered across jobs until a trusted reset time passes; an
+unknown reset stays unknown. Model-authored text, generic 429,
+`account_rate_limit`, timeouts, consent, region, and auth errors never
+change the route. Zen balance overflow and direct paid APIs are disabled.
+
+## Process ownership
+
+Every model child is an invocation row committed with NULL PID before any
+spawn. An independent supervisor process group starts the child, records its
+PID, PGID, and start identity, waits for it, and writes the exit code and
+result. File-backed output survives controller death.
+
+- NULL PID or a changed start identity is unresolved ownership, never death.
+- A live child or supervisor is `live`. An owned OpenCode server whose
+  supervisor died is `orphaned`: its password is gone, so `recover` stops
+  that task-owned group.
+- Each invocation has an action key from its kind, command, prompt, model,
+  and Luna turn number. A restarted controller replays from saved state. A
+  finished action is reused, a live one is adopted by waiting for its
+  result, and a failed model turn is not replayed: the job blocks with the
+  reason. This prevents duplicate dispatches, planner turns, and workers.
+- `recover` stops orphaned servers, consumes uncollected results once
+  (including a finished planner answer), and restarts the controller for a
+  dispatched job whose controller is gone. Unknown ownership blocks.
+- `cancel` and timeouts signal every child and supervisor group and keep the
+  workspace claimed until they are confirmed dead.
+
+Default child timeouts: Codex 1800 s, Claude 900 s, OpenCode 1800 s.
+`--timeout-secs` bounds the whole job and is enforced by `recover`.
 
 ## State
 
-`--state-dir` (or `DURABLE_RUNNER_STATE_DIR`), `0700`; `jobs.db` (SQLite
-WAL), `outputs/*.log`, `outputs/*.result.json`, and `workers/*.json` are
-`0600`. File-backed output is append-only; recovery never truncates
-partial logs. Status views redact start tokens and never echo task bodies.
-Events store hashes and IDs, never credentials.
+`--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is `0700`. `jobs.db` (SQLite,
+WAL), `outputs/*`, and `workers/*.json` are `0600`. Status views never echo
+task bodies or tokens. Passwords and credentials are never written to the
+database, events, or logs.
 
-States: `pending -> running <-> question_pending -> succeeded|failed|cancelled`.
-`blocked` means unknown ownership, busy planner, or failed callback with
-an explicit reason; it never spawns. Terminal states are final: no
-resurrection, no budget reset, no retry loop. `max_attempts` (default 3,
-1..10) bounds recovery. Planner, executor, Codex task, and OpenCode
-session IDs are assigned once and preserved; recovery reuses the same
-sessions and never forks the planner or the Luna task.
-
-## Adapters and controller
-
-Stdlib only (`runner/adapters.py`, `runner/controller.py`). Built-in
-defaults require no executor/callback commands:
-
-- Codex dispatcher: `codex exec --json --output-last-message PATH
-  --model gpt-5.6-luna -c model_reasoning_effort="max" --sandbox
-  workspace-write --cd WS`. The returned thread/task ID (from
-  `thread.started`/`thread_id` or the completed agent message /
-  output-last-message envelope, exact ID preserved) persists before the
-  dispatch counts as accepted. Resume is `codex exec resume ID --json`
-  with the saved workspace as cwd (never `--cd`/`--reasoning`).
-- Claude planner: `claude --resume SID --model fable-5.1 --effort max`
-  production default (explicit `claude-sonnet-5`/`medium` is only the
-  bounded live-test override). Missing sessions are rejected; no new
-  planner session is ever created implicitly.
-- Implementation: `opencode run --format json --pure --dir WS --model
-  opencode/muse-spark-1.3-contributor-free --variant xhigh --agent
-  build` free-first (`opencode-go/muse-spark-1.3-contributor` only
-  after exact free exhaustion; `--session` resumes the saved session).
-  Command injection stays as a test seam.
-
-Luna returns `planner_question`, `implementation`, or `completion`.
-`planner_question` persists before Claude `--resume`; the answer persists
-before resuming the same Luna task. `implementation` carries the saved
-artifact/output. Busy planner or callback failure becomes durable
-`blocked` with a reason; questions stay pending for `answer` + `recover`.
-
-OpenCode quota uses an owned ephemeral per-job `opencode serve --pure
---hostname 127.0.0.1 --port 0` process (fresh in-memory password in the
-child environment, URL parsed from durable stdout, never logged, never a
-shared service) or an injectable equivalent. The public controller path
-creates/saves the session on that server before prompting and observes
-only that session's status. Never invent a random password for a server
-the job does not own. Free to Go needs the exact vendor class
-`FreeUsageLimitError` (including decoded `responseBody` JSON) or a retry
-with reason `free_tier_limit` and provider `opencode` for the saved
-session. The old free session aborts before transfer, ownership/idle
-confirms, artifacts preserve. Route, adapter, model, effort, session IDs,
-attempts, and redacted provider evidence persist without secrets. Full
-task content is passed to Luna and adapters without silent clipping; the
-Luna action envelope persists before its side effect.
-
-Each model spawn persists immutable invocation intent (NULL pid/pgid)
-before Popen. An independent supervisor process group waits on the child,
-captures IDs from file-backed output, and writes rc/result. Killing only
-the controller does not destroy that output. A NULL PID/PGID or start-
-identity mismatch is unresolved ownership, never proof of death.
-`recover` consumes finished output exactly once and will not rerun a
-completed child. Cancellation and timeout signal every child and
-supervisor process group and keep the workspace claimed until they are
-confirmed dead. These seams are proved with fake executables, not live
-model CLIs.
-
-## Ownership
-
-Lease: `jobs.owner_token` + `jobs.owner_pid`. The live worker advertises
-`{token, pid, updated}` in `workers/<id>.json` with a fresh heartbeat.
-Owned means token match plus pid match plus alive plus fresh. PID
-aliveness alone never proves ownership. `complete`/`fail` require the
-lease token. Unknown live tokens block with a reason instead of spawning
-a possible duplicate.
+States: `pending -> running <-> question_pending -> succeeded | failed |
+cancelled`. `blocked` always has a reason and never spawns.
 
 ## Policy
 
-`runner/policy.py` (`durable-runner-policy-v1`): Luna max dispatch;
-Terra only as recorded fallback after demonstrated Luna coordination
-failure (no live-exercised adapter); Muse Spark 1.3 Contributor xhigh
-free-first then the same model on Go included allowance only after
-explicit `FREE_ALLOWANCE_EXHAUSTED` `confirmed:true`, exact vendor
-`FreeUsageLimitError` (including decoded `responseBody` JSON), or retry
-`free_tier_limit` + provider `opencode`; Go DeepSeek V4.1 Flash -> GLM
-5.3 Flash -> MiniMax M3 then MiMo 2.5 / LongCat 2.0 as recorded capacity
-(precise blocker if not operational); Kimi K2.7 Code only after the
-initial worker plus one bounded correction (not operational here);
-independent Luna max review; Opus 5 high combined review; planning
-Fable 5.1 max / Astra max (the production fable-5.1 slug is not
-live-verified; Claude help advertises `claude-fable-5`); recovery Grok
-4.6 medium (Grok Build) then Astra medium then Opus 5 high (named
-recovery adapters are not live-exercised); `sonnet/medium` is the
-explicit `claude-sonnet-5` / `medium` live-test override only. Cross-job
-capacity memory persists exhausted routes until trusted provider reset
-evidence; unknown reset stays unknown and is never invented as a daily
-timer. Generic 429, `RateLimitError`/`rate_limit`, timeout,
-permission/consent, invalid-plan, `DataPolicyError`, `RegionError`,
-`AuthError`, and `GoUsageLimitError`/`account_rate_limit` never switch
-quota. No text-only 429 matching. Zen overflow and direct paid APIs are
-off. `make_action`/`make_result` carry implementation, planner-question,
-review, and completion envelopes with artifact and failure evidence.
+`runner/policy.py` (`durable-runner-policy-v1`) records the agreed roles:
+planning Fable 5.1 max (`claude-fable-5-1`) or Astra max in Codex; Luna max
+dispatch, Terra only after demonstrated coordination failure; Muse Spark 1.3
+Contributor xhigh free first, then Go included allowance; Go capacity order
+DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3, then MiMo 2.5 and LongCat
+2.0; one bounded correction, then Kimi K2.7 Code; recovery Grok 4.6 medium,
+Astra medium, Opus 5 high; independent Luna max review; Opus 5 high combined
+review. Only Luna dispatch, the Claude planner callback, and the two Muse
+routes have runner adapters. Other routes return a precise blocker and are
+never reported as a successful fallback. `claude-sonnet-5` / `medium` is an
+explicit test override only.
 
-## Tests
-
-Deterministic only; no live model CLIs:
+## Verification
 
 ```
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests
 python -m compileall -q runner tests
 ```
 
-Fault injection uses real detached fake processes for duplicate submits,
-workspace clashes, launch races, controller death, worker death with
-same-session recovery, partial logs, question replay, cancel/timeout,
-quota-vs-other-errors, unsupported routes, missing permissions, unknown
-ownership, bounded recovery, live-child adopt, completion-before-recover
-consume-once, NULL-pid unresolved ownership, and answer+recover
-continuation. Bridge tests add default command construction, missing
-planner session, adapter session persistence, planner resume/no-fork,
-built-in controller lifecycle seams, exact
-`FreeUsageLimitError`/`responseBody`/retry classification, fake HTTP
-provider-envelope + owned-serve control-path checks, capacity blockers,
-and callback failure/busy persistence. All offline; no live model CLIs.
-Named recovery adapters and live OpenCode quota transfers are not
-claimed from this suite.
+The suite uses fake `codex`, `claude`, and `opencode` executables shaped like
+the real contracts (`tests/fakes.py`) and real detached processes. It covers
+duplicate and concurrent submission, workspace conflicts, launch races,
+controller and worker death, killed supervisors, pending questions,
+answer-plus-recover, cancellation, timeouts, trusted and untrusted quota
+evidence, unsupported routes, and unknown ownership. It does not prove live
+model behavior. Live verification evidence is recorded on the owning Issue.
 
-Live check: `fixtures/LIVE_RECIPE.md` plus `fixtures/live_sequence.json`.
-Real live verification is external.
+Not verified live: the production planner default `claude-fable-5-1`, a real
+free-to-Go transfer through this runner, recovery routes, and interactive
+planner sessions opened without the session ID in their arguments (the busy
+check cannot see them).

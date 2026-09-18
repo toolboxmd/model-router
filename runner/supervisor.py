@@ -154,8 +154,9 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
         con.execute("BEGIN IMMEDIATE")
         con.execute(
             "UPDATE invocations SET pid=?, pgid=?, process_start=?,"
-            " supervisor_pid=?, supervisor_pgid=? WHERE invocation_id=?",
-            (pid, pgid, start_id, sup_pid, sup_pgid, invocation_id),
+            " supervisor_pid=?, supervisor_pgid=?, supervisor_start=? WHERE invocation_id=?",
+            (pid, pgid, start_id, sup_pid, sup_pgid,
+             process_start_identity(sup_pid), invocation_id),
         )
         core._event(con, request_id, "invocation_spawned",
                     {"invocation_id": invocation_id[:16], "kind": kind,
@@ -185,9 +186,14 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     control_result = None
     try:
         if kind == "opencode_control":
-            control_result, captured_session, captured_kind = _drive_opencode_control(
-                state_dir, request_id, invocation_id, proc, pgid, pid,
-                stdout_path, stderr_path, generated_password, meta, job, deadline)
+            try:
+                control_result, captured_session, captured_kind = _drive_opencode_control(
+                    state_dir, request_id, invocation_id, proc,
+                    stdout_path, stderr_path, generated_password, meta, job,
+                    deadline, workspace)
+            except Exception as e:  # noqa: BLE001 - recorded, never silent
+                control_result = {"ok": False, "rc": 1,
+                                  "error": f"control failed: {type(e).__name__}: {str(e)[:300]}"}
             rc = 0 if (control_result or {}).get("ok") else int((control_result or {}).get("rc") or 1)
             try:
                 os.killpg(int(pgid or pid), 15)
@@ -249,21 +255,10 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
             _persist_session(state_dir, request_id, invocation_id, sid, skind, job)
 
     envelope = control_result
-    if envelope is None and kind in ("codex_dispatch", "codex_resume", "opencode_run",
-                                     "opencode_control", "opencode_serve"):
-        envelope = adapters.parse_luna_envelope_from_texts(stdout_text, stderr_text)
-        if envelope is None:
-            for blob in (stdout_text, stderr_text):
-                blob = (blob or "").strip()
-                if not blob:
-                    continue
-                try:
-                    obj = json.loads(blob)
-                    if isinstance(obj, dict):
-                        envelope = obj
-                        break
-                except ValueError:
-                    continue
+    if envelope is None and kind in ("codex_dispatch", "codex_resume"):
+        envelope = adapters.parse_codex_agent_envelope(
+            stdout_text, adapters.read_last_message_file(
+                adapters.last_message_path_from_cmd(cmd)))
 
     result = {
         "rc": rc,
@@ -281,10 +276,18 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     return 0 if rc == 0 else int(rc or 1)
 
 
-def _drive_opencode_control(state_dir, request_id, invocation_id, proc, pgid, pid,
-                            stdout_path, stderr_path, password, meta, job, deadline):
-    """Create/save a session on the owned server, prompt, observe status."""
-    from . import adapters, policy
+def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
+                            stdout_path, stderr_path, password, meta, job,
+                            deadline, workspace):
+    """Drive one implementation turn on the owned ``opencode serve``.
+
+    Save the session before the model request, prompt asynchronously,
+    and observe only that session. Free exhaustion requires trusted
+    server evidence; the session is aborted and confirmed idle before
+    the result allows a Go transfer.
+    """
+    from . import adapters
+    meta = meta if isinstance(meta, dict) else {}
     base_url = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -297,56 +300,111 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc, pgid, pi
         time.sleep(0.05)
     if not base_url:
         return {"ok": False, "rc": 124, "error": "opencode serve did not emit a localhost URL"}, None, None
-    client = adapters.OpenCodeClient(base_url, password)
-    saved = None
-    if isinstance(meta, dict):
-        saved = meta.get("session_id") or None
+    client = adapters.OpenCodeClient(base_url, password, directory=workspace)
+    health_err = None
+    while time.monotonic() < deadline:
+        try:
+            client.health()
+            health_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            health_err = f"{type(e).__name__}: {str(e)[:200]}"
+            time.sleep(0.2)
+    if health_err:
+        return {"ok": False, "rc": 1, "error": f"opencode health failed: {health_err}"}, None, None
+    saved = meta.get("session_id") or None
     if not saved:
-        created = client.create_session()
+        created = client.create_session(title=f"model-router runner {request_id}")
         saved = client.session_id_from(created)
         if not saved:
-            return {"ok": False, "rc": 1, "error": "opencode session create returned no id",
-                    "create": adapters.redact_nested(created)}, None, None
-    _persist_session(state_dir, request_id, invocation_id, saved, "opencode_session_id", job)
-    prompt = (meta or {}).get("prompt") or ""
-    allowance = (meta or {}).get("allowance") or "free"
-    try:
-        model = adapters.opencode_model_for_allowance(allowance)
-    except ValueError:
-        model = adapters.OPENCODE_FREE_MODEL
-    if (meta or {}).get("model"):
-        model = meta["model"]
-    prompted = client.prompt(saved, prompt, model=model, variant=adapters.OPENCODE_VARIANT)
-    status = client.session_status(saved)
-    combined = {"prompt_result": adapters.redact_nested(prompted),
-                "status": adapters.redact_nested(status),
-                "opencode_session_id": saved,
-                "ok": True}
-    if policy.classify_quota_exhaustion(status) or policy.classify_quota_exhaustion(prompted):
-        combined["ok"] = False
-        combined["quota"] = True
-        combined["class"] = "FreeUsageLimitError"
+            return {"ok": False, "rc": 1,
+                    "error": "opencode session create returned no id"}, None, None
+    _persist_session(state_dir, request_id, invocation_id, saved,
+                     "opencode_session_id", job)
+    allowance = meta.get("allowance") or "free"
+    model = meta.get("model") or adapters.opencode_model_for_allowance(allowance)
+    baseline = set()
+    for m in client.messages(saved):
+        info = m.get("info") if isinstance(m, dict) else None
+        if isinstance(info, dict) and info.get("id"):
+            baseline.add(info["id"])
+    client.prompt_async(saved, meta.get("prompt") or "", model=model)
+    result = {"opencode_session_id": saved, "model": model,
+              "variant": adapters.OPENCODE_VARIANT, "agent": adapters.OPENCODE_AGENT,
+              "ok": False}
+    prompted_at = time.monotonic()
+    seen_active = False
+
+    def abort_and_confirm():
         try:
             client.abort(saved)
-            idle = client.ensure_idle_ownership(saved)
-            combined["idle"] = adapters.redact_nested(idle)
-        except Exception as e:
-            combined["abort_error"] = str(e)[:200]
-            combined["go_transfer_abort_failed"] = True
+        except Exception as e:  # noqa: BLE001
+            result["abort_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        try:
+            idle = client.wait_idle(saved, timeout=30.0)
+        except Exception as e:  # noqa: BLE001
+            idle = {"idle": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        result["idle_confirmed"] = bool(idle.get("idle"))
+        result["idle_status"] = adapters.redact_nested(idle.get("status"))
+
+    while True:
+        if proc.poll() is not None:
+            result.update(rc=1, error="opencode serve exited during the turn")
+            break
+        status = client.session_status(saved)
+        evidence = adapters.trusted_free_exhaustion(status=status)
+        if evidence:
+            result.update(rc=3, quota=True, free_exhaustion_evidence=evidence)
+            abort_and_confirm()
+            break
+        typ = status.get("type")
+        if typ in ("busy", "retry"):
+            seen_active = True
+            if typ == "retry":
+                result["last_retry"] = adapters.redact_nested(status)
         else:
-            combined["transferred_to_go"] = True
-    # Append a durable JSON line without secrets for recover/consume.
+            new = adapters.assistant_messages_after(client.messages(saved), baseline)
+            if new:
+                last = new[-1]
+                info = last.get("info") or {}
+                if (info.get("time") or {}).get("completed") or info.get("error"):
+                    err = info.get("error")
+                    evidence = adapters.trusted_free_exhaustion(message_error=err)
+                    texts = [adapters.message_text(m) for m in new]
+                    result["assistant_text"] = next(
+                        (t for t in reversed(texts) if t.strip()), "")[-8000:]
+                    result["finish"] = info.get("finish")
+                    result["assistant_messages"] = len(new)
+                    result["actual_model"] = {"providerID": info.get("providerID"),
+                                              "modelID": info.get("modelID"),
+                                              "variant": info.get("variant")}
+                    if evidence:
+                        # The session already ended idle with this error.
+                        result.update(rc=3, quota=True, free_exhaustion_evidence=evidence,
+                                      idle_confirmed=True)
+                    elif err:
+                        result.update(rc=1, error=adapters.redact_nested(err))
+                    else:
+                        result.update(rc=0, ok=True)
+                    break
+            elif not seen_active and time.monotonic() - prompted_at > 60:
+                result.update(rc=1, error="prompt was not accepted within 60 seconds")
+                abort_and_confirm()
+                break
+        if time.monotonic() > deadline:
+            result.update(rc=124, error="implementation turn timed out")
+            abort_and_confirm()
+            break
+        time.sleep(1.0)
+    summary = {k: result.get(k) for k in (
+        "opencode_session_id", "ok", "rc", "quota", "idle_confirmed", "finish",
+        "actual_model", "error", "free_exhaustion_evidence")}
     try:
         with open(stdout_path, "a", encoding="utf-8") as f:
-            f.write("\n" + json.dumps({
-                "opencode_session_id": saved,
-                "ok": combined.get("ok"),
-                "quota": combined.get("quota"),
-                "transferred_to_go": combined.get("transferred_to_go"),
-            }) + "\n")
+            f.write("\nRUNNER_RESULT " + json.dumps(summary, sort_keys=True) + "\n")
     except OSError:
         pass
-    return combined, saved, "opencode_session_id"
+    return result, saved, "opencode_session_id"
 
 
 def _persist_session(state_dir, request_id, invocation_id, sid, skind, job) -> None:
@@ -364,10 +422,12 @@ def _persist_session(state_dir, request_id, invocation_id, sid, skind, job) -> N
                 (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, core._utcnow(), request_id),
             )
         elif skind == "opencode_session_id":
-            route = (job or {}).get("route") or "muse-spark-xhigh-free"
+            row = con.execute("SELECT route FROM jobs WHERE request_id=?",
+                              (request_id,)).fetchone()
+            route = (row["route"] if row is not None else None) or "muse-spark-xhigh-free"
             con.execute(
-                "UPDATE jobs SET opencode_session_id=?, route=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, route, adapters.OPENCODE_FREE_MODEL, adapters.OPENCODE_VARIANT,
+                "UPDATE jobs SET opencode_session_id=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
+                (sid, adapters.opencode_model_for_route(route), adapters.OPENCODE_VARIANT,
                  core._utcnow(), request_id),
             )
         elif skind == "planner_session_id":
@@ -399,7 +459,7 @@ def _finish(state_dir, invocation_id, request_id, rc, state,
             "UPDATE invocations SET rc=?, state=?, ended_at=?, result_json=?,"
             " session_id=COALESCE(?, session_id), session_kind=COALESCE(?, session_kind)"
             " WHERE invocation_id=?",
-            (rc, state, core._utcnow(), json.dumps(payload, sort_keys=True)[:16000],
+            (rc, state, core._utcnow(), json.dumps(payload, sort_keys=True),
              session_id, session_kind, invocation_id),
         )
         core._event(con, request_id, "invocation_finished",

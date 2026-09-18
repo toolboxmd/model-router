@@ -1,31 +1,12 @@
-"""Stdlib-only adapter defaults and ephemeral OpenCode control seam.
+"""Stdlib-only harness adapters. See RUNNER.md for the full contract.
 
-Built-in defaults (no executor/callback commands required):
-
-- Codex dispatcher: existing ``codex`` CLI as
-  ``codex exec --json --output-last-message PATH --model gpt-5.6-luna
-  -c model_reasoning_effort="max" --sandbox workspace-write --cd WS``.
-  The returned thread/task ID is persisted before the dispatch counts
-  as accepted. Resume is ``codex exec resume ID --json`` with the saved
-  workspace as cwd (never ``--cd``/``--reasoning`` on resume).
-- Claude planner: existing ``claude`` CLI with ``--resume`` of the exact
-  saved planner session. Production default is Fable 5.1 max; the
-  explicit bounded live-test override is Claude Sonnet 5 medium. Never
-  creates a new planner session implicitly.
-- Implementation: existing ``opencode`` CLI as
-  ``opencode run --format json --pure --dir WS
-  --model opencode/muse-spark-1.3-contributor-free --variant xhigh
-  --agent build`` free-first, ``opencode-go/muse-spark-1.3-contributor``
-  only after exact free exhaustion. ``--session`` resumes the saved
-  OpenCode session. Command injection stays available as a test seam
-  but is not required in normal submit/start usage.
-
-Control seam: an ephemeral per-job ``opencode serve --pure
---hostname 127.0.0.1 --port 0`` process owned by the controller with a
-fresh in-memory password that is never logged or persisted (or an
-injectable ``request_func`` equivalent for deterministic tests). Only
-the saved OpenCode session status is observed. Never invent a random
-password for a server the controller does not own.
+- Codex dispatcher: ``codex exec --json`` with Luna max and a read-only
+  sandbox; resume names the saved thread, model, effort, and sandbox.
+- Claude planner: ``claude --resume SID --output-format json --tools ""``
+  on the exact saved session; the result must come from that session.
+- Implementation: an owned ``opencode serve`` per turn, driven through
+  :class:`OpenCodeClient`. ``build_opencode_cmd`` (``opencode run``) is kept
+  as a deterministic test seam only.
 """
 from __future__ import annotations
 
@@ -34,6 +15,7 @@ import os
 import secrets
 import subprocess
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -41,12 +23,14 @@ CODEX_BIN = "codex"
 CODEX_MODEL = "gpt-5.6-luna"
 CODEX_EFFORT = "max"
 CODEX_REASONING_CONFIG = 'model_reasoning_effort="max"'
-CODEX_SANDBOX = "workspace-write"
+# The dispatcher coordinates and verifies; it never edits. Codex enforces
+# this with its OS sandbox. Implementation belongs to the Muse worker.
+CODEX_SANDBOX = "read-only"
 
 CLAUDE_BIN = "claude"
 # Production planner default: Fable 5.1 max. Sonnet medium is only the
-# explicit bounded live-test override (see fixtures/LIVE_RECIPE.md).
-CLAUDE_MODEL = "fable-5.1"
+# explicit bounded live-test override.
+CLAUDE_MODEL = "claude-fable-5-1"
 CLAUDE_EFFORT = "max"
 CLAUDE_LIVE_MODEL = "claude-sonnet-5"
 CLAUDE_LIVE_EFFORT = "medium"
@@ -64,15 +48,29 @@ OPENCODE_EFFORT = OPENCODE_VARIANT
 # Explicit structured-action protocol embedded in every Luna prompt.
 # Luna must reply with exactly one JSON envelope as its final message.
 LUNA_ACTION_PROTOCOL = (
+    "ROLE: you are the dispatcher for this runner job. Your sandbox is "
+    "read-only: do not edit files. Ask the saved planner with "
+    "planner_question when a decision belongs to the planner. Request code "
+    "changes with the implementation action; put complete worker "
+    "instructions in payload.instructions. The runner sends them to the "
+    "implementation worker and returns its result to you. Inspect the "
+    "workspace and run the task's proof before reporting completion. Do not "
+    "start other agents or models yourself.\n"
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
-    '{"action":"implementation","artifact":"<path or empty>","payload":{},"route":"muse-spark-xhigh-free"}\n'
+    '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"},"route":"muse-spark-xhigh-free"}\n'
     '{"action":"completion","output":"<final result text>","artifact":"<path or empty>"}\n'
     "Rules: exactly one envelope; valid JSON; action must be one of "
-    "planner_question, implementation, completion; never invent a new "
-    "planner or Codex session ID."
+    "planner_question, implementation, completion; use a new qid for each "
+    "new question; never invent a new planner or Codex session ID."
 )
+
+
+def build_luna_followup(kind: str, body: str) -> str:
+    """Frame a resumed-turn message for the saved Luna task."""
+    return f"{kind}:\n{body}\n\n{LUNA_ACTION_PROTOCOL}"
+
 
 BUSY_MARKERS = (
     "session is busy",
@@ -95,7 +93,7 @@ def build_codex_dispatch_cmd(workspace: str, prompt: str,
     """Default Codex dispatch using the proved CLI contract.
 
     ``codex exec --json --output-last-message PATH --model gpt-5.6-luna
-    -c model_reasoning_effort="max" --sandbox workspace-write --cd WS``.
+    -c model_reasoning_effort="max" --sandbox read-only --cd WS``.
     Never uses nonexistent ``--reasoning``.
     """
     if not workspace:
@@ -115,137 +113,124 @@ def build_codex_dispatch_cmd(workspace: str, prompt: str,
             prompt]
 
 
-def build_codex_resume_cmd(task_id: str, workspace: str | None = None,
-                           prompt: str = "",
-                           last_message_path: str | None = None) -> list[str]:
+def build_codex_resume_cmd(task_id: str, prompt: str = "",
+                           last_message_path: str | None = None,
+                           model: str = CODEX_MODEL) -> list[str]:
     """Resume only the saved Codex thread/task ID (never fork).
 
-    ``codex exec resume ID --json`` with the saved workspace as cwd.
-    Never emits ``--cd`` or ``--reasoning`` on resume. ``workspace`` is
-    kept as an optional cwd hint for seam compat and is never placed on
-    the command line.
+    ``codex exec resume ID --json -m gpt-5.6-luna -c
+    model_reasoning_effort="max" -c sandbox_mode="read-only"`` with the
+    saved workspace as cwd. Model, effort, and sandbox are explicit on
+    every resume; ``resume`` has no ``--cd`` or ``--sandbox`` flag.
     """
     if not task_id:
         raise ValueError("missing saved Codex task ID for resume")
-    # Back-compat: old callers passed (task_id, workspace, prompt).
-    # If the second positional looks like prompt text and no third arg
-    # was given, treat it as the prompt. A workspace path hint is
-    # otherwise ignored for argv (it becomes cwd at runtime).
-    actual_prompt = prompt
-    if workspace is not None and not prompt:
-        # Heuristic: if workspace contains whitespace/newlines it is
-        # almost certainly prompt text, not a path.
-        if any(ch in workspace for ch in ("\n", "?", "!", " ")):
-            actual_prompt = workspace
-            workspace = None
-    cmd = [CODEX_BIN, "exec", "resume", task_id, "--json"]
+    cmd = [CODEX_BIN, "exec", "resume", task_id, "--json",
+           "-m", model, "-c", CODEX_REASONING_CONFIG,
+           "-c", f'sandbox_mode="{CODEX_SANDBOX}"']
     if last_message_path:
         cmd += ["--output-last-message", last_message_path]
-    if actual_prompt:
-        cmd += [actual_prompt]
+    if prompt:
+        cmd += [prompt]
     return cmd
 
 
 def _codex_id_from_obj(obj: object) -> str | None:
-    if isinstance(obj, dict):
-        # thread.started / thread envelope first (exact ID preserved).
-        for key in ("thread_id", "threadId", "thread-id"):
-            val = obj.get(key)
-            if isinstance(val, str) and val:
-                return val
-        typ = obj.get("type")
-        if isinstance(typ, str) and "thread" in typ.lower():
-            for key in ("id", "thread_id", "session_id", "sessionId"):
-                val = obj.get(key)
-                if isinstance(val, str) and val:
-                    return val
-            data = obj.get("thread")
-            if isinstance(data, dict):
-                for key in ("id", "thread_id", "session_id"):
-                    val = data.get(key)
-                    if isinstance(val, str) and val:
-                        return val
-        for key in ("task_id", "taskId", "session_id", "sessionId",
-                    "id", "codex_task_id", "conversation_id",
-                    "conversationId"):
-            val = obj.get(key)
-            if isinstance(val, str) and val:
-                return val
-        data = obj.get("data")
-        if isinstance(data, dict):
-            found = _codex_id_from_obj(data)
-            if found:
-                return found
-        # Completed agent message envelope may nest the ID.
-        for key in ("thread", "session", "conversation"):
-            nested = obj.get(key)
-            if isinstance(nested, dict):
-                found = _codex_id_from_obj(nested)
-                if found:
-                    return found
+    """Thread ID from ``thread.started`` or an explicit ``thread_id`` key."""
+    if not isinstance(obj, dict):
+        return None
+    for key in ("thread_id", "threadId"):
+        val = obj.get(key)
+        if isinstance(val, str) and val:
+            return val
+    if obj.get("type") == "thread.started":
+        val = obj.get("id")
+        if isinstance(val, str) and val:
+            return val
     return None
 
 
 def parse_codex_task_id(output_text: str,
                         last_message_text: str | None = None) -> str | None:
-    """Extract a Codex thread/task ID from JSONL stdout + last-message file.
+    """Extract the Codex thread ID from ``codex exec --json`` output.
 
-    Prefers ``thread.started`` / ``thread_id`` events, then any
-    task/session/conversation ID, preserving the exact string. Falls
-    back to the output-last-message envelope when stdout has no ID.
+    The first ``thread.started`` event wins. Item, message, and other
+    IDs are never treated as the task ID. ``last_message_text`` is kept
+    for call compatibility and is not an ID source.
     """
-    for blob in (output_text or "", last_message_text or ""):
-        if not blob or not blob.strip():
+    for line in (output_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
             continue
-        text = blob.strip()
-        # Whole-payload JSON first.
         try:
-            obj = json.loads(text)
-            found = _codex_id_from_obj(obj)
-            if found:
-                return found
-            if isinstance(obj, dict):
-                for key in ("result", "data", "final", "message"):
-                    nested = obj.get(key)
-                    if isinstance(nested, dict):
-                        found = _codex_id_from_obj(nested)
-                        if found:
-                            return found
-                    if isinstance(nested, str):
-                        try:
-                            inner = json.loads(nested)
-                        except ValueError:
-                            continue
-                        found = _codex_id_from_obj(inner)
-                        if found:
-                            return found
+            obj = json.loads(line)
         except ValueError:
-            pass
-        # JSON-lines scan: first thread.started ID wins, else last ID wins.
-        first_thread_id = None
-        last_id = None
-        for line in text.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            typ = str(obj.get("type") or "")
-            found = _codex_id_from_obj(obj)
-            if found:
-                last_id = found
-                if "thread" in typ.lower() and "start" in typ.lower():
-                    if first_thread_id is None:
-                        first_thread_id = found
-        if first_thread_id:
-            return first_thread_id
-        if last_id:
-            return last_id
+            continue
+        found = _codex_id_from_obj(obj)
+        if found:
+            return found
     return None
+
+
+def last_message_path_from_cmd(cmd) -> str | None:
+    if not isinstance(cmd, list):
+        return None
+    for flag in ("--output-last-message", "-o"):
+        if flag in cmd:
+            i = cmd.index(flag)
+            if i + 1 < len(cmd):
+                return str(cmd[i + 1])
+    return None
+
+
+def _envelope_from_message_text(text: str) -> dict | None:
+    from . import policy as _policy
+    text = (text or "").strip()
+    if not text:
+        return None
+    candidates = [text] + [l.strip() for l in reversed(text.splitlines())]
+    if text.startswith("```"):
+        candidates.append(text.strip("`").partition("\n")[2])
+    for cand in candidates:
+        if not cand.startswith("{"):
+            continue
+        try:
+            obj = json.loads(cand)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
+            return obj
+    return None
+
+
+def parse_codex_agent_envelope(output_text: str,
+                               last_message_text: str | None = None) -> dict | None:
+    """Parse Luna's action from its own final agent message only.
+
+    Uses the last ``item.completed`` ``agent_message`` text in the JSONL
+    stream, else the ``--output-last-message`` file. Command output and
+    other items can contain arbitrary JSON and are never parsed.
+    """
+    last_text = None
+    for line in (output_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+            continue
+        item = obj.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" \
+                and isinstance(item.get("text"), str):
+            last_text = item["text"]
+    if last_text is not None:
+        found = _envelope_from_message_text(last_text)
+        if found:
+            return found
+    return _envelope_from_message_text(last_message_text or "")
 
 
 def read_last_message_file(path: str | None) -> str | None:
@@ -333,12 +318,90 @@ def build_claude_cmd(planner_session_id: str, prompt: str,
 
     Never creates a new planner session implicitly; missing session is
     a caller error so recover can persist a durable blocked reason.
+    JSON output lets the runner verify the resumed session identity.
     """
     if not planner_session_id:
         raise ValueError("missing planner session ID: refusing to fork a new session")
+    # The callback asks for a decision only: no tools, so a resumed
+    # planner turn cannot take new actions on the runner's behalf.
     return [CLAUDE_BIN, "--resume", planner_session_id,
             "--model", model, "--effort", effort,
+            "--output-format", "json", "--tools", "",
             "-p", prompt]
+
+
+def parse_claude_result(stdout: str) -> dict:
+    """Parse ``claude -p --output-format json``.
+
+    Returns ``{ok, answer, session_id, error}``. Only a ``result`` object
+    with ``is_error`` false and a non-empty string result is an answer.
+    """
+    obj = None
+    text = (stdout or "").strip()
+    if text:
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    cand = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(cand, dict) and cand.get("type") == "result":
+                    obj = cand
+                    break
+    if not isinstance(obj, dict) or obj.get("type") != "result":
+        return {"ok": False, "answer": None, "session_id": None,
+                "error": "planner output is not a Claude JSON result"}
+    sid = obj.get("session_id") if isinstance(obj.get("session_id"), str) else None
+    result = obj.get("result")
+    if obj.get("is_error") or obj.get("subtype") not in (None, "success"):
+        return {"ok": False, "answer": None, "session_id": sid,
+                "error": f"planner result error: {str(obj.get('subtype') or 'is_error')[:80]}",
+                "detail": str(result or "")[:500]}
+    if not isinstance(result, str) or not result.strip():
+        return {"ok": False, "answer": None, "session_id": sid,
+                "error": "planner result is empty"}
+    return {"ok": True, "answer": result.strip(), "session_id": sid, "error": None}
+
+
+def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int]:
+    """PIDs of running ``claude`` processes naming this session in argv.
+
+    Detects a planner started with ``--session-id``/``--resume``. An
+    interactive session opened without the ID in argv is not visible.
+    """
+    if not planner_session_id:
+        return []
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return []
+    found = []
+    for line in out.splitlines():
+        line = line.strip()
+        pid_s, _, command = line.partition(" ")
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid in exclude_pids or pid == os.getpid():
+            continue
+        argv = command.split()
+        # Native binary, or an interpreter/shell wrapper running it.
+        if not any(os.path.basename(a) == CLAUDE_BIN for a in argv[:3]):
+            continue
+        if planner_session_id in argv:
+            found.append(pid)
+    return found
+
+
+def opencode_model_for_route(route: str | None) -> str:
+    return OPENCODE_GO_MODEL if route == "muse-spark-xhigh-go" else OPENCODE_FREE_MODEL
 
 
 def opencode_model_for_allowance(allowance: str) -> str:
@@ -467,82 +530,6 @@ def parse_serve_url(output_text: str) -> str | None:
     return url
 
 
-class OpenCodeClient:
-    """Authenticated loopback client. Password stays in memory."""
-
-    def __init__(self, base_url: str, password: str | None, request_func=None):
-        if not base_url:
-            raise ValueError("missing control base_url")
-        _ensure_localhost(base_url)
-        if request_func is None and not password:
-            raise ValueError(
-                "missing control password: refusing to invent one for "
-                "a server this job does not own")
-        self._base_url = base_url.rstrip("/")
-        self._password = password or ""
-        self._request_func = request_func
-
-    def _http(self, method: str, path: str, body: dict | None = None) -> dict:
-        if self._request_func is not None:
-            return dict(self._request_func(method, path, body or {}))
-        url = self._base_url + path
-        data = None
-        headers = {"Authorization": "Bearer " + self._password,
-                   "Content-Type": "application/json"}
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            return json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            return {"raw": raw}
-
-    def create_session(self) -> dict:
-        return self._http("POST", "/session", {})
-
-    def session_id_from(self, payload: dict) -> str | None:
-        if not isinstance(payload, dict):
-            return None
-        for key in ("id", "session_id", "sessionId"):
-            val = payload.get(key)
-            if isinstance(val, str) and val:
-                return val
-        sess = payload.get("session")
-        if isinstance(sess, dict):
-            for key in ("id", "session_id", "sessionId"):
-                val = sess.get(key)
-                if isinstance(val, str) and val:
-                    return val
-        if isinstance(sess, str) and sess:
-            return sess
-        return None
-
-    def prompt(self, session_id: str, text: str, model: str | None = None,
-               variant: str | None = None) -> dict:
-        if not session_id:
-            raise ValueError("missing saved OpenCode session ID")
-        body = {"session": session_id, "parts": [{"type": "text", "text": text}]}
-        if model:
-            body["model"] = model
-        if variant:
-            body["variant"] = variant
-        return self._http("POST", f"/session/{urllib.parse.quote(session_id)}/prompt", body)
-
-    def session_status(self, session_id: str) -> dict:
-        return OpenCodeControl(self._base_url, self._password, session_id,
-                               request_func=self._request_func).session_status()
-
-    def abort(self, session_id: str) -> dict:
-        return OpenCodeControl(self._base_url, self._password, session_id,
-                               request_func=self._request_func).abort()
-
-    def ensure_idle_ownership(self, session_id: str) -> dict:
-        return OpenCodeControl(self._base_url, self._password, session_id,
-                               request_func=self._request_func).ensure_idle_ownership()
-
-
 def _ensure_localhost(base_url: str) -> urllib.parse.ParseResult:
     parts = urllib.parse.urlparse(base_url)
     host = (parts.hostname or "").lower()
@@ -553,23 +540,52 @@ def _ensure_localhost(base_url: str) -> urllib.parse.ParseResult:
     return parts
 
 
-class OpenCodeControl:
-    """Ephemeral per-job OpenCode server/control handle (stdlib only).
+def split_model(model: str) -> dict:
+    """``provider/model`` -> the server's ``{providerID, modelID}`` object."""
+    provider, sep, model_id = (model or "").partition("/")
+    if not sep or not provider or not model_id:
+        raise ValueError(f"model must be provider/model, got {model!r}")
+    return {"providerID": provider, "modelID": model_id}
 
-    ``password`` stays in process memory and is never written to the DB,
-    logs, or events. Only ``session_id`` (the saved OpenCode session) is
-    ever observed. ``request_func`` is an injectable equivalent with
-    signature ``(method, path, body) -> dict`` for deterministic tests;
-    when it is provided no real password is required and no random
-    password is invented for a server the controller does not own.
+
+# Harness write boundary for the owned implementation session. Session
+# rules are appended to the build agent's rules. Anything outside the
+# served directory is denied; subagents, interactive questions, doom-loop
+# prompts, and web access are denied so a headless session cannot block
+# on an approval or recurse into other workers. Bash is not OS-confined
+# by OpenCode; the live proof checks the fixture diff separately.
+SESSION_PERMISSION_RULES = (
+    {"permission": "external_directory", "pattern": "*", "action": "deny"},
+    {"permission": "task", "pattern": "*", "action": "deny"},
+    {"permission": "question", "pattern": "*", "action": "deny"},
+    {"permission": "doom_loop", "pattern": "*", "action": "deny"},
+    {"permission": "webfetch", "pattern": "*", "action": "deny"},
+    {"permission": "websearch", "pattern": "*", "action": "deny"},
+)
+
+
+class OpenCodeHTTPError(RuntimeError):
+    def __init__(self, status: int, body: str):
+        super().__init__(f"opencode server HTTP {status}")
+        self.status = status
+        self.body = (body or "")[:2000]
+
+
+class OpenCodeClient:
+    """Client for an owned ``opencode serve`` (API of OpenCode 1.18.31).
+
+    Basic auth ``opencode:<password>``; the password stays in memory.
+    Every call is scoped with ``directory=<workspace>``. Only the saved
+    session is observed or aborted. ``request_func(method, path, body)``
+    is the deterministic test seam; ``path`` includes the query string.
     """
 
-    def __init__(self, base_url: str, password: str | None, session_id: str,
-                 request_func=None):
+    USERNAME = "opencode"
+
+    def __init__(self, base_url: str, password: str | None,
+                 directory: str | None = None, request_func=None):
         if not base_url:
             raise ValueError("missing control base_url")
-        if not session_id:
-            raise ValueError("missing saved OpenCode session ID")
         _ensure_localhost(base_url)
         if request_func is None and not password:
             raise ValueError(
@@ -577,148 +593,155 @@ class OpenCodeControl:
                 "a server this job does not own")
         self._base_url = base_url.rstrip("/")
         self._password = password or ""
-        self._session_id = session_id
+        self._directory = directory
         self._request_func = request_func
 
-    @property
-    def session_id(self) -> str:
-        return self._session_id
+    def _path(self, path: str, query: dict | None = None) -> str:
+        q = dict(query or {})
+        if self._directory:
+            q["directory"] = self._directory
+        return path + ("?" + urllib.parse.urlencode(q) if q else "")
 
-    def _http(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _http(self, method: str, path: str, body=None, query: dict | None = None):
+        full = self._path(path, query)
         if self._request_func is not None:
-            return dict(self._request_func(method, path, body or {}))
-        url = self._base_url + path
+            return self._request_func(method, full, body)
+        import base64
+        token = base64.b64encode(
+            f"{self.USERNAME}:{self._password}".encode("utf-8")).decode("ascii")
+        headers = {"Authorization": "Basic " + token}
         data = None
-        headers = {"Authorization": "Bearer " + self._password,
-                   "Content-Type": "application/json"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            raw = resp.read().decode("utf-8", errors="replace")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self._base_url + full, data=data,
+                                     headers=headers, method=method)
         try:
-            return json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            return {"raw": raw}
-
-    def session_status(self) -> dict:
-        """Observe only the saved session ID (never list other sessions)."""
-        qs = urllib.parse.urlencode({"session": self._session_id})
-        return self._http("GET", f"/session/status?{qs}", None)
-
-    def abort(self) -> dict:
-        """Abort the saved free session before any Go transfer."""
-        return self._http("POST", "/session/abort", {"session": self._session_id})
-
-    def ensure_idle_ownership(self) -> dict:
-        """Confirm ownership/idle state for the saved session after abort."""
-        return self._http("GET", "/session/status?" + urllib.parse.urlencode(
-            {"session": self._session_id, "ownership": "1"}), None)
-
-
-def fetch_session_status(base_url: str, password: str | None, session_id: str,
-                         request_func=None) -> dict:
-    """Fetch status for exactly one saved session ID (localhost only)."""
-    return OpenCodeControl(base_url, password, session_id,
-                           request_func=request_func).session_status()
-
-
-class EphemeralOpenCodeServe:
-    """Own an ephemeral per-job ``opencode serve`` process (stdlib only).
-
-    Spawns ``opencode serve --pure --hostname 127.0.0.1 --port 0`` with a
-    fresh in-memory ``OPENCODE_SERVER_PASSWORD``. Parses the emitted URL
-    (stdout ``http://127.0.0.1:PORT``). Never installs a service, never
-    logs the password, never touches unrelated servers. Caller must call
-    :meth:`close` (terminates the owned child only).
-    """
-
-    def __init__(self, proc: "subprocess.Popen[str]", base_url: str,
-                 password: str):
-        self._proc = proc
-        self._base_url = base_url
-        self._password = password
-
-    @property
-    def base_url(self) -> str:
-        return self._base_url
-
-    @property
-    def pid(self) -> int | None:
-        try:
-            return self._proc.pid
-        except Exception:
-            return None
-
-    def control_for(self, session_id: str,
-                    request_func=None) -> "OpenCodeControl":
-        return OpenCodeControl(self._base_url, self._password, session_id,
-                               request_func=request_func)
-
-    def close(self) -> None:
-        try:
-            self._proc.terminate()
-        except Exception:
-            pass
-        try:
-            self._proc.wait(timeout=5)
-        except Exception:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
             try:
-                self._proc.kill()
+                detail = e.read().decode("utf-8", errors="replace")
             except Exception:
-                pass
+                detail = ""
+            raise OpenCodeHTTPError(e.code, detail) from None
+        if not raw.strip():
+            return {}
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"raw": raw[:2000]}
+
+    def health(self):
+        return self._http("GET", "/global/health")
+
+    def create_session(self, title: str = "model-router runner",
+                       permission=SESSION_PERMISSION_RULES) -> dict:
+        body = {"title": title}
+        if permission:
+            body["permission"] = [dict(r) for r in permission]
+        got = self._http("POST", "/session", body)
+        return got if isinstance(got, dict) else {}
+
+    @staticmethod
+    def session_id_from(payload) -> str | None:
+        if isinstance(payload, dict):
+            val = payload.get("id")
+            if isinstance(val, str) and val.startswith("ses"):
+                return val
+        return None
+
+    def prompt_async(self, session_id: str, text: str, model: str,
+                     variant: str | None = OPENCODE_VARIANT,
+                     agent: str | None = OPENCODE_AGENT):
+        if not session_id:
+            raise ValueError("missing saved OpenCode session ID")
+        body = {"parts": [{"type": "text", "text": text}],
+                "model": split_model(model)}
+        if agent:
+            body["agent"] = agent
+        if variant:
+            body["variant"] = variant
+        return self._http("POST",
+                          f"/session/{urllib.parse.quote(session_id)}/prompt_async",
+                          body)
+
+    def status_map(self) -> dict:
+        got = self._http("GET", "/session/status")
+        return got if isinstance(got, dict) else {}
+
+    def session_status(self, session_id: str) -> dict:
+        """Status of the saved session only. Absent means idle."""
+        entry = self.status_map().get(session_id)
+        if isinstance(entry, dict) and entry.get("type"):
+            return entry
+        return {"type": "idle"}
+
+    def abort(self, session_id: str):
+        return self._http("POST", f"/session/{urllib.parse.quote(session_id)}/abort")
+
+    def messages(self, session_id: str) -> list:
+        got = self._http("GET", f"/session/{urllib.parse.quote(session_id)}/message")
+        return got if isinstance(got, list) else []
+
+    def wait_idle(self, session_id: str, timeout: float = 30.0,
+                  interval: float = 0.5) -> dict:
+        """Poll until the saved session is idle. Returns the last status."""
+        import time as _time
+        end = _time.monotonic() + max(0.0, timeout)
+        last = {"type": "unknown"}
+        while True:
+            last = self.session_status(session_id)
+            if last.get("type") == "idle":
+                return {"idle": True, "status": last}
+            if _time.monotonic() >= end:
+                return {"idle": False, "status": last}
+            _time.sleep(interval)
 
 
-def start_ephemeral_serve(password: str | None = None,
-                          hostname: str = "127.0.0.1",
-                          timeout: float = 15.0) -> EphemeralOpenCodeServe:
-    """Start an owned ephemeral ``opencode serve`` on localhost:0."""
-    if hostname not in ("127.0.0.1", "localhost", "::1"):
-        raise ValueError("ephemeral serve allows localhost only")
-    pwd = password or generate_control_password()
-    env = dict(os.environ)
-    env["OPENCODE_SERVER_PASSWORD"] = pwd
-    proc = subprocess.Popen(
-        [OPENCODE_BIN, "serve", "--pure", "--hostname", hostname,
-         "--port", "0"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=env, start_new_session=True, close_fds=True,
-    )
-    import re as _re
-    import time as _time
-    url_re = _re.compile(r"https?://(?:127\.0\.0\.1|localhost|::1):\d+")
-    end = _time.time() + max(1.0, timeout)
-    buf = ""
-    base_url: str | None = None
-    while _time.time() < end:
-        if proc.poll() is not None:
-            break
-        import select as _select
-        try:
-            import fcntl as _fcntl
-            fd = proc.stdout.fileno() if proc.stdout else -1
-            if fd >= 0:
-                flags = _fcntl.fcntl(fd, _fcntl.F_GETFL)
-                _fcntl.fcntl(fd, _fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        except Exception:
-            pass
-        try:
-            chunk = proc.stdout.read(1024) if proc.stdout else ""
-        except Exception:
-            chunk = ""
-        if chunk:
-            buf += chunk
-            m = url_re.search(buf)
-            if m:
-                base_url = m.group(0)
-                break
-        else:
-            _time.sleep(0.05)
-    if base_url is None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        raise RuntimeError("ephemeral opencode serve did not emit a localhost URL")
-    _ensure_localhost(base_url)
-    return EphemeralOpenCodeServe(proc, base_url, pwd)
+def trusted_free_exhaustion(status: dict | None = None,
+                            message_error: dict | None = None) -> dict | None:
+    """Provider evidence for free-allowance exhaustion, or None.
+
+    Only two server-generated sources count: the owned session's retry
+    status with reason ``free_tier_limit`` from provider ``opencode``, or
+    an assistant ``APIError`` whose provider ``responseBody`` names
+    ``FreeUsageLimitError`` (OpenCode's own rule). Model-authored text,
+    generic 429, and Go limits never count.
+    """
+    if isinstance(status, dict) and status.get("type") == "retry":
+        action = status.get("action")
+        if isinstance(action, dict) and action.get("reason") == "free_tier_limit" \
+                and action.get("provider") == "opencode":
+            return {"source": "session_status", "type": "retry",
+                    "reason": "free_tier_limit", "provider": "opencode",
+                    "attempt": status.get("attempt"), "next": status.get("next"),
+                    "message": str(status.get("message") or "")[:500]}
+    if isinstance(message_error, dict) and message_error.get("name") == "APIError":
+        data = message_error.get("data") if isinstance(message_error.get("data"), dict) else {}
+        body = data.get("responseBody")
+        if isinstance(body, str) and "FreeUsageLimitError" in body:
+            return {"source": "assistant_error", "name": "APIError",
+                    "statusCode": data.get("statusCode"),
+                    "responseBody": body[:2000]}
+    return None
+
+
+def assistant_messages_after(messages: list, baseline_ids: set) -> list:
+    out = []
+    for m in messages or []:
+        info = m.get("info") if isinstance(m, dict) else None
+        if not isinstance(info, dict) or info.get("id") in baseline_ids:
+            continue
+        if info.get("role") == "assistant":
+            out.append(m)
+    return out
+
+
+def message_text(message: dict) -> str:
+    parts = message.get("parts") if isinstance(message, dict) else None
+    texts = []
+    for p in parts or []:
+        if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
+            texts.append(p["text"])
+    return "\n".join(texts)

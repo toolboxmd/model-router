@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   planner_model TEXT,
   planner_effort TEXT,
   controller_state TEXT,
-  last_error_json TEXT
+  last_error_json TEXT,
+  planner_cwd TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +117,9 @@ CREATE TABLE IF NOT EXISTS invocations (
   result_json TEXT,
   consumed_at TEXT,
   timeout_secs INTEGER,
-  meta_json TEXT
+  meta_json TEXT,
+  supervisor_start TEXT,
+  action_key TEXT
 );
 CREATE TABLE IF NOT EXISTS capacity (
   route TEXT PRIMARY KEY,
@@ -199,6 +202,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("planner_effort", "TEXT"),
         ("controller_state", "TEXT"),
         ("last_error_json", "TEXT"),
+        ("planner_cwd", "TEXT"),
     ):
         if _col not in cols:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {_col} {_ddl}")
@@ -211,6 +215,8 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("consumed_at", "TEXT"),
         ("timeout_secs", "INTEGER"),
         ("meta_json", "TEXT"),
+        ("supervisor_start", "TEXT"),
+        ("action_key", "TEXT"),
     ):
         if _col not in inv_cols:
             con.execute(f"ALTER TABLE invocations ADD COLUMN {_col} {_ddl}")

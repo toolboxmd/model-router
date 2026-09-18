@@ -232,11 +232,26 @@ def _process_start_identity(pid: int | None) -> str | None:
     return process_start_identity(pid)
 
 
-def _invocation_ownership(inv: dict) -> str:
-    """Classify a recorded invocation: live, dead, unresolved, or finished.
+def _supervisor_alive(inv: dict) -> bool:
+    sup = inv.get("supervisor_pid")
+    if not sup or not _is_pid_alive(sup):
+        return False
+    recorded = inv.get("supervisor_start")
+    if recorded:
+        current = _process_start_identity(sup)
+        if current and current != recorded:
+            return False
+    return True
 
-    A NULL PID/PGID, or a PID whose start identity no longer matches, is
-    unresolved ownership — never proof of process death.
+
+def _invocation_ownership(inv: dict) -> str:
+    """Classify a recorded invocation.
+
+    ``finished``: state recorded. ``live``: the child or its supervisor
+    still runs. ``orphaned``: an owned OpenCode server outlived its
+    supervisor; only its task-owned group may be stopped. ``dead``: both
+    are gone and output can be consumed once. ``unresolved``: NULL
+    PID/PGID or a start-identity mismatch, never proof of death.
     """
     state = inv.get("state")
     if state not in LIVE_INVOCATION_STATES:
@@ -253,8 +268,45 @@ def _invocation_ownership(inv: dict) -> str:
             current = _process_start_identity(pid)
             if current and current != recorded:
                 return "unresolved"
+        if inv.get("kind") in ("opencode_control", "opencode_serve") \
+                and inv.get("supervisor_pid") and not _supervisor_alive(inv):
+            return "orphaned"
+        return "live"
+    if _supervisor_alive(inv):
         return "live"
     return "dead"
+
+
+def _stop_orphaned_invocations(state_dir, request_id: str) -> int:
+    """Stop owned OpenCode servers whose supervisor died.
+
+    Their password existed only in the dead supervisor, so no process can
+    observe or abort the session; the recorded group is task-owned.
+    """
+    stopped = 0
+    for inv in _list_invocations(state_dir, request_id):
+        if _invocation_ownership(inv) != "orphaned":
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(int(inv["pgid"]), sig)
+            except (ProcessLookupError, PermissionError, ValueError, OSError):
+                pass
+            end = time.monotonic() + 5.0
+            while time.monotonic() < end and _is_pgid_alive(inv["pgid"]):
+                time.sleep(0.1)
+            if not _is_pgid_alive(inv["pgid"]):
+                break
+        stopped += 1
+        con = store.connect(state_dir)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            _event(con, request_id, "orphaned_server_stopped",
+                   {"invocation_id": inv["invocation_id"][:16]})
+            con.execute("COMMIT")
+        finally:
+            con.close()
+    return stopped
 
 
 def _invocation_output_paths(root: Path, request_id: str, invocation_id: str) -> tuple[Path, Path]:
@@ -313,16 +365,125 @@ def _redact_cmd(cmd: list[str]) -> list[str]:
     ]
 
 
+DEFAULT_KIND_TIMEOUTS = {
+    "codex_dispatch": 1800, "codex_resume": 1800,
+    "claude_callback": 900,
+    "opencode_control": 1800, "opencode_serve": 1800, "opencode_run": 1800,
+}
+# A failed model turn is never replayed automatically: the job blocks
+# with its reason. Replaying could fork a task or repeat a side effect.
+MAX_FAILED_ATTEMPTS_PER_ACTION = 1
+
+
+def _action_key(kind: str, cmd: list[str], meta: dict | None) -> str:
+    """Identity of one logical side effect, stable across controllers.
+
+    Volatile values such as a saved session learned by an earlier
+    attempt are excluded so a restarted controller finds the same key.
+    """
+    m = dict(meta or {})
+    stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid")}
+    blob = json.dumps([kind, list(cmd), stable], sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _read_invocation_output(inv: dict) -> tuple[str, str]:
+    out = err = ""
+    try:
+        out = Path(inv["stdout_path"]).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    try:
+        err = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return out, err
+
+
+def _mark_collected(state_dir, request_id: str, invocation_id: str, reused: bool) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET consumed_at=COALESCE(consumed_at, ?) WHERE invocation_id=?",
+            (_utcnow(), invocation_id))
+        if reused:
+            _event(con, request_id, "invocation_reused",
+                   {"invocation_id": invocation_id[:16]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _prior_action_result(state_dir, request_id: str, key: str):
+    """Return (rc, out, err) of a finished attempt to reuse, else None.
+
+    Raises OwnershipError while an attempt for the same action is live,
+    orphaned, or unresolved: a second copy would be a duplicate writer.
+    """
+    prior = [i for i in _list_invocations(state_dir, request_id)
+             if i.get("action_key") == key]
+    if not prior:
+        return None
+    for inv in prior:
+        own = _invocation_ownership(inv)
+        if own == "live":
+            # Adopt: the same action is already running under its own
+            # supervisor. Wait for its durable result instead of copying it.
+            limit = float(inv.get("timeout_secs") or 1800) + 120.0
+            end = time.monotonic() + limit
+            while time.monotonic() < end:
+                cur = [i for i in _list_invocations(state_dir, request_id)
+                       if i["invocation_id"] == inv["invocation_id"]]
+                if not cur or _invocation_ownership(cur[0]) != "live":
+                    break
+                time.sleep(0.2)
+            own = _invocation_ownership(
+                [i for i in _list_invocations(state_dir, request_id)
+                 if i["invocation_id"] == inv["invocation_id"]][0])
+        if own in ("live", "orphaned", "unresolved"):
+            raise OwnershipError(
+                f"action already owned by invocation {inv['invocation_id'][:8]} ({own}); "
+                "refusing duplicate")
+    if any(i.get("state") in LIVE_INVOCATION_STATES for i in prior):
+        consume_finished_invocations(state_dir, request_id)
+        prior = [i for i in _list_invocations(state_dir, request_id)
+                 if i.get("action_key") == key]
+    done = [i for i in prior if i.get("state") == "completed" and i.get("rc") == 0]
+    failed = [i for i in prior if i.get("state") != "completed" or i.get("rc") != 0]
+    pick = done[-1] if done else (
+        failed[-1] if len(failed) >= MAX_FAILED_ATTEMPTS_PER_ACTION else None)
+    if pick is None:
+        return None
+    out, err = _read_invocation_output(pick)
+    _mark_collected(state_dir, request_id, pick["invocation_id"], reused=True)
+    rc = pick.get("rc")
+    return (int(rc) if rc is not None else 1), out, err
+
+
 def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
                  cmd: list[str], cwd: str | None = None,
-                 timeout: int = 120, meta: dict | None = None) -> tuple[int, str, str]:
+                 timeout: int | None = None, meta: dict | None = None) -> tuple[int, str, str]:
     """Persist spawn intent, then hand the child to an independent supervisor.
 
     The invocation row is committed with NULL pid/pgid before any Popen.
     That window is unresolved ownership, never proof of death. The
     supervisor process group is detached from the controller so killing
-    only the controller cannot destroy output, IDs, or completion.
+    only the controller cannot destroy output, IDs, or completion. A
+    finished attempt of the same action is reused, never rerun.
     """
+    if timeout is None:
+        timeout = DEFAULT_KIND_TIMEOUTS.get(kind, 1800)
+    key = _action_key(kind, cmd, meta)
+    reused = _prior_action_result(state_dir, request_id, key)
+    if reused is not None:
+        return reused
     root = store.ensure_state_dir(state_dir)
     invocation_id = secrets.token_hex(8)
     stdout_path, stderr_path = _invocation_output_paths(root, request_id, invocation_id)
@@ -341,11 +502,11 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             "INSERT INTO invocations("
             " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
             " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
-            " state, task_json, timeout_secs, meta_json"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?)",
+            " state, task_json, timeout_secs, meta_json, action_key"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?)",
             (invocation_id, request_id, kind, json.dumps(list(cmd)),
              workspace, owner_token, str(stdout_path), str(stderr_path),
-             started_at, job.get("task_json"), int(timeout), meta_json),
+             started_at, job.get("task_json"), int(timeout), meta_json, key),
         )
         _event(con, request_id, "invocation_attempting",
                {"invocation_id": invocation_id[:16], "kind": kind})
@@ -403,7 +564,9 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     finally:
         con.close()
 
-    deadline = time.monotonic() + max(1.0, float(timeout) + 15.0)
+    # The supervisor enforces the child timeout, then may need to abort
+    # and confirm an idle OpenCode session before it records the result.
+    deadline = time.monotonic() + max(1.0, float(timeout) + 60.0)
     rc = 124
     while time.monotonic() < deadline:
         invs = [i for i in _list_invocations(state_dir, request_id)
@@ -452,6 +615,14 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
         pass
 
     try:
+        sup.wait(timeout=10)  # reap the finished supervisor
+    except Exception:
+        pass
+    try:
+        _mark_collected(state_dir, request_id, invocation_id, reused=False)
+    except Exception:
+        pass
+    try:
         log = store.output_path_for(root, request_id)
         store.append_text(log, f"[{kind} invocation={invocation_id[:8]}]\n")
         if stdout_text:
@@ -470,7 +641,7 @@ def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
     The returned callable matches the (cmd, cwd, timeout) -> (rc, out, err)
     signature used by controller.dispatch and friends.
     """
-    def run_cmd(cmd: list[str], cwd: str | None = None, timeout: int = 120,
+    def run_cmd(cmd: list[str], cwd: str | None = None, timeout: int | None = None,
                 kind: str | None = None, meta: dict | None = None):
         kind = kind or _infer_invocation_kind(cmd)
         return _durable_run(state_dir, request_id, owner_token, kind,
@@ -543,7 +714,7 @@ def _any_live_invocation(state_dir, request_id: str) -> list[dict]:
     """Return invocations whose recorded child or supervisor is still live."""
     live = []
     for inv in _list_invocations(state_dir, request_id):
-        if _invocation_ownership(inv) == "live":
+        if _invocation_ownership(inv) in ("live", "orphaned"):
             live.append(inv)
     return live
 
@@ -570,7 +741,7 @@ def consume_finished_invocations(state_dir, request_id: str) -> list[dict]:
         if inv.get("consumed_at"):
             continue
         own = _invocation_ownership(inv)
-        if own in ("live", "unresolved"):
+        if own in ("live", "unresolved", "orphaned"):
             continue
         applied.append(_consume_one_invocation(state_dir, request_id, inv, job))
         try:
@@ -591,27 +762,44 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         stderr_text = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
     except OSError:
         pass
-    sid, skind = _parse_session_from_output(
-        inv.get("kind") or "", stdout_text, stderr_text, job)
-    envelope = adapters.parse_luna_envelope_from_texts(stdout_text, stderr_text)
+    kind = inv.get("kind") or ""
+    sid, skind = _parse_session_from_output(kind, stdout_text, stderr_text, job)
+    try:
+        inv_cmd = json.loads(inv.get("cmd_json") or "[]")
+    except ValueError:
+        inv_cmd = []
+    envelope = None
+    planner_answer = None
+    if kind in ("codex_dispatch", "codex_resume"):
+        # Only Luna's own final agent message can carry an action.
+        envelope = adapters.parse_codex_agent_envelope(
+            stdout_text, adapters.read_last_message_file(
+                adapters.last_message_path_from_cmd(inv_cmd)))
     result_obj = None
     if inv.get("result_json"):
         try:
             result_obj = json.loads(inv["result_json"])
         except ValueError:
             result_obj = None
-    if envelope is None and isinstance(result_obj, dict):
-        env = result_obj.get("envelope")
-        if isinstance(env, dict):
-            envelope = env
     rc = inv.get("rc")
     if rc is None:
-        # Child is dead. If output contains a completed turn, treat as 0.
-        blob = (stdout_text or "") + (stderr_text or "")
-        if "turn.completed" in blob or (isinstance(envelope, dict) and envelope.get("action")):
+        # Child and supervisor are dead. A Codex turn counts only with
+        # its completion event and a parsed action.
+        if kind in ("codex_dispatch", "codex_resume") and "turn.completed" in stdout_text \
+                and isinstance(envelope, dict):
+            rc = 0
+        elif kind == "claude_callback" and adapters.parse_claude_result(stdout_text).get("ok"):
             rc = 0
         else:
             rc = 1
+    if kind == "claude_callback" and rc == 0:
+        parsed = adapters.parse_claude_result(stdout_text)
+        try:
+            qid = (json.loads(inv.get("meta_json") or "{}") or {}).get("qid")
+        except ValueError:
+            qid = None
+        if parsed.get("ok") and qid and parsed.get("session_id") == job.get("planner_session_id"):
+            planner_answer = (qid, parsed["answer"])
     state = "completed" if rc == 0 else "failed"
     now = _utcnow()
     con = store.connect(state_dir)
@@ -637,7 +825,7 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             "UPDATE invocations SET rc=?, state=?, ended_at=COALESCE(ended_at, ?),"
             " consumed_at=?, result_json=?, session_id=COALESCE(?, session_id),"
             " session_kind=COALESCE(?, session_kind) WHERE invocation_id=?",
-            (rc, state, now, now, json.dumps(payload, sort_keys=True)[:16000],
+            (rc, state, now, now, json.dumps(payload, sort_keys=True),
              sid, skind, inv["invocation_id"]),
         )
         if sid and skind == "codex_task_id":
@@ -656,6 +844,22 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         job_status = job_row["status"] if job_row else None
         applied = "consumed"
+        if planner_answer and job_status not in store.TERMINAL:
+            qid, text = planner_answer
+            upd = con.execute(
+                "UPDATE questions SET status='answered', answer=?, answered_at=?"
+                " WHERE request_id=? AND qid=? AND status='pending'",
+                (text, now, request_id, qid))
+            if upd.rowcount:
+                _event(con, request_id, "answer_persisted", {"qid": qid, "via": "consumed-invocation"})
+                left = con.execute(
+                    "SELECT COUNT(*) AS n FROM questions WHERE request_id=? AND status='pending'",
+                    (request_id,)).fetchone()["n"]
+                if left == 0 and job_status == "question_pending":
+                    con.execute("UPDATE jobs SET status='running', updated_at=? WHERE request_id=?",
+                                (now, request_id))
+                    job_status = "running"
+                applied = "answer-persisted"
         if job_row is not None and job_status not in store.TERMINAL and isinstance(envelope, dict):
             action_name = envelope.get("action")
             # Persist the Luna envelope before any completion effect.
@@ -668,6 +872,7 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             st["phase"] = "consumed-invocation"
             st["last_action"] = envelope
             st["last_action_name"] = action_name
+            st["seq"] = int(st.get("seq") or 0) + 1
             con.execute(
                 "UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                 (json.dumps(st, sort_keys=True), now, request_id),
@@ -864,6 +1069,20 @@ def _wait_invocations_dead(state_dir, request_id: str, timeout: float = 10.0) ->
     return False
 
 
+def _raise_if_unowned_invocation(state_dir, request_id: str) -> None:
+    """Block a new controller only when ownership cannot be established.
+
+    A live supervised child is adopted by the next controller, which
+    waits for that action's durable result instead of starting a copy.
+    Unresolved or orphaned ownership still blocks; run recover.
+    """
+    for inv in _list_invocations(state_dir, request_id):
+        own = _invocation_ownership(inv)
+        if own in ("unresolved", "orphaned"):
+            raise OwnershipError(
+                f"job {request_id} has {own} invocation {inv['invocation_id']}; run recover")
+
+
 def _raise_if_live_invocation(state_dir, request_id: str) -> None:
     """Block duplicate launches while any owned child process group lives.
 
@@ -930,7 +1149,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
            policy_id: str | None = None, max_attempts: int = 3,
            timeout_secs: int | None = None,
            planner_model: str | None = None,
-           planner_effort: str | None = None) -> dict:
+           planner_effort: str | None = None,
+           planner_cwd: str | None = None) -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Built-in defaults mean no executor/callback commands are required:
@@ -956,11 +1176,12 @@ def submit(state_dir, request_id: str, task, workspace: str,
         _pm_default = _adapters.CLAUDE_MODEL
         _pe_default = _adapters.CLAUDE_EFFORT
     except Exception:
-        _pm_default, _pe_default = "fable-5.1", "max"
+        _pm_default, _pe_default = "claude-fable-5-1", "max"
     planner_model = planner_model or _pm_default
     planner_effort = planner_effort or _pe_default
     task_json = _canonical_task(task)
     thash = _task_hash(task_json)
+    pcwd = _canonical_workspace(planner_cwd) if planner_cwd else ws
     root = store.ensure_state_dir(state_dir)
     out_path = str(store.output_path_for(root, request_id))
     now = _utcnow()
@@ -987,6 +1208,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
             if _em is not None and _em != planner_model:
                 same = False
             if _ee is not None and _ee != planner_effort:
+                same = False
+            if existing["planner_cwd"] is not None and existing["planner_cwd"] != pcwd:
                 same = False
             con.execute("ROLLBACK")
             if same:
@@ -1023,13 +1246,13 @@ def submit(state_dir, request_id: str, task, workspace: str,
             "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,"
             "planner_session_id,executor_session_id,output_path,status,route,"
             "cancel_requested,attempts,max_attempts,timeout_secs,created_at,updated_at,"
-            "planner_model,planner_effort,adapter,model,effort)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)",
+            "planner_model,planner_effort,adapter,model,effort,planner_cwd)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
-             "opencode/muse-spark-1.3-contributor-free", "xhigh"),
+             "opencode/muse-spark-1.3-contributor-free", "xhigh", pcwd),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
@@ -1062,7 +1285,8 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      timeout_secs: int | None = None,
                      planner_model: str | None = None,
                      planner_effort: str | None = None,
-                     launcher=None, spawn=None) -> dict:
+                     launcher=None, spawn=None,
+                     planner_cwd: str | None = None) -> dict:
     """Persist first, then launch a detached controller with built-ins.
 
     The durable row commits before any spawn, so controller death leaves
@@ -1075,13 +1299,15 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
     job = submit(state_dir, request_id, task, workspace, planner_session_id,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
                  timeout_secs=timeout_secs, planner_model=planner_model,
-                 planner_effort=planner_effort)
+                 planner_effort=planner_effort, planner_cwd=planner_cwd)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.
     if job.get("owner_token") and job.get("owner_pid") and _is_pid_alive(job.get("owner_pid")):
         return job
-    _raise_if_live_invocation(state_dir, request_id)
+    if job["status"] in store.TERMINAL:
+        return job
+    _raise_if_unowned_invocation(state_dir, request_id)
     start_controller(state_dir, request_id, launcher=launcher, spawn=spawn)
     return get_job(state_dir, request_id)
 
@@ -1114,10 +1340,10 @@ def start_controller(state_dir, request_id: str, launcher=None, spawn=None) -> d
         if job["status"] == "blocked":
             con.execute("ROLLBACK")
             raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
-        # Durable child ownership: never launch a second writer while any
-        # owned child process group from a prior controller is still alive.
+        # Durable child ownership: never launch while ownership of a prior
+        # child is unknown. A live supervised child is adopted, not copied.
         try:
-            _raise_if_live_invocation(state_dir, request_id)
+            _raise_if_unowned_invocation(state_dir, request_id)
         except OwnershipError:
             con.execute("ROLLBACK")
             raise
@@ -1552,10 +1778,10 @@ def launch_worker(state_dir, request_id: str, mode: str = "sleep",
         if job["status"] == "blocked":
             con.execute("ROLLBACK")
             raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
-        # Durable child ownership: never launch a second writer while any
-        # owned child process group from a prior controller is still alive.
+        # Durable child ownership: never launch while ownership of a prior
+        # child is unknown. A live supervised child is adopted, not copied.
         try:
-            _raise_if_live_invocation(state_dir, request_id)
+            _raise_if_unowned_invocation(state_dir, request_id)
         except OwnershipError:
             con.execute("ROLLBACK")
             raise
@@ -1679,7 +1905,9 @@ def recover_one(state_dir, request_id: str) -> dict:
     root = store.ensure_state_dir(state_dir)
     # Reconcile identity, then consume finished child output exactly once
     # before considering the controller lease gone. A completed child must
-    # not be rerun.
+    # not be rerun. An owned server without its supervisor is unusable
+    # (its password died with the supervisor) and is stopped first.
+    _stop_orphaned_invocations(state_dir, request_id)
     _reconcile_dead_invocations(state_dir, request_id)
     consumed = consume_finished_invocations(state_dir, request_id)
     if any(c.get("action") == "completed" for c in consumed):
@@ -1800,24 +2028,35 @@ def recover_one(state_dir, request_id: str) -> dict:
             if _invocation_ownership(inv) == "live"
         ]
         if live_invocations:
-            has_session = any(inv.get("session_id") for inv in live_invocations)
-            if has_session:
-                if job["status"] == "blocked":
+            lease_pid_alive = bool(job["owner_pid"]) and _is_pid_alive(job["owner_pid"])
+            if job["status"] == "blocked":
+                con.execute(
+                    "UPDATE jobs SET status='running', block_reason=NULL, updated_at=? WHERE request_id=?",
+                    (_utcnow(), request_id),
+                )
+            if not lease_pid_alive:
+                if job["owner_token"]:
                     con.execute(
-                        "UPDATE jobs SET status='running', block_reason=NULL, updated_at=? WHERE request_id=?",
-                        (_utcnow(), request_id),
-                    )
-                _event(con, request_id, "recovered-adopted-live-invocation",
-                       {"invocation_id": live_invocations[0]["invocation_id"][:16],
-                        "kind": live_invocations[0].get("kind", "")})
-                con.execute("COMMIT")
-                return {"request_id": request_id, "action": "adopted-live-invocation",
-                        "status": get_job(state_dir, request_id)["status"]}
-            mark_blocked(
-                f"live invocation {live_invocations[0]['invocation_id'][:8]}... without handshake; refusing duplicate")
+                        "UPDATE launches SET state='dead' WHERE request_id=? AND start_token=?"
+                        " AND state IN ('attempting','acknowledged')",
+                        (request_id, job["owner_token"]))
+                con.execute(
+                    "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, updated_at=? WHERE request_id=?",
+                    (_utcnow(), request_id))
+            _event(con, request_id, "recovered-adopted-live-invocation",
+                   {"invocation_id": live_invocations[0]["invocation_id"][:16],
+                    "kind": live_invocations[0].get("kind", "")})
             con.execute("COMMIT")
-            return {"request_id": request_id, "action": "blocked-claimed-live-invocation",
-                    "status": "blocked"}
+            out = {"request_id": request_id, "action": "adopted-live-invocation"}
+            if not lease_pid_alive and job["codex_task_id"]:
+                # A new controller waits for the live child's durable
+                # result through the same action identity.
+                try:
+                    out["pid"] = start_controller(state_dir, request_id).get("pid")
+                except (OwnershipError, TerminalError, BlockedError, RunnerError) as e:
+                    out["resume_error"] = str(e)[:200]
+            out["status"] = get_job(state_dir, request_id)["status"]
+            return out
 
         lease_token = job["owner_token"]
         lease_pid = job["owner_pid"]
@@ -1932,6 +2171,24 @@ def recover_one(state_dir, request_id: str) -> dict:
                 "SELECT COUNT(*) AS n FROM questions WHERE request_id=? AND status='pending'",
                 (request_id,),
             ).fetchone()["n"]
+            if pending_q > 0 and status == "question_pending" and job["codex_task_id"] \
+                    and int(job["attempts"]) < int(job["max_attempts"]):
+                # The controller asks the saved planner again through the
+                # same action identity: a finished callback is reused.
+                con.execute(
+                    "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, updated_at=? WHERE request_id=?",
+                    (_utcnow(), request_id))
+                _event(con, request_id, "recovered-question-callback", {"pending": pending_q})
+                con.execute("COMMIT")
+                try:
+                    info = start_controller(state_dir, request_id)
+                    return {"request_id": request_id, "action": "resumed-controller",
+                            "status": get_job(state_dir, request_id)["status"],
+                            "pid": info.get("pid")}
+                except (OwnershipError, TerminalError, BlockedError, RunnerError) as e:
+                    return {"request_id": request_id, "action": "replay-questions",
+                            "status": get_job(state_dir, request_id)["status"],
+                            "pending": pending_q, "resume_error": str(e)[:200]}
             if pending_q > 0:
                 if status != "question_pending":
                     con.execute(
@@ -1942,11 +2199,9 @@ def recover_one(state_dir, request_id: str) -> dict:
                 con.execute("COMMIT")
                 return {"request_id": request_id, "action": "replay-questions",
                         "status": "question_pending", "pending": pending_q}
-            answered_n = con.execute(
-                "SELECT COUNT(*) AS n FROM questions WHERE request_id=? AND status='answered'",
-                (request_id,),
-            ).fetchone()["n"]
-            should_resume = bool(job["codex_task_id"]) and int(answered_n) > 0
+            # A dispatched job continues on its saved Luna task. Finished
+            # child output is reused by action identity, never rerun.
+            should_resume = bool(job["codex_task_id"])
             # Same-session recovery within budget: clear lease, keep planner
             # and executor session IDs, keep partial log. When a public
             # answer is waiting on a saved Luna task, recover resumes a

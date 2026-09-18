@@ -9,7 +9,7 @@ Public operations (built-in defaults, no executor/callback commands):
   cancel     persist cancellation before ack
   recover    reconcile durable records with live ownership (resume saved IDs)
 
-Worker-internal helpers (used by tests/fixtures, not new authority):
+Worker-internal helpers (used by tests, not new authority):
   launch, post-question, complete, fail
 
 State:
@@ -69,10 +69,12 @@ def main(argv=None) -> int:
     p.add_argument("--policy", default=policy.POLICY_ID)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--timeout-secs", type=int, default=None)
-    p.add_argument("--planner-model", default="fable-5.1",
-                   help="planner model (default fable-5.1; live-test override claude-sonnet-5)")
+    p.add_argument("--planner-model", default="claude-fable-5-1",
+                   help="planner model (default claude-fable-5-1; live-test override claude-sonnet-5)")
     p.add_argument("--planner-effort", default="max",
                    help="planner effort (default max; live-test override medium)")
+    p.add_argument("--planner-cwd", default=None,
+                   help="directory where the planner session was started (default: workspace)")
     p.add_argument("--start", action="store_true",
                    help="launch detached controller with built-in adapters after persist")
     p.add_argument("--no-start", action="store_true",
@@ -145,14 +147,16 @@ def main(argv=None) -> int:
                                             policy_id=args.policy, max_attempts=args.max_attempts,
                                             timeout_secs=args.timeout_secs,
                                             planner_model=args.planner_model,
-                                            planner_effort=args.planner_effort)
+                                            planner_effort=args.planner_effort,
+                                            planner_cwd=args.planner_cwd)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
                                   policy_id=args.policy, max_attempts=args.max_attempts,
                                   timeout_secs=args.timeout_secs,
                                   planner_model=args.planner_model,
-                                  planner_effort=args.planner_effort)
+                                  planner_effort=args.planner_effort,
+                                  planner_cwd=args.planner_cwd)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
                          "policy": job["policy_id"]})

@@ -27,6 +27,20 @@ from runner import adapters, controller, core, policy, store  # noqa: E402
 PY = sys.executable
 
 
+def codex_out(thread, env):
+    """Realistic ``codex exec --json`` stream carrying Luna's envelope."""
+    lines = [{"type": "thread.started", "thread_id": thread},
+             {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message",
+                                                 "text": json.dumps(env)}},
+             {"type": "turn.completed", "usage": {}}]
+    return "\n".join(json.dumps(x) for x in lines) + "\n"
+
+
+def claude_out(sid, text):
+    return json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                       "result": text, "session_id": sid})
+
+
 def cli(state_dir, *args, timeout=20):
     cmd = [PY, "-m", "runner", "--state-dir", str(state_dir), *args]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(ROOT))
@@ -105,7 +119,7 @@ class TestPublicDefaults(Base):
         self.assertEqual(job["planner_session_id"], "claude-1")
         # Production planner default is Fable 5.1 max; Sonnet medium is
         # only the explicit bounded live-test override.
-        self.assertEqual(job["planner_model"], "fable-5.1")
+        self.assertEqual(job["planner_model"], "claude-fable-5-1")
         self.assertEqual(job["planner_effort"], "max")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         self.assertEqual(job["attempts"], 0)
@@ -131,7 +145,7 @@ class TestPublicDefaults(Base):
         self.assertIn("--json", cmd)
         self.assertIn("--output-last-message", cmd)
         self.assertIn("--sandbox", cmd)
-        self.assertIn("workspace-write", cmd)
+        self.assertIn("read-only", cmd)
         self.assertIn("--cd", cmd)
         self.assertIn("/tmp/ws", cmd)
         self.assertIn(adapters.CODEX_MODEL, cmd)
@@ -139,8 +153,12 @@ class TestPublicDefaults(Base):
         self.assertNotIn("--reasoning", cmd)
         self.assertTrue(any("model_reasoning_effort" in c and "max" in c for c in cmd), blob)
         # Resume reuses only the saved ID with cwd, never --cd/--reasoning.
-        rcmd = adapters.build_codex_resume_cmd("thread-abc-123", "/tmp/ws", "follow up")
+        rcmd = adapters.build_codex_resume_cmd("thread-abc-123", "follow up")
         self.assertIn("resume", rcmd)
+        self.assertEqual(rcmd[rcmd.index("-m") + 1], "gpt-5.6-luna")
+        self.assertIn('model_reasoning_effort="max"', rcmd)
+        self.assertIn('sandbox_mode="read-only"', rcmd)
+        self.assertEqual(rcmd[-1], "follow up")
         self.assertIn("thread-abc-123", rcmd)
         self.assertIn("--json", rcmd)
         self.assertNotIn("--cd", rcmd)
@@ -154,6 +172,7 @@ class TestPublicDefaults(Base):
         self.assertIn("claude-live-001", cmd)
         self.assertIn("claude-sonnet-5", cmd)
         self.assertIn("medium", cmd)
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "json")
         cmd2 = adapters.build_claude_cmd("s1", "p", model="m2", effort="high")
         self.assertIn("m2", cmd2)
         self.assertIn("high", cmd2)
@@ -192,7 +211,7 @@ class TestPublicDefaults(Base):
         with self.assertRaises(ValueError):
             adapters.build_claude_cmd("", "prompt")
         with self.assertRaises(ValueError):
-            adapters.build_codex_resume_cmd("", "/tmp/ws", "p")
+            adapters.build_codex_resume_cmd("", "p")
 
     def test_public_recipe_submit_status_questions_answer_cancel_recover(self):
         w = self.ws()
@@ -222,12 +241,11 @@ class TestAdapterSessions(Base):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
         seen = []
 
-        def fake_run(cmd, cwd=None, timeout=120):
+        def fake_run(cmd, cwd=None, timeout=120, **kw):
             seen.append(list(cmd))
             self.assertIn("codex", cmd[0])
-            out = json.dumps({"task_id": "codex-task-123",
-                              "action": "planner_question",
-                              "qid": "q1", "prompt": "Confirm?"})
+            out = codex_out("codex-task-123", {"action": "planner_question",
+                                               "qid": "q1", "prompt": "Confirm?"})
             return 0, out, ""
 
         res = controller.dispatch(self.sd, "r1", run_cmd=fake_run)
@@ -240,7 +258,7 @@ class TestAdapterSessions(Base):
         # Second dispatch never forks: no new run, same ID.
         seen.clear()
 
-        def boom(cmd, cwd=None, timeout=120):
+        def boom(cmd, cwd=None, timeout=120, **kw):
             raise AssertionError("must not fork a second Codex task")
 
         res2 = controller.dispatch(self.sd, "r1", run_cmd=boom)
@@ -250,15 +268,15 @@ class TestAdapterSessions(Base):
     def test_resume_only_saved_task_id(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
 
-        def fake_dispatch(cmd, cwd=None, timeout=120):
-            return 0, json.dumps({"task_id": "codex-saved-9", "action": "completion"}), ""
+        def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
+            return 0, codex_out("codex-saved-9", {"action": "completion", "output": "x"}), ""
 
         controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
         captured = {}
 
-        def fake_resume(cmd, cwd=None, timeout=120):
+        def fake_resume(cmd, cwd=None, timeout=120, **kw):
             captured["cmd"] = list(cmd)
-            return 0, json.dumps({"action": "completion", "output": "done"}), ""
+            return 0, codex_out("codex-saved-9", {"action": "completion", "output": "done"}), ""
 
         controller.resume_luna(self.sd, "r1", "planner answer text", run_cmd=fake_resume)
         cmd = captured["cmd"]
@@ -272,9 +290,9 @@ class TestAdapterSessions(Base):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-exact-77")
         captured = {}
 
-        def fake_claude(cmd, cwd=None, timeout=120):
+        def fake_claude(cmd, cwd=None, timeout=120, **kw):
             captured["cmd"] = list(cmd)
-            return 0, "Approved as written.", ""
+            return 0, claude_out("claude-exact-77", "Approved as written."), ""
 
         res = controller.planner_callback(self.sd, "r1", "q1", "Confirm paragraph?",
                                           run_cmd=fake_claude)
@@ -292,7 +310,7 @@ class TestAdapterSessions(Base):
     def test_opencode_session_persisted_with_route_adapter_model(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
 
-        def fake_oc(cmd, cwd=None, timeout=120):
+        def fake_oc(cmd, cwd=None, timeout=120, **kw):
             self.assertIn("opencode", cmd[0])
             self.assertIn("opencode/muse-spark-1.3-contributor-free", cmd)
             self.assertIn("--variant", cmd)
@@ -322,7 +340,7 @@ class TestAdapterSessions(Base):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
         seen = {}
 
-        def fake(cmd, cwd=None, timeout=120):
+        def fake(cmd, cwd=None, timeout=120, **kw):
             seen["cmd"] = list(cmd)
             return 0, json.dumps({"ok": True}), ""
 
@@ -373,12 +391,12 @@ class TestControllerLifecycle(Base):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
         before = core.get_job(self.sd, "r1")
 
-        def fake_dispatch(cmd, cwd=None, timeout=120):
-            return 0, json.dumps({"task_id": "codex-keep-1", "action": "completion"}), ""
+        def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
+            return 0, codex_out("codex-keep-1", {"action": "completion", "output": "x"}), ""
 
         controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
 
-        def fake_oc(cmd, cwd=None, timeout=120):
+        def fake_oc(cmd, cwd=None, timeout=120, **kw):
             return 0, json.dumps({"opencode_session_id": "oc-keep-2"}), ""
 
         controller.run_implementation(self.sd, "r1", run_cmd=fake_oc)
@@ -435,13 +453,22 @@ class TestControllerLifecycle(Base):
 
 class TestPlannerBusyAndCallback(Base):
     def test_busy_planner_becomes_durable_blocked_with_reason(self):
-        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
+        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-busy-1")
+        bindir = Path(self.tmp.name) / "busybin"
+        bindir.mkdir()
+        fake = bindir / "claude"
+        fake.write_text("#!/bin/sh\nsleep 30\n")
+        fake.chmod(0o700)
+        holder = subprocess.Popen([str(fake), "--session-id", "claude-busy-1"],
+                                  start_new_session=True)
+        self.track(holder.pid)
+        time.sleep(0.2)
 
-        def fake_busy(cmd, cwd=None, timeout=120):
-            return 0, "Session is busy, try later", ""
+        def fake_claude(cmd, cwd=None, timeout=120, **kw):
+            raise AssertionError("a busy planner must not be resumed")
 
         res = controller.planner_callback(self.sd, "r1", "q-busy", "Confirm?",
-                                          run_cmd=fake_busy)
+                                          run_cmd=fake_claude)
         self.assertEqual(res["action"], "blocked")
         self.assertIn("busy", res["reason"])
         job = core.get_job(self.sd, "r1")
@@ -451,10 +478,20 @@ class TestPlannerBusyAndCallback(Base):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["qid"], "q-busy")
 
+    def test_forked_planner_result_blocks(self):
+        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-orig-1")
+
+        def fake_claude(cmd, cwd=None, timeout=120, **kw):
+            return 0, claude_out("claude-other-2", "Yes."), ""
+
+        res = controller.planner_callback(self.sd, "r1", "q1", "Confirm?", run_cmd=fake_claude)
+        self.assertEqual(res["reason"], "planner_session_mismatch")
+        self.assertEqual(len(core.list_questions(self.sd, "r1", only_pending=True)), 1)
+
     def test_callback_failure_becomes_durable_blocked_with_reason(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
 
-        def fake_fail(cmd, cwd=None, timeout=120):
+        def fake_fail(cmd, cwd=None, timeout=120, **kw):
             return 1, "", "claude: connection reset"
 
         res = controller.planner_callback(self.sd, "r1", "q-fail", "Confirm?",
@@ -474,38 +511,37 @@ class TestPlannerBusyAndCallback(Base):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
         calls = []
 
-        def fake_dispatch(cmd, cwd=None, timeout=120):
+        def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
             calls.append("dispatch")
-            return 0, json.dumps({"task_id": "codex-q-1",
-                                  "action": "planner_question",
-                                  "qid": "q-live-1",
-                                  "prompt": "Confirm paragraph?"}), ""
+            return 0, codex_out("codex-q-1", {"action": "planner_question",
+                                              "qid": "q-live-1",
+                                              "prompt": "Confirm paragraph?"}), ""
 
         d = controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
         luna_action = d["luna_action"]
         self.assertEqual(luna_action["action"], "planner_question")
 
-        def fake_claude(cmd, cwd=None, timeout=120):
+        def fake_claude(cmd, cwd=None, timeout=120, **kw):
             # Question must already be persisted before Claude is called.
             pending = core.list_questions(self.sd, "r1", only_pending=True)
             calls.append("claude-after-persist")
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0]["qid"], "q-live-1")
-            return 0, "Approved as written.", ""
+            return 0, claude_out("claude-1", "Approved as written."), ""
 
         res = controller.planner_callback(self.sd, "r1", "q-live-1",
                                           "Confirm paragraph?", run_cmd=fake_claude)
         self.assertEqual(res["action"], "answered")
         self.assertIn("claude-after-persist", calls)
 
-        def fake_resume(cmd, cwd=None, timeout=120):
+        def fake_resume(cmd, cwd=None, timeout=120, **kw):
             # Answer must already be persisted before Luna resume.
             qs = core.list_questions(self.sd, "r1", only_pending=False)
             answered = [q for q in qs if q["qid"] == "q-live-1" and q["status"] == "answered"]
             calls.append("resume-after-answer")
             self.assertEqual(len(answered), 1)
             self.assertIn("codex-q-1", " ".join(cmd))
-            return 0, json.dumps({"action": "completion", "output": "done"}), ""
+            return 0, codex_out("codex-q-1", {"action": "completion", "output": "done"}), ""
 
         r = controller.resume_luna(self.sd, "r1", "Approved as written.", run_cmd=fake_resume)
         self.assertEqual(r["action"], "resumed")
@@ -567,146 +603,126 @@ class TestQuotaClassification(Base):
 
 
 class TestQuotaTransfer(Base):
-    def test_free_exhaustion_aborts_old_session_confirms_idle_preserves_artifacts(self):
+    """``opencode run`` seam: only structured error events count."""
+
+    def test_free_exhaustion_error_event_transfers_and_preserves_artifacts(self):
         w = self.ws()
         core.submit(self.sd, "r1", {"goal": "t"}, w, "claude-1")
         log = Path(self.sd) / "outputs" / "r1.log"
         log.write_text("prior artifact chunk\n", encoding="utf-8")
-        calls = []
 
-        def fake_oc(cmd, cwd=None, timeout=120):
-            envelope = {"class": "FreeUsageLimitError",
-                        "opencode_session_id": "oc-free-1",
-                        "responseBody": json.dumps({"error": {"class": "FreeUsageLimitError"}})}
-            return 1, json.dumps(envelope), ""
-
-        def fake_control(method, path, body):
-            calls.append((method, path, dict(body)))
-            return {"ok": True, "idle": True}
+        def fake_oc(cmd, cwd=None, timeout=120, **kw):
+            events = [{"type": "step_start", "sessionID": "ses_free1"},
+                      {"type": "error", "sessionID": "ses_free1",
+                       "error": {"name": "APIError", "data": {
+                           "statusCode": 429,
+                           "responseBody": json.dumps({"type": "error", "error": {"type": "FreeUsageLimitError"}})}}}]
+            return 1, "\n".join(json.dumps(e) for e in events), ""
 
         res = controller.run_implementation(self.sd, "r1", artifact="outputs/fix.txt",
-                                            run_cmd=fake_oc,
-                                            control_request_func=fake_control)
+                                            run_cmd=fake_oc)
         self.assertEqual(res["action"], "transferred_to_go")
         job = core.get_job(self.sd, "r1")
         self.assertEqual(job["route"], "muse-spark-xhigh-go")
-        self.assertEqual(job["opencode_session_id"], "oc-free-1")
-        # Abort + idle confirm exercised against the saved session.
-        methods = [m for m, _, _ in calls]
-        self.assertIn("POST", methods)
-        self.assertIn("GET", methods)
-        self.assertTrue(any("oc-free-1" in json.dumps(b) or "oc-free-1" in p for _, p, b in calls))
-        # Artifacts preserved.
+        self.assertEqual(job["opencode_session_id"], "ses_free1")
         self.assertIn("prior artifact chunk", log.read_text(encoding="utf-8"))
-        self.assertTrue(job["last_error_json"])
         self.assertIn("FreeUsageLimitError", job["last_error_json"])
+
+    def test_model_text_naming_the_error_never_transfers(self):
+        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
+
+        def fake_oc(cmd, cwd=None, timeout=120, **kw):
+            events = [{"type": "text", "sessionID": "ses_t", "part": {"text": "FreeUsageLimitError"}}]
+            return 1, "\n".join(json.dumps(e) for e in events), ""
+
+        res = controller.run_implementation(self.sd, "r1", run_cmd=fake_oc)
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], "muse-spark-xhigh-free")
 
     def test_generic_rate_limit_never_transfers(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
 
-        def fake_oc(cmd, cwd=None, timeout=120):
-            return 1, json.dumps({"class": "RateLimitError", "message": "429 rate limit"}), ""
+        def fake_oc(cmd, cwd=None, timeout=120, **kw):
+            return 1, json.dumps({"type": "error", "error": {"name": "RateLimitError", "message": "429 rate limit"}}), ""
 
-        res = controller.run_implementation(self.sd, "r1", run_cmd=fake_oc,
-                                            control_request_func=lambda m, p, b: {"ok": True})
+        res = controller.run_implementation(self.sd, "r1", run_cmd=fake_oc)
         self.assertEqual(res["action"], "blocked")
         job = core.get_job(self.sd, "r1")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         self.assertEqual(job["status"], "blocked")
 
 
-class FakeStatusHandler(http.server.BaseHTTPRequestHandler):
-    mode = "free"
+class RealShapeHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal OpenCode 1.18.31 shapes for the loopback client."""
+    status = {}
+    seen = []
 
-    def do_GET(self):  # noqa: N802
-        parsed = self.path
-        if parsed.startswith("/session/status"):
-            if FakeStatusHandler.mode == "free":
-                body = {"session": "oc-fake-1", "status": "error",
-                        "error": {"class": "FreeUsageLimitError",
-                                  "responseBody": json.dumps({"error": {"class": "FreeUsageLimitError"}})}}
-            else:
-                body = {"session": "oc-fake-1", "status": "error",
-                        "error": {"class": "RateLimitError", "message": "429"}}
-            data = json.dumps(body).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-    def do_POST(self):  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
-        data = json.dumps({"ok": True}).encode("utf-8")
+    def _send(self, obj):
+        data = json.dumps(obj).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
-    def log_message(self, *args):  # silence
+    def do_GET(self):  # noqa: N802
+        RealShapeHandler.seen.append(("GET", self.path, self.headers.get("Authorization")))
+        if self.path.startswith("/session/status"):
+            return self._send(RealShapeHandler.status)
+        self._send([])
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length", "0"))
+        if n:
+            self.rfile.read(n)
+        RealShapeHandler.seen.append(("POST", self.path, self.headers.get("Authorization")))
+        self._send(True)
+
+    def log_message(self, *args):
         return
 
 
-class TestFakeHttpControl(Base):
-    def _serve(self, mode):
-        FakeStatusHandler.mode = mode
-        srv = http.server.HTTPServer(("127.0.0.1", 0), FakeStatusHandler)
-        port = srv.server_address[1]
+class TestOpenCodeClient(Base):
+    def _serve(self, status):
+        RealShapeHandler.status = status
+        RealShapeHandler.seen = []
+        srv = http.server.HTTPServer(("127.0.0.1", 0), RealShapeHandler)
         t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         t.start()
         self.addCleanup(srv.shutdown)
         self.addCleanup(srv.server_close)
-        return f"http://127.0.0.1:{port}"
+        return f"http://127.0.0.1:{srv.server_address[1]}"
 
-    def test_fake_http_free_envelope_selects_go_and_generic_does_not(self):
-        base = self._serve("free")
+    def test_status_is_scoped_and_only_trusted_retry_counts(self):
+        free = {"type": "retry", "attempt": 1, "message": "m", "next": 5,
+                "action": {"reason": "free_tier_limit", "provider": "opencode",
+                           "title": "t", "message": "m", "label": "l"}}
+        base = self._serve({"ses_mine": free, "ses_other": {"type": "busy"}})
         pwd = adapters.generate_control_password()
-        ctrl = adapters.OpenCodeControl(base, pwd, "oc-fake-1")
-        status = ctrl.session_status()
-        self.assertIn("oc-fake-1", json.dumps(status))
-        err = status.get("error", status)
-        self.assertTrue(policy.classify_provider_free_exhaustion(err))
-        self.assertTrue(policy.classify_quota_exhaustion(err))
-        # Abort + idle confirm over the same seam.
-        self.assertEqual(ctrl.abort().get("ok"), True)
-        idle = ctrl.ensure_idle_ownership()
-        self.assertTrue(isinstance(idle, dict))
-        # Password never persisted in DB/events.
-        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
-        con = store.connect(self.sd)
-        try:
-            blob = json.dumps([dict(r) for r in con.execute("SELECT * FROM jobs").fetchall()])
-            ev = json.dumps([dict(r) for r in con.execute("SELECT * FROM events").fetchall()])
-        finally:
-            con.close()
-        self.assertNotIn(pwd, blob + ev)
+        client = adapters.OpenCodeClient(base, pwd, directory="/tmp/ws")
+        st = client.session_status("ses_mine")
+        self.assertTrue(adapters.trusted_free_exhaustion(status=st))
+        self.assertEqual(client.session_status("ses_absent"), {"type": "idle"})
+        client.abort("ses_mine")
+        import base64
+        want = "Basic " + base64.b64encode(("opencode:" + pwd).encode()).decode()
+        self.assertTrue(all(a == want for _, _, a in RealShapeHandler.seen))
+        self.assertTrue(all("directory=%2Ftmp%2Fws" in p for _, p, _ in RealShapeHandler.seen))
+        self.assertIn(("POST", "/session/ses_mine/abort?directory=%2Ftmp%2Fws", want),
+                      RealShapeHandler.seen)
+        go = dict(free, action=dict(free["action"], reason="account_rate_limit"))
+        self.assertIsNone(adapters.trusted_free_exhaustion(status=go))
+        self.assertIsNone(adapters.trusted_free_exhaustion(status={"type": "retry", "message": "429"}))
+        self.assertIsNone(adapters.trusted_free_exhaustion(
+            message_error={"name": "UnknownError", "data": {"message": "FreeUsageLimitError"}}))
+        self.assertTrue(adapters.trusted_free_exhaustion(message_error={
+            "name": "APIError", "data": {"responseBody": '{"error":{"type":"FreeUsageLimitError"}}'}}))
 
-        base2 = self._serve("generic")
-        ctrl2 = adapters.OpenCodeControl(base2, adapters.generate_control_password(), "oc-fake-1")
-        status2 = ctrl2.session_status()
-        err2 = status2.get("error", status2)
-        self.assertFalse(policy.classify_provider_free_exhaustion(err2))
-        self.assertFalse(policy.classify_quota_exhaustion(err2))
-        self.assertIsNone(policy.next_implementation_route("muse-spark-xhigh-free", err2))
-
-    def test_control_rejects_non_localhost(self):
+    def test_control_rejects_non_localhost_and_missing_password(self):
         with self.assertRaises(ValueError):
-            adapters.OpenCodeControl("http://example.com:4000",
-                                     adapters.generate_control_password(), "s1")
-
-    def test_status_observes_only_saved_session(self):
-        base = self._serve("free")
-        ctrl = adapters.OpenCodeControl(base, adapters.generate_control_password(), "oc-saved-9")
-        status = ctrl.session_status()
-        # Fake server echoes the saved session scoping; the seam never
-        # requests another session ID.
-        self.assertTrue(isinstance(status, dict))
+            adapters.OpenCodeClient("http://example.com:4000", adapters.generate_control_password())
+        with self.assertRaises(ValueError):
+            adapters.OpenCodeClient("http://127.0.0.1:4000", None)
 
 
 if __name__ == "__main__":

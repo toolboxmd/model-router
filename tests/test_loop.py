@@ -28,7 +28,6 @@ PY = sys.executable
 
 THREAD_ID = "thread-loop-001"
 PLANNER_SID = "claude-planner-loop-001"
-OC_SESSION = "oc-loop-001"
 QID = "q-loop-1"
 
 FAKE_CODEX = """#!/usr/bin/env python3
@@ -52,6 +51,9 @@ if argv and argv[0] == "exec" and len(argv) > 1 and argv[1] == "resume":
     rid = argv[2] if len(argv) > 2 else ""
     assert rid == "%s", f"resume must use exact saved ID, got {rid!r}"
     assert "--json" in argv, "resume must pass --json"
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-luna", "resume must name Luna"
+    assert 'model_reasoning_effort="max"' in argv, "resume must pass max effort"
+    assert 'sandbox_mode="read-only"' in argv, "resume must stay read-only"
     assert "--cd" not in argv, "resume must not use --cd"
     assert "--reasoning" not in argv, "resume must not use --reasoning"
     n = 0
@@ -82,7 +84,7 @@ else:
     assert "--model" in argv and "%s" in argv, "dispatch model"
     blob = " ".join(argv)
     assert "model_reasoning_effort" in blob and "max" in blob, "dispatch reasoning effort"
-    assert "--sandbox" in argv and "workspace-write" in argv, "dispatch sandbox"
+    assert "--sandbox" in argv and "read-only" in argv, "dispatch sandbox"
     assert "--cd" in argv, "dispatch must pass --cd"
     assert "--reasoning" not in argv, "dispatch must not use --reasoning"
     tid = "%s"
@@ -96,107 +98,19 @@ else:
     print(json.dumps(env))
 """ % (THREAD_ID, THREAD_ID, "gpt-5.6-luna", THREAD_ID, QID)
 
-FAKE_CLAUDE = """#!/usr/bin/env python3
-import json, os, sys
-from pathlib import Path
-state = Path(os.environ["DURABLE_FAKE_STATE"])
-state.mkdir(parents=True, exist_ok=True)
-log = state / "claude.log"
-argv = sys.argv[1:]
-with open(log, "a", encoding="utf-8") as f:
-    f.write(json.dumps(argv) + "\\n")
-assert "--resume" in argv, "claude must use --resume"
-i = argv.index("--resume")
-sid = argv[i + 1] if i + 1 < len(argv) else ""
-assert sid == "%s", f"must resume exact planner session, got {sid!r}"
-assert "--fork-session" not in argv, "must never fork planner"
-print("Approved as written.")
-""" % PLANNER_SID
+from tests.fakes import FAKE_CLAUDE as _FC, FAKE_OPENCODE as _FO  # noqa: E402
 
-FAKE_OPENCODE = r'''#!/usr/bin/env python3
-import json, os, sys, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-state = Path(os.environ["DURABLE_FAKE_STATE"])
-state.mkdir(parents=True, exist_ok=True)
-log = state / "opencode.log"
-argv = sys.argv[1:]
-with open(log, "a", encoding="utf-8") as f:
-    f.write(json.dumps(argv) + "\n")
-SESSION = "''' + OC_SESSION + r'''"
-PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
+FAKE_CLAUDE = "#!" + PY + "\n" + _FC
+FAKE_OPENCODE = "#!" + PY + "\n" + _FO
 
-if argv and argv[0] == "serve":
-    assert "--pure" in argv, "serve must use --pure"
-    assert "--hostname" in argv and "127.0.0.1" in argv, "serve must bind loopback"
-    assert "--port" in argv, "serve must pass --port"
-    assert PASSWORD, "serve password must arrive via environment, not argv"
-    assert "password" not in " ".join(argv).lower()
-    class H(BaseHTTPRequestHandler):
-        def _auth(self):
-            got = self.headers.get("Authorization") or ""
-            return got == "Bearer " + PASSWORD
-        def _json(self, code, obj):
-            data = json.dumps(obj).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        def do_GET(self):
-            if not self._auth():
-                return self._json(401, {"error": "unauthorized"})
-            parsed = urlparse(self.path)
-            if parsed.path == "/session/status":
-                qs = parse_qs(parsed.query)
-                sid = (qs.get("session") or [SESSION])[0]
-                self._json(200, {"session": sid, "status": "idle"})
-                return
-            self._json(404, {"error": "missing"})
-        def do_POST(self):
-            if not self._auth():
-                return self._json(401, {"error": "unauthorized"})
-            length = int(self.headers.get("Content-Length") or "0")
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                body = json.loads(raw.decode("utf-8") or "{}")
-            except ValueError:
-                body = {}
-            path = urlparse(self.path).path
-            if path == "/session":
-                self._json(200, {"id": SESSION})
-                return
-            if path.endswith("/prompt"):
-                (state / "opencode-prompt.jsonl").open("a").write(json.dumps(body) + "\n")
-                self._json(200, {"ok": True, "session": SESSION})
-                return
-            if path == "/session/abort":
-                self._json(200, {"ok": True})
-                return
-            self._json(404, {"error": "missing"})
-        def log_message(self, *args):
-            return
-    srv = HTTPServer(("127.0.0.1", 0), H)
-    port = srv.server_address[1]
-    print(f"listening on http://127.0.0.1:{port}", flush=True)
-    try:
-        srv.serve_forever(poll_interval=0.05)
-    except KeyboardInterrupt:
-        pass
-    sys.exit(0)
 
-assert argv and argv[0] == "run", f"must use opencode run or serve, got {argv!r}"
-assert "--format" in argv and "json" in argv, "must use --format json"
-assert "--pure" in argv, "must use --pure"
-assert "--dir" in argv, "must use --dir"
-assert "--model" in argv and "opencode/muse-spark-1.3-contributor-free" in argv, f"free model, got {argv!r}"
-assert "--variant" in argv and "xhigh" in argv, "must use --variant xhigh"
-assert "--agent" in argv and "build" in argv, "must use --agent build"
-assert "--effort" not in argv, "must not use --effort"
-assert "--cd" not in argv, "must not use --cd"
-print(json.dumps({"opencode_session_id": SESSION, "ok": True}))
-'''
+def wait_for_dead(pid, secs=15.0):
+    end = time.time() + secs
+    while time.time() < end:
+        if not _is_pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def kill_pid(pid):
@@ -226,6 +140,8 @@ class TestPublicLoopProof(unittest.TestCase):
         env = dict(os.environ)
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
         env["DURABLE_FAKE_STATE"] = str(fake_state)
+        env["FAKE_STATE"] = str(fake_state)
+        env["FAKE_OC_WRITE"] = "fix.txt"
 
         req = "loop-proof-001"
         task = json.dumps({"goal": "Loop proof fix", "scope": "one file"})
@@ -265,7 +181,7 @@ class TestPublicLoopProof(unittest.TestCase):
             return [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
 
         codex_calls = read_log("codex.log")
-        claude_calls = read_log("claude.log")
+        claude_calls = [c["argv"] for c in read_log("claude.log")]
         oc_calls = read_log("opencode.log")
 
         # One Luna fresh dispatch (exec without resume) + exact-ID resumes.
@@ -274,40 +190,38 @@ class TestPublicLoopProof(unittest.TestCase):
         resumes = [c for c in codex_calls
                    if len(c) > 1 and c[0] == "exec" and c[1] == "resume"]
         self.assertEqual(len(dispatches), 1, codex_calls)
-        self.assertGreaterEqual(len(resumes), 1, codex_calls)
+        self.assertEqual(len(resumes), 2, codex_calls)
         for r in resumes:
             self.assertIn(THREAD_ID, r)
-        # No duplicate dispatch after the loop.
         self.assertEqual(len(codex_calls), len(dispatches) + len(resumes))
 
-        # One Claude --resume of the exact original planner ID, never fork.
+        # One Claude --resume of the exact original planner ID, JSON output,
+        # run in the planner's directory (default: the workspace).
         self.assertEqual(len(claude_calls), 1, claude_calls)
         self.assertIn("--resume", claude_calls[0])
         self.assertIn(PLANNER_SID, claude_calls[0])
+        self.assertEqual(read_log("claude.log")[0]["cwd"], os.path.realpath(ws))
 
-        # Owned ephemeral OpenCode serve (public path) or run (fallback).
-        self.assertGreaterEqual(len(oc_calls), 1, oc_calls)
-        serve_calls = [c for c in oc_calls if c and c[0] == "serve"]
-        run_calls = [c for c in oc_calls if c and c[0] == "run"]
-        self.assertTrue(serve_calls or run_calls, oc_calls)
-        if serve_calls:
-            sc = serve_calls[0]
-            self.assertIn("--pure", sc)
-            self.assertIn("127.0.0.1", sc)
-            self.assertIn("--port", sc)
-            self.assertNotIn("password", " ".join(sc).lower())
-            prompt_log = fake_state / "opencode-prompt.jsonl"
-            self.assertTrue(prompt_log.exists(), "owned server must prompt the saved session")
-            prompts = [json.loads(l) for l in prompt_log.read_text().splitlines() if l.strip()]
-            self.assertTrue(prompts)
-            self.assertIn("opencode/muse-spark-1.3-contributor-free",
-                          json.dumps(prompts))
-        else:
-            oc = run_calls[0]
-            self.assertIn("opencode/muse-spark-1.3-contributor-free", oc)
-            self.assertIn("xhigh", oc)
-            self.assertIn("--dir", oc)
-            self.assertIn(str(ws), oc)
+        # Owned ephemeral OpenCode server with the real API contract.
+        self.assertEqual([c[0] for c in oc_calls], ["serve"], oc_calls)
+        self.assertNotIn("password", " ".join(oc_calls[0]).lower())
+        self.assertEqual((fake_state / "pwd-in-argv").read_text(), "no")
+        reqs = read_log("opencode-requests.jsonl")
+        self.assertTrue(reqs and all(r["auth_ok"] for r in reqs), reqs)
+        creates = [r for r in reqs if r["method"] == "POST" and r["path"] == "/session"]
+        self.assertEqual(len(creates), 1)
+        rules = {(x["permission"], x["action"]) for x in creates[0]["body"]["permission"]}
+        self.assertIn(("external_directory", "deny"), rules)
+        self.assertIn(("task", "deny"), rules)
+        prompts = [r for r in reqs if r["path"].endswith("/prompt_async")]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["body"]["model"],
+                         {"providerID": "opencode", "modelID": "muse-spark-1.3-contributor-free"})
+        self.assertEqual(prompts[0]["body"]["variant"], "xhigh")
+        self.assertEqual(prompts[0]["body"]["agent"], "build")
+        self.assertTrue(all(r["query"].get("directory") == job["workspace"] for r in reqs
+                            if r["path"] != "/global/health"), reqs)
+        self.assertTrue((ws / "fix.txt").exists())
 
         # Durable question then answer then completion.
         qs = core.list_questions(sd, req, only_pending=False)
@@ -315,7 +229,7 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertEqual(qs[0]["qid"], QID)
         self.assertEqual(qs[0]["status"], "answered")
         self.assertIn("Approved", qs[0]["answer"] or "")
-        self.assertEqual(job["opencode_session_id"], OC_SESSION)
+        self.assertTrue(job["opencode_session_id"].startswith("ses_"))
         # Controller state + child records preserve session IDs.
         self.assertTrue(job.get("controller_state"))
         con = store.connect(sd)
@@ -329,17 +243,22 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("codex_dispatch", kinds)
         self.assertIn("codex_resume", kinds)
         self.assertIn("claude_callback", kinds)
-        self.assertTrue("opencode_run" in kinds or "opencode_control" in kinds
-                        or "opencode_serve" in kinds, kinds)
+        self.assertIn("opencode_control", kinds)
+        # Every model child ran under a supervisor and was collected once.
+        invs = core._list_invocations(sd, req)
+        self.assertEqual(sorted(i["kind"] for i in invs),
+                         ["claude_callback", "codex_dispatch", "codex_resume",
+                          "codex_resume", "opencode_control"])
+        self.assertTrue(all(i["state"] == "completed" and i["consumed_at"] for i in invs))
 
         # Recover/restart must not fork a second planner session or writer.
-        n_claude_before = len(claude_calls)
+        n_claude_before = len(read_log("claude.log"))
         n_codex_before = len(codex_calls)
         rc, _, _ = self._cli(sd, "recover", "--request-id", req, env=env)
         self.assertEqual(rc, 0)
         time.sleep(0.5)
         codex_after = read_log("codex.log")
-        claude_after = read_log("claude.log")
+        claude_after = read_log("claude.log")  # noqa: F841
         self.assertEqual(len(claude_after), n_claude_before,
                          "recover must never fork a second planner session")
         self.assertEqual(len(codex_after), n_codex_before,
@@ -453,8 +372,9 @@ time.sleep(60)
         self.assertEqual(rc, 0, err[-2000:])
         self.assertNotEqual(rec.get("action"), "worker-dead-cleared",
                             "recover must not clear a live child invocation")
-        self.assertIn(rec.get("action"),
-                      ("adopted-live-invocation", "blocked-claimed-live-invocation"))
+        self.assertEqual(rec.get("action"), "adopted-live-invocation")
+        # The adopting controller waits on the same action; it never
+        # launches a second Codex task.
 
         # start() must refuse to fork a second writer.
         rc, start_out, err = self._cli(sd, "start", "--request-id", req, env=env)
@@ -480,6 +400,12 @@ time.sleep(60)
                 os.kill(int(controller_pid), signal.SIGKILL)
             except Exception:
                 pass
+        adopter = core.get_job(sd, req).get("owner_pid")
+        if adopter:
+            self.assertTrue(wait_for_dead(adopter), "adopting controller must stop after the child fails")
+        self.assertFalse(wait_calls(2, deadline=1.0),
+                         "a failed dispatch must not be replayed as a new task")
+        self.assertEqual(core.get_job(sd, req)["status"], "blocked")
 
     def test_cancel_while_child_lives_blocks_replacement_until_dead(self):
         """Regression: cancel must stop the child before releasing the workspace.

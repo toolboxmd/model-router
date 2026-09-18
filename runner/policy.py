@@ -43,18 +43,18 @@ SUPPORTED_ROUTES = {
     },
     # Final combined review.
     "opus-5/high-review": {
-        "model": "opus-5",
+        "model": "claude-opus-5",
         "effort": "high",
         "role": "review",
     },
     "opus-5/high": {
-        "model": "opus-5",
+        "model": "claude-opus-5",
         "effort": "high",
         "role": "recovery",
     },
     # Planning.
     "fable-5.1/max": {
-        "model": "fable-5.1",
+        "model": "claude-fable-5-1",
         "effort": "max",
         "role": "planning",
     },

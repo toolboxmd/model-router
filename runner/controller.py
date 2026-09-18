@@ -1,29 +1,11 @@
-"""Structured controller flow (stdlib only).
+"""Controller flow (stdlib only). See RUNNER.md.
 
-Built-in detached controller drives the durable flow with at most one
-useful bounded transition per :func:`step` (a detached
-:func:`run_controller_process` loops those steps boundedly):
-
-- dispatch Luna with the built-in Codex adapter and persist the
-  returned thread/task ID before accepting; the same Luna result is
-  parsed for a structured action envelope (explicit action JSON
-  protocol lives in the prompt);
-- ``planner_question`` persists via ``core.post_question`` before
-  calling Claude ``--resume`` of the exact original planner session;
-  the Claude answer persists via ``core.answer`` before resuming that
-  exact saved Luna task ID and parsing the next action;
-- ``implementation`` runs Muse OpenCode with the selected route,
-  persists session/artifact/output evidence, then resumes/finishes
-  through the same saved Luna task or a structured completion path;
-- ``completion`` persists the terminal result before acknowledgement;
-- busy/callback/model/permission errors persist a durable ``blocked``
-  reason and leave unanswered questions durable for recover.
-
-Never forks a planner or Luna session: resume always reuses saved IDs.
-A restart resumes saved IDs; a waiting question proceeds after the
-public ``answer`` + ``recover``. ``run_cmd`` and control seams stay
-injectable for deterministic tests; normal submit/start uses built-in
-defaults with no injection required.
+One :func:`step` advances one useful transition: dispatch Luna, ask the
+saved planner, run one Muse turn, or complete. The detached
+:func:`run_controller_process` loops a bounded number of steps with the
+durable run command, so every child is supervised, recorded before spawn,
+and reused by action identity after a restart. Resume always reuses saved
+session IDs. ``run_cmd`` stays injectable for deterministic tests.
 """
 from __future__ import annotations
 
@@ -34,7 +16,7 @@ from pathlib import Path
 
 from . import adapters, core, policy, store
 
-MAX_LOOP_STEPS = 8
+MAX_LOOP_STEPS = 12
 
 
 def default_run_cmd(cmd: list[str], cwd: str | None = None,
@@ -174,6 +156,7 @@ def _persist_envelope(state_dir, request_id: str, envelope: dict | None,
         cur["last_action"] = envelope
         if envelope:
             cur["last_action_name"] = envelope.get("action")
+            cur["seq"] = int(cur.get("seq") or 0) + 1
         now = core._utcnow()
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(cur, sort_keys=True), now, request_id))
@@ -257,10 +240,12 @@ def _save_codex_task(state_dir, request_id: str, task_id: str,
             con.execute("ROLLBACK")
             raise core.NotFoundError(f"unknown request: {request_id}")
         now = core._utcnow()
+        st = _load_controller_state(dict(job))
+        st.update({"phase": "dispatched", "codex_task_id": task_id})
         con.execute("UPDATE jobs SET codex_task_id=?, adapter=?, model=?, effort=?,"
                     " controller_state=?, updated_at=? WHERE request_id=?",
                     (task_id, "codex", model, effort,
-                     json.dumps({"phase": "dispatched", "codex_task_id": task_id}), now, request_id))
+                     json.dumps(st, sort_keys=True), now, request_id))
         core._event(con, request_id, "codex_dispatched", {"task": task_id[:12] + "..."})
         con.execute("COMMIT")
     except Exception:
@@ -302,37 +287,46 @@ def _save_opencode_session(state_dir, request_id: str, session_id: str,
     return core.get_job(state_dir, request_id)
 
 
+def _prompt_digest(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
     """Ensure Codex dispatch; persist the task ID before accepting."""
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
-    if job.get("codex_task_id"):
-        st = _load_controller_state(job)
+    st = _load_controller_state(job)
+    if job.get("codex_task_id") and st.get("seq"):
         return {"action": "already-dispatched", "codex_task_id": job["codex_task_id"],
                 "luna_action": st.get("last_action")}
+    # A saved thread without a saved action means the dispatch turn's
+    # result was not collected. Re-entering the same action reuses or
+    # adopts that invocation; it never starts a second dispatch.
     workspace = job["workspace"]
     prompt = _full_luna_prompt(job["task_json"])
-    last_path = _last_message_path(state_dir, request_id, "codex-last")
+    last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
     cmd = adapters.build_codex_dispatch_cmd(workspace, prompt,
                                             last_message_path=last_path)
     rc, out, err = run_cmd(cmd, workspace)
     last_text = adapters.read_last_message_file(last_path)
-    # Test-seam fakes may embed the last-message envelope in stdout only;
-    # production reads both stdout JSONL and the last-message file.
-    task_id = adapters.parse_codex_task_id(out, last_text)
+    task_id = adapters.parse_codex_task_id(out)
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
                   session_id=task_id, output_text=(out or "") + (err or ""))
-    if rc != 0 or not task_id:
+    if not task_id:
         _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
         _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted")
         return {"action": "blocked", "reason": "codex_dispatch_failed"}
+    # The thread exists even when the turn failed: save it so recovery
+    # resumes it instead of creating a replacement task.
     _save_codex_task(state_dir, request_id, task_id)
-    luna_action = parse_luna_action(out, last_text)
+    if rc != 0:
+        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}")
+        return {"action": "blocked", "reason": "codex_dispatch_failed", "codex_task_id": task_id}
+    luna_action = adapters.parse_codex_agent_envelope(out, last_text)
     # Persist the envelope before any side effect it commands.
-    try:
-        _persist_envelope(state_dir, request_id, luna_action, "dispatched")
-    except Exception:
-        pass
+    _persist_envelope(state_dir, request_id, luna_action, "dispatched")
     if luna_action is None:
         _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
         return {"action": "blocked", "reason": "luna_missing_action",
@@ -340,12 +334,23 @@ def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
     return {"action": "dispatched", "codex_task_id": task_id, "luna_action": luna_action}
 
 
+def _own_invocation_pids(state_dir, request_id: str) -> set:
+    pids = set()
+    for inv in core._list_invocations(state_dir, request_id):
+        if inv.get("state") in core.LIVE_INVOCATION_STATES:
+            for k in ("pid", "supervisor_pid"):
+                if inv.get(k):
+                    pids.add(int(inv[k]))
+    return pids
+
+
 def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
                      run_cmd=None) -> dict:
     """Persist question before Claude --resume; persist answer before resume.
 
-    Never forks a new planner session. Busy or failed callbacks become a
-    durable blocked state with a reason; the question stays pending.
+    Never forks a new planner session. A busy planner, a failed callback,
+    or a result from another session becomes a durable blocked state
+    with a reason; the question stays pending for ``answer`` + recover.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -359,32 +364,52 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     except core.ConflictError as e:
         _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
         return {"action": "blocked", "reason": "question_conflict"}
+    busy = adapters.planner_session_in_use(
+        planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
+    if busy:
+        _mark_blocked(state_dir, request_id,
+                      f"planner_busy: session in use by pid {busy[0]}; answer the question and recover")
+        return {"action": "blocked", "reason": "planner_busy"}
     planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
     planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
+    question = ("The runner dispatcher for your submitted request "
+                f"{request_id} asks (question {qid}):\n{prompt}\n\n"
+                "Answer briefly with the decision only. Do not run tools.")
     try:
-        cmd = adapters.build_claude_cmd(planner_session, prompt,
+        cmd = adapters.build_claude_cmd(planner_session, question,
                                          model=planner_model, effort=planner_effort)
     except ValueError as e:
         _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
         return {"action": "blocked", "reason": "planner_resume_refused"}
-    rc, out, err = run_cmd(cmd, job["workspace"])
-    combined = (out or "") + "\n" + (err or "")
+    cwd = job.get("planner_cwd") or job["workspace"]
+    rc, out, err = run_cmd(cmd, cwd, None, kind="claude_callback", meta={"qid": qid})
+    parsed = adapters.parse_claude_result(out)
     _record_child(state_dir, request_id, "claude_callback", cmd, rc,
-                  session_id=planner_session, output_text=combined)
-    if rc != 0 or adapters.is_planner_busy(combined):
-        reason = "planner_busy" if adapters.is_planner_busy(combined) else f"planner_callback_failed rc={rc}"
+                  session_id=parsed.get("session_id") or planner_session,
+                  output_text=(parsed.get("answer") or "") + "\n" + (err or "")[-1000:])
+    if rc != 0 or not parsed.get("ok"):
+        reason = f"planner_callback_failed rc={rc}: {parsed.get('error') or 'error'}"
         _persist_error_evidence(state_dir, request_id,
                                 {"source": "claude_callback", "rc": rc,
-                                 "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
+                                 "error": parsed.get("error"),
+                                 "stderr": (err or "")[:1000]})
         _mark_blocked(state_dir, request_id, reason)
-        return {"action": "blocked", "reason": reason}
-    answer_text = (out or "").strip() or (err or "").strip() or "acknowledged"
+        return {"action": "blocked", "reason": "planner_callback_failed"}
+    if parsed.get("session_id") != planner_session:
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "claude_callback",
+                                 "expected_session": planner_session,
+                                 "reported_session": parsed.get("session_id")})
+        _mark_blocked(state_dir, request_id,
+                      "planner_session_mismatch: resumed result came from another session")
+        return {"action": "blocked", "reason": "planner_session_mismatch"}
     # Persist the answer before resuming the same Luna task.
-    core.answer(state_dir, request_id, qid, answer_text)
+    core.answer(state_dir, request_id, qid, parsed["answer"])
     return {"action": "answered", "qid": qid}
 
 
-def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None) -> dict:
+def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
+                label: str = "CONTEXT") -> dict:
     """Resume only the saved Luna task ID with new context (never fork)."""
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -392,35 +417,33 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None) -> dict:
     if not task_id:
         _mark_blocked(state_dir, request_id, "missing saved Codex task ID: refusing to fork")
         return {"action": "blocked", "reason": "missing_codex_task"}
-    last_path = _last_message_path(state_dir, request_id, "codex-resume-last")
-    cmd = adapters.build_codex_resume_cmd(task_id, job["workspace"], prompt,
+    message = adapters.build_luna_followup(label, prompt)
+    last_path = _last_message_path(state_dir, request_id,
+                                   "codex-resume-" + _prompt_digest(message))
+    cmd = adapters.build_codex_resume_cmd(task_id, message,
                                           last_message_path=last_path)
     # Resume uses the saved workspace as cwd; never --cd/--reasoning.
     rc, out, err = run_cmd(cmd, job["workspace"])
     last_text = adapters.read_last_message_file(last_path)
-    # Preserve the exact saved ID even if this resume emits no new ID.
-    resumed_id = adapters.parse_codex_task_id(out, last_text) or task_id
+    resumed_id = adapters.parse_codex_task_id(out)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
-                  session_id=resumed_id, output_text=(out or "") + (err or ""))
+                  session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
+    if resumed_id and resumed_id != task_id:
+        _mark_blocked(state_dir, request_id,
+                      f"luna_task_mismatch: resume reported {resumed_id[:12]}")
+        return {"action": "blocked", "reason": "luna_task_mismatch"}
     if rc != 0:
         _persist_error_evidence(state_dir, request_id,
                                 {"source": "codex_resume", "rc": rc,
                                  "stderr": (err or "")[:1000]})
-        low = ((out or "") + "\n" + (err or "")).lower()
-        if any(s in low for s in ("busy", "locked", "already running")):
-            _mark_blocked(state_dir, request_id, "luna_busy")
-            return {"action": "blocked", "reason": "luna_busy"}
-        if any(s in low for s in ("permission", "consent", "denied", "auth", "model")):
-            _mark_blocked(state_dir, request_id, f"luna_blocked rc={rc}")
-            return {"action": "blocked", "reason": "luna_blocked"}
         _mark_blocked(state_dir, request_id, f"codex_resume_failed rc={rc}")
         return {"action": "blocked", "reason": "codex_resume_failed"}
-    luna_action = parse_luna_action(out, last_text)
-    try:
-        _persist_envelope(state_dir, request_id, luna_action, "resumed")
-    except Exception:
-        pass
-    return {"action": "resumed", "luna_action": luna_action, "raw": out}
+    luna_action = adapters.parse_codex_agent_envelope(out, last_text)
+    _persist_envelope(state_dir, request_id, luna_action, "resumed")
+    if luna_action is None:
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        return {"action": "blocked", "reason": "luna_missing_action"}
+    return {"action": "resumed", "luna_action": luna_action}
 
 
 def _route_allowance(route: str) -> str:
@@ -429,192 +452,224 @@ def _route_allowance(route: str) -> str:
     return "free"
 
 
+WORKER_RULES = (
+    "WORKER RULES: you are the implementation worker for one runner job. "
+    "Edit only what the task and instructions allow, inside this "
+    "workspace. Run the task's proof command when it has one. Do not "
+    "start other agents, commit, push, or install anything. Finish with a "
+    "short report of changed files and proof results."
+)
+
+
+def _implementation_prompt(task_json: str, artifact, payload) -> str:
+    prompt = f"TASK (complete):\n{_task_summary(task_json)}\n"
+    if isinstance(payload, dict) and isinstance(payload.get("instructions"), str):
+        prompt += f"\nDISPATCHER INSTRUCTIONS:\n{payload['instructions']}\n"
+    if artifact:
+        prompt += f"\nartifact: {artifact}\n"
+    if payload:
+        try:
+            prompt += "\ncontext: " + json.dumps(payload, sort_keys=True) + "\n"
+        except Exception:
+            prompt += f"\ncontext: {payload!r}\n"
+    return prompt + "\n" + WORKER_RULES
+
+
+def _runner_result(out: str) -> dict | None:
+    found = None
+    for line in (out or "").splitlines():
+        if line.startswith("RUNNER_RESULT "):
+            try:
+                found = json.loads(line[len("RUNNER_RESULT "):])
+            except ValueError:
+                continue
+    return found
+
+
+def _invocation_result(state_dir, request_id: str, session_id: str | None) -> dict:
+    """Full supervisor result of the latest opencode_control invocation."""
+    for inv in reversed(core._list_invocations(state_dir, request_id)):
+        if inv.get("kind") != "opencode_control" or not inv.get("result_json"):
+            continue
+        try:
+            obj = json.loads(inv["result_json"])
+        except ValueError:
+            continue
+        env = obj.get("envelope") if isinstance(obj, dict) else None
+        if isinstance(env, dict) and (session_id is None or env.get("opencode_session_id") == session_id):
+            return env
+    return {}
+
+
+def _structured_run_errors(out: str, err: str) -> list:
+    """Error objects from ``opencode run --format json`` (not model text)."""
+    found = []
+    for blob in (out or "", err or ""):
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") in ("text", "reasoning", "tool_use", "step_start", "step_finish"):
+                continue
+            if "error" in obj or "code" in obj or obj.get("type") == "error":
+                found.append(obj)
+    return found
+
+
+def _set_phase(state_dir, request_id: str, **fields) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        st = {}
+        if cur is not None and cur["controller_state"]:
+            try:
+                st = json.loads(cur["controller_state"]) or {}
+            except ValueError:
+                st = {}
+        st.update(fields)
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "implementation_output",
+                    {"session": str(fields.get("opencode_session_id") or "")[:24],
+                     "phase": fields.get("phase")})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _switch_to_go(state_dir, request_id: str, evidence: dict) -> dict:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("UPDATE jobs SET route=?, model=?, updated_at=? WHERE request_id=?",
+                    ("muse-spark-xhigh-go", adapters.OPENCODE_GO_MODEL,
+                     core._utcnow(), request_id))
+        core._event(con, request_id, "route_switched",
+                    {"from": "muse-spark-xhigh-free", "to": "muse-spark-xhigh-go",
+                     "evidence": str(evidence.get("source") or evidence.get("class") or "provider")[:64]})
+        core._record_capacity_locked(con, "muse-spark-xhigh-free", "exhausted",
+                                     evidence, core._trusted_reset_at(evidence))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"action": "transferred_to_go", "route": "muse-spark-xhigh-go"}
+
+
 def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                        payload: dict | None = None, run_cmd=None,
-                       control_request_func=None, control_base_url: str | None = None,
-                       control_password: str | None = None,
                        use_owned_server: bool = False) -> dict:
-    """Run the OpenCode adapter carrying the saved artifact/output.
+    """Run one Muse implementation turn for the current Luna action.
 
-    Uses the installed CLI contract (``--format json --pure --dir``,
-    provider/model route, ``--variant xhigh --agent build``,
-    ``--session`` for saved sessions). The durable ``allowance``
-    (free vs go-included) always selects the model route. Handles exact
-    free-exhaustion evidence with abort + idle confirm before any Go
-    transfer. Generic errors never select Go.
+    The public controller uses an owned ``opencode serve`` driven by the
+    supervisor. ``use_owned_server=False`` keeps the ``opencode run``
+    test seam. Free to Go needs trusted provider evidence; on the owned
+    server the old session must also be confirmed idle. Generic errors
+    never select Go.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
     workspace = job["workspace"]
     route = job.get("route") or "muse-spark-xhigh-free"
     allowance = _route_allowance(route)
+    model = adapters.opencode_model_for_allowance(allowance)
     saved_session = job.get("opencode_session_id")
-    # Full task content, never silently clipped; artifact/context ride
-    # along in full so the writer sees the complete handoff.
-    base_task = _task_summary(job["task_json"])
-    prompt = base_task
-    if artifact:
-        prompt += f"\nartifact: {artifact}"
-    if payload:
-        try:
-            prompt += "\ncontext: " + json.dumps(payload, sort_keys=True)
-        except Exception:
-            prompt += f"\ncontext: {payload!r}"
-    cmd = adapters.build_opencode_cmd(workspace, prompt,
-                                      allowance=allowance,
-                                      session_id=saved_session)
-    recorded_kind = "opencode_run"
-    recorded_cmd = cmd
-    if use_owned_server and control_request_func is None:
-        serve_cmd = adapters.build_opencode_serve_cmd()
-        meta = {"prompt": prompt, "allowance": allowance,
-                "session_id": saved_session, "model": adapters.opencode_model_for_allowance(allowance)}
-        recorded_kind = "opencode_control"
-        recorded_cmd = serve_cmd
-        try:
-            rc, out, err = run_cmd(serve_cmd, workspace, 120,
-                                   kind="opencode_control", meta=meta)
-        except TypeError:
-            recorded_kind = "opencode_run"
-            recorded_cmd = cmd
-            rc, out, err = run_cmd(cmd, workspace)
-    else:
-        rc, out, err = run_cmd(cmd, workspace)
-    combined = (out or "") + "\n" + (err or "")
-    # Try to extract a provider-shaped envelope from stdout/stderr.
-    envelope: object = combined
-    for blob in (out or "", err or ""):
-        blob = blob.strip()
-        if not blob:
-            continue
-        try:
-            envelope = json.loads(blob)
-            break
-        except ValueError:
-            continue
-        # keep scanning lines
-    if isinstance(envelope, str):
-        for line in envelope.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    envelope = json.loads(line)
-                    break
-                except ValueError:
-                    continue
-    # Persist the OpenCode session ID when the adapter reports one.
-    session_id = None
-    if isinstance(envelope, dict):
-        for key in ("opencode_session_id", "session_id", "sessionId", "session"):
-            val = envelope.get(key)
-            if isinstance(val, str) and val:
-                session_id = val
-                break
-            if isinstance(val, dict):
-                for sub in ("id", "session_id", "sessionId"):
-                    if isinstance(val.get(sub), str) and val.get(sub):
-                        session_id = val.get(sub)
-                        break
-    if session_id:
-        try:
-            _save_opencode_session(state_dir, request_id, session_id, route)
-        except Exception:
-            pass
-    _record_child(state_dir, request_id, recorded_kind, recorded_cmd, rc,
-                  session_id=(session_id or saved_session), output_text=combined)
-    if rc == 0:
-        # Persist session/artifact/output evidence before resume/finish.
-        try:
-            con = store.connect(state_dir)
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                cur = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
-                                  (request_id,)).fetchone()
-                st = {}
-                if cur is not None and cur["controller_state"]:
-                    try:
-                        st = json.loads(cur["controller_state"]) or {}
-                    except ValueError:
-                        st = {}
-                st["phase"] = "implemented"
-                st["opencode_session_id"] = session_id or saved_session
-                st["artifact"] = artifact
-                st["implementation_output"] = (out or "")[-8000:]
-                con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
-                            (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
-                core._event(con, request_id, "implementation_output",
-                            {"session": ((session_id or saved_session or "")[:24]),
-                             "artifact": str(artifact or "")[:256]})
-                con.execute("COMMIT")
-            except Exception:
-                try:
-                    con.execute("ROLLBACK")
-                except Exception:
-                    pass
-            finally:
-                con.close()
-        except Exception:
-            pass
-        return {"action": "implementation_ok", "output": (out or "")}
-    # Failure: classify exact free exhaustion only.
-    _persist_error_evidence(state_dir, request_id,
-                            envelope if isinstance(envelope, dict) else {"source": "opencode", "rc": rc, "output": combined[:2000]})
-    if route == "muse-spark-xhigh-free" and policy.classify_quota_exhaustion(envelope):
-        # Abort the old free session before transfer and confirm idle.
-        # Never invent a random password for a server this job does not
-        # own: a real base_url requires its real password; tests use the
-        # injectable request_func equivalent.
-        saved = (core.get_job(state_dir, request_id).get("opencode_session_id") or session_id)
-        if saved and (control_base_url or control_request_func is not None):
-            try:
-                if control_request_func is not None and not control_base_url:
-                    fake = control_request_func
-                    fake("POST", "/session/abort", {"session": saved})
-                    fake("GET", f"/session/status?session={saved}&ownership=1", {})
-                elif control_base_url:
-                    if not control_password and control_request_func is None:
-                        raise ValueError("missing control password for owned server")
-                    ctrl = adapters.OpenCodeControl(control_base_url,
-                                                    control_password,
-                                                    saved, request_func=control_request_func)
-                    ctrl.abort()
-                    idle = ctrl.ensure_idle_ownership()
-                    _persist_error_evidence(state_dir, request_id,
-                                            {"source": "opencode_idle_confirm", "status": adapters.redact_nested(idle)})
-                else:
-                    raise ValueError("no control seam for abort")
-            except Exception as e:
-                _mark_blocked(state_dir, request_id, f"go_transfer_abort_failed: {e}")
+    seq = _load_controller_state(job).get("seq", 0)
+    prompt = _implementation_prompt(job["task_json"], artifact, payload)
+    if route in core.exhausted_routes(state_dir) and route == "muse-spark-xhigh-free":
+        return _switch_to_go(state_dir, request_id,
+                             {"source": "capacity_memory", "route": route})
+    if use_owned_server:
+        cmd = adapters.build_opencode_serve_cmd()
+        rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
+                               meta={"prompt": prompt, "allowance": allowance,
+                                     "model": model, "session_id": saved_session,
+                                     "seq": seq})
+        summary = _runner_result(out) or {}
+        session_id = summary.get("opencode_session_id") or saved_session
+        full = _invocation_result(state_dir, request_id, session_id) or summary
+        _record_child(state_dir, request_id, "opencode_control", cmd, rc,
+                      session_id=session_id, output_text=json.dumps(summary, sort_keys=True))
+        if rc == 0 and full.get("ok"):
+            _set_phase(state_dir, request_id, phase="implemented",
+                       opencode_session_id=session_id, artifact=artifact,
+                       implementation_output=str(full.get("assistant_text") or "")[-8000:])
+            return {"action": "implementation_ok", "session": session_id,
+                    "output": str(full.get("assistant_text") or ""),
+                    "finish": full.get("finish"), "actual_model": full.get("actual_model")}
+        evidence = full.get("free_exhaustion_evidence")
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "opencode_control", "rc": rc,
+                                 "error": full.get("error"), "quota": full.get("quota"),
+                                 "evidence": evidence,
+                                 "idle_confirmed": full.get("idle_confirmed")})
+        if full.get("quota") and isinstance(evidence, dict) and route == "muse-spark-xhigh-free":
+            if not full.get("idle_confirmed"):
+                _mark_blocked(state_dir, request_id,
+                              "go_transfer_abort_failed: free session not confirmed idle")
                 return {"action": "blocked", "reason": "go_transfer_abort_failed"}
-        # Preserve artifacts: only switch the stored route; logs stay.
-        con = store.connect(state_dir)
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            con.execute("UPDATE jobs SET route=?, updated_at=? WHERE request_id=?",
-                        ("muse-spark-xhigh-go", core._utcnow(), request_id))
-            core._event(con, request_id, "route_switched",
-                        {"from": "muse-spark-xhigh-free", "to": "muse-spark-xhigh-go"})
-            con.execute("COMMIT")
-        except Exception:
+            return _switch_to_go(state_dir, request_id, evidence)
+        _mark_blocked(state_dir, request_id,
+                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
+        return {"action": "blocked", "reason": "implementation_failed"}
+
+    cmd = adapters.build_opencode_cmd(workspace, prompt, allowance=allowance,
+                                      session_id=saved_session)
+    rc, out, err = run_cmd(cmd, workspace)
+    errors = _structured_run_errors(out, err)
+    session_id = None
+    for blob in (out or "",):
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
             try:
-                con.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            con.close()
-        try:
-            core.record_capacity(state_dir, "muse-spark-xhigh-free", "exhausted",
-                                 envelope if isinstance(envelope, dict) else {"source": "opencode"},
-                                 reset_at=core._trusted_reset_at(envelope if isinstance(envelope, dict) else None))
-        except Exception:
-            pass
-        return {"action": "transferred_to_go", "route": "muse-spark-xhigh-go"}
-    # Generic failures/blockers never select Go.
-    low = combined.lower()
-    if any(s in low for s in ("busy", "locked", "already running")):
-        _mark_blocked(state_dir, request_id, "opencode_busy")
-        return {"action": "blocked", "reason": "opencode_busy"}
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                for key in ("opencode_session_id", "sessionID", "session_id"):
+                    if isinstance(obj.get(key), str) and obj.get(key):
+                        session_id = obj[key]
+                        break
+            if session_id:
+                break
+    if session_id:
+        _save_opencode_session(state_dir, request_id, session_id, route,
+                               model=model)
+    _record_child(state_dir, request_id, "opencode_run", cmd, rc,
+                  session_id=(session_id or saved_session), output_text=(out or "") + (err or ""))
+    if rc == 0 and not errors:
+        _set_phase(state_dir, request_id, phase="implemented",
+                   opencode_session_id=session_id or saved_session, artifact=artifact,
+                   implementation_output=(out or "")[-8000:])
+        return {"action": "implementation_ok", "session": session_id or saved_session,
+                "output": (out or "")}
+    _persist_error_evidence(state_dir, request_id,
+                            errors[-1] if errors else {"source": "opencode", "rc": rc,
+                                                       "output": ((out or "") + (err or ""))[:2000]})
+    # The run process owned the session and has exited, so it is idle.
+    if route == "muse-spark-xhigh-free" and any(policy.classify_quota_exhaustion(e) for e in errors):
+        return _switch_to_go(state_dir, request_id, errors[-1])
     _mark_blocked(state_dir, request_id, f"implementation_failed rc={rc}")
     return {"action": "blocked", "reason": "implementation_failed"}
 
@@ -634,10 +689,8 @@ def _complete_job(state_dir, request_id: str, token: str | None,
             return {"action": "completed", "status": done["status"]}
         except (core.OwnershipError, core.TerminalError, core.NotFoundError):
             pass
-        except Exception:
-            pass
-    # Fallback for offline helper paths without a live lease: durable
-    # terminal write (still persists result + file before ack).
+    # Offline helper paths without a live lease: durable terminal write
+    # (still persists result + file before ack).
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -675,79 +728,58 @@ def _complete_job(state_dir, request_id: str, token: str | None,
 
 def _handle_question_action(state_dir, request_id: str, envelope: dict,
                             run_cmd) -> dict:
-    """One bounded planner_question transition.
-
-    Persist question -> Claude --resume exact planner session ->
-    persist answer -> resume exact Luna task -> parse next action.
-    Never forks a new planner or Luna session.
+    """Persist question -> Claude --resume exact planner session ->
+    persist answer -> resume exact Luna task. Never forks a session.
+    An answer already persisted (public ``answer`` or earlier callback)
+    is used without asking the planner again.
     """
     qid = str(envelope.get("qid") or envelope.get("question_id") or "q1")
     prompt_q = str(envelope.get("prompt") or envelope.get("question") or
                    envelope.get("text") or "Planner input requested.")
-    # If this exact question already answered (restart/recover replay),
-    # skip Claude and resume Luna directly with the saved answer.
-    try:
-        existing = core.list_questions(state_dir, request_id, only_pending=False)
-        for q in existing:
-            if q["qid"] == qid and q["status"] == "answered" and q.get("answer"):
-                r = resume_luna(state_dir, request_id, str(q["answer"]),
-                                run_cmd=run_cmd)
-                return {"action": "question-resumed-from-saved",
-                        "qid": qid, "resume": r}
-    except Exception:
-        pass
-    cb = planner_callback(state_dir, request_id, qid, prompt_q, run_cmd=run_cmd)
-    if cb.get("action") == "blocked":
-        return cb
-    # Answer persisted; resume the exact saved Luna task.
-    try:
-        qs = core.list_questions(state_dir, request_id, only_pending=False)
-        answer_text = ""
-        for q in qs:
+    answer_text = None
+    for q in core.list_questions(state_dir, request_id, only_pending=False):
+        if q["qid"] == qid and q["status"] == "answered" and q.get("answer"):
+            answer_text = str(q["answer"])
+    if answer_text is None:
+        cb = planner_callback(state_dir, request_id, qid, prompt_q, run_cmd=run_cmd)
+        if cb.get("action") == "blocked":
+            return cb
+        for q in core.list_questions(state_dir, request_id, only_pending=False):
             if q["qid"] == qid:
                 answer_text = q.get("answer") or ""
-                break
-    except Exception:
-        answer_text = ""
-    r = resume_luna(state_dir, request_id, answer_text or "acknowledged",
-                    run_cmd=run_cmd)
+    r = resume_luna(state_dir, request_id, f"question {qid}: {prompt_q}\nanswer: {answer_text}",
+                    run_cmd=run_cmd, label="PLANNER ANSWER")
     if r.get("action") == "blocked":
         return r
     return {"action": "question-answered-resumed", "qid": qid,
-            "luna_action": r.get("luna_action"), "resume": r}
+            "luna_action": r.get("luna_action")}
 
 
 def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
-                                  run_cmd, control_request_func=None,
-                                  control_base_url=None,
-                                  control_password=None,
-                                  use_owned_server: bool = False) -> dict:
+                                  run_cmd, use_owned_server: bool = False) -> dict:
     """One bounded implementation transition: OpenCode then Luna resume."""
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
     impl = run_implementation(state_dir, request_id, artifact=artifact,
                               payload=payload, run_cmd=run_cmd,
-                              control_request_func=control_request_func,
-                              control_base_url=control_base_url,
-                              control_password=control_password,
                               use_owned_server=use_owned_server)
     if impl.get("action") != "implementation_ok":
-        # transferred_to_go or blocked: next loop retries on the new route
-        # or waits; never fork a second writer here.
+        # transferred_to_go or blocked: the next step retries on the new
+        # route or stops; never fork a second writer here.
         return impl
-    evidence = f"implementation session={core.get_job(state_dir, request_id).get('opencode_session_id') or ''} " \
-               f"artifact={artifact or ''} output={str(impl.get('output') or '')[-4000:]}"
-    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd)
+    job = core.get_job(state_dir, request_id)
+    evidence = (f"worker route={job.get('route')} model={job.get('model')} "
+                f"session={impl.get('session') or ''} finish={impl.get('finish') or ''}\n"
+                f"worker report:\n{str(impl.get('output') or '')[-4000:]}\n"
+                "Inspect the workspace and run the proof before completion.")
+    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                    label="IMPLEMENTATION RESULT")
     if r.get("action") == "blocked":
         return r
-    return {"action": "implementation-resumed",
-            "luna_action": r.get("luna_action"), "resume": r}
+    return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
 
 
-def step(state_dir, request_id: str, run_cmd=None,
-         control_request_func=None, control_base_url: str | None = None,
-         control_password: str | None = None,
-         token: str | None = None,
+def step(state_dir, request_id: str, run_cmd=None, token: str | None = None,
          use_owned_server: bool = False) -> dict:
     """Advance exactly one useful bounded controller transition."""
     run_cmd = run_cmd or default_run_cmd
@@ -756,69 +788,20 @@ def step(state_dir, request_id: str, run_cmd=None,
         return {"action": "noop-terminal", "status": job["status"]}
     if job["cancel_requested"]:
         return {"action": "cancelled", "status": job["status"]}
-    # Ensure dispatch first (persists task ID + envelope before accept).
-    if not job.get("codex_task_id"):
+    if job["status"] == "blocked":
+        return {"action": "blocked", "reason": job.get("block_reason")}
+    if not job.get("codex_task_id") or not _load_controller_state(job).get("seq"):
         return dispatch(state_dir, request_id, run_cmd=run_cmd)
-    # A live pending question the planner has not answered yet waits for
-    # the public `answer` + `recover`; never fork Claude/Luna here.
-    # But an answered question (public answer path) must proceed to Luna
-    # resume below instead of stalling.
-    pending = core.list_questions(state_dir, request_id, only_pending=True)
-    st = _load_controller_state(job)
-    last = st.get("last_action")
-    if pending and job["status"] == "blocked":
-        return {"action": "blocked-awaiting-answer", "pending": len(pending)}
-    if pending and last is None:
-        # Crashed between question persist and Claude call, or a
-        # public post-question without a Luna envelope yet: wait for the
-        # answer path rather than forking a duplicate question.
-        return {"action": "blocked-awaiting-answer", "pending": len(pending)}
-    # No envelope yet (e.g. dispatch parsed nothing but kept the task
-    # ID): repair with one bounded Luna resume carrying the protocol.
+    last = _load_controller_state(job).get("last_action")
     if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:
-        # If there are answered questions waiting, resume with them;
-        # else re-ask Luna with the explicit protocol.
-        try:
-            answered = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
-                        if q["status"] == "answered"]
-        except Exception:
-            answered = []
-        if answered:
-            latest = answered[-1].get("answer") or "acknowledged"
-            r = resume_luna(state_dir, request_id, latest, run_cmd=run_cmd)
-            nxt = r.get("luna_action")
-            if isinstance(nxt, dict) and nxt.get("action") == "planner_question":
-                return _handle_question_action(state_dir, request_id, nxt, run_cmd)
-            if isinstance(nxt, dict) and nxt.get("action") == "implementation":
-                return _handle_implementation_action(
-                    state_dir, request_id, nxt, run_cmd,
-                    control_request_func=control_request_func,
-                    control_base_url=control_base_url,
-                    control_password=control_password,
-                    use_owned_server=use_owned_server)
-            if isinstance(nxt, dict) and nxt.get("action") == "completion":
-                return _complete_job(state_dir, request_id, token,
-                                     str(nxt.get("output") or "done"),
-                                     nxt.get("artifact"))
-            return r
-        repair = ("Your last reply contained no valid action envelope. "
-                  "Reply again with exactly one JSON object per the protocol.")
-        r = resume_luna(state_dir, request_id, repair, run_cmd=run_cmd)
-        return r
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no saved action to continue")
+        return {"action": "blocked", "reason": "luna_missing_action"}
     action_name = last.get("action")
     if action_name == "planner_question":
-        # If the recorded question is still pending (Claude never
-        # answered: crash between persist and callback), run the bounded
-        # question transition now; it reuses the same qid (idempotent)
-        # and never forks a second planner session.
         return _handle_question_action(state_dir, request_id, last, run_cmd)
     if action_name == "implementation":
-        return _handle_implementation_action(
-            state_dir, request_id, last, run_cmd,
-            control_request_func=control_request_func,
-            control_base_url=control_base_url,
-            control_password=control_password,
-            use_owned_server=use_owned_server)
+        return _handle_implementation_action(state_dir, request_id, last, run_cmd,
+                                             use_owned_server=use_owned_server)
     if action_name == "completion":
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
@@ -891,40 +874,36 @@ def run_controller_process(state_dir: str, request_id: str, token: str,
             _time.sleep(0.2)
         return 0
     # Bounded durable loop with built-in adapters (normal submit/start).
-    # Use the durable run_cmd so every child spawn is file-backed,
-    # detached, and recorded in the invocations table before the spawn.
+    # Every child spawn is file-backed, supervised, and recorded before
+    # the spawn; a finished action is reused, never rerun.
     durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
+    continuing = ("dispatched", "question-answered-resumed",
+                  "implementation-resumed", "transferred_to_go")
     for _ in range(MAX_LOOP_STEPS):
         try:
             res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token,
                        use_owned_server=True)
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - persisted, never silent
+            try:
+                _mark_blocked(state_dir, request_id,
+                              f"controller_error: {type(e).__name__}: {str(e)[:300]}")
+            except Exception:
+                pass
             break
         try:
             _advertise(state_dir, request_id, token)
         except Exception:
             pass
-        action = (res or {}).get("action")
-        # Terminal / waiting states stop; intermediate states continue
-        # boundedly (dispatched -> question -> implementation ->
-        # completion) without forking.
-        if action in ("noop-terminal", "completed", "cancelled",
-                      "blocked", "blocked-awaiting-answer",
-                      "awaiting-luna", "already-dispatched"):
-            # already-dispatched with no envelope progress also stops to
-            # keep one useful transition per recovery; the next
-            # start/recover resumes saved IDs.
-            if action == "already-dispatched":
-                break
-            if action in ("dispatched",):
-                continue
+        if (res or {}).get("action") not in continuing:
             break
-        if action in ("dispatched", "question-answered-resumed",
-                      "question-resumed-from-saved",
-                      "implementation-resumed", "transferred_to_go",
-                      "implementation_ok", "resumed", "answered"):
-            continue
-        break
+    else:
+        try:
+            job = core.get_job(state_dir, request_id)
+            if job["status"] not in store.TERMINAL and job["status"] != "blocked":
+                _mark_blocked(state_dir, request_id,
+                              f"controller_step_budget_exhausted after {MAX_LOOP_STEPS} steps")
+        except Exception:
+            pass
     try:
         _advertise(state_dir, request_id, token)
     except Exception:
