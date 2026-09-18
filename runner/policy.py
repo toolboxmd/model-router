@@ -1,0 +1,343 @@
+"""Versioned model policy for the durable local runner.
+
+Thin coordination only. Project workflow, authority, proof, and review
+ownership stay with AgentsMD and the target project. This module only
+names allowed routes, the free-first then Go-included order, recovery
+order, and the explicit-evidence rule for quota exhaustion.
+"""
+
+POLICY_ID = "durable-runner-policy-v1"
+POLICY_VERSION = "1.0.0"
+
+# No Zen balance overflow. No direct paid APIs.
+ALLOW_ZEN_OVERFLOW = False
+ALLOW_DIRECT_PAID_API = False
+
+# Canonical supported routes. Keys are the only accepted route strings.
+SUPPORTED_ROUTES = {
+    # Dispatch through persistent Luna dispatcher.
+    "luna/max": {
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+        "role": "dispatch",
+    },
+    # Implementation: Muse Spark 1.3 Contributor xhigh, free allowance first.
+    "muse-spark-xhigh-free": {
+        "model": "muse-spark-1.3-contributor",
+        "effort": "xhigh",
+        "role": "implementation",
+        "allowance": "free",
+    },
+    # Same model through Go included allowance, only after confirmed free exhaustion.
+    "muse-spark-xhigh-go": {
+        "model": "muse-spark-1.3-contributor",
+        "effort": "xhigh",
+        "role": "implementation",
+        "allowance": "go-included",
+    },
+    # Independent ticket review.
+    "luna-max-review": {
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+        "role": "review",
+    },
+    # Final combined review.
+    "opus-5/high-review": {
+        "model": "opus-5",
+        "effort": "high",
+        "role": "review",
+    },
+    "opus-5/high": {
+        "model": "opus-5",
+        "effort": "high",
+        "role": "recovery",
+    },
+    # Planning.
+    "fable-5.1/max": {
+        "model": "fable-5.1",
+        "effort": "max",
+        "role": "planning",
+    },
+    "astra/max": {
+        "model": "gpt-6-astra",
+        "effort": "max",
+        "role": "planning",
+    },
+    # Recovery sequence after bounded implementation failure.
+    "grok-4.6/medium": {
+        "model": "grok-4.6",
+        "effort": "medium",
+        "role": "recovery",
+        "harness": "grok-build",
+    },
+    "astra/medium": {
+        "model": "gpt-6-astra",
+        "effort": "medium",
+        "role": "recovery",
+    },
+    # Bounded live integration test override only.
+    "sonnet/medium": {
+        "model": "sonnet",
+        "effort": "medium",
+        "role": "live-test-override",
+    },
+}
+
+# Agreed orders.
+IMPLEMENTATION_ORDER = ["muse-spark-xhigh-free", "muse-spark-xhigh-go"]
+RECOVERY_ORDER = ["grok-4.6/medium", "astra/medium", "opus-5/high"]
+
+# Only this explicit code proves free-quota exhaustion and permits the
+# free -> Go transition. Everything else must not switch quota.
+EXPLICIT_FREE_EXHAUSTED_CODE = "FREE_ALLOWANCE_EXHAUSTED"
+
+# Vendor-shaped evidence (OpenCode 1.18.31, see quota-status-evidence.md).
+# Free exhaustion is proven only by the exact vendor class
+# "FreeUsageLimitError" (including decoded responseBody JSON) or by a
+# session retry action with reason "free_tier_limit" and provider "opencode".
+# Generic RateLimitError/rate_limit, bare 429, timeout, DataPolicyError,
+# RegionError, AuthError, and consent/permission errors never prove it.
+VENDOR_FREE_ERROR_CLASS = "FreeUsageLimitError"
+VENDOR_FREE_RETRY_REASON = "free_tier_limit"
+VENDOR_FREE_PROVIDER = "opencode"
+
+
+def is_supported(route: str) -> bool:
+    return route in SUPPORTED_ROUTES
+
+
+def validate_route(route: str) -> dict:
+    if route not in SUPPORTED_ROUTES:
+        raise ValueError(f"unsupported route: {route!r}")
+    return SUPPORTED_ROUTES[route]
+
+
+def _decoded_response_bodies(obj):
+    """Yield decoded JSON bodies from responseBody-shaped keys."""
+    import json as _json
+
+    if isinstance(obj, dict):
+        for key in ("responseBody", "response_body", "responsebody"):
+            if key in obj and isinstance(obj[key], str):
+                raw = obj[key]
+                try:
+                    yield _json.loads(raw)
+                except ValueError:
+                    continue
+        for v in obj.values():
+            yield from _decoded_response_bodies(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _decoded_response_bodies(v)
+
+
+def _contains_exact_free_error(obj, _depth=0) -> bool:
+    """True iff the exact vendor class FreeUsageLimitError appears."""
+    if _depth > 12:
+        return False
+    if isinstance(obj, str):
+        return VENDOR_FREE_ERROR_CLASS in obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if _contains_exact_free_error(v, _depth + 1):
+                return True
+        for decoded in _decoded_response_bodies(obj):
+            if _contains_exact_free_error(decoded, _depth + 1):
+                return True
+        return False
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_exact_free_error(v, _depth + 1) for v in obj)
+    return False
+
+
+def _reason_and_provider_in_dict(d: dict) -> tuple[str | None, str | None]:
+    reason = d.get("reason")
+    provider = d.get("provider")
+    action = d.get("action")
+    if isinstance(action, dict):
+        if reason is None:
+            reason = action.get("reason")
+        if provider is None:
+            provider = action.get("provider")
+    if not isinstance(reason, str) and isinstance(d.get("retry"), dict):
+        reason = d["retry"].get("reason")
+    return (reason if isinstance(reason, str) else None,
+            provider if isinstance(provider, str) else None)
+
+
+def _collect_retry_markers(obj, _depth=0, _reasons=None, _providers=None):
+    if _reasons is None:
+        _reasons = set()
+        _providers = set()
+    if _depth > 12:
+        return _reasons, _providers
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk == "reason" and isinstance(v, str):
+                _reasons.add(v)
+            if lk in ("provider", "vendor") and isinstance(v, str):
+                _providers.add(v)
+            # Nested action envelope: {"action": {"reason": ...}}.
+            if lk == "action" and isinstance(v, dict):
+                r = v.get("reason")
+                if isinstance(r, str):
+                    _reasons.add(r)
+                p = v.get("provider") or v.get("vendor")
+                if isinstance(p, str):
+                    _providers.add(p)
+            _collect_retry_markers(v, _depth + 1, _reasons, _providers)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _collect_retry_markers(v, _depth + 1, _reasons, _providers)
+    return _reasons, _providers
+
+
+def is_free_tier_retry_status(obj, _depth=0) -> bool:
+    """True iff a session retry envelope names free_tier_limit + opencode."""
+    if _depth > 12:
+        return False
+    if isinstance(obj, dict):
+        reason, provider = _reason_and_provider_in_dict(obj)
+        if reason == VENDOR_FREE_RETRY_REASON and provider == VENDOR_FREE_PROVIDER:
+            return True
+        if any(is_free_tier_retry_status(v, _depth + 1) for v in obj.values()):
+            return True
+        # Envelope-level fallback: reason and provider may live at
+        # different nesting depths in the same provider envelope
+        # (e.g. {"status": {"action": {"reason": ...}}, "provider": ...}).
+        # Only the top call applies this so nested accidental matches
+        # do not widen the rule.
+        if _depth == 0:
+            reasons, providers = _collect_retry_markers(obj)
+            if VENDOR_FREE_RETRY_REASON in reasons and VENDOR_FREE_PROVIDER in providers:
+                return True
+        return False
+    if isinstance(obj, (list, tuple)):
+        if any(is_free_tier_retry_status(v, _depth + 1) for v in obj):
+            return True
+        if _depth == 0:
+            reasons, providers = _collect_retry_markers(obj)
+            if VENDOR_FREE_RETRY_REASON in reasons and VENDOR_FREE_PROVIDER in providers:
+                return True
+        return False
+    return False
+
+
+def classify_provider_free_exhaustion(error) -> bool:
+    """Provider-shaped free-exhaustion check (no text-only 429).
+
+    True only for the exact vendor class FreeUsageLimitError (including
+    decoded responseBody JSON) or a retry action with reason
+    free_tier_limit and provider opencode. Generic RateLimitError,
+    rate_limit, 429, timeout, DataPolicyError, RegionError, AuthError,
+    and consent/permission envelopes return False.
+    """
+    if error is None:
+        return False
+    if isinstance(error, (bytes, bytearray)):
+        try:
+            error = error.decode("utf-8", errors="replace")
+        except Exception:
+            return False
+    if _contains_exact_free_error(error):
+        return True
+    if is_free_tier_retry_status(error):
+        return True
+    return False
+
+
+def classify_quota_exhaustion(error) -> bool:
+    """Return True only on explicit confirmed free-exhaustion evidence.
+
+    Accepted evidence shapes:
+      {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True}
+    or a string containing "FREE_ALLOWANCE_EXHAUSTED:confirmed".
+    or provider-shaped evidence with the exact vendor class
+      FreeUsageLimitError (including decoded responseBody JSON)
+    or a session retry action with reason free_tier_limit and
+      provider opencode.
+
+    Generic 429, timeouts, permission/consent, invalid-plan,
+    RateLimitError/rate_limit, DataPolicyError, RegionError, AuthError,
+    and GoUsageLimitError/account_rate_limit return False.
+    """
+    if isinstance(error, dict):
+        code = str(error.get("code", ""))
+        confirmed = error.get("confirmed") is True
+        allowance = str(error.get("allowance", "free"))
+        if code == EXPLICIT_FREE_EXHAUSTED_CODE and confirmed and allowance == "free":
+            return True
+        if classify_provider_free_exhaustion(error):
+            return True
+        return False
+    if isinstance(error, str):
+        if "FREE_ALLOWANCE_EXHAUSTED:confirmed" in error:
+            return True
+        if classify_provider_free_exhaustion(error):
+            # Only the exact vendor class in text form; bare 429 stays False.
+            return True
+        return False
+    if isinstance(error, (list, tuple)):
+        return classify_provider_free_exhaustion(error)
+    return False
+
+
+def next_implementation_route(current: str, error) -> str | None:
+    """Free-first then Go-included only after confirmed exhaustion."""
+    validate_route(current)
+    if current != "muse-spark-xhigh-free":
+        return None
+    if classify_quota_exhaustion(error):
+        return "muse-spark-xhigh-go"
+    return None
+
+
+def next_recovery_route(current: str | None) -> str | None:
+    """Bounded recovery order. None means no further route."""
+    if current is None:
+        return RECOVERY_ORDER[0]
+    if current not in RECOVERY_ORDER:
+        # Implementation routes enter recovery at the head.
+        if current in IMPLEMENTATION_ORDER or current in ("luna/max", "sonnet/medium"):
+            return RECOVERY_ORDER[0]
+        return None
+    idx = RECOVERY_ORDER.index(current)
+    if idx + 1 < len(RECOVERY_ORDER):
+        return RECOVERY_ORDER[idx + 1]
+    return None
+
+
+# Structured action/result envelope. Represents coordination only;
+# it does not duplicate workflow, proof, or authority.
+VALID_ACTIONS = ("implementation", "planner_question", "review", "completion")
+
+
+def make_action(action: str, route: str, payload: dict | None = None,
+                artifact: str | None = None, evidence: str | None = None) -> dict:
+    if action not in VALID_ACTIONS:
+        raise ValueError(f"unsupported action: {action!r}")
+    validate_route(route)
+    return {
+        "policy": POLICY_ID,
+        "action": action,
+        "route": route,
+        "payload": payload or {},
+        "artifact": artifact,
+        "evidence": evidence,
+    }
+
+
+def make_result(action: str, ok: bool, output: str | None = None,
+                error: dict | str | None = None,
+                artifact: str | None = None) -> dict:
+    if action not in VALID_ACTIONS:
+        raise ValueError(f"unsupported action: {action!r}")
+    return {
+        "policy": POLICY_ID,
+        "action": action,
+        "ok": bool(ok),
+        "output": output,
+        "error": error,
+        "artifact": artifact,
+    }
