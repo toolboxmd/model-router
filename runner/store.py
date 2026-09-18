@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   planner_effort TEXT,
   controller_state TEXT,
   last_error_json TEXT,
-  planner_cwd TEXT
+  planner_cwd TEXT,
+  owner_start TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +142,9 @@ ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked"
 
 
 def ensure_state_dir(state_dir: str | os.PathLike) -> Path:
-    root = Path(state_dir)
+    # Absolute, because children run in their workspace and every recorded
+    # path must stay valid from any working directory.
+    root = Path(os.path.abspath(os.path.expanduser(str(state_dir))))
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         os.chmod(root, 0o700)
@@ -203,6 +206,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("controller_state", "TEXT"),
         ("last_error_json", "TEXT"),
         ("planner_cwd", "TEXT"),
+        ("owner_start", "TEXT"),
     ):
         if _col not in cols:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {_col} {_ddl}")
@@ -299,13 +303,14 @@ def write_worker_identity(root: Path, request_id: str, token: str, pid: int, upd
     )
 
 
-def redact_for_log(obj: dict) -> dict:
-    """Strip secret-bearing keys so logs/config never carry credentials."""
-    out = {}
-    for k, v in obj.items():
-        lk = k.lower()
-        if any(s in lk for s in ("secret", "token", "password", "api_key", "apikey", "credential", "auth")):
-            out[k] = "<redacted>"
-        else:
-            out[k] = v
-    return out
+_SECRET_KEY_PARTS = ("secret", "token", "password", "api_key", "apikey", "credential", "auth")
+
+
+def redact_for_log(obj):
+    """Recursively strip secret-bearing keys so logs never carry credentials."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if any(s in str(k).lower() for s in _SECRET_KEY_PARTS)
+                    else redact_for_log(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_for_log(v) for v in obj]
+    return obj

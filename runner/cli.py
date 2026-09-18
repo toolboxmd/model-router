@@ -37,7 +37,7 @@ from . import core, policy
 
 def _state_dir(args) -> str:
     d = args.state_dir or os.environ.get("DURABLE_RUNNER_STATE_DIR") or os.path.expanduser("~/.local/share/durable-runner")
-    return d
+    return os.path.abspath(os.path.expanduser(d))
 
 
 def _out(obj, code=0) -> int:
@@ -65,7 +65,7 @@ def main(argv=None) -> int:
     p.add_argument("--workspace", required=True)
     p.add_argument("--planner-session", required=True)
     p.add_argument("--route", default="muse-spark-xhigh-free",
-                   help=f"supported: {', '.join(sorted(policy.SUPPORTED_ROUTES))}")
+                   help=f"implementation route: {', '.join(policy.IMPLEMENTATION_ORDER)}")
     p.add_argument("--policy", default=policy.POLICY_ID)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--timeout-secs", type=int, default=None)
@@ -84,6 +84,9 @@ def main(argv=None) -> int:
     p.add_argument("--request-id", required=True)
 
     p = sub.add_parser("status", help="show job status")
+    p.add_argument("--request-id", required=True)
+
+    p = sub.add_parser("result", help="print the terminal result, including the completion report")
     p.add_argument("--request-id", required=True)
 
     p = sub.add_parser("questions", help="list pending questions")
@@ -107,6 +110,10 @@ def main(argv=None) -> int:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--request-id", default=None)
     g.add_argument("--all", action="store_true")
+
+    p = sub.add_parser("capacity", help="show remembered route capacity; --clear forgets one")
+    p.add_argument("--clear", default=None, metavar="ROUTE",
+                   help="operator action after checking the provider allowance")
 
     p = sub.add_parser("launch", help="worker-internal: start a detached worker")
     p.add_argument("--request-id", required=True)
@@ -165,6 +172,12 @@ def main(argv=None) -> int:
             redacted = dict(info)
             redacted["token"] = "<redacted>"
             return _out({"launched": True, **redacted})
+        if args.cmd == "capacity":
+            if args.clear:
+                return _out(core.clear_capacity(sd, args.clear))
+            return _out({"capacity": core.list_capacity(sd)})
+        if args.cmd == "result":
+            return _out(core.result_view(sd, args.request_id))
         if args.cmd == "status":
             return _out(core.status_view(sd, args.request_id))
         if args.cmd == "questions":

@@ -77,6 +77,7 @@ if argv and argv[0] == "exec" and len(argv) > 1 and argv[1] == "resume":
         Path(lp).write_text(json.dumps(env), encoding="utf-8")
     print(json.dumps({"type": "thread.started", "thread_id": tid}))
     print(json.dumps(env))
+    print(json.dumps({"type": "turn.completed"}))
 else:
     # Fresh dispatch contract.
     assert "--json" in argv, "dispatch must pass --json"
@@ -96,6 +97,7 @@ else:
         Path(lp).write_text(json.dumps(env), encoding="utf-8")
     print(json.dumps({"type": "thread.started", "thread_id": tid}))
     print(json.dumps(env))
+    print(json.dumps({"type": "turn.completed"}))
 """ % (THREAD_ID, THREAD_ID, "gpt-5.6-luna", THREAD_ID, QID)
 
 from tests.fakes import FAKE_CLAUDE as _FC, FAKE_OPENCODE as _FO  # noqa: E402

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2026-09-18
+
+### Added
+
+- Add an opt-in durable local runner that hands Claude-planned work to a persistent Codex Luna dispatcher and Muse workers with crash-safe process ownership
+
 ## [0.2.1] - 2026-09-19
 
 ### Changed

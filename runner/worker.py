@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import sys
 import time
@@ -36,8 +37,11 @@ def run_worker(state_dir: str, request_id: str, token: str, mode: str = "sleep",
     log = outputs_dir / f"{request_id}.log"
     pid = os.getpid()
 
+    from .supervisor import process_start_identity
+    start = process_start_identity(pid)
+
     def advertise() -> None:
-        payload = f'{{"token": "{token}", "pid": {pid}, "updated": "{_utcnow()}"}}'
+        payload = json.dumps({"token": token, "pid": pid, "updated": _utcnow(), "start": start})
         tmp = ident.with_name(ident.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(payload)

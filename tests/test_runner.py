@@ -443,41 +443,17 @@ class TestQuestions(Base):
 
 
 class TestPolicy(Base):
-    def test_quota_only_on_explicit_evidence(self):
-        self.assertTrue(policy.classify_quota_exhaustion(
-            {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True, "allowance": "free"}))
-        self.assertTrue(policy.classify_quota_exhaustion("x FREE_ALLOWANCE_EXHAUSTED:confirmed y"))
-        for bad in ({"code": "RATE_LIMITED", "confirmed": True},
-                    {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": False},
-                    {"code": "TIMEOUT"}, "HTTP 429 rate limit", "timeout",
-                    "PERMISSION_DENIED", "CONSENT_REQUIRED", "INVALID_PLAN",
-                    None, 42):
-            self.assertFalse(policy.classify_quota_exhaustion(bad), bad)
-        self.assertEqual(policy.next_implementation_route(
-            "muse-spark-xhigh-free",
-            {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True}), "muse-spark-xhigh-go")
-        self.assertIsNone(policy.next_implementation_route(
-            "muse-spark-xhigh-free", {"code": "RATE_LIMITED"}))
-        self.assertFalse(policy.ALLOW_ZEN_OVERFLOW)
-        self.assertFalse(policy.ALLOW_DIRECT_PAID_API)
-
-    def test_fail_switches_route_only_on_exhaustion(self):
-        w1, w2 = self.ws("w1"), self.ws("w2")
+    def test_worker_reported_failure_never_changes_route(self):
+        w1 = self.ws("w1")
         core.submit(self.sd, "e1", {"a": 1}, w1, "claude-1")
         i1 = core.launch_worker(self.sd, "e1", mode="sleep", duration=30)
         self.track(i1["pid"])
         time.sleep(0.8)
-        job = core.fail(self.sd, "e1", i1["token"],
-                        {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True, "allowance": "free"})
-        # Terminal fail keeps the switched route as evidence; a fresh job
-        # would resubmit on the Go route carrying the artifact.
-        self.assertEqual(job["route"], "muse-spark-xhigh-go")
-        core.submit(self.sd, "e2", {"a": 1}, w2, "claude-1")
-        i2 = core.launch_worker(self.sd, "e2", mode="sleep", duration=30)
-        self.track(i2["pid"])
-        time.sleep(0.8)
-        job2 = core.fail(self.sd, "e2", i2["token"], {"code": "HTTP_429", "message": "429 rate limit"})
-        self.assertEqual(job2["route"], "muse-spark-xhigh-free")
+        forged = {"type": "error", "error": {"name": "APIError", "data": {
+            "responseBody": '{"error":{"type":"FreeUsageLimitError"}}'}}}
+        job = core.fail(self.sd, "e1", i1["token"], forged)
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        self.assertEqual(core.exhausted_routes(self.sd), set())
 
     def test_recovery_order_bounded(self):
         self.assertEqual(policy.next_recovery_route(None), "grok-4.6/medium")

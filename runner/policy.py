@@ -159,9 +159,6 @@ OPERATIONAL_ROUTES = {
     "fable-5.1/max",
 }
 
-# Only this explicit code proves free-quota exhaustion and permits the
-# free -> Go transition. Everything else must not switch quota.
-EXPLICIT_FREE_EXHAUSTED_CODE = "FREE_ALLOWANCE_EXHAUSTED"
 
 # Vendor-shaped evidence (OpenCode 1.18.31, see quota-status-evidence.md).
 # Free exhaustion is proven only by the exact vendor class
@@ -176,6 +173,15 @@ VENDOR_FREE_PROVIDER = "opencode"
 
 def is_supported(route: str) -> bool:
     return route in SUPPORTED_ROUTES
+
+
+def validate_implementation_route(route: str) -> dict:
+    """A job route must be an implementation route with a runner adapter."""
+    info = validate_route(route)
+    if route not in IMPLEMENTATION_ORDER:
+        raise ValueError(f"route {route!r} is a {info.get('role')} route, not an implementation "
+                         f"route; supported: {', '.join(IMPLEMENTATION_ORDER)}")
+    return info
 
 
 def validate_route(route: str) -> dict:
@@ -228,175 +234,48 @@ def next_capacity_route(current: str | None, exhausted: set[str] | None = None) 
     return None, None
 
 
-def _decoded_response_bodies(obj):
-    """Yield decoded JSON bodies from responseBody-shaped keys."""
-    import json as _json
-
-    if isinstance(obj, dict):
-        for key in ("responseBody", "response_body", "responsebody"):
-            if key in obj and isinstance(obj[key], str):
-                raw = obj[key]
-                try:
-                    yield _json.loads(raw)
-                except ValueError:
-                    continue
-        for v in obj.values():
-            yield from _decoded_response_bodies(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _decoded_response_bodies(v)
-
-
-def _contains_exact_free_error(obj, _depth=0) -> bool:
-    """True iff the exact vendor class FreeUsageLimitError appears."""
-    if _depth > 12:
+def is_free_tier_retry_status(status) -> bool:
+    """OpenCode session status proving free-allowance exhaustion."""
+    if not isinstance(status, dict) or status.get("type") != "retry":
         return False
-    if isinstance(obj, str):
-        return VENDOR_FREE_ERROR_CLASS in obj
-    if isinstance(obj, dict):
-        for v in obj.values():
-            if _contains_exact_free_error(v, _depth + 1):
-                return True
-        for decoded in _decoded_response_bodies(obj):
-            if _contains_exact_free_error(decoded, _depth + 1):
-                return True
-        return False
-    if isinstance(obj, (list, tuple)):
-        return any(_contains_exact_free_error(v, _depth + 1) for v in obj)
-    return False
+    action = status.get("action")
+    return (isinstance(action, dict)
+            and action.get("reason") == VENDOR_FREE_RETRY_REASON
+            and action.get("provider") == VENDOR_FREE_PROVIDER)
 
 
-def _reason_and_provider_in_dict(d: dict) -> tuple[str | None, str | None]:
-    reason = d.get("reason")
-    provider = d.get("provider")
-    action = d.get("action")
-    if isinstance(action, dict):
-        if reason is None:
-            reason = action.get("reason")
-        if provider is None:
-            provider = action.get("provider")
-    if not isinstance(reason, str) and isinstance(d.get("retry"), dict):
-        reason = d["retry"].get("reason")
-    return (reason if isinstance(reason, str) else None,
-            provider if isinstance(provider, str) else None)
+def is_free_usage_api_error(error) -> bool:
+    """Provider ``APIError`` whose response body names the free limit.
 
-
-def _collect_retry_markers(obj, _depth=0, _reasons=None, _providers=None):
-    if _reasons is None:
-        _reasons = set()
-        _providers = set()
-    if _depth > 12:
-        return _reasons, _providers
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            lk = str(k).lower()
-            if lk == "reason" and isinstance(v, str):
-                _reasons.add(v)
-            if lk in ("provider", "vendor") and isinstance(v, str):
-                _providers.add(v)
-            # Nested action envelope: {"action": {"reason": ...}}.
-            if lk == "action" and isinstance(v, dict):
-                r = v.get("reason")
-                if isinstance(r, str):
-                    _reasons.add(r)
-                p = v.get("provider") or v.get("vendor")
-                if isinstance(p, str):
-                    _providers.add(p)
-            _collect_retry_markers(v, _depth + 1, _reasons, _providers)
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            _collect_retry_markers(v, _depth + 1, _reasons, _providers)
-    return _reasons, _providers
-
-
-def is_free_tier_retry_status(obj, _depth=0) -> bool:
-    """True iff a session retry envelope names free_tier_limit + opencode."""
-    if _depth > 12:
-        return False
-    if isinstance(obj, dict):
-        reason, provider = _reason_and_provider_in_dict(obj)
-        if reason == VENDOR_FREE_RETRY_REASON and provider == VENDOR_FREE_PROVIDER:
-            return True
-        if any(is_free_tier_retry_status(v, _depth + 1) for v in obj.values()):
-            return True
-        # Envelope-level fallback: reason and provider may live at
-        # different nesting depths in the same provider envelope
-        # (e.g. {"status": {"action": {"reason": ...}}, "provider": ...}).
-        # Only the top call applies this so nested accidental matches
-        # do not widen the rule.
-        if _depth == 0:
-            reasons, providers = _collect_retry_markers(obj)
-            if VENDOR_FREE_RETRY_REASON in reasons and VENDOR_FREE_PROVIDER in providers:
-                return True
-        return False
-    if isinstance(obj, (list, tuple)):
-        if any(is_free_tier_retry_status(v, _depth + 1) for v in obj):
-            return True
-        if _depth == 0:
-            reasons, providers = _collect_retry_markers(obj)
-            if VENDOR_FREE_RETRY_REASON in reasons and VENDOR_FREE_PROVIDER in providers:
-                return True
-        return False
-    return False
-
-
-def classify_provider_free_exhaustion(error) -> bool:
-    """Provider-shaped free-exhaustion check (no text-only 429).
-
-    True only for the exact vendor class FreeUsageLimitError (including
-    decoded responseBody JSON) or a retry action with reason
-    free_tier_limit and provider opencode. Generic RateLimitError,
-    rate_limit, 429, timeout, DataPolicyError, RegionError, AuthError,
-    and consent/permission envelopes return False.
+    This is OpenCode's own rule (``responseBody`` includes
+    ``FreeUsageLimitError``). The body comes from the provider HTTP
+    response, not from model output.
     """
-    if error is None:
+    if not isinstance(error, dict) or error.get("name") != "APIError":
         return False
-    if isinstance(error, (bytes, bytearray)):
-        try:
-            error = error.decode("utf-8", errors="replace")
-        except Exception:
-            return False
-    if _contains_exact_free_error(error):
-        return True
-    if is_free_tier_retry_status(error):
-        return True
-    return False
+    data = error.get("data")
+    body = data.get("responseBody") if isinstance(data, dict) else None
+    return isinstance(body, str) and VENDOR_FREE_ERROR_CLASS in body
 
 
-def classify_quota_exhaustion(error) -> bool:
-    """Return True only on explicit confirmed free-exhaustion evidence.
+def classify_quota_exhaustion(evidence) -> bool:
+    """True only for exact provider-shaped free-exhaustion evidence.
 
-    Accepted evidence shapes:
-      {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True}
-    or a string containing "FREE_ALLOWANCE_EXHAUSTED:confirmed".
-    or provider-shaped evidence with the exact vendor class
-      FreeUsageLimitError (including decoded responseBody JSON)
-    or a session retry action with reason free_tier_limit and
-      provider opencode.
-
-    Generic 429, timeouts, permission/consent, invalid-plan,
-    RateLimitError/rate_limit, DataPolicyError, RegionError, AuthError,
-    and GoUsageLimitError/account_rate_limit return False.
+    Accepted: a retry status with reason ``free_tier_limit`` from provider
+    ``opencode``; an ``APIError`` whose ``responseBody`` names
+    ``FreeUsageLimitError``; or an ``opencode run`` error event carrying
+    that ``APIError``. Strings, nested free text, generic 429,
+    ``RateLimitError``, ``account_rate_limit``, ``GoUsageLimitError``,
+    timeouts, consent, region, and auth errors never count.
     """
-    if isinstance(error, dict):
-        code = str(error.get("code", ""))
-        confirmed = error.get("confirmed") is True
-        allowance = str(error.get("allowance", "free"))
-        if code == EXPLICIT_FREE_EXHAUSTED_CODE and confirmed and allowance == "free":
-            return True
-        if classify_provider_free_exhaustion(error):
-            return True
+    if not isinstance(evidence, dict):
         return False
-    if isinstance(error, str):
-        if "FREE_ALLOWANCE_EXHAUSTED:confirmed" in error:
-            return True
-        if classify_provider_free_exhaustion(error):
-            # Only the exact vendor class in text form; bare 429 stays False.
-            return True
-        return False
-    if isinstance(error, (list, tuple)):
-        return classify_provider_free_exhaustion(error)
-    return False
+    if is_free_tier_retry_status(evidence) or is_free_usage_api_error(evidence):
+        return True
+    return evidence.get("type") == "error" and is_free_usage_api_error(evidence.get("error"))
+
+
+classify_provider_free_exhaustion = classify_quota_exhaustion
 
 
 def next_implementation_route(current: str, error) -> str | None:

@@ -84,7 +84,9 @@ BUSY_MARKERS = (
 # Session-bound variables a parent Claude Code or Codex process exports to
 # its tools. A detached child harness must start as its own session, so
 # these never pass through. Auth and home locations are kept.
-_KEEP_HARNESS_ENV = {"CODEX_HOME", "CLAUDE_CONFIG_DIR"}
+_KEEP_HARNESS_ENV = {"CODEX_HOME", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR",
+                     "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+                     "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"}
 
 
 def child_harness_env(base: dict | None = None) -> dict:
@@ -386,6 +388,39 @@ def parse_claude_result(stdout: str) -> dict:
         return {"ok": False, "answer": None, "session_id": sid,
                 "error": "planner result is empty"}
     return {"ok": True, "answer": result.strip(), "session_id": sid, "error": None}
+
+
+def planner_transcript_age(planner_session_id: str) -> float | None:
+    """Seconds since the planner session transcript last changed, if found."""
+    import glob
+    import time as _time
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    ages = []
+    for path in glob.glob(os.path.join(base, "projects", "*", planner_session_id + ".jsonl")):
+        try:
+            ages.append(_time.time() - os.path.getmtime(path))
+        except OSError:
+            continue
+    return min(ages) if ages else None
+
+
+def wait_planner_quiet(planner_session_id: str, quiet: float = 5.0,
+                       limit: float = 30.0) -> bool:
+    """True once the transcript has been unchanged for ``quiet`` seconds.
+
+    A turn in progress keeps writing its transcript. This catches an
+    interactive planner that the argv check cannot see while it is
+    actively working; an open but idle session is not detectable.
+    """
+    import time as _time
+    end = _time.monotonic() + limit
+    while True:
+        age = planner_transcript_age(planner_session_id)
+        if age is None or age >= quiet:
+            return True
+        if _time.monotonic() >= end:
+            return False
+        _time.sleep(min(quiet - age + 0.1, 1.0))
 
 
 def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int]:
@@ -723,27 +758,21 @@ def trusted_free_exhaustion(status: dict | None = None,
                             message_error: dict | None = None) -> dict | None:
     """Provider evidence for free-allowance exhaustion, or None.
 
-    Only two server-generated sources count: the owned session's retry
-    status with reason ``free_tier_limit`` from provider ``opencode``, or
-    an assistant ``APIError`` whose provider ``responseBody`` names
-    ``FreeUsageLimitError`` (OpenCode's own rule). Model-authored text,
-    generic 429, and Go limits never count.
+    Only the owned session's retry status or an assistant ``APIError``
+    count (see :func:`policy.classify_quota_exhaustion`). Model-authored
+    text, generic 429, and Go limits never count.
     """
-    if isinstance(status, dict) and status.get("type") == "retry":
-        action = status.get("action")
-        if isinstance(action, dict) and action.get("reason") == "free_tier_limit" \
-                and action.get("provider") == "opencode":
-            return {"source": "session_status", "type": "retry",
-                    "reason": "free_tier_limit", "provider": "opencode",
-                    "attempt": status.get("attempt"), "next": status.get("next"),
-                    "message": str(status.get("message") or "")[:500]}
-    if isinstance(message_error, dict) and message_error.get("name") == "APIError":
-        data = message_error.get("data") if isinstance(message_error.get("data"), dict) else {}
-        body = data.get("responseBody")
-        if isinstance(body, str) and "FreeUsageLimitError" in body:
-            return {"source": "assistant_error", "name": "APIError",
-                    "statusCode": data.get("statusCode"),
-                    "responseBody": body[:2000]}
+    from . import policy as _policy
+    if _policy.is_free_tier_retry_status(status):
+        return {"source": "session_status", "type": "retry",
+                "reason": "free_tier_limit", "provider": "opencode",
+                "attempt": status.get("attempt"), "next": status.get("next"),
+                "message": str(status.get("message") or "")[:500]}
+    if _policy.is_free_usage_api_error(message_error):
+        data = message_error.get("data") or {}
+        return {"source": "assistant_error", "name": "APIError",
+                "statusCode": data.get("statusCode"),
+                "responseBody": data.get("responseBody")[:2000]}
     return None
 
 

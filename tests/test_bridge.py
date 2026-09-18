@@ -447,8 +447,12 @@ class TestControllerLifecycle(Base):
         self.assertEqual(rc, 0)
         # A live recorded PID without a matching fresh handshake stays
         # claimed and blocks duplicates (never treated as worker_gone).
+        # Worker and sleep controller both advertise the same identity file;
+        # whichever wrote last decides. A recent acknowledgment without a
+        # matching handshake is a launch in progress.
         self.assertIn(out.get("action"), ("adopted-live-worker", "reconciled-launch-race",
-                                          "noop", "blocked-claimed-live-pid", "blocked-unknown-owner"))
+                                          "noop", "blocked-claimed-live-pid", "blocked-unknown-owner",
+                                          "launch-in-progress"))
 
 
 class TestPlannerBusyAndCallback(Base):
@@ -548,58 +552,49 @@ class TestPlannerBusyAndCallback(Base):
         self.assertIn("resume-after-answer", calls)
 
 
+FREE_STATUS = {"type": "retry", "attempt": 1, "message": "m", "next": 5,
+               "action": {"reason": "free_tier_limit", "provider": "opencode",
+                          "title": "t", "message": "m", "label": "l"}}
+FREE_API_ERROR = {"name": "APIError", "data": {
+    "statusCode": 429, "responseBody": json.dumps({"type": "error", "error": {"type": "FreeUsageLimitError"}})}}
+
+
 class TestQuotaClassification(Base):
-    def test_exact_free_usage_limit_error(self):
-        self.assertTrue(policy.classify_quota_exhaustion({"class": "FreeUsageLimitError"}))
-        self.assertTrue(policy.classify_quota_exhaustion({"error": {"type": "FreeUsageLimitError"}}))
-        self.assertTrue(policy.classify_provider_free_exhaustion({"class": "FreeUsageLimitError"}))
+    def test_only_exact_provider_shapes_count(self):
+        self.assertTrue(policy.classify_quota_exhaustion(FREE_STATUS))
+        self.assertTrue(policy.classify_quota_exhaustion(FREE_API_ERROR))
+        self.assertTrue(policy.classify_quota_exhaustion({"type": "error", "error": FREE_API_ERROR}))
+        self.assertEqual(policy.next_implementation_route("muse-spark-xhigh-free", FREE_STATUS),
+                         "muse-spark-xhigh-go")
 
-    def test_response_body_json_decoded(self):
-        inner = json.dumps({"error": {"class": "FreeUsageLimitError", "message": "free exhausted"}})
-        self.assertTrue(policy.classify_quota_exhaustion({"responseBody": inner}))
-        self.assertTrue(policy.classify_provider_free_exhaustion({"responseBody": inner}))
-
-    def test_retry_status_free_tier_limit_opencode(self):
-        self.assertTrue(policy.classify_quota_exhaustion(
-            {"action": "retry", "reason": "free_tier_limit", "provider": "opencode"}))
-        self.assertTrue(policy.classify_quota_exhaustion(
-            {"status": {"action": {"reason": "free_tier_limit"}}, "provider": "opencode"}))
-
-    def test_generic_errors_never_select_go(self):
+    def test_text_and_generic_errors_never_select_go(self):
         bad = [
-            {"class": "RateLimitError"},
-            {"code": "rate_limit"},
-            "HTTP 429 Too Many Requests",
-            {"code": "TIMEOUT"},
-            "timeout",
-            {"class": "DataPolicyError"},
-            {"class": "RegionError"},
-            {"class": "AuthError"},
-            "CONSENT_REQUIRED",
-            "PERMISSION_DENIED",
-            "INVALID_PLAN",
-            {"class": "GoUsageLimitError"},
-            {"reason": "account_rate_limit", "provider": "opencode"},
+            {"class": "FreeUsageLimitError"},
+            {"error": {"message": "FreeUsageLimitError"}},
+            {"name": "UnknownError", "data": {"message": "FreeUsageLimitError"}},
+            {"responseBody": json.dumps({"error": {"type": "FreeUsageLimitError"}})},
+            "FreeUsageLimitError", "FREE_ALLOWANCE_EXHAUSTED:confirmed",
+            {"code": "FREE_ALLOWANCE_EXHAUSTED", "confirmed": True},
+            {"reason": "free_tier_limit", "provider": "opencode"},
+            dict(FREE_STATUS, type="busy"),
+            dict(FREE_STATUS, action=dict(FREE_STATUS["action"], provider="opencode-go")),
+            dict(FREE_STATUS, action=dict(FREE_STATUS["action"], reason="account_rate_limit")),
+            {"name": "APIError", "data": {"statusCode": 429, "responseBody": '{"error":{"type":"RateLimitError"}}'}},
+            {"name": "APIError", "data": {"responseBody": '{"error":{"type":"GoUsageLimitError"}}'}},
+            {"class": "RateLimitError"}, "HTTP 429 Too Many Requests", {"code": "TIMEOUT"},
+            {"class": "DataPolicyError"}, {"class": "RegionError"}, {"class": "AuthError"},
             None, 42,
         ]
         for b in bad:
             self.assertFalse(policy.classify_quota_exhaustion(b), b)
-            self.assertFalse(policy.classify_provider_free_exhaustion(b), b)
-        self.assertIsNone(policy.next_implementation_route(
-            "muse-spark-xhigh-free", {"class": "RateLimitError"}))
-        self.assertIsNone(policy.next_implementation_route(
-            "muse-spark-xhigh-free", "HTTP 429"))
+        self.assertIsNone(policy.next_implementation_route("muse-spark-xhigh-free", "HTTP 429"))
         self.assertFalse(policy.ALLOW_ZEN_OVERFLOW)
         self.assertFalse(policy.ALLOW_DIRECT_PAID_API)
 
-    def test_free_to_go_only_on_exact_evidence(self):
-        self.assertEqual(policy.next_implementation_route(
-            "muse-spark-xhigh-free", {"class": "FreeUsageLimitError"}),
-            "muse-spark-xhigh-go")
-        self.assertEqual(policy.next_implementation_route(
-            "muse-spark-xhigh-free",
-            {"reason": "free_tier_limit", "provider": "opencode"}),
-            "muse-spark-xhigh-go")
+    def test_non_implementation_routes_rejected_at_submit(self):
+        for route in ("luna-max-review", "grok-4.6/medium", "luna/max", "fable-5.1/max"):
+            with self.assertRaises(ValueError):
+                core.submit(self.sd, "r-" + route.replace("/", "-"), {"g": 1}, self.ws(), "p", route=route)
 
 
 class TestQuotaTransfer(Base):

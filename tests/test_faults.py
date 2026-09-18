@@ -185,6 +185,7 @@ if "--output-last-message" in argv:
     Path(lp).write_text(json.dumps(env))
 print(json.dumps({"type": "thread.started", "thread_id": tid}), flush=True)
 print(json.dumps(env), flush=True)
+print(json.dumps({"type": "turn.completed"}), flush=True)
 """)
         (bindir / "codex").chmod(0o700)
         (bindir / "claude").write_text(
@@ -231,17 +232,19 @@ class TestCapacityPolicy(unittest.TestCase):
         ws = Path(tmp.name) / "ws"
         ws.mkdir()
         core.submit(sd, "c1", {"g": 1}, str(ws), "p1")
-        core.record_capacity(sd, "muse-spark-xhigh-free", "exhausted",
-                             {"class": "FreeUsageLimitError"})
+        free_status = {"type": "retry", "attempt": 1, "message": "m", "next": 1,
+                       "action": {"reason": "free_tier_limit", "provider": "opencode",
+                                  "title": "t", "message": "m", "label": "l"}}
+        core.record_capacity(sd, "muse-spark-xhigh-free", "exhausted", free_status)
         self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
         nxt, blocker = core.select_implementation_route(
-            sd, "muse-spark-xhigh-free",
-            {"class": "FreeUsageLimitError"})
+            sd, "muse-spark-xhigh-free", free_status)
         self.assertEqual(nxt, "muse-spark-xhigh-go")
         self.assertIsNone(blocker)
         # Duplicate recover must not reset capacity memory.
         core.recover_one(sd, "c1")
         self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
+        (Path(tmp.name) / "ws2").mkdir()
         core.submit(sd, "c2", {"g": 2}, str(Path(tmp.name) / "ws2"), "p1")
         nxt2, blocker2 = policy.next_capacity_route(
             "muse-spark-xhigh-free", core.exhausted_routes(sd))
@@ -299,6 +302,11 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         os.environ["FAKE_STATE"] = str(self.fake_state)
         os.environ["FAKE_OC_MODE"] = mode
         core.submit(self.sd, "oc1", {"goal": "owned serve"}, str(self.ws), "planner")
+        con = store.connect(self.sd)  # hold the lease as a controller would
+        try:
+            con.execute("UPDATE jobs SET owner_token='tok' WHERE request_id='oc1'")
+        finally:
+            con.close()
         self.addCleanup(self._kill_groups)
         run = core.make_durable_run_cmd(self.sd, "oc1", "tok")
 
