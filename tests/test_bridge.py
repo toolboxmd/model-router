@@ -682,6 +682,21 @@ class RealShapeHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
+class TestClaudeResult(Base):
+    def test_api_error_result_is_not_an_answer(self):
+        out = json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                          "api_error_status": 429, "session_id": "s1",
+                          "result": "You've hit your session limit"})
+        got = adapters.parse_claude_result(out)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["error"], "planner result error: is_error (API status 429)")
+        self.assertFalse(adapters.parse_claude_result("plain text")["ok"])
+        ok = adapters.parse_claude_result(json.dumps({"type": "result", "subtype": "success",
+                                                      "is_error": False, "result": " Descending. ",
+                                                      "session_id": "s1"}))
+        self.assertEqual((ok["ok"], ok["answer"], ok["session_id"]), (True, "Descending.", "s1"))
+
+
 class TestChildEnvironment(Base):
     def test_parent_harness_session_variables_do_not_leak(self):
         env = adapters.child_harness_env({

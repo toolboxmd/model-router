@@ -376,8 +376,11 @@ def parse_claude_result(stdout: str) -> dict:
     sid = obj.get("session_id") if isinstance(obj.get("session_id"), str) else None
     result = obj.get("result")
     if obj.get("is_error") or obj.get("subtype") not in (None, "success"):
+        kind = obj.get("subtype") if obj.get("subtype") not in (None, "success") else "is_error"
+        status = obj.get("api_error_status")
         return {"ok": False, "answer": None, "session_id": sid,
-                "error": f"planner result error: {str(obj.get('subtype') or 'is_error')[:80]}",
+                "error": f"planner result error: {str(kind)[:80]}"
+                         + (f" (API status {status})" if status else ""),
                 "detail": str(result or "")[:500]}
     if not isinstance(result, str) or not result.strip():
         return {"ok": False, "answer": None, "session_id": sid,
