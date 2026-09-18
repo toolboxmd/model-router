@@ -682,6 +682,16 @@ class RealShapeHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
+class TestChildEnvironment(Base):
+    def test_parent_harness_session_variables_do_not_leak(self):
+        env = adapters.child_harness_env({
+            "PATH": "/bin", "HOME": "/h", "CODEX_HOME": "/c", "ANTHROPIC_API_KEY": "k",
+            "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_EFFORT": "high",
+            "CLAUDE_PID": "1", "CODEX_THREAD_ID": "t", "CODEX_PERMISSION_PROFILE": "p"})
+        self.assertEqual(env, {"PATH": "/bin", "HOME": "/h", "CODEX_HOME": "/c",
+                               "ANTHROPIC_API_KEY": "k"})
+
+
 class TestOpenCodeClient(Base):
     def _serve(self, status):
         RealShapeHandler.status = status

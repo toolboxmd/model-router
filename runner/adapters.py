@@ -81,6 +81,23 @@ BUSY_MARKERS = (
 )
 
 
+# Session-bound variables a parent Claude Code or Codex process exports to
+# its tools. A detached child harness must start as its own session, so
+# these never pass through. Auth and home locations are kept.
+_KEEP_HARNESS_ENV = {"CODEX_HOME", "CLAUDE_CONFIG_DIR"}
+
+
+def child_harness_env(base: dict | None = None) -> dict:
+    env = dict(os.environ if base is None else base)
+    for key in list(env):
+        if key in _KEEP_HARNESS_ENV:
+            continue
+        if key in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT") \
+                or key.startswith("CLAUDE_CODE_") or key.startswith("CODEX_"):
+            env.pop(key, None)
+    return env
+
+
 def default_last_message_path() -> str:
     """Fallback output-last-message path when the caller has no state dir."""
     return os.path.join(tempfile.gettempdir(), "codex-last-message.json")

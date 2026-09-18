@@ -99,7 +99,7 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
         except ValueError:
             meta = {}
     kind = inv.get("kind") or "unknown"
-    env = os.environ.copy()
+    env = adapters.child_harness_env()
     extra_env = meta.get("env") if isinstance(meta.get("env"), dict) else {}
     # Only pass through non-secret test PATH/fixture keys plus any
     # already-present child environment. Passwords stay in this process
