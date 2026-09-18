@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import adapters
 from . import policy
 from . import store
 
@@ -134,6 +135,56 @@ def _is_pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _is_pgid_alive(pgid: int | None) -> bool:
+    """True if the recorded process group still has at least one member."""
+    if pgid is None:
+        return False
+    try:
+        pgid = int(pgid)
+    except (ValueError, OverflowError):
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pgid_for_pid(pid: int | None) -> int | None:
+    if pid is None:
+        return None
+    try:
+        return os.getpgid(int(pid))
+    except (ProcessLookupError, OSError, ValueError):
+        return None
+
+
+def _process_start_time(pid: int | None) -> int | None:
+    """Best-effort process start identity (stdlib-only, seconds since epoch).
+
+    Used together with PID/PGID to reduce reuse collisions. Returns None
+    when unavailable without adding non-stdlib dependencies.
+    """
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (ValueError, OverflowError):
+        return None
+    # /proc/<pid>/stat starttime is Linux-only and not stdlib-friendly.
+    # Use the executable's stat-based birth time approximation on platforms
+    # where /proc/<pid> exists; otherwise fall back to None.
+    try:
+        st = os.stat(f"/proc/{pid}")
+        return int(st.st_mtime)
+    except (OSError, ValueError):
+        return None
+
+
 def _heartbeat_fresh(updated: str | None) -> bool:
     ts = _parse_ts(updated)
     if ts is None:
@@ -143,6 +194,551 @@ def _heartbeat_fresh(updated: str | None) -> bool:
 
 def _row_to_job(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
+
+
+# ---------------------------------------------------------------------------
+# Durable child ownership (invocations)
+# ---------------------------------------------------------------------------
+
+INVOCATION_KINDS = ("codex_dispatch", "codex_resume", "claude_callback", "opencode_run")
+LIVE_INVOCATION_STATES = ("running", "cancelling")
+
+
+def _infer_invocation_kind(cmd: list[str]) -> str:
+    """Infer the invocation kind from a built-in adapter command."""
+    if not cmd:
+        return "unknown"
+    name = os.path.basename(cmd[0]).lower() if cmd[0] else ""
+    if name == "codex":
+        if any(a == "resume" for a in cmd[1:]):
+            return "codex_resume"
+        return "codex_dispatch"
+    if name == "claude":
+        return "claude_callback"
+    if name == "opencode":
+        return "opencode_run"
+    return "unknown"
+
+
+def _invocation_output_paths(root: Path, request_id: str, invocation_id: str) -> tuple[Path, Path]:
+    return (
+        root / "outputs" / f"{request_id}.{invocation_id}.stdout",
+        root / "outputs" / f"{request_id}.{invocation_id}.stderr",
+    )
+
+
+def _parse_session_from_output(kind: str, stdout: str, stderr: str,
+                               job: dict | None = None) -> tuple[str | None, str | None]:
+    """Return (session_id, session_kind) extracted from streamed child output."""
+    if kind in ("codex_dispatch", "codex_resume"):
+        sid = adapters.parse_codex_task_id(stdout, stderr)
+        if sid:
+            return sid, "codex_task_id"
+        return None, None
+    if kind == "claude_callback":
+        # The session identity is the exact planner session we resumed.
+        if job is not None:
+            sid = job.get("planner_session_id")
+            if sid:
+                return sid, "planner_session_id"
+        return None, None
+    if kind == "opencode_run":
+        for blob in (stdout, stderr):
+            if not blob:
+                continue
+            text = blob.strip()
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                for key in ("opencode_session_id", "session_id", "sessionId", "session"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val:
+                        return val, "opencode_session_id"
+                    if isinstance(val, dict):
+                        for sub in ("id", "session_id", "sessionId"):
+                            if isinstance(val.get(sub), str) and val.get(sub):
+                                return val.get(sub), "opencode_session_id"
+        return None, None
+    return None, None
+
+
+def _redact_cmd(cmd: list[str]) -> list[str]:
+    return [
+        ("<redacted>" if any(s in str(c).lower() for s in ("password", "bearer", "token=")) else c)
+        for c in cmd
+    ]
+
+
+def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
+                 cmd: list[str], cwd: str | None = None,
+                 timeout: int = 120) -> tuple[int, str, str]:
+    """Spawn a detached, file-backed child and stream-capture its identity.
+
+    Persists the invocation before spawn so controller death never loses
+    the live writer. The child runs in its own process group and writes
+    stdout/stderr to durable files. Session IDs are parsed from the stream
+    and persisted immediately. Returns (rc, stdout, stderr).
+    """
+    root = store.ensure_state_dir(state_dir)
+    invocation_id = secrets.token_hex(8)
+    stdout_path, stderr_path = _invocation_output_paths(root, request_id, invocation_id)
+    store.secure_write_text(stdout_path, "")
+    store.secure_write_text(stderr_path, "")
+
+    job = get_job(state_dir, request_id)
+    workspace = job["workspace"]
+    started_at = _utcnow()
+
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO invocations("
+            " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
+            " pid, pgid, stdout_path, stderr_path, started_at, state, task_json"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,?,?,?,'running',?)",
+            (invocation_id, request_id, kind, json.dumps(_redact_cmd(cmd)),
+             workspace, owner_token, str(stdout_path), str(stderr_path),
+             started_at, job.get("task_json")),
+        )
+        _event(con, request_id, "invocation_attempting",
+               {"invocation_id": invocation_id[:16], "kind": kind})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    proc = None
+    try:
+        out_f = open(stdout_path, "a", encoding="utf-8")
+        err_f = open(stderr_path, "a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd or None,
+                stdout=out_f, stderr=err_f,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        except Exception:
+            out_f.close()
+            err_f.close()
+            raise
+    except OSError as e:
+        con = store.connect(state_dir)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE invocations SET state='failed', rc=127, ended_at=? WHERE invocation_id=?",
+                (_utcnow(), invocation_id),
+            )
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        return 127, "", f"spawn failed: {e}"
+
+    pid = proc.pid
+    pgid = _pgid_for_pid(pid)
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET pid=?, pgid=? WHERE invocation_id=?",
+            (pid, pgid, invocation_id),
+        )
+        _event(con, request_id, "invocation_spawned",
+               {"invocation_id": invocation_id[:16], "kind": kind,
+                "pid": pid, "pgid": pgid})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        # Best-effort cleanup of the spawned child on metadata failure.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    # Stream-capture session IDs while the child runs.
+    captured_session: str | None = None
+    captured_kind: str | None = None
+    deadline = time.monotonic() + max(1.0, timeout)
+    stdout_acc = ""
+    stderr_acc = ""
+    out_pos = 0
+    err_pos = 0
+    try:
+        with open(stdout_path, "r", encoding="utf-8", errors="replace") as out_r, \
+             open(stderr_path, "r", encoding="utf-8", errors="replace") as err_r:
+            while True:
+                rc = proc.poll()
+                out_r.seek(out_pos)
+                out_chunk = out_r.read(65536)
+                out_pos = out_r.tell()
+                if out_chunk:
+                    stdout_acc += out_chunk
+                err_r.seek(err_pos)
+                err_chunk = err_r.read(65536)
+                err_pos = err_r.tell()
+                if err_chunk:
+                    stderr_acc += err_chunk
+                if (out_chunk or err_chunk) and captured_session is None:
+                    sid, skind = _parse_session_from_output(kind, stdout_acc, stderr_acc, job)
+                    if sid:
+                        captured_session = sid
+                        captured_kind = skind
+                        con = store.connect(state_dir)
+                        try:
+                            con.execute("BEGIN IMMEDIATE")
+                            con.execute(
+                                "UPDATE invocations SET session_id=?, session_kind=? WHERE invocation_id=?",
+                                (sid, skind, invocation_id),
+                            )
+                            # Persist launch identity before acknowledgement.
+                            if skind == "codex_task_id":
+                                con.execute(
+                                    "UPDATE jobs SET codex_task_id=?, adapter='codex', model=?, effort=?, updated_at=? WHERE request_id=?",
+                                    (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, _utcnow(), request_id),
+                                )
+                            elif skind == "opencode_session_id":
+                                route = job.get("route") or "muse-spark-xhigh-free"
+                                con.execute(
+                                    "UPDATE jobs SET opencode_session_id=?, route=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
+                                    (sid, route, adapters.OPENCODE_FREE_MODEL, adapters.OPENCODE_VARIANT, _utcnow(), request_id),
+                                )
+                            elif skind == "planner_session_id":
+                                con.execute(
+                                    "UPDATE jobs SET planner_session_id=?, updated_at=? WHERE request_id=?",
+                                    (sid, _utcnow(), request_id),
+                                )
+                            _event(con, request_id, "invocation_session_captured",
+                                   {"invocation_id": invocation_id[:16], "kind": kind,
+                                    "session_kind": skind, "session": sid[:24]})
+                            con.execute("COMMIT")
+                        except Exception:
+                            try:
+                                con.execute("ROLLBACK")
+                            except Exception:
+                                pass
+                        finally:
+                            con.close()
+                if rc is not None:
+                    break
+                if time.monotonic() > deadline:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        rc = proc.wait(timeout=5)
+                    except Exception:
+                        rc = 124
+                    break
+                time.sleep(0.05)
+    finally:
+        # Ensure files are closed in this process; the child keeps its own fds.
+        try:
+            out_f.close()
+        except Exception:
+            pass
+        try:
+            err_f.close()
+        except Exception:
+            pass
+
+    # Final read of complete output.
+    stdout_text = ""
+    stderr_text = ""
+    try:
+        stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    try:
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+
+    # Append bounded tail to the main output log for operator visibility.
+    try:
+        log = store.output_path_for(root, request_id)
+        snippet = f"[{kind} pid={pid}]\n"
+        store.append_text(log, snippet)
+        if stdout_text:
+            store.append_text(log, stdout_text[-2000:])
+        if stderr_text:
+            store.append_text(log, stderr_text[-2000:])
+    except OSError:
+        pass
+
+    state = "completed" if rc == 0 else "failed"
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET rc=?, state=?, ended_at=? WHERE invocation_id=?",
+            (rc, state, _utcnow(), invocation_id),
+        )
+        _event(con, request_id, "invocation_finished",
+               {"invocation_id": invocation_id[:16], "kind": kind, "rc": rc})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+    return rc, stdout_text, stderr_text
+
+
+def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
+    """Factory for a run_cmd closure that creates durable invocations.
+
+    The returned callable matches the (cmd, cwd, timeout) -> (rc, out, err)
+    signature used by controller.dispatch and friends.
+    """
+    def run_cmd(cmd: list[str], cwd: str | None = None, timeout: int = 120):
+        kind = _infer_invocation_kind(cmd)
+        return _durable_run(state_dir, request_id, owner_token, kind,
+                            cmd, cwd=cwd, timeout=timeout)
+    return run_cmd
+
+
+def _list_invocations(state_dir, request_id: str,
+                      state: str | None = None) -> list[dict]:
+    con = store.connect(state_dir)
+    try:
+        if state is None:
+            rows = con.execute(
+                "SELECT * FROM invocations WHERE request_id=? ORDER BY id",
+                (request_id,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM invocations WHERE request_id=? AND state=? ORDER BY id",
+                (request_id, state),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def _reconcile_dead_invocations(state_dir, request_id: str) -> list[dict]:
+    """Mark live invocations whose process group is gone as reconciled-dead."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in LIVE_INVOCATION_STATES)
+        rows = con.execute(
+            f"SELECT invocation_id, pgid, pid FROM invocations WHERE request_id=? AND state IN ({placeholders})",
+            (request_id, *LIVE_INVOCATION_STATES),
+        ).fetchall()
+        now = _utcnow()
+        dead = []
+        for r in rows:
+            if not _is_pgid_alive(r["pgid"]):
+                con.execute(
+                    "UPDATE invocations SET state='reconciled-dead', ended_at=? WHERE invocation_id=?",
+                    (now, r["invocation_id"]),
+                )
+                dead.append(dict(r))
+        _event(con, request_id, "invocations_reconciled",
+               {"reconciled_dead": len(dead)})
+        con.execute("COMMIT")
+        return dead
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _any_live_invocation(state_dir, request_id: str) -> list[dict]:
+    """Return live invocations (running or cancelling) whose process group still exists."""
+    live = []
+    for inv in _list_invocations(state_dir, request_id):
+        if inv.get("state") in LIVE_INVOCATION_STATES and _is_pgid_alive(inv.get("pgid")):
+            live.append(inv)
+    return live
+
+
+def _capture_invocation_sessions(state_dir, request_id: str,
+                                 invocations: list[dict] | None = None) -> bool:
+    """Read durable output files of live invocations and persist any IDs found."""
+    if invocations is None:
+        invocations = _any_live_invocation(state_dir, request_id)
+    if not invocations:
+        return False
+    # Also scan cancelling invocations that may have emitted IDs before being stopped.
+    seen_ids = {inv["invocation_id"] for inv in invocations}
+    cancelling = [
+        inv for inv in _list_invocations(state_dir, request_id, state="cancelling")
+        if inv["invocation_id"] not in seen_ids
+    ]
+    invocations = invocations + cancelling
+    job = get_job(state_dir, request_id)
+    captured = False
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for inv in invocations:
+            if inv.get("session_id"):
+                captured = True
+                continue
+            try:
+                stdout = Path(inv["stdout_path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stdout = ""
+            try:
+                stderr = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stderr = ""
+            sid, skind = _parse_session_from_output(inv["kind"], stdout, stderr, job)
+            if sid:
+                captured = True
+                con.execute(
+                    "UPDATE invocations SET session_id=?, session_kind=? WHERE invocation_id=?",
+                    (sid, skind, inv["invocation_id"]),
+                )
+                if skind == "codex_task_id":
+                    con.execute(
+                        "UPDATE jobs SET codex_task_id=?, adapter='codex', model=?, effort=?, updated_at=? WHERE request_id=?",
+                        (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, _utcnow(), request_id),
+                    )
+                elif skind == "opencode_session_id":
+                    route = job.get("route") or "muse-spark-xhigh-free"
+                    con.execute(
+                        "UPDATE jobs SET opencode_session_id=?, route=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
+                        (sid, route, adapters.OPENCODE_FREE_MODEL, adapters.OPENCODE_VARIANT, _utcnow(), request_id),
+                    )
+                elif skind == "planner_session_id":
+                    con.execute(
+                        "UPDATE jobs SET planner_session_id=?, updated_at=? WHERE request_id=?",
+                        (sid, _utcnow(), request_id),
+                    )
+                _event(con, request_id, "invocation_session_reconciled",
+                       {"invocation_id": inv["invocation_id"][:16],
+                        "session_kind": skind, "session": sid[:24]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return captured
+
+
+def _mark_invocations_cancelling(state_dir, request_id: str) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET state='cancelling' WHERE request_id=? AND state='running'",
+            (request_id,),
+        )
+        _event(con, request_id, "invocations_cancelling", {})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _terminate_invocations(state_dir, request_id: str,
+                           owner_pid: int | None = None,
+                           signal_no: int = signal.SIGTERM) -> None:
+    """Signal every owned child process group and the controller lease holder.
+
+    Targets both running and cancelling invocations so a cancellation intent
+    never skips a still-live child.
+    """
+    for inv in _list_invocations(state_dir, request_id):
+        if inv.get("state") not in LIVE_INVOCATION_STATES:
+            continue
+        pgid = inv.get("pgid")
+        if pgid:
+            try:
+                os.killpg(int(pgid), signal_no)
+            except (ProcessLookupError, PermissionError, ValueError, OSError):
+                pass
+    if owner_pid is not None:
+        try:
+            os.kill(int(owner_pid), signal_no)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
+
+
+def _wait_invocations_dead(state_dir, request_id: str, timeout: float = 10.0) -> bool:
+    """Wait until all owned child process groups are confirmed stopped."""
+    end = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < end:
+        _reconcile_dead_invocations(state_dir, request_id)
+        live = _any_live_invocation(state_dir, request_id)
+        if not live:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _raise_if_live_invocation(state_dir, request_id: str) -> None:
+    """Block duplicate launches while any owned child process group lives.
+
+    Read-only with respect to durable metadata: it must not start a write
+    transaction because callers already hold the main lease transaction.
+    """
+    live = _any_live_invocation(state_dir, request_id)
+    if not live:
+        return
+    has_session = any(inv.get("session_id") for inv in live)
+    if has_session:
+        raise OwnershipError(
+            f"job {request_id} has live invocation {live[0]['invocation_id']}; refusing duplicate launch")
+    raise OwnershipError(
+        f"job {request_id} has live invocation without handshake; run recover")
+
+
+def _drain_owned_children(state_dir, request_id: str,
+                          owner_pid: int | None = None) -> bool:
+    """Signal and wait for all owned child process groups to stop.
+
+    Returns True only after every owned process group is confirmed dead.
+    """
+    _mark_invocations_cancelling(state_dir, request_id)
+    _terminate_invocations(state_dir, request_id, owner_pid, signal.SIGTERM)
+    if _wait_invocations_dead(state_dir, request_id, timeout=10.0):
+        return True
+    _terminate_invocations(state_dir, request_id, owner_pid, signal.SIGKILL)
+    if _wait_invocations_dead(state_dir, request_id, timeout=5.0):
+        return True
+    _reconcile_dead_invocations(state_dir, request_id)
+    return not _any_live_invocation(state_dir, request_id)
 
 
 def get_job(state_dir, request_id: str) -> dict:
@@ -317,9 +913,11 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                  timeout_secs=timeout_secs, planner_model=planner_model,
                  planner_effort=planner_effort)
     # Idempotent resubmit of the same payload must not fork a second
-    # controller when one already holds the lease.
+    # controller when one already holds the lease or when a durable child
+    # process group from a prior controller is still alive.
     if job.get("owner_token") and job.get("owner_pid") and _is_pid_alive(job.get("owner_pid")):
         return job
+    _raise_if_live_invocation(state_dir, request_id)
     start_controller(state_dir, request_id, launcher=launcher, spawn=spawn)
     return get_job(state_dir, request_id)
 
@@ -352,6 +950,13 @@ def start_controller(state_dir, request_id: str, launcher=None, spawn=None) -> d
         if job["status"] == "blocked":
             con.execute("ROLLBACK")
             raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
+        # Durable child ownership: never launch a second writer while any
+        # owned child process group from a prior controller is still alive.
+        try:
+            _raise_if_live_invocation(state_dir, request_id)
+        except OwnershipError:
+            con.execute("ROLLBACK")
+            raise
         if job["owner_token"]:
             ident = store.read_worker_identity(root, request_id)
             if ident and ident.get("token") == job["owner_token"] \
@@ -610,12 +1215,13 @@ def cancel(state_dir, request_id: str) -> dict:
             con.execute("ROLLBACK")
             return _row_to_job(job)
         now = _utcnow()
-        result = {"cancelled": True, "at": now}
+        # Persist cancellation intent durably, but do NOT mark terminal
+        # cancelled until every owned child process group is confirmed stopped.
         con.execute(
-            "UPDATE jobs SET cancel_requested=1, status='cancelled', result_json=?, updated_at=? WHERE request_id=?",
-            (json.dumps(result), now, request_id),
+            "UPDATE jobs SET cancel_requested=1, status='cancelling', updated_at=? WHERE request_id=?",
+            (now, request_id),
         )
-        _event(con, request_id, "cancelled", {})
+        _event(con, request_id, "cancelling", {})
         con.execute("COMMIT")
         owner_token, owner_pid = job["owner_token"], job["owner_pid"]
     except Exception:
@@ -626,7 +1232,12 @@ def cancel(state_dir, request_id: str) -> dict:
         raise
     finally:
         con.close()
-    # Best-effort stop of the owned worker only when ownership is proven.
+
+    # Stop every owned child process group, not just the controller PID.
+    # The workspace claim is retained until all owned children confirm dead.
+    all_dead = _drain_owned_children(state_dir, request_id, owner_pid)
+
+    # Best-effort stop of the legacy owned worker PID when ownership proven.
     try:
         root = store.ensure_state_dir(state_dir)
         ident = store.read_worker_identity(root, request_id)
@@ -635,16 +1246,46 @@ def cancel(state_dir, request_id: str) -> dict:
             _terminate_pid(owner_pid)
     except OSError:
         pass
-    # Mirror terminal result to file (0600) without touching partial log.
+
+    con = store.connect(state_dir)
     try:
-        root = store.ensure_state_dir(state_dir)
-        store.secure_write_text(
-            store.result_path_for(root, request_id),
-            json.dumps({"request_id": request_id, "status": "cancelled",
-                        "result": {"cancelled": True}}),
-        )
-    except OSError:
-        pass
+        con.execute("BEGIN IMMEDIATE")
+        if not all_dead:
+            # Retain the workspace claim: block until a subsequent recover
+            # confirms the child process group is gone.
+            con.execute(
+                "UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?",
+                ("cancellation_pending: live child process group remains", _utcnow(), request_id),
+            )
+            _event(con, request_id, "blocked", {"reason": "cancellation_pending"})
+        else:
+            # All owned children stopped: finalize cancellation.
+            con.execute(
+                "UPDATE jobs SET status='cancelled', result_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps({"cancelled": True, "at": _utcnow()}), _utcnow(), request_id),
+            )
+            _event(con, request_id, "cancelled", {})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    # Mirror terminal result to file (0600) only after confirmed stop.
+    if all_dead:
+        try:
+            root = store.ensure_state_dir(state_dir)
+            store.secure_write_text(
+                store.result_path_for(root, request_id),
+                json.dumps({"request_id": request_id, "status": "cancelled",
+                            "result": {"cancelled": True}}),
+            )
+        except OSError:
+            pass
     return get_job(state_dir, request_id)
 
 
@@ -744,6 +1385,13 @@ def launch_worker(state_dir, request_id: str, mode: str = "sleep",
         if job["status"] == "blocked":
             con.execute("ROLLBACK")
             raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
+        # Durable child ownership: never launch a second writer while any
+        # owned child process group from a prior controller is still alive.
+        try:
+            _raise_if_live_invocation(state_dir, request_id)
+        except OwnershipError:
+            con.execute("ROLLBACK")
+            raise
         # Launch-race guard: never spawn a second writer while the lease
         # holder PID is still alive. A live recorded PID without a
         # matching fresh handshake remains claimed/unknown and blocks
@@ -862,6 +1510,13 @@ def _known_tokens(con: sqlite3.Connection, request_id: str) -> set[str]:
 def recover_one(state_dir, request_id: str) -> dict:
     """Reconcile durable records with live ownership; resume only when safe."""
     root = store.ensure_state_dir(state_dir)
+    # Reconcile durable invocation records before acquiring the main write lock.
+    # A running invocation whose process group is gone is marked dead; live
+    # ones have their streamed session IDs captured so recover can adopt.
+    _reconcile_dead_invocations(state_dir, request_id)
+    live_invocations = _any_live_invocation(state_dir, request_id)
+    if live_invocations:
+        _capture_invocation_sessions(state_dir, request_id, live_invocations)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -877,26 +1532,103 @@ def recover_one(state_dir, request_id: str) -> dict:
                     "status": status}
         now = _utcnow()
         # Timeout enforcement (bounded, persisted before ack).
+        # Mark timing-out intent, stop owned children, then finalize only after
+        # every owned process group is confirmed dead.
         if job["timeout_secs"] is not None:
             created = _parse_ts(job["created_at"])
             if created is not None and (time.time() - created) > int(job["timeout_secs"]):
                 con.execute(
-                    "UPDATE jobs SET status='failed', error_class='timeout',"
-                    " result_json=?, updated_at=? WHERE request_id=?",
-                    (json.dumps({"ok": False, "error": {"code": "TIMEOUT"}}), now, request_id),
+                    "UPDATE jobs SET status='cancelling', updated_at=? WHERE request_id=?",
+                    (now, request_id),
                 )
-                _event(con, request_id, "timeout", {})
+                _event(con, request_id, "timing_out", {})
                 con.execute("COMMIT")
-                return {"request_id": request_id, "action": "timeout", "status": "failed"}
+                con.close()
+                all_dead = _drain_owned_children(state_dir, request_id, job["owner_pid"])
+                con = store.connect(state_dir)
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    if not all_dead:
+                        con.execute(
+                            "UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?",
+                            ("timeout_pending: live child process group remains", _utcnow(), request_id),
+                        )
+                        _event(con, request_id, "blocked", {"reason": "timeout_pending"})
+                    else:
+                        con.execute(
+                            "UPDATE jobs SET status='failed', error_class='timeout',"
+                            " result_json=?, updated_at=? WHERE request_id=?",
+                            (json.dumps({"ok": False, "error": {"code": "TIMEOUT"}}), _utcnow(), request_id),
+                        )
+                        _event(con, request_id, "timeout", {})
+                    con.execute("COMMIT")
+                finally:
+                    con.close()
+                return {"request_id": request_id, "action": "timeout",
+                        "status": get_job(state_dir, request_id)["status"]}
+        # Cancellation intent persisted previously. Stop owned children and
+        # finalize cancellation only after every owned process group is dead.
         if job["cancel_requested"]:
-            con.execute(
-                "UPDATE jobs SET status='cancelled',"
-                " result_json=?, updated_at=? WHERE request_id=?",
-                (json.dumps({"cancelled": True}), now, request_id),
-            )
-            _event(con, request_id, "cancelled", {})
             con.execute("COMMIT")
-            return {"request_id": request_id, "action": "cancelled", "status": "cancelled"}
+            con.close()
+            all_dead = _drain_owned_children(state_dir, request_id, job["owner_pid"])
+            con = store.connect(state_dir)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                if not all_dead:
+                    con.execute(
+                        "UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?",
+                        ("cancellation_pending: live child process group remains", _utcnow(), request_id),
+                    )
+                    _event(con, request_id, "blocked", {"reason": "cancellation_pending"})
+                else:
+                    con.execute(
+                        "UPDATE jobs SET status='cancelled', result_json=?, updated_at=? WHERE request_id=?",
+                        (json.dumps({"cancelled": True}), _utcnow(), request_id),
+                    )
+                    _event(con, request_id, "cancelled", {})
+                con.execute("COMMIT")
+            finally:
+                con.close()
+            if all_dead:
+                try:
+                    root = store.ensure_state_dir(state_dir)
+                    store.secure_write_text(
+                        store.result_path_for(root, request_id),
+                        json.dumps({"request_id": request_id, "status": "cancelled",
+                                    "result": {"cancelled": True}}),
+                    )
+                except OSError:
+                    pass
+            return {"request_id": request_id, "action": "cancelled",
+                    "status": get_job(state_dir, request_id)["status"]}
+
+        # If any owned child process group is still alive, the workspace stays
+        # claimed. Use the session IDs already captured outside the write lock.
+        # (Re-query here to avoid holding a stale list across the transaction.)
+        live_invocations = [
+            inv for inv in _list_invocations(state_dir, request_id)
+            if inv.get("state") in LIVE_INVOCATION_STATES and _is_pgid_alive(inv.get("pgid"))
+        ]
+        if live_invocations:
+            has_session = any(inv.get("session_id") for inv in live_invocations)
+            if has_session:
+                if job["status"] == "blocked":
+                    con.execute(
+                        "UPDATE jobs SET status='running', block_reason=NULL, updated_at=? WHERE request_id=?",
+                        (_utcnow(), request_id),
+                    )
+                _event(con, request_id, "recovered-adopted-live-invocation",
+                       {"invocation_id": live_invocations[0]["invocation_id"][:16],
+                        "kind": live_invocations[0].get("kind", "")})
+                con.execute("COMMIT")
+                return {"request_id": request_id, "action": "adopted-live-invocation",
+                        "status": get_job(state_dir, request_id)["status"]}
+            mark_blocked(
+                f"live invocation {live_invocations[0]['invocation_id'][:8]}... without handshake; refusing duplicate")
+            con.execute("COMMIT")
+            return {"request_id": request_id, "action": "blocked-claimed-live-invocation",
+                    "status": "blocked"}
 
         lease_token = job["owner_token"]
         lease_pid = job["owner_pid"]

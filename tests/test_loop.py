@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import core, store  # noqa: E402
+from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
 
@@ -271,6 +272,257 @@ class TestPublicLoopProof(unittest.TestCase):
              "--request-id", req],
             capture_output=True, text=True, timeout=20, cwd=str(ROOT), env=env)
         self.assertNotEqual(p2.returncode, 0)
+
+    def test_controller_death_child_lives_no_duplicate_codex(self):
+        """Regression: killing only the controller must not orphan the writer.
+
+        A durable child invocation survives controller death. recover() must
+        detect the live process group and captured thread ID, and start() must
+        refuse to fork a second Codex. This is the exact unsafe ownership bug
+        reproduced by reproduce-controller-crash.py.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        fake_bin = base / "fakebin"
+        fake_bin.mkdir()
+        fake_state = base / "fakestate"
+        fake_state.mkdir()
+        calls = fake_state / "codex-calls.jsonl"
+        thread_id = "crash-repro-thread-001"
+
+        fake_codex = '''#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+p = Path(os.environ["CRASH_REPRO_CALLS"])
+with p.open("a") as f:
+    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),
+                        "args": __import__("sys").argv[1:]}) + "\\n")
+print(json.dumps({"type": "thread.started", "thread_id": "%s"}), flush=True)
+time.sleep(60)
+''' % thread_id
+        p = fake_bin / "codex"
+        p.write_text(fake_codex, encoding="utf-8")
+        os.chmod(p, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["CRASH_REPRO_CALLS"] = str(calls)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        def rows():
+            if not calls.exists():
+                return []
+            return [json.loads(line) for line in calls.read_text().splitlines() if line.strip()]
+
+        def wait_calls(count, deadline=10.0):
+            end = time.time() + deadline
+            while time.time() < end:
+                if len(rows()) >= count:
+                    return True
+                time.sleep(0.05)
+            return False
+
+        def kill_pgid(pgid):
+            try:
+                os.killpg(int(pgid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        def wait_pgid_dead(pgid, deadline=5.0):
+            end = time.time() + deadline
+            while time.time() < end:
+                try:
+                    os.killpg(int(pgid), 0)
+                except ProcessLookupError:
+                    return True
+                except (PermissionError, OSError):
+                    return False
+                time.sleep(0.05)
+            return False
+
+        req = "crash-repro"
+        rc, out, err = self._cli(
+            sd, "submit", "--request-id", req,
+            "--task", json.dumps({"goal": "offline crash reproduction"}),
+            "--workspace", str(ws), "--planner-session", "original-planner",
+            "--planner-model", "claude-sonnet-5", "--planner-effort", "medium",
+            "--start", env=env)
+        self.assertEqual(rc, 0, err[-2000:])
+        self.assertTrue(out.get("acknowledged"))
+        self.assertTrue(wait_calls(1), "first fake Codex did not launch")
+
+        # Kill only the controller lease holder, not the fake Codex child.
+        job = core.get_job(sd, req)
+        controller_pid = job["owner_pid"]
+        self.assertIsNotNone(controller_pid)
+        try:
+            os.kill(int(controller_pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        time.sleep(0.3)
+
+        first = rows()[0]
+        self.assertTrue(_is_pid_alive(first["pid"]), "first fake Codex child must survive controller death")
+
+        # Recover must NOT declare the worker gone and clear the lease.
+        rc, rec, err = self._cli(sd, "recover", "--request-id", req, env=env)
+        self.assertEqual(rc, 0, err[-2000:])
+        self.assertNotEqual(rec.get("action"), "worker-dead-cleared",
+                            "recover must not clear a live child invocation")
+        self.assertIn(rec.get("action"),
+                      ("adopted-live-invocation", "blocked-claimed-live-invocation"))
+
+        # start() must refuse to fork a second writer.
+        rc, start_out, err = self._cli(sd, "start", "--request-id", req, env=env)
+        self.assertNotEqual(rc, 0, "start must refuse duplicate launch while child lives")
+        self.assertFalse(wait_calls(2, deadline=3.0),
+                         "a second fake Codex must not start")
+
+        # The captured thread ID must be durable.
+        job = core.get_job(sd, req)
+        self.assertEqual(job.get("codex_task_id"), thread_id)
+
+        # Cleanup: stop the surviving fake Codex and any controller remnants.
+        for r in rows():
+            kill_pgid(r["pgid"])
+        for r in rows():
+            wait_pgid_dead(r["pgid"])
+        try:
+            os.kill(int(controller_pid), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                os.kill(int(controller_pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+    def test_cancel_while_child_lives_blocks_replacement_until_dead(self):
+        """Regression: cancel must stop the child before releasing the workspace.
+
+        Cancelling while a fake Codex invocation is still running must signal
+        the child process group, wait for it to die, and only then mark the job
+        terminal. A same-workspace replacement must not start until the first
+        writer is gone, so two fake Codex processes are never alive together.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        fake_bin = base / "fakebin"
+        fake_bin.mkdir()
+        fake_state = base / "fakestate"
+        fake_state.mkdir()
+        calls = fake_state / "codex-calls.jsonl"
+        thread_id = "cancel-repro-thread-001"
+
+        fake_codex = '''#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+p = Path(os.environ["CRASH_REPRO_CALLS"])
+with p.open("a") as f:
+    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),
+                        "args": __import__("sys").argv[1:]}) + "\\n")
+print(json.dumps({"type": "thread.started", "thread_id": "%s"}), flush=True)
+time.sleep(60)
+''' % thread_id
+        p = fake_bin / "codex"
+        p.write_text(fake_codex, encoding="utf-8")
+        os.chmod(p, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["CRASH_REPRO_CALLS"] = str(calls)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        def rows():
+            if not calls.exists():
+                return []
+            return [json.loads(line) for line in calls.read_text().splitlines() if line.strip()]
+
+        def wait_calls(count, deadline=15.0):
+            end = time.time() + deadline
+            while time.time() < end:
+                if len(rows()) >= count:
+                    return True
+                time.sleep(0.05)
+            return False
+
+        def is_pid_alive(pid):
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                return False
+            except (PermissionError, OSError):
+                return True
+            return True
+
+        def kill_pgid(pgid):
+            try:
+                os.killpg(int(pgid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        def wait_pgid_dead(pgid, deadline=5.0):
+            end = time.time() + deadline
+            while time.time() < end:
+                try:
+                    os.killpg(int(pgid), 0)
+                except ProcessLookupError:
+                    return True
+                except (PermissionError, OSError):
+                    return False
+                time.sleep(0.05)
+            return False
+
+        req = "cancel-repro"
+        rc, out, err = self._cli(
+            sd, "submit", "--request-id", req,
+            "--task", json.dumps({"goal": "cancellation reproduction"}),
+            "--workspace", str(ws), "--planner-session", "original-planner",
+            "--planner-model", "claude-sonnet-5", "--planner-effort", "medium",
+            "--start", env=env)
+        self.assertEqual(rc, 0, err[-2000:])
+        self.assertTrue(out.get("acknowledged"))
+        self.assertTrue(wait_calls(1), "first fake Codex did not launch")
+        first_pid = rows()[0]["pid"]
+        first_pgid = rows()[0]["pgid"]
+
+        # Cancel while the fake Codex child is still running.
+        rc, out, err = self._cli(sd, "cancel", "--request-id", req, env=env)
+        self.assertEqual(rc, 0, err[-2000:])
+        # cancel must wait for the child process group to stop before returning.
+        self.assertFalse(is_pid_alive(first_pid),
+                         "cancel must stop the fake Codex child before returning")
+        job = core.get_job(sd, req)
+        self.assertEqual(job["status"], "cancelled",
+                         "cancel must only mark terminal after child is dead")
+
+        # A same-workspace replacement may now start; the first writer is gone.
+        rc, out, err = self._cli(
+            sd, "submit", "--request-id", "replacement",
+            "--task", json.dumps({"goal": "replacement after cancel"}),
+            "--workspace", str(ws), "--planner-session", "replacement-planner",
+            "--planner-model", "claude-sonnet-5", "--planner-effort", "medium",
+            "--start", env=env)
+        self.assertEqual(rc, 0, err[-2000:])
+        self.assertTrue(wait_calls(2), "replacement fake Codex did not launch")
+
+        # Prove no duplicate writer: the first child was dead before the second started.
+        second_pid = rows()[1]["pid"]
+        self.assertNotEqual(first_pid, second_pid)
+        # (The cleanup below stops the replacement; the assertion above already
+        # proves the first died before this point because cancel waited.)
+
+        # Cleanup.
+        for r in rows():
+            kill_pgid(r["pgid"])
+        for r in rows():
+            wait_pgid_dead(r["pgid"])
 
     def _cli(self, sd, *args, env):
         cmd = [PY, "-m", "runner", "--state-dir", sd, *args]

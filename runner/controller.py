@@ -863,9 +863,12 @@ def run_controller_process(state_dir: str, request_id: str, token: str,
             _time.sleep(0.2)
         return 0
     # Bounded durable loop with built-in adapters (normal submit/start).
+    # Use the durable run_cmd so every child spawn is file-backed,
+    # detached, and recorded in the invocations table before the spawn.
+    durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
     for _ in range(MAX_LOOP_STEPS):
         try:
-            res = step(state_dir, request_id, token=token)
+            res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token)
         except Exception:
             break
         try:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 SCHEMA = """
@@ -90,14 +91,36 @@ CREATE TABLE IF NOT EXISTS child_calls (
   session_id TEXT,
   output_path TEXT
 );
+CREATE TABLE IF NOT EXISTS invocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invocation_id TEXT NOT NULL UNIQUE,
+  request_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  cmd_json TEXT NOT NULL,
+  workspace TEXT NOT NULL,
+  owner_token TEXT NOT NULL,
+  pid INTEGER,
+  pgid INTEGER,
+  stdout_path TEXT NOT NULL,
+  stderr_path TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  state TEXT NOT NULL,
+  rc INTEGER,
+  session_id TEXT,
+  session_kind TEXT,
+  task_json TEXT,
+  ended_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
 CREATE INDEX IF NOT EXISTS idx_questions_req ON questions(request_id);
 CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id);
+CREATE INDEX IF NOT EXISTS idx_invocations_request ON invocations(request_id);
+CREATE INDEX IF NOT EXISTS idx_invocations_state ON invocations(state);
 """
 
 TERMINAL = ("succeeded", "failed", "cancelled")
-ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked")
+ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked", "cancelling")
 
 
 def ensure_state_dir(state_dir: str | os.PathLike) -> Path:
@@ -130,10 +153,22 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     first = not db.exists()
     con = sqlite3.connect(str(db), timeout=10.0, isolation_level=None)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    con.execute("PRAGMA foreign_keys=ON;")
-    con.executescript(SCHEMA)
+    # Concurrent first connections may race on WAL setup; retry briefly.
+    last_err = None
+    for _ in range(20):
+        try:
+            con.execute("PRAGMA journal_mode=WAL;")
+            con.execute("PRAGMA synchronous=NORMAL;")
+            con.execute("PRAGMA foreign_keys=ON;")
+            con.executescript(SCHEMA)
+            break
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if "locked" not in str(e).lower():
+                raise
+            time.sleep(0.05)
+    else:
+        raise last_err or sqlite3.OperationalError("database locked during setup")
     # Lightweight migration for DBs created before owner lease columns.
     cols = {r["name"] for r in con.execute("PRAGMA table_info(jobs)").fetchall()}
     if "owner_token" not in cols:
