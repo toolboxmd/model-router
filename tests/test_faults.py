@@ -241,6 +241,10 @@ class TestCapacityPolicy(unittest.TestCase):
             sd, "muse-spark-xhigh-free", free_status)
         self.assertEqual(nxt, "muse-spark-xhigh-go")
         self.assertIsNone(blocker)
+        # The stored lane decides where a shared route continues.
+        self.assertEqual(core.select_implementation_route(sd, "muse-spark-xhigh-go", free_status,
+                                                          lane="implementation_hard"),
+                         ("kimi-k3-go", None))
         # Duplicate recover must not reset capacity memory.
         core.recover_one(sd, "c1")
         self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
@@ -250,15 +254,18 @@ class TestCapacityPolicy(unittest.TestCase):
             "muse-spark-xhigh-free", core.exhausted_routes(sd))
         self.assertEqual(nxt2, "muse-spark-xhigh-go")
         self.assertIsNone(blocker2)
-        # Unavailable next eligible route is a precise blocker, not operational.
+        # After Go Muse the default lane continues on another family; every
+        # policy route has an adapter, so there is no blocker, and the lane
+        # ends with (None, None) instead of an inoperable placeholder.
         nxt3, blocker3 = policy.next_capacity_route("muse-spark-xhigh-go", set())
-        self.assertEqual(nxt3, "go-deepseek-v4.1-flash")
-        self.assertTrue(blocker3)
-        self.assertIn("no live-exercised adapter", blocker3)
-        self.assertFalse(policy.is_operational("go-deepseek-v4.1-flash"))
-        self.assertFalse(policy.is_operational("terra/max"))
-        self.assertFalse(policy.is_operational("kimi-k2.7-code"))
-        self.assertFalse(policy.is_operational("grok-4.6/medium"))
+        self.assertEqual(nxt3, "glm-5.3-go")
+        self.assertIsNone(blocker3)
+        self.assertEqual(policy.next_capacity_route("glm-5.3-go", set()), (None, None))
+        self.assertTrue(policy.is_operational("glm-5.3-go"))
+        for gone in ("go-deepseek-v4.1-flash", "terra/max", "kimi-k2.7-code", "grok-4.6/medium",
+                     "astra/medium", "opus-5/high"):
+            self.assertFalse(policy.is_operational(gone))
+            self.assertIn("unsupported route", policy.route_blocker(gone))
         self.assertIsNone(policy.route_blocker("muse-spark-xhigh-free"))
         # Unknown reset stays unknown; no invented daily reset.
         core.record_capacity(sd, "muse-spark-xhigh-go", "exhausted",
@@ -313,6 +320,54 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         def timed_run(cmd, cwd=None, timeout=None, **kw):
             return run(cmd, cwd, timeout_secs or timeout, **kw)
         return timed_run
+
+    def test_route_params_flow_from_policy_to_owned_server(self):
+        run = self._setup("ok")
+        for route, expect_model, expect_variant in (
+                ("muse-spark-xhigh-free", {"providerID": "opencode", "modelID": "muse-spark-1.3-contributor-free"}, "xhigh"),
+                ("muse-spark-xhigh-go", {"providerID": "opencode-go", "modelID": "muse-spark-1.3-contributor"}, "xhigh"),
+                ("glm-5.3-flash-go", {"providerID": "opencode-go", "modelID": "glm-5.3-flash"}, None),
+                ("kimi-k2.7-code-go", {"providerID": "opencode-go", "modelID": "kimi-k2.7-code"}, None),
+                ("grok-4.6-go", {"providerID": "opencode-go", "modelID": "grok-4.6"}, "medium"),
+                ("grok-4.6-xai", {"providerID": "xai", "modelID": "grok-4.6"}, "medium")):
+            con = store.connect(self.sd)
+            try:
+                con.execute("UPDATE jobs SET route=?, status='running' WHERE request_id='oc1'", (route,))
+            finally:
+                con.close()
+            res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+            self.assertEqual(res["action"], "implementation_ok", route)
+            body = [r for r in self._requests() if r["path"].endswith("/prompt_async")][-1]["body"]
+            self.assertEqual(body["model"], expect_model)
+            self.assertEqual(body.get("variant"), expect_variant)
+            self.assertEqual(body["agent"], "build")
+            job = core.get_job(self.sd, "oc1")
+            self.assertEqual(job["model"], policy.opencode_route_params(route)[0])
+            self.assertEqual(job["effort"], expect_variant or "default")
+        self._no_secret_leak()
+
+    def _set_route(self, route):
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET route=?, status='running' WHERE request_id='oc1'", (route,))
+        finally:
+            con.close()
+
+    def test_one_turn_route_is_refused_a_second_turn(self):
+        run = self._setup("ok")
+        self._set_route("kimi-k3-go")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "implementation_ok")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='oc1'",
+                        (json.dumps({"seq": 1, "last_action": {"action": "implementation"}}),))
+        finally:
+            con.close()
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual((res2["action"], res2["reason"]), ("blocked", "one_turn_per_job"))
+        prompts = [r for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual(len(prompts), 1)
 
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):

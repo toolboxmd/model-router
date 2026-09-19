@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   controller_state TEXT,
   last_error_json TEXT,
   planner_cwd TEXT,
-  owner_start TEXT
+  owner_start TEXT,
+  lane TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,6 +168,16 @@ def ensure_state_dir(state_dir: str | os.PathLike) -> Path:
     return root
 
 
+def _add_column(con: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
+    """Add a migration column; a concurrent first connection may have added
+    it a moment earlier, which is not an error."""
+    try:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+
+
 def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     root = ensure_state_dir(state_dir)
     db = root / "jobs.db"
@@ -192,9 +203,9 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     # Lightweight migration for DBs created before owner lease columns.
     cols = {r["name"] for r in con.execute("PRAGMA table_info(jobs)").fetchall()}
     if "owner_token" not in cols:
-        con.execute("ALTER TABLE jobs ADD COLUMN owner_token TEXT")
+        _add_column(con, "jobs", "owner_token", "TEXT")
     if "owner_pid" not in cols:
-        con.execute("ALTER TABLE jobs ADD COLUMN owner_pid INTEGER")
+        _add_column(con, "jobs", "owner_pid", "INTEGER")
     for _col, _ddl in (
         ("codex_task_id", "TEXT"),
         ("opencode_session_id", "TEXT"),
@@ -207,9 +218,10 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("last_error_json", "TEXT"),
         ("planner_cwd", "TEXT"),
         ("owner_start", "TEXT"),
+        ("lane", "TEXT"),
     ):
         if _col not in cols:
-            con.execute(f"ALTER TABLE jobs ADD COLUMN {_col} {_ddl}")
+            _add_column(con, "jobs", _col, _ddl)
     inv_cols = {r["name"] for r in con.execute("PRAGMA table_info(invocations)").fetchall()}
     for _col, _ddl in (
         ("process_start", "TEXT"),
@@ -223,7 +235,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("action_key", "TEXT"),
     ):
         if _col not in inv_cols:
-            con.execute(f"ALTER TABLE invocations ADD COLUMN {_col} {_ddl}")
+            _add_column(con, "invocations", _col, _ddl)
     if first:
         try:
             os.chmod(db, 0o600)

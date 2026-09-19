@@ -456,10 +456,13 @@ class TestPolicy(Base):
         self.assertEqual(core.exhausted_routes(self.sd), set())
 
     def test_recovery_order_bounded(self):
-        self.assertEqual(policy.next_recovery_route(None), "grok-4.6/medium")
-        self.assertEqual(policy.next_recovery_route("grok-4.6/medium"), "astra/medium")
-        self.assertEqual(policy.next_recovery_route("astra/medium"), "opus-5/high")
-        self.assertIsNone(policy.next_recovery_route("opus-5/high"))
+        # One escalation: Grok 4.6 on Go, the same model on the xAI pool, then
+        # the planner. Astra and Opus are no longer automatic recovery routes.
+        self.assertEqual(policy.next_recovery_route(None), "grok-4.6-go")
+        self.assertEqual(policy.next_recovery_route("muse-spark-xhigh-free"), "grok-4.6-go")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-xai")
+        self.assertIsNone(policy.next_recovery_route("grok-4.6-xai"))
+        self.assertIsNone(policy.next_recovery_route("opus-5/high-review"))
 
     def test_envelope(self):
         a = policy.make_action("implementation", "muse-spark-xhigh-free", {"t": 1})

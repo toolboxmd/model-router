@@ -1,8 +1,12 @@
 # Model Router
 
-A small Codex routing contract. AgentsMD owns workflow, authority, and proof;
-Model Router owns the model choices in [one policy table](skills/model-routing/references/codex.md).
-The [routing Skill](skills/model-routing/SKILL.md) loads only the active host's reference.
+One versioned routing policy and a durable runner. AgentsMD owns workflow,
+authority, and proof; Model Router owns the routes in
+[`runner/policy.py`](runner/policy.py), from which the
+[Codex skill reference](skills/model-routing/references/codex.md) is generated.
+The [routing Skill](skills/model-routing/SKILL.md) sends implementation to the
+runner and keeps native Codex subagents for ticket review. Terms are in
+[GLOSSARY.md](GLOSSARY.md).
 
 ## Install from a release
 
@@ -30,7 +34,7 @@ It is not installed or started automatically. See [RUNNER.md](RUNNER.md).
 
 ```
 python -m runner --state-dir DIR submit --request-id ID --task-file TASK.json \
-  --workspace PATH --planner-session SID --start
+  --workspace PATH --planner-session SID --lane default --start
 python -m runner --state-dir DIR status --request-id ID
 python -m runner --state-dir DIR recover --request-id ID
 ```
