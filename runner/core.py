@@ -243,7 +243,10 @@ _PKG_ROOT = str(Path(__file__).resolve().parents[1])
 
 RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "unknown worker ownership", "live invocation",
-                        "orphaned server", "timeout_pending", "cancellation_pending")
+                        "orphaned server", "timeout_pending", "cancellation_pending",
+                        "controller_step_budget_exhausted")
+# Steps across every launch of one job; a launch has MAX_LOOP_STEPS of them.
+MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
 
 INVOCATION_KINDS = (
@@ -1474,7 +1477,11 @@ def harness_version_for(kind: str) -> str | None:
 def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
     if crashed:
         return "crashed"
-    signal_name = result_obj.get("signal") if isinstance(result_obj, dict) else None
+    signal_name = None
+    if isinstance(result_obj, dict):
+        signal_name = result_obj.get("signal")
+        if signal_name is None and isinstance(result_obj.get("envelope"), dict):
+            signal_name = result_obj["envelope"].get("signal")
     if signal_name == "exhausted":
         return "quota"
     if signal_name == "overloaded":
@@ -2161,6 +2168,37 @@ def post_question(state_dir, request_id: str, qid: str, prompt: str,
         con2.close()
 
 
+def clear_question(state_dir, request_id: str, qid: str) -> dict:
+    """Operator action: forget a stored question so the dispatcher's next
+    question with that id is asked afresh. Clears a planner_question_conflict
+    block when that was the reason."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        job = con.execute("SELECT status, block_reason FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise NotFoundError(f"unknown request: {request_id}")
+        cur = con.execute("DELETE FROM questions WHERE request_id=? AND qid=?", (request_id, qid))
+        if cur.rowcount == 0:
+            con.execute("ROLLBACK")
+            raise NotFoundError(f"unknown question: {qid}")
+        if job["status"] == "blocked" and str(job["block_reason"] or "").startswith("planner_question_conflict"):
+            con.execute("UPDATE jobs SET status='running', block_reason=NULL, updated_at=? WHERE request_id=?",
+                        (_utcnow(), request_id))
+        _event(con, request_id, "question_cleared", {"qid": qid})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"request_id": request_id, "qid": qid, "cleared": True}
+
+
 def list_questions(state_dir, request_id: str, only_pending: bool = True) -> list[dict]:
     con = store.connect(state_dir)
     try:
@@ -2647,6 +2685,20 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.execute("ROLLBACK")
             return {"request_id": request_id, "action": "blocked-sticky",
                     "status": "blocked", "reason": job["block_reason"]}
+        # A dispatch whose supervisor could not spawn was closed as failed by
+        # the controller; if that controller died before blocking the job,
+        # the job would sit running without an owner. Block it here.
+        if status in ("pending", "running") and not job["codex_task_id"]:
+            failed_dispatch = [inv for inv in _list_invocations(state_dir, request_id)
+                               if inv.get("kind") == "codex_dispatch" and inv.get("state") == "failed"]
+            live_or_open = [inv for inv in _list_invocations(state_dir, request_id)
+                            if inv.get("state") in LIVE_INVOCATION_STATES]
+            if failed_dispatch and not live_or_open:
+                mark_blocked(f"codex_dispatch_failed rc={failed_dispatch[-1].get('rc')} "
+                             "(consumed by recovery): the dispatch never started")
+                con.execute("COMMIT")
+                return {"request_id": request_id, "action": "blocked-failed-dispatch",
+                        "status": "blocked"}
         orphans_left = [inv for inv in _list_invocations(state_dir, request_id)
                         if _invocation_ownership(inv) == "orphaned"]
         if orphans_left:

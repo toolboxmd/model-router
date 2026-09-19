@@ -486,11 +486,20 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     resumed_id = adapters.parse_codex_task_id(out)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
                   session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
+    if rc != 0:
+        # A resume that failed by exit code is a failed turn with its error
+        # kept, whatever thread it named or did not reach.
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "codex_resume", "rc": rc,
+                                 "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_resume_failed rc={rc}: turn not completed")
+        return {"action": "blocked", "reason": "codex_resume_failed"}
     if resumed_id != task_id:
+        # A turn on another thread, completed or not, never replaces the saved task.
         _mark_blocked(state_dir, request_id,
                       f"luna_task_mismatch: resume reported {str(resumed_id or 'no thread')[:24]}")
         return {"action": "blocked", "reason": "luna_task_mismatch"}
-    if rc != 0 or "turn.completed" not in (out or ""):
+    if "turn.completed" not in (out or ""):
         _persist_error_evidence(state_dir, request_id,
                                 {"source": "codex_resume", "rc": rc,
                                  "stderr": (err or "")[:1000]})
@@ -799,9 +808,23 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                               f"route_transfer_abort_failed: session not confirmed idle after {signal}")
                 return {"action": "blocked", "reason": "route_transfer_abort_failed"}
             return _move_after_signal(state_dir, request_id, route, signal, evidence)
-        _mark_blocked(state_dir, request_id,
-                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
-        return {"action": "blocked", "reason": "implementation_failed"}
+        if not full or rc in (124, 143) or full.get("rc") in (124, 143):
+            # No control result means the supervisor never finished its loop
+            # (a crash or a stop); that is an ownership matter, not a worker
+            # failure, and it blocks as before.
+            _mark_blocked(state_dir, request_id,
+                          f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
+            return {"action": "blocked", "reason": "implementation_failed"}
+        # A hard provider or worker error ends the turn as failed. The
+        # dispatcher hears about it and the escalation ladder decides the
+        # next route; nothing is retried here.
+        report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
+                                    status="failed", error=full.get("error"))
+        _set_phase(state_dir, request_id, phase="implementation_failed",
+                   opencode_session_id=session_id, report_path=report.get("report_path"))
+        return {"action": "implementation_failed", "session": session_id, "rc": rc,
+                "error": full.get("error"), "report": report,
+                "output": str(full.get("assistant_text") or "")}
 
     cmd = adapters.build_opencode_cmd(workspace, prompt, model=model, variant=variant, agent=agent,
                                       allowance=allowance, session_id=saved_session)
@@ -878,7 +901,8 @@ def _git_changes(workspace: str) -> tuple[list[str], str, str | None]:
 
 
 def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: str,
-                       full: dict, session_id: str | None) -> dict:
+                       full: dict, session_id: str | None, status: str = "ok",
+                       error=None) -> dict:
     """Write report.json, proof.log, diff.patch, and worker.txt for one turn.
 
     The runner runs the task's own proof command and records the exit code;
@@ -913,7 +937,8 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         "stage": "implementation", "route": route, "policy_version": policy.POLICY_VERSION,
         "model": model, "variant": variant, "observed_model": observed,
         "observed_variant": am.get("variant"), "session_id": session_id,
-        "finish": full.get("finish"), "status": "ok",
+        "finish": full.get("finish"), "status": status,
+        "error": adapters.redact_nested(error) if error else None,
         "changed_files": files, "workspace_note": note,
         "proof_command": proof_cmd, "proof_exit_code": proof_rc,
         "proof_log": str(proof_log), "diff": str(turn_dir / "diff.patch"),
@@ -953,6 +978,8 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
     except OSError:
         tail = ""
     fields = {
+        "turn_status": report.get("status") or ("failed" if impl.get("action") == "implementation_failed" else "ok"),
+        "turn_error": report.get("error"),
         "route": job.get("route"), "model": job.get("model"),
         "observed_model": report.get("observed_model"),
         "session": impl.get("session") or "", "finish": impl.get("finish") or "",
@@ -1048,6 +1075,11 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
     answer_text = None
     for q in core.list_questions(state_dir, request_id, only_pending=False):
         if q["qid"] == qid and q["status"] == "answered" and q.get("answer"):
+            if q.get("prompt") != prompt_q:
+                _mark_blocked(state_dir, request_id,
+                              f"planner_question_conflict: {qid} was answered for a different prompt; "
+                              f"clear it with `questions --clear {qid}` or use a new qid")
+                return {"action": "blocked", "reason": "question_conflict"}
             answer_text = str(q["answer"])
     if answer_text is None:
         cb = planner_callback(state_dir, request_id, qid, prompt_q, run_cmd=run_cmd)
@@ -1064,18 +1096,140 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
             "luna_action": r.get("luna_action")}
 
 
+LADDER_RUNGS = ("initial", "correction", "correction_fresh", "recovery")
+
+
+def _ladder(job: dict) -> dict:
+    st = _load_controller_state(job)
+    ladder = st.get("ladder") if isinstance(st.get("ladder"), dict) else {}
+    return {"failures": int(ladder.get("failures") or 0),
+            "rung": ladder.get("rung") or "initial",
+            "escalated": bool(ladder.get("escalated"))}
+
+
+def _clear_session(state_dir, request_id: str) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        con.execute("UPDATE jobs SET opencode_session_id=NULL, updated_at=? WHERE request_id=?",
+                    (core._utcnow(), request_id))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict | None:
+    """Choose the rung for the next implementation turn from the failures so far.
+
+    0 failures: the initial route. 1: a correction in the same worker
+    session. 2: a fresh correction on the correction stage's route. 3: the
+    single escalation to the recovery stage. 4 or more: the job ends failed
+    with its evidence, which is the planner's to act on. A pool move inside
+    the recovery stage is not a second escalation."""
+    job = core.get_job(state_dir, request_id)
+    ladder = _ladder(job)
+    failures = ladder["failures"]
+    if failures <= 0:
+        return None
+    if failures == 1:
+        rung = "correction"
+        target = None
+    elif failures == 2:
+        rung = "correction_fresh"
+        target = policy.stage_routes("correction")[0]
+    elif failures == 3:
+        rung = "recovery"
+        target = policy.next_recovery_route(None)
+    else:
+        reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
+                                          .glob("turn-*/report.json")))
+        error = {"code": "ESCALATION_EXHAUSTED", "failures": failures, "reports": reports,
+                 "message": "initial turn, one correction, one fresh correction, and one escalation failed"}
+        if token:
+            try:
+                core.fail(state_dir, request_id, token, error)
+            except core.OwnershipError as e:
+                raise core.LeaseLostError(str(e))
+        else:
+            _fail_offline(state_dir, request_id, error)
+        return {"action": "failed", "reason": "escalation_exhausted", "reports": reports}
+    if rung == ladder["rung"]:
+        return None
+    if target and target != job.get("route"):
+        _clear_session(state_dir, request_id)
+        _switch_route(state_dir, request_id, target,
+                      "escalation" if rung == "recovery" else "correction",
+                      {"source": "ladder", "failures": failures})
+    _set_phase(state_dir, request_id, ladder={"failures": failures, "rung": rung,
+                                              "escalated": ladder["escalated"] or rung == "recovery"})
+    return None
+
+
+def _fail_offline(state_dir, request_id: str, error: dict) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        cur = con.execute("SELECT status FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if cur is None or cur["status"] in store.TERMINAL:
+            con.execute("ROLLBACK")
+            return
+        con.execute("UPDATE jobs SET status='failed', error_class=?, result_json=?, updated_at=?"
+                    " WHERE request_id=?",
+                    ("escalation_exhausted", json.dumps({"ok": False, "error": error}), core._utcnow(),
+                     request_id))
+        core._event(con, request_id, "failed", {"reason": "escalation_exhausted"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    core._mirror_result(state_dir, request_id, json.dumps({"request_id": request_id, "status": "failed",
+                                                          "result": {"ok": False, "error": error}}))
+
+
+def _record_turn_outcome(state_dir, request_id: str, impl: dict) -> None:
+    """A turn counts as failed when the worker or provider errored or the
+    task's proof failed. Success does not reset the ladder."""
+    report = impl.get("report") if isinstance(impl.get("report"), dict) else {}
+    proof_rc = report.get("proof_exit_code")
+    failed = impl.get("action") == "implementation_failed" or (proof_rc is not None and proof_rc != 0)
+    if not failed:
+        return
+    job = core.get_job(state_dir, request_id)
+    ladder = _ladder(job)
+    ladder["failures"] += 1
+    _set_phase(state_dir, request_id, ladder=ladder)
+
+
 def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
-                                  run_cmd, use_owned_server: bool = False) -> dict:
+                                  run_cmd, use_owned_server: bool = False,
+                                  token: str | None = None) -> dict:
     """One bounded implementation transition: OpenCode then Luna resume."""
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
+    ended = _apply_ladder(state_dir, request_id, token)
+    if ended is not None:
+        return ended
     impl = run_implementation(state_dir, request_id, artifact=artifact,
                               payload=payload, run_cmd=run_cmd,
                               use_owned_server=use_owned_server)
-    if impl.get("action") != "implementation_ok":
-        # transferred_to_go or blocked: the next step retries on the new
-        # route or stops; never fork a second writer here.
+    if impl.get("action") not in ("implementation_ok", "implementation_failed"):
+        # transferred_to_go, route_switched, or blocked: the next step
+        # retries on the new route or stops; never fork a second writer here.
         return impl
+    _record_turn_outcome(state_dir, request_id, impl)
     job = core.get_job(state_dir, request_id)
     evidence = _implementation_evidence(job, impl)
     r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
@@ -1107,7 +1261,7 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None,
         return _handle_question_action(state_dir, request_id, last, run_cmd)
     if action_name == "implementation":
         return _handle_implementation_action(state_dir, request_id, last, run_cmd,
-                                             use_owned_server=use_owned_server)
+                                             use_owned_server=use_owned_server, token=token)
     if action_name == "completion":
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
@@ -1115,6 +1269,21 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None,
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}
+
+
+def _count_step(state_dir, request_id: str) -> int:
+    """Steps taken by every launch of this job; the per-launch budget can
+    be renewed by `recover`, the job budget cannot."""
+    job = core.get_job(state_dir, request_id)
+    st = _load_controller_state(job)
+    total = int(st.get("steps_total") or 0) + 1
+    try:
+        _set_phase(state_dir, request_id, steps_total=total)
+    except core.LeaseLostError:
+        raise
+    except Exception:
+        pass
+    return total
 
 
 def _advertise(state_dir: str, request_id: str, token: str) -> None:
@@ -1204,6 +1373,11 @@ def run_controller_process(state_dir: str, request_id: str, token: str,
                   "implementation-resumed", "transferred_to_go", "route_switched")
     for _ in range(MAX_LOOP_STEPS):
         try:
+            total = _count_step(state_dir, request_id)
+            if total > core.MAX_JOB_STEPS:
+                _mark_blocked(state_dir, request_id,
+                              f"job_step_budget_exhausted after {total} steps across launches")
+                break
             res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token,
                        use_owned_server=True)
         except core.LeaseLostError:

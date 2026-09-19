@@ -539,6 +539,23 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(core.result_view(self.sd, "oc1")["reports"], [report["report_path"]])
         self._no_secret_leak()
 
+    def test_hard_error_ends_the_turn_failed_without_blocking(self):
+        run = self._setup("hard_error")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "implementation_failed")
+        job = core.get_job(self.sd, "oc1")
+        self.assertNotEqual(job["status"], "blocked")
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        report = json.loads(Path(res["report"]["report_path"]).read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("context_length_exceeded", json.dumps(report["error"]))
+        inv = [i for i in core._list_invocations(self.sd, "oc1") if i["kind"] == "opencode_control"][-1]
+        self.assertEqual(inv["terminal_class"], "hard_error")
+        controller._record_turn_outcome(self.sd, "oc1", res)
+        self.assertEqual(controller._ladder(core.get_job(self.sd, "oc1"))["failures"], 1)
+        self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+        self.assertNotIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
+
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):
             for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):

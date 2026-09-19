@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.0] - 2026-09-19
+
+### Added
+
+- Escalation ladder with one recovery escalation and a terminal hand-back to the planner, job-level step budget with recover-owned launch budget, question conflict clearing, resume and recovery fixes from #8
+
 ## [0.6.0] - 2026-09-19
 
 ### Added

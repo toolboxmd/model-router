@@ -19,7 +19,7 @@ python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-fi
   [--timeout-secs S] [--start | --no-start]
 python -m runner --state-dir DIR start --request-id ID
 python -m runner --state-dir DIR status --request-id ID
-python -m runner --state-dir DIR questions --request-id ID [--all]
+python -m runner --state-dir DIR questions --request-id ID [--all | --clear QID]
 python -m runner --state-dir DIR answer --request-id ID --qid Q --answer TEXT
 python -m runner --state-dir DIR cancel --request-id ID
 python -m runner --state-dir DIR recover (--request-id ID | --all)
@@ -80,7 +80,29 @@ allowance; the runner never invents a reset time.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
 but cannot edit. The controller runs at most 12 transitions per launch and
-then blocks with a reason instead of spinning.
+then blocks with `controller_step_budget_exhausted`; `recover` restarts such
+a job with a fresh launch budget. A job budget of 48 transitions across all
+launches blocks with `job_step_budget_exhausted`, which stays blocked.
+
+Escalation ladder. A turn fails when the worker or provider errors (not a
+capacity signal, which moves routes instead) or when the task's own proof
+command exits non-zero. The first failure leads to a correction in the same
+worker session on the same route. The second leads to a fresh correction on
+the correction stage's route (Kimi K2.7 Code). The third is the single
+escalation to the recovery stage (Grok 4.6 on Go, then on the xAI
+subscription if Go is exhausted; that pool move is not a second escalation).
+A fourth failure ends the job as `failed` with `ESCALATION_EXHAUSTED` and
+the turn reports listed in `result`, which is the planner's to act on. A
+failed turn does not block the job: the dispatcher receives the report and
+decides; the runner enforces the ceiling.
+
+A stored answer is reused only when the stored prompt matches the
+dispatcher's prompt; a reused `qid` with a different prompt blocks with
+`planner_question_conflict`, cleared by `questions --clear QID` or by the
+dispatcher using a new qid. When the live planner callback fails or reports
+another session after the question was answered publicly through `answer`,
+the stored public answer wins. A resume that fails before `thread.started`
+records `codex_resume_failed` with its exit code, as recovery does.
 
 Before resuming the planner, the runner also waits up to 30 seconds for the
 session transcript to be unchanged for 5 seconds; a planner still writing

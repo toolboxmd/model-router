@@ -102,6 +102,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("questions", help="list pending questions")
     p.add_argument("--request-id", required=True)
     p.add_argument("--all", action="store_true", help="include answered")
+    p.add_argument("--clear", default=None, metavar="QID",
+                   help="operator action: forget a stored question (clears planner_question_conflict)")
 
     p = sub.add_parser("post-question", help="worker-internal: persist a question")
     p.add_argument("--request-id", required=True)
@@ -197,6 +199,8 @@ def main(argv=None) -> int:
         if args.cmd == "status":
             return _out(core.status_view(sd, args.request_id))
         if args.cmd == "questions":
+            if args.clear:
+                return _out(core.clear_question(sd, args.request_id, args.clear))
             qs = core.list_questions(sd, args.request_id, only_pending=not args.all)
             return _out({"request_id": args.request_id, "questions": qs})
         if args.cmd == "post-question":

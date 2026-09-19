@@ -103,6 +103,10 @@ def run_turn(sid, model, directory, aborted):
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "rate limited", "statusCode": 429, "isRetryable": True,
             "responseBody": json.dumps({"type": "error", "error": {"type": "RateLimitError"}})}})
+    elif mode == "hard_error":
+        msg = assistant(sid, model, error={"name": "APIError", "data": {
+            "message": "context length exceeded", "statusCode": 400, "isRetryable": False,
+            "responseBody": json.dumps({"type": "error", "error": {"type": "context_length_exceeded"}})}})
     elif mode == "go_limit":
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "go exceeded", "statusCode": 429, "isRetryable": False,
