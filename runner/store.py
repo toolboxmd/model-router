@@ -53,14 +53,20 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_error_json TEXT,
   planner_cwd TEXT,
   owner_start TEXT,
-  lane TEXT
+  lane TEXT,
+  job_kind TEXT,
+  replay_of TEXT,
+  planner_harness TEXT,
+  base_commit TEXT,
+  head_commit TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL,
   ts TEXT NOT NULL,
   kind TEXT NOT NULL,
-  payload_json TEXT NOT NULL
+  payload_json TEXT NOT NULL,
+  schema_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS launches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +127,19 @@ CREATE TABLE IF NOT EXISTS invocations (
   timeout_secs INTEGER,
   meta_json TEXT,
   supervisor_start TEXT,
-  action_key TEXT
+  action_key TEXT,
+  stage TEXT,
+  requested_route TEXT,
+  policy_version TEXT,
+  reason TEXT,
+  terminal_class TEXT,
+  harness_version TEXT,
+  usage_json TEXT,
+  observed_model TEXT,
+  elapsed_secs REAL,
+  native_ids_json TEXT,
+  report_path TEXT,
+  schema_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS capacity (
   route TEXT PRIMARY KEY,
@@ -140,6 +158,10 @@ CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_request ON invocations(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_state ON invocations(state);
 """
+
+# Ledger contract version for events and invocations; Agent Observer reads
+# the ledger directly and checks this before importing.
+SCHEMA_VERSION = 2
 
 TERMINAL = ("succeeded", "failed", "cancelled")
 ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked", "cancelling")
@@ -223,9 +245,17 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("planner_cwd", "TEXT"),
         ("owner_start", "TEXT"),
         ("lane", "TEXT"),
+        ("job_kind", "TEXT"),
+        ("replay_of", "TEXT"),
+        ("planner_harness", "TEXT"),
+        ("base_commit", "TEXT"),
+        ("head_commit", "TEXT"),
     ):
         if _col not in cols:
             _add_column(con, "jobs", _col, _ddl)
+    ev_cols = {r["name"] for r in con.execute("PRAGMA table_info(events)").fetchall()}
+    if "schema_version" not in ev_cols:
+        _add_column(con, "events", "schema_version", "INTEGER")
     cap_cols = {r["name"] for r in con.execute("PRAGMA table_info(capacity)").fetchall()}
     for _col in ("pool", "model", "window"):
         if _col not in cap_cols:
@@ -241,6 +271,18 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("meta_json", "TEXT"),
         ("supervisor_start", "TEXT"),
         ("action_key", "TEXT"),
+        ("stage", "TEXT"),
+        ("requested_route", "TEXT"),
+        ("policy_version", "TEXT"),
+        ("reason", "TEXT"),
+        ("terminal_class", "TEXT"),
+        ("harness_version", "TEXT"),
+        ("usage_json", "TEXT"),
+        ("observed_model", "TEXT"),
+        ("elapsed_secs", "REAL"),
+        ("native_ids_json", "TEXT"),
+        ("report_path", "TEXT"),
+        ("schema_version", "INTEGER"),
     ):
         if _col not in inv_cols:
             _add_column(con, "invocations", _col, _ddl)
@@ -292,6 +334,11 @@ def append_text(path: Path, text: str) -> None:
 
 def output_path_for(root: Path, request_id: str) -> Path:
     return root / "outputs" / f"{request_id}.log"
+
+
+def job_dir_for(root: Path, request_id: str) -> Path:
+    """Per-job directory holding turn reports, proof logs, and diffs."""
+    return root / "outputs" / request_id
 
 
 def result_path_for(root: Path, request_id: str) -> Path:

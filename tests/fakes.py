@@ -53,7 +53,9 @@ def assistant(sid, model, text="", error=None, finish="stop"):
     info = {"id": nid("msg"), "sessionID": sid, "role": "assistant",
             "time": {"created": 1, "completed": 2},
             "providerID": model.get("providerID"), "modelID": model.get("modelID"),
-            "variant": "xhigh", "finish": finish}
+            "variant": "xhigh", "finish": finish,
+            "tokens": {"input": 100, "output": 20, "reasoning": 5, "cache": {"read": 300, "write": 0}},
+            "cost": 0.0}
     if error:
         info["error"] = error
     parts = [{"type": "text", "text": text}] if text else []
@@ -215,12 +217,21 @@ if mode == "fork":
     sid = "00000000-0000-4000-8000-000000000000"
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "result": os.environ.get("FAKE_CLAUDE_ANSWER", "Approved as written."),
-                  "session_id": sid}))
+                  "session_id": sid, "uuid": "fake-result-uuid", "duration_ms": 12,
+                  "num_turns": 1, "total_cost_usd": 0.0,
+                  "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 0}}))
 '''
+
+
+VERSION_GUARD = (
+    "import sys as _vs\n"
+    "if _vs.argv[1:2] == ['--version']:\n"
+    "    print('fake-harness 0.0.0'); raise SystemExit(0)\n"
+)
 
 
 def write_fake(bindir, name, body, python):
     path = bindir / name
-    path.write_text("#!" + python + "\n" + body, encoding="utf-8")
+    path.write_text("#!" + python + "\n" + VERSION_GUARD + body, encoding="utf-8")
     path.chmod(0o700)
     return path

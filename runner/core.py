@@ -745,11 +745,16 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             "INSERT INTO invocations("
             " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
             " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
-            " state, task_json, timeout_secs, meta_json, action_key"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?)",
+            " state, task_json, timeout_secs, meta_json, action_key,"
+            " stage, requested_route, policy_version, reason, harness_version, schema_version"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?)",
             (invocation_id, request_id, kind, json.dumps(list(cmd)),
              workspace, owner_token, str(stdout_path), str(stderr_path),
-             started_at, job.get("task_json"), int(timeout), meta_json, key),
+             started_at, job.get("task_json"), int(timeout), meta_json, key,
+             (meta or {}).get("stage") or STAGE_FOR_KIND.get(kind),
+             (meta or {}).get("route") or (job.get("route") if kind.startswith("opencode") else None),
+             policy.POLICY_VERSION, (meta or {}).get("reason") or "initial",
+             harness_version_for(kind), store.SCHEMA_VERSION),
         )
         _event(con, request_id, "invocation_attempting",
                {"invocation_id": invocation_id[:16], "kind": kind})
@@ -846,6 +851,7 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     except Exception:
         pass
     _mark_collected(state_dir, request_id, invocation_id, reused=False)
+    _measure_invocation(state_dir, request_id, invocation_id)
     try:
         log = store.output_path_for(root, request_id)
         store.append_text(log, f"[{kind} invocation={invocation_id[:8]} rc={rc}]\n")
@@ -984,6 +990,7 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         pass
     kind = inv.get("kind") or ""
     sid, skind = _parse_session_from_output(kind, stdout_text, stderr_text, job)
+    head_commit = _workspace_head(job.get("workspace"))  # before the write lock
     try:
         inv_cmd = json.loads(inv.get("cmd_json") or "[]")
     except ValueError:
@@ -1156,8 +1163,8 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                                                            sort_keys=True)}
                 con.execute(
                     "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
-                    " updated_at=? WHERE request_id=?",
-                    (json.dumps(result), now, request_id),
+                    " head_commit=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(result), head_commit, now, request_id),
                 )
                 _event(con, request_id, "completed", {"via": "consumed-invocation"})
                 applied = "completed"
@@ -1193,6 +1200,7 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         raise
     finally:
         con.close()
+    _measure_invocation(state_dir, request_id, inv["invocation_id"], crashed=inv.get("rc") is None)
     if applied == "completed":
         try:
             root = store.ensure_state_dir(state_dir)
@@ -1412,9 +1420,208 @@ def _mirror_result(state_dir, request_id: str, text: str) -> None:
 def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -> None:
     safe = store.redact_for_log(dict(payload))
     con.execute(
-        "INSERT INTO events(request_id, ts, kind, payload_json) VALUES(?,?,?,?)",
-        (request_id, _utcnow(), kind, json.dumps(safe, sort_keys=True)),
+        "INSERT INTO events(request_id, ts, kind, payload_json, schema_version) VALUES(?,?,?,?,?)",
+        (request_id, _utcnow(), kind, json.dumps(safe, sort_keys=True), store.SCHEMA_VERSION),
     )
+
+
+# ---------------------------------------------------------------------------
+# Measurement (Agent Observer compatible)
+# ---------------------------------------------------------------------------
+
+STAGE_FOR_KIND = {"codex_dispatch": "dispatch", "codex_resume": "dispatch",
+                  "claude_callback": "planning", "opencode_control": "implementation",
+                  "opencode_run": "implementation", "opencode_serve": "implementation"}
+JOB_KINDS = ("ordinary", "experiment", "replay")
+PLANNER_HARNESSES = ("claude", "codex")
+_HARNESS_VERSIONS: dict = {}
+
+
+def _workspace_head(workspace: str | None) -> str | None:
+    """HEAD of the workspace when it is a Git checkout, else None."""
+    if not workspace:
+        return None
+    try:
+        out = subprocess.run(["git", "-C", workspace, "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    sha = (out.stdout or "").strip()
+    return sha if out.returncode == 0 and len(sha) >= 7 else None
+
+
+def harness_version_for(kind: str) -> str | None:
+    """``<binary> --version`` once per process for the harness behind a kind."""
+    if kind in ("codex_dispatch", "codex_resume"):
+        binary = adapters.CODEX_BIN
+    elif kind == "claude_callback":
+        binary = adapters.CLAUDE_BIN
+    elif kind.startswith("opencode"):
+        binary = adapters.OPENCODE_BIN
+    else:
+        return None
+    if binary not in _HARNESS_VERSIONS:
+        try:
+            out = subprocess.run([binary, "--version"], capture_output=True, text=True,
+                                 timeout=5, stdin=subprocess.DEVNULL).stdout
+            first = (out or "").strip().splitlines()
+            _HARNESS_VERSIONS[binary] = first[0][:80] if first else None
+        except Exception:
+            _HARNESS_VERSIONS[binary] = None
+    return _HARNESS_VERSIONS[binary]
+
+
+def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
+    if crashed:
+        return "crashed"
+    signal_name = result_obj.get("signal") if isinstance(result_obj, dict) else None
+    if signal_name == "exhausted":
+        return "quota"
+    if signal_name == "overloaded":
+        return "overloaded"
+    if signal_name == "hard":
+        return "hard_error"
+    if rc == 0:
+        return "completed"
+    if rc == 124:
+        return "timeout"
+    if rc in (143, -15):
+        return "cancelled"
+    return "failed"
+
+
+def _runner_result_line(stdout: str) -> dict:
+    found = {}
+    for line in (stdout or "").splitlines():
+        if line.startswith("RUNNER_RESULT "):
+            try:
+                found = json.loads(line[len("RUNNER_RESULT "):])
+            except ValueError:
+                continue
+    return found if isinstance(found, dict) else {}
+
+
+def measure_output(kind: str, stdout: str, stderr: str, meta: dict | None = None) -> tuple:
+    """(usage, observed_model, native_ids) from a harness's own records.
+
+    Counters are copied verbatim under a ``source`` label and never folded;
+    a harness that reports nothing leaves usage None."""
+    usage = None
+    observed = None
+    ids: dict = {}
+    meta = meta or {}
+    if kind in ("codex_dispatch", "codex_resume"):
+        ids = {"thread_id": None, "turn_ids": [], "agent_message_ids": []}
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            typ = obj.get("type")
+            if typ == "thread.started":
+                ids["thread_id"] = obj.get("thread_id") or obj.get("id")
+            elif typ == "turn.completed":
+                usage = {"source": "codex", **(obj.get("usage") or {})}
+                if obj.get("turn_id"):
+                    ids["turn_ids"].append(obj["turn_id"])
+            elif typ == "item.completed":
+                item = obj.get("item") or {}
+                if item.get("type") == "agent_message" and item.get("id"):
+                    ids["agent_message_ids"].append(item["id"])
+    elif kind == "claude_callback":
+        obj = None
+        text = (stdout or "").strip()
+        try:
+            obj = json.loads(text) if text else None
+        except ValueError:
+            for line in reversed(text.splitlines()):
+                try:
+                    cand = json.loads(line.strip())
+                except ValueError:
+                    continue
+                if isinstance(cand, dict) and cand.get("type") == "result":
+                    obj = cand
+                    break
+        if isinstance(obj, dict):
+            usage = {"source": "claude", **(obj.get("usage") or {})}
+            for key in ("total_cost_usd", "duration_ms", "num_turns"):
+                if obj.get(key) is not None:
+                    usage[key] = obj.get(key)
+            ids = {"session_id": obj.get("session_id"), "uuid": obj.get("uuid")}
+            observed = obj.get("model") if isinstance(obj.get("model"), str) else None
+        if meta.get("prompt_sha256"):
+            ids["prompt_sha256"] = meta["prompt_sha256"]
+    elif kind == "opencode_control":
+        summary = _runner_result_line(stdout)
+        usage = summary.get("usage") if isinstance(summary.get("usage"), dict) else None
+        ids = summary.get("native_ids") if isinstance(summary.get("native_ids"), dict) else {}
+        am = summary.get("actual_model") if isinstance(summary.get("actual_model"), dict) else None
+        if am and am.get("providerID") and am.get("modelID"):
+            observed = f"{am['providerID']}/{am['modelID']}" + (f" {am['variant']}" if am.get("variant") else "")
+    return usage, observed, ids
+
+
+def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed: bool = False) -> None:
+    """Fill elapsed time, terminal class, usage, observed model, and native
+    identities on a finished invocation from its own files and result."""
+    rows = [i for i in _list_invocations(state_dir, request_id) if i["invocation_id"] == invocation_id]
+    if not rows:
+        return
+    inv = rows[0]
+    stdout, stderr = _read_invocation_output(inv)
+    try:
+        result_obj = json.loads(inv.get("result_json") or "null")
+    except ValueError:
+        result_obj = None
+    try:
+        meta = json.loads(inv.get("meta_json") or "{}") or {}
+    except ValueError:
+        meta = {}
+    usage, observed, ids = measure_output(inv.get("kind") or "", stdout, stderr, meta)
+    started = _parse_ts(inv.get("started_at"))
+    ended = _parse_ts(inv.get("ended_at")) or time.time()
+    elapsed = round(max(0.0, ended - started), 3) if started is not None else None
+    tclass = terminal_class_for(inv.get("rc"), result_obj, crashed=crashed)
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
+            " observed_model=COALESCE(?, observed_model), native_ids_json=? WHERE invocation_id=?",
+            (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
+             observed, json.dumps(ids, sort_keys=True) if ids else None, invocation_id))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
+def invocation_measurements(state_dir, request_id: str) -> list[dict]:
+    """Per-invocation measurements for ``status`` and ``result``."""
+    out = []
+    for inv in _list_invocations(state_dir, request_id):
+        try:
+            usage = json.loads(inv.get("usage_json") or "null")
+        except ValueError:
+            usage = None
+        out.append({"invocation": inv["invocation_id"][:8], "kind": inv.get("kind"),
+                    "stage": inv.get("stage"), "requested_route": inv.get("requested_route"),
+                    "policy_version": inv.get("policy_version"), "reason": inv.get("reason"),
+                    "observed_model": inv.get("observed_model"),
+                    "terminal_class": inv.get("terminal_class"), "elapsed_secs": inv.get("elapsed_secs"),
+                    "usage": usage, "harness_version": inv.get("harness_version"),
+                    "report_path": inv.get("report_path"), "started_at": inv.get("started_at"),
+                    "ended_at": inv.get("ended_at")})
+    return out
 
 
 def submit(state_dir, request_id: str, task, workspace: str,
@@ -1424,7 +1631,9 @@ def submit(state_dir, request_id: str, task, workspace: str,
            planner_model: str | None = None,
            planner_effort: str | None = None,
            planner_cwd: str | None = None,
-           lane: str | None = None) -> dict:
+           lane: str | None = None,
+           job_kind: str = "ordinary", replay_of: str | None = None,
+           planner_harness: str = "claude") -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Built-in defaults mean no executor/callback commands are required:
@@ -1455,6 +1664,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
         raise ValueError("missing policy identity")
     if max_attempts < 1 or max_attempts > 10:
         raise ValueError("max_attempts must be 1..10")
+    if job_kind not in JOB_KINDS:
+        raise ValueError(f"job_kind must be one of {', '.join(JOB_KINDS)}")
+    if job_kind == "replay" and not replay_of:
+        raise ValueError("a replay names the request it replays (replay_of)")
+    if job_kind != "replay" and replay_of:
+        raise ValueError("replay_of applies to replay jobs only")
+    if planner_harness not in PLANNER_HARNESSES:
+        raise ValueError(f"planner_harness must be one of {', '.join(PLANNER_HARNESSES)}")
     # Planner defaults come from the first route in the policy's planning
     # stage; explicit overrides are preserved verbatim. Never fork a new
     # session implicitly.
@@ -1471,6 +1688,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
     out_path = str(store.output_path_for(root, request_id))
     now = _utcnow()
     executor_session = "exec-" + secrets.token_hex(8)
+    base_commit = _workspace_head(ws)  # before the write lock
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -1499,6 +1717,10 @@ def submit(state_dir, request_id: str, task, workspace: str,
             if existing["planner_cwd"] is not None and existing["planner_cwd"] != pcwd:
                 same = False
             if existing["lane"] is not None and existing["lane"] != lane_stage:
+                same = False
+            if existing["job_kind"] is not None and (
+                    existing["job_kind"] != job_kind or existing["replay_of"] != replay_of
+                    or existing["planner_harness"] != planner_harness):
                 same = False
             con.execute("ROLLBACK")
             if same:
@@ -1554,17 +1776,18 @@ def submit(state_dir, request_id: str, task, workspace: str,
                     f"({_r['request_id']!r}); refusing duplicate writer"
                 )
         con.execute(
-            "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,"
-            "planner_session_id,executor_session_id,output_path,status,route,"
-            "cancel_requested,attempts,max_attempts,timeout_secs,created_at,updated_at,"
-            "planner_model,planner_effort,adapter,model,effort,planner_cwd,lane)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,planner_session_id,"
+            "executor_session_id,output_path,status,route,cancel_requested,attempts,max_attempts,timeout_secs,created_at,"
+            "updated_at,planner_model,planner_effort,adapter,model,effort,planner_cwd,lane,"
+            "job_kind,replay_of,planner_harness,base_commit)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
              adapters.opencode_route_params(route)[0],
-             adapters.opencode_route_params(route)[1] or "default", pcwd, lane_stage),
+             adapters.opencode_route_params(route)[1] or "default", pcwd, lane_stage,
+             job_kind, replay_of, planner_harness, base_commit),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
@@ -1599,7 +1822,9 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_effort: str | None = None,
                      launcher=None, spawn=None,
                      planner_cwd: str | None = None,
-                     lane: str | None = None) -> dict:
+                     lane: str | None = None,
+                     job_kind: str = "ordinary", replay_of: str | None = None,
+                     planner_harness: str = "claude") -> dict:
     """Persist first, then launch a detached controller with built-ins.
 
     The durable row commits before any spawn, so controller death leaves
@@ -1613,7 +1838,8 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
                  timeout_secs=timeout_secs, planner_model=planner_model,
                  planner_effort=planner_effort, planner_cwd=planner_cwd,
-                 lane=lane)
+                 lane=lane, job_kind=job_kind, replay_of=replay_of,
+                 planner_harness=planner_harness)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.
@@ -2134,6 +2360,7 @@ def _complete_with_token(state_dir, request_id: str, token: str, ok: bool,
                          output: str | None, error, route: str | None = None) -> dict:
     if not token:
         raise ValueError("missing start token")
+    head_commit = _workspace_head(get_job(state_dir, request_id).get("workspace"))
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -2163,8 +2390,9 @@ def _complete_with_token(state_dir, request_id: str, token: str, ok: bool,
             # A worker-reported failure never changes routes or capacity:
             # only the controller's owned-session provider evidence does.
         con.execute(
-            "UPDATE jobs SET status=?, result_json=?, error_class=?, updated_at=? WHERE request_id=?",
-            (status, json.dumps(result), err_class, now, request_id),
+            "UPDATE jobs SET status=?, result_json=?, error_class=?, head_commit=?, updated_at=?"
+            " WHERE request_id=?",
+            (status, json.dumps(result), err_class, head_commit, now, request_id),
         )
         _event(con, request_id, "completed" if ok else "failed",
                {"route": job["route"]})
@@ -2870,8 +3098,14 @@ def result_view(state_dir, request_id: str) -> dict:
             res["output"] = json.loads(res["output"])
         except ValueError:
             pass
+    root = store.ensure_state_dir(state_dir)
+    job_dir = store.job_dir_for(root, request_id)
+    reports = sorted(str(p) for p in job_dir.glob("turn-*/report.json")) if job_dir.exists() else []
     return {"request_id": request_id, "status": job["status"], "result": res,
-            "result_path": str(store.result_path_for(store.ensure_state_dir(state_dir), request_id))}
+            "result_path": str(store.result_path_for(root, request_id)),
+            "base_commit": job.get("base_commit"), "head_commit": job.get("head_commit"),
+            "job_kind": job.get("job_kind"), "replay_of": job.get("replay_of"),
+            "reports": reports, "measurements": invocation_measurements(state_dir, request_id)}
 
 
 def status_view(state_dir, request_id: str) -> dict:
@@ -2929,5 +3163,6 @@ def status_view(state_dir, request_id: str) -> dict:
                                  if isinstance(res, dict) else None)
     if job_public.get("owner_token"):
         job_public["owner_token"] = "<redacted>"
+    job_public["measurements"] = invocation_measurements(state_dir, request_id)
     return {"job": job_public, "launches": launches, "questions": questions,
             "recent_events": events, "output_tail": tail}

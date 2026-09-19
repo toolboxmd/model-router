@@ -9,8 +9,10 @@ session IDs. ``run_cmd`` stays injectable for deterministic tests.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -337,7 +339,8 @@ def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
     cmd = adapters.build_codex_dispatch_cmd(workspace, prompt, model=dispatch["model"],
                                             effort=dispatch["variant"],
                                             last_message_path=last_path)
-    rc, out, err = run_cmd(cmd, workspace)
+    rc, out, err = run_cmd(cmd, workspace, None, kind="codex_dispatch",
+                           meta={"stage": "dispatch", "route": "luna/max", "reason": "initial"})
     last_text = adapters.read_last_message_file(last_path)
     task_id = adapters.parse_codex_task_id(out)
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
@@ -423,7 +426,11 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
         _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
         return {"action": "blocked", "reason": "planner_resume_refused"}
     cwd = job.get("planner_cwd") or job["workspace"]
-    rc, out, err = run_cmd(cmd, cwd, None, kind="claude_callback", meta={"qid": qid})
+    planner_route = "sonnet/medium" if planner_model == adapters.CLAUDE_LIVE_MODEL else "fable-5.1/max"
+    rc, out, err = run_cmd(cmd, cwd, None, kind="claude_callback",
+                           meta={"qid": qid, "stage": "planning", "route": planner_route,
+                                 "reason": "planner_question",
+                                 "prompt_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest()})
     parsed = adapters.parse_claude_result(out)
     _record_child(state_dir, request_id, "claude_callback", cmd, rc,
                   session_id=parsed.get("session_id") or planner_session,
@@ -473,7 +480,8 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
                                           model=dispatch["model"], effort=dispatch["variant"])
     # Resume uses the saved workspace as cwd; never --cd/--reasoning.
-    rc, out, err = run_cmd(cmd, job["workspace"])
+    rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
+                           meta={"stage": "dispatch", "route": "luna/max", "reason": "resume"})
     last_text = adapters.read_last_message_file(last_path)
     resumed_id = adapters.parse_codex_task_id(out)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
@@ -598,8 +606,16 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
         row = con.execute("SELECT route FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         prev = row["route"] if row is not None else None
         model, variant, _agent = adapters.opencode_route_params(target)
-        con.execute("UPDATE jobs SET route=?, model=?, effort=?, updated_at=? WHERE request_id=?",
-                    (target, model, variant or "default", core._utcnow(), request_id))
+        st_row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        try:
+            st = json.loads(st_row["controller_state"] or "{}") if st_row is not None else {}
+        except ValueError:
+            st = {}
+        st["route_reason"] = reason
+        con.execute("UPDATE jobs SET route=?, model=?, effort=?, controller_state=?, updated_at=?"
+                    " WHERE request_id=?",
+                    (target, model, variant or "default", json.dumps(st, sort_keys=True),
+                     core._utcnow(), request_id))
         core._event(con, request_id, "route_switched",
                     {"from": prev, "to": target, "reason": reason,
                      "evidence": str(evidence.get("source") or evidence.get("class")
@@ -730,7 +746,9 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     allowance = _route_allowance(route)
     model, variant, agent = adapters.opencode_route_params(route)
     saved_session = job.get("opencode_session_id")
-    seq = _load_controller_state(job).get("seq", 0)
+    state = _load_controller_state(job)
+    seq = state.get("seq", 0)
+    route_reason = state.get("route_reason") or "initial"
     prompt = _implementation_prompt(job["task_json"], artifact, payload)
     attempted = any(i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
                     and json.loads(i.get("meta_json") or "{}").get("seq") == seq
@@ -745,7 +763,8 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                                meta={"prompt": prompt, "allowance": allowance,
                                      "model": model, "variant": variant, "agent": agent,
                                      "session_id": saved_session, "seq": seq,
-                                     "route": route})
+                                     "stage": "implementation", "route": route,
+                                     "reason": route_reason})
         # The result line comes from this invocation's own output file.
         full = _runner_result(out) or {}
         session_id = full.get("opencode_session_id") or saved_session
@@ -754,12 +773,15 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                       output_text=json.dumps({k: full.get(k) for k in (
                           "ok", "rc", "quota", "finish", "actual_model")}, sort_keys=True))
         if rc == 0 and full.get("ok"):
+            report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
             _set_phase(state_dir, request_id, phase="implemented",
                        opencode_session_id=session_id, artifact=artifact,
+                       report_path=report.get("report_path"),
                        implementation_output=str(full.get("assistant_text") or "")[-8000:])
             return {"action": "implementation_ok", "session": session_id,
                     "output": str(full.get("assistant_text") or ""),
-                    "finish": full.get("finish"), "actual_model": full.get("actual_model")}
+                    "finish": full.get("finish"), "actual_model": full.get("actual_model"),
+                    "report": report}
         evidence = full.get("free_exhaustion_evidence") or full.get("signal_evidence")
         signal = full.get("signal") or ("exhausted" if full.get("quota") else None)
         _persist_error_evidence(state_dir, request_id,
@@ -824,6 +846,130 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     return {"action": "blocked", "reason": "implementation_failed"}
 
 
+def _proof_command(task_json: str) -> str | None:
+    """The task's own proof command, when the task JSON names one."""
+    try:
+        task = json.loads(task_json or "null")
+    except ValueError:
+        return None
+    if isinstance(task, dict) and isinstance(task.get("proof"), str) and task["proof"].strip():
+        return task["proof"].strip()
+    return None
+
+
+def _git_changes(workspace: str) -> tuple[list[str], str, str | None]:
+    """(changed files, diff text, note) for a Git workspace; a note when not Git."""
+    try:
+        probe = subprocess.run(["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+                               capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except Exception:
+        return [], "", "git unavailable"
+    if probe.returncode != 0:
+        return [], "", "workspace is not a git checkout"
+    try:
+        status = subprocess.run(["git", "-C", workspace, "status", "--porcelain"],
+                                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL).stdout
+        diff = subprocess.run(["git", "-C", workspace, "diff"], capture_output=True, text=True,
+                              timeout=30, stdin=subprocess.DEVNULL).stdout
+    except Exception as e:  # noqa: BLE001
+        return [], "", f"git failed: {type(e).__name__}"
+    files = [line[3:].strip() for line in status.splitlines() if line.strip()]
+    return files, diff, None
+
+
+def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: str,
+                       full: dict, session_id: str | None) -> dict:
+    """Write report.json, proof.log, diff.patch, and worker.txt for one turn.
+
+    The runner runs the task's own proof command and records the exit code;
+    the worker's prose is kept in full but only summarized in the report."""
+    root = store.ensure_state_dir(state_dir)
+    turn_dir = store.job_dir_for(root, request_id) / f"turn-{seq}"
+    turn_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    workspace = job["workspace"]
+    worker_text = str(full.get("assistant_text") or "")
+    store.secure_write_text(turn_dir / "worker.txt", worker_text)
+    files, diff, note = _git_changes(workspace)
+    store.secure_write_text(turn_dir / "diff.patch", diff if not note else f"# {note}\n")
+    proof_cmd = _proof_command(job.get("task_json") or "")
+    proof_rc = None
+    proof_log = turn_dir / "proof.log"
+    if proof_cmd:
+        try:
+            run = subprocess.run(shlex.split(proof_cmd), cwd=workspace, capture_output=True, text=True,
+                                 timeout=600, stdin=subprocess.DEVNULL)
+            proof_rc = run.returncode
+            store.secure_write_text(proof_log, (run.stdout or "") + (run.stderr or ""))
+        except Exception as e:  # noqa: BLE001
+            proof_rc = 127
+            store.secure_write_text(proof_log, f"proof command failed to run: {type(e).__name__}: {e}\n")
+    else:
+        store.secure_write_text(proof_log, "# no proof command in the task\n")
+    am = full.get("actual_model") if isinstance(full.get("actual_model"), dict) else {}
+    observed = (f"{am.get('providerID')}/{am.get('modelID')}" if am.get("providerID") and am.get("modelID") else None)
+    model, variant, _agent = adapters.opencode_route_params(route)
+    report = {
+        "schema_version": store.SCHEMA_VERSION, "request_id": request_id, "seq": seq,
+        "stage": "implementation", "route": route, "policy_version": policy.POLICY_VERSION,
+        "model": model, "variant": variant, "observed_model": observed,
+        "observed_variant": am.get("variant"), "session_id": session_id,
+        "finish": full.get("finish"), "status": "ok",
+        "changed_files": files, "workspace_note": note,
+        "proof_command": proof_cmd, "proof_exit_code": proof_rc,
+        "proof_log": str(proof_log), "diff": str(turn_dir / "diff.patch"),
+        "worker_text": str(turn_dir / "worker.txt"), "worker_summary": worker_text[:1500],
+        "blockers": [], "tokens": full.get("usage"), "native_ids": full.get("native_ids"),
+    }
+    report_path = turn_dir / "report.json"
+    store.secure_write_text(report_path, json.dumps(report, sort_keys=True, indent=1))
+    report["report_path"] = str(report_path)
+    # Link the report to the invocation that produced it.
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("UPDATE invocations SET report_path=? WHERE request_id=? AND kind='opencode_control'"
+                    " AND invocation_id=(SELECT invocation_id FROM invocations WHERE request_id=?"
+                    " AND kind='opencode_control' ORDER BY id DESC LIMIT 1)",
+                    (str(report_path), request_id, request_id))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+    return report
+
+
+def _implementation_evidence(job: dict, impl: dict) -> str:
+    """The dispatcher's resume message: paths and structured fields, not prose."""
+    report = impl.get("report") if isinstance(impl.get("report"), dict) else {}
+    tail = ""
+    try:
+        if report.get("proof_log"):
+            lines = Path(report["proof_log"]).read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-40:])
+    except OSError:
+        tail = ""
+    fields = {
+        "route": job.get("route"), "model": job.get("model"),
+        "observed_model": report.get("observed_model"),
+        "session": impl.get("session") or "", "finish": impl.get("finish") or "",
+        "changed_files": report.get("changed_files") or [],
+        "proof_command": report.get("proof_command"), "proof_exit_code": report.get("proof_exit_code"),
+        "blockers": report.get("blockers") or [],
+        "report": report.get("report_path"), "proof_log": report.get("proof_log"),
+        "diff": report.get("diff"), "worker_text": report.get("worker_text"),
+    }
+    summary = (report.get("worker_summary") or str(impl.get("output") or "")[:1500])
+    return (json.dumps(fields, sort_keys=True) + "\n"
+            + (f"proof log tail:\n{tail}\n" if tail else "")
+            + f"worker summary:\n{summary}\n"
+            "Read the report, proof log, and diff at the paths above. Run the proof "
+            "yourself and inspect the workspace before completion.")
+
+
 def _complete_job(state_dir, request_id: str, token: str | None,
                   output: str, artifact: str | None = None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
@@ -852,6 +998,7 @@ def _complete_job(state_dir, request_id: str, token: str | None,
             pass
     # Offline helper paths without a live lease: durable terminal write
     # (still persists result + file before ack).
+    head_commit = core._workspace_head(job.get("workspace"))
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -864,8 +1011,9 @@ def _complete_job(state_dir, request_id: str, token: str | None,
             con.execute("ROLLBACK")
             return {"action": "noop-terminal", "status": cur["status"]}
         now = core._utcnow()
-        con.execute("UPDATE jobs SET status='succeeded', result_json=?, updated_at=? WHERE request_id=?",
-                    (json.dumps({"ok": True, **result_payload}), now, request_id))
+        con.execute("UPDATE jobs SET status='succeeded', result_json=?, head_commit=?, updated_at=?"
+                    " WHERE request_id=?",
+                    (json.dumps({"ok": True, **result_payload}), head_commit, now, request_id))
         core._event(con, request_id, "completed", {"via": "controller"})
         con.execute("COMMIT")
     except Exception:
@@ -929,10 +1077,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
         # route or stops; never fork a second writer here.
         return impl
     job = core.get_job(state_dir, request_id)
-    evidence = (f"worker route={job.get('route')} model={job.get('model')} "
-                f"session={impl.get('session') or ''} finish={impl.get('finish') or ''}\n"
-                f"worker report:\n{str(impl.get('output') or '')[-4000:]}\n"
-                "Inspect the workspace and run the proof before completion.")
+    evidence = _implementation_evidence(job, impl)
     r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
                     label="IMPLEMENTATION RESULT")
     if r.get("action") == "blocked":

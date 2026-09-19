@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, policy, store  # noqa: E402
-from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, write_fake  # noqa: E402
+from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
@@ -68,7 +68,7 @@ class TestCompletedChildBeforeRecover(unittest.TestCase):
         calls = base / "calls.jsonl"
         release = base / "finish-child"
         fake = bindir / "codex"
-        fake.write_text("#!" + PY + "\n" + r"""
+        fake.write_text("#!" + PY + "\n" + VERSION_GUARD + r"""
 import json, os, pathlib, sys, time
 p = pathlib.Path(os.environ["REPRO_CALLS"])
 n = 1 + (len(p.read_text().splitlines()) if p.exists() else 0)
@@ -160,7 +160,7 @@ class TestAnswerRecoverContinues(unittest.TestCase):
         fake_state.mkdir()
         thread = "answer-recover-thread"
         planner = "planner-ar-1"
-        (bindir / "codex").write_text("#!" + PY + "\n" + r"""
+        (bindir / "codex").write_text("#!" + PY + "\n" + VERSION_GUARD + r"""
 import json, os, sys, time
 from pathlib import Path
 st = Path(os.environ["FAKE_STATE"])
@@ -490,6 +490,55 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(res2["action"], "implementation_ok")
         self._no_secret_leak()
 
+    def test_turn_report_and_invocation_measurements(self):
+        run = self._setup("ok")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET task_json=?, status='running' WHERE request_id='oc1'",
+                        (json.dumps({"goal": "owned serve", "proof": "python3 -c \"print('proof-ran')\""}),))
+        finally:
+            con.close()
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res["action"], "implementation_ok")
+        report = res["report"]
+        turn_dir = Path(report["report_path"]).parent
+        self.assertEqual(turn_dir.name, "turn-0")
+        for name in ("report.json", "proof.log", "diff.patch", "worker.txt"):
+            self.assertTrue((turn_dir / name).exists(), name)
+            self.assertEqual((turn_dir / name).stat().st_mode & 0o777, 0o600, name)
+        on_disk = json.loads((turn_dir / "report.json").read_text())
+        self.assertEqual((on_disk["proof_command"], on_disk["proof_exit_code"]),
+                         ("python3 -c \"print('proof-ran')\"", 0))
+        self.assertIn("proof-ran", (turn_dir / "proof.log").read_text())
+        self.assertEqual(on_disk["observed_model"], "opencode/muse-spark-1.3-contributor-free")
+        self.assertEqual(on_disk["tokens"]["source"], "opencode")
+        self.assertEqual(on_disk["tokens"]["messages"][0]["tokens"]["cache"]["read"], 300)
+        self.assertTrue(on_disk["native_ids"]["assistant_message_ids"])
+        self.assertEqual(on_disk["workspace_note"], "workspace is not a git checkout")
+        self.assertIn("IMPLEMENTED by fake worker", on_disk["worker_summary"])
+        # The dispatcher gets paths and fields, not the prose.
+        evidence = controller._implementation_evidence(core.get_job(self.sd, "oc1"), res)
+        self.assertIn(report["report_path"], evidence)
+        self.assertIn('"proof_exit_code": 0', evidence)
+        self.assertIn("proof-ran", evidence)
+        # The invocation row carries the measurements Agent Observer needs.
+        inv = [i for i in core._list_invocations(self.sd, "oc1") if i["kind"] == "opencode_control"][-1]
+        self.assertEqual((inv["stage"], inv["requested_route"], inv["policy_version"], inv["reason"]),
+                         ("implementation", "muse-spark-xhigh-free", policy.POLICY_VERSION, "initial"))
+        self.assertEqual(inv["terminal_class"], "completed")
+        self.assertGreater(inv["elapsed_secs"], 0)
+        self.assertEqual(inv["observed_model"], "opencode/muse-spark-1.3-contributor-free xhigh")
+        self.assertEqual(json.loads(inv["usage_json"])["source"], "opencode")
+        self.assertEqual(json.loads(inv["native_ids_json"])["session_id"], inv["session_id"])
+        self.assertEqual(inv["report_path"], report["report_path"])
+        self.assertEqual(inv["schema_version"], store.SCHEMA_VERSION)
+        view = core.status_view(self.sd, "oc1")
+        m = view["job"]["measurements"][-1]
+        self.assertEqual((m["stage"], m["terminal_class"], m["observed_model"]),
+                         ("implementation", "completed", inv["observed_model"]))
+        self.assertEqual(core.result_view(self.sd, "oc1")["reports"], [report["report_path"]])
+        self._no_secret_leak()
+
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):
             for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
@@ -747,7 +796,7 @@ class TestCancelTimeoutOwnChildren(unittest.TestCase):
         bindir = base / "bin"
         bindir.mkdir()
         calls = base / "calls.jsonl"
-        (bindir / "codex").write_text("#!" + PY + "\n" + r"""
+        (bindir / "codex").write_text("#!" + PY + "\n" + VERSION_GUARD + r"""
 import json, os, time
 from pathlib import Path
 p = Path(os.environ["CALLS"])

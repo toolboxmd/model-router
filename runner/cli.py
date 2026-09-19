@@ -80,6 +80,11 @@ def main(argv=None) -> int:
                    help="planner effort (default: policy planning route; live-test override medium)")
     p.add_argument("--planner-cwd", default=None,
                    help="directory where the planner session was started (default: workspace)")
+    p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
+                   help="ordinary work, an experiment, or a replay of an earlier request")
+    p.add_argument("--replay-of", default=None, help="request id this replay repeats")
+    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex"),
+                   help="harness that hosts the planner session")
     p.add_argument("--start", action="store_true",
                    help="launch detached controller with built-in adapters after persist")
     p.add_argument("--no-start", action="store_true",
@@ -161,7 +166,9 @@ def main(argv=None) -> int:
                                             planner_model=args.planner_model,
                                             planner_effort=args.planner_effort,
                                             planner_cwd=args.planner_cwd,
-                                            lane=args.lane)
+                                            lane=args.lane, job_kind=args.job_kind,
+                                            replay_of=args.replay_of,
+                                            planner_harness=args.planner_harness)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
@@ -170,7 +177,9 @@ def main(argv=None) -> int:
                                   planner_model=args.planner_model,
                                   planner_effort=args.planner_effort,
                                   planner_cwd=args.planner_cwd,
-                                  lane=args.lane)
+                                  lane=args.lane, job_kind=args.job_kind,
+                                  replay_of=args.replay_of,
+                                  planner_harness=args.planner_harness)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
                          "policy": job["policy_id"]})

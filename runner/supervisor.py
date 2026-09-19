@@ -538,6 +538,20 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     result["actual_model"] = {"providerID": info.get("providerID"),
                                               "modelID": info.get("modelID"),
                                               "variant": info.get("variant")}
+                    # Counters verbatim per assistant message, never folded,
+                    # plus the native message identities for deduplication.
+                    all_msgs = client.messages(saved)
+                    user_ids = [m["info"].get("id") for m in all_msgs
+                                if isinstance(m, dict) and isinstance(m.get("info"), dict)
+                                and m["info"].get("role") == "user"
+                                and m["info"].get("id") not in baseline]
+                    result["usage"] = {"source": "opencode", "messages": [
+                        {"id": (m.get("info") or {}).get("id"),
+                         "tokens": (m.get("info") or {}).get("tokens"),
+                         "cost": (m.get("info") or {}).get("cost")} for m in new]}
+                    result["native_ids"] = {"session_id": saved,
+                                            "assistant_message_ids": [(m.get("info") or {}).get("id") for m in new],
+                                            "user_message_ids": user_ids}
                     cls = _policy.classify_signal(err) if err else None
                     if evidence:
                         # The session already ended idle with this error.
@@ -569,7 +583,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     summary = {k: result.get(k) for k in (
         "opencode_session_id", "ok", "rc", "quota", "idle_confirmed", "finish",
         "actual_model", "error", "free_exhaustion_evidence", "signal", "signal_evidence",
-        "assistant_text",
+        "usage", "native_ids", "assistant_text",
         "assistant_messages", "model", "variant", "agent")}
     try:
         with open(stdout_path, "a", encoding="utf-8") as f:

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.0] - 2026-09-19
+
+### Added
+
+- Turn reports, structured dispatcher evidence, per-invocation measurements with native identities, job provenance, and ledger schema version 2
+
 ## [0.5.0] - 2026-09-19
 
 ### Added

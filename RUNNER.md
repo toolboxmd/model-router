@@ -242,6 +242,27 @@ that completed before `recover` ran keeps its result. A timeout finalizes as
 
 ## State
 
+Each implementation turn writes `outputs/<request_id>/turn-<seq>/`:
+`report.json` (route, policy version, observed model and variant, session,
+changed files, proof command and exit code, tokens verbatim with a source
+label, native message identities, blockers, a worker summary), `proof.log`
+(the output of the task's own `proof` command, run by the runner in the
+workspace), `diff.patch` (the Git diff, or a note when the workspace is not a
+checkout), and `worker.txt` (the worker's full text). The dispatcher's resume
+message carries these paths and fields instead of the worker's prose.
+
+Every invocation records its stage, requested route, policy version, route
+reason, harness version, elapsed time, terminal class (completed, failed,
+crashed, cancelled, timeout, quota, overloaded, hard_error), usage counters
+verbatim under a source label, the observed model, and native identities
+(Codex thread and turn ids, Claude session and result ids with the
+callback's prompt digest, OpenCode session and message ids). Jobs record
+their kind (`ordinary`, `experiment`, `replay` with `--replay-of`), the
+planner harness, and the workspace commit at submit and completion. Events
+and invocations carry `schema_version` 2; Agent Observer reads this ledger
+directly. `status` and `result` show the measurements; `result` also lists
+the turn reports.
+
 `--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is made absolute and is
 `0700`. Detached controllers and supervisors start from the package
 directory, so the CLI works from any working directory. `jobs.db` (SQLite,
