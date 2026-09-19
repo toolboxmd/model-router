@@ -2717,8 +2717,16 @@ def _trusted_reset_at(evidence) -> str | None:
     return None
 
 
+CAPACITY_STATES = ("unknown", "exhausted", "degraded", "available")
+
+
 def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
-                            evidence=None, reset_at: str | None = None) -> None:
+                            evidence=None, reset_at: str | None = None,
+                            window: str | None = None) -> None:
+    """Record capacity per route, which names one pool and model. The window
+    is the one the evidence names; otherwise it stays unknown rather than
+    guessed. ``reset_at`` comes only from provider evidence, the documented
+    degraded cooldown, or an operator."""
     now = _utcnow()
     ev = None
     if evidence is not None:
@@ -2726,19 +2734,32 @@ def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
             ev = json.dumps(adapters.redact_nested(evidence), sort_keys=True)[:4000]
         except Exception:
             ev = json.dumps({"recorded": True})
+    spec = policy.ROUTES.get(route) or {}
+    if window is None and isinstance(evidence, dict):
+        window = evidence.get("window") if isinstance(evidence.get("window"), str) else None
     con.execute(
-        "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at)"
-        " VALUES(?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET"
+        "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at, pool, model, window)"
+        " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET"
         " state=excluded.state, evidence_json=excluded.evidence_json,"
-        " reset_at=excluded.reset_at, updated_at=excluded.updated_at",
-        (route, state, ev, reset_at, now),
+        " reset_at=excluded.reset_at, updated_at=excluded.updated_at,"
+        " pool=excluded.pool, model=excluded.model, window=excluded.window",
+        (route, state, ev, reset_at, now, spec.get("pool"), spec.get("model"),
+         window or ("cooldown" if state == "degraded" else "unknown")),
     )
+
+
+def degraded_until(now_ts: float | None = None) -> str:
+    """Documented cooldown end for an overloaded route."""
+    secs = policy.SIGNAL_CLASSES["overloaded"]["degraded_secs"]
+    base = datetime.datetime.fromtimestamp(now_ts if now_ts is not None else time.time(),
+                                           datetime.timezone.utc)
+    return (base + datetime.timedelta(seconds=secs)).isoformat()
 
 
 def record_capacity(state_dir, route: str, state: str, evidence=None,
                     reset_at: str | None = None) -> None:
     policy.validate_route(route)
-    if state not in ("unknown", "exhausted", "available"):
+    if state not in CAPACITY_STATES:
         raise ValueError(f"invalid capacity state: {state!r}")
     con = store.connect(state_dir)
     try:
@@ -2783,8 +2804,7 @@ def clear_capacity(state_dir, route: str) -> dict:
     return {"route": route, "cleared": True}
 
 
-def exhausted_routes(state_dir) -> set[str]:
-    """Routes known exhausted until a trusted reset time has passed."""
+def _routes_in_state(state_dir, state: str) -> set[str]:
     now = time.time()
     out = set()
     con = store.connect(state_dir)
@@ -2793,7 +2813,7 @@ def exhausted_routes(state_dir) -> set[str]:
     finally:
         con.close()
     for r in rows:
-        if r["state"] != "exhausted":
+        if r["state"] != state:
             continue
         reset_at = r["reset_at"]
         if reset_at:
@@ -2802,6 +2822,16 @@ def exhausted_routes(state_dir) -> set[str]:
                 continue
         out.add(r["route"])
     return out
+
+
+def exhausted_routes(state_dir) -> set[str]:
+    """Routes known exhausted until a trusted reset time has passed."""
+    return _routes_in_state(state_dir, "exhausted")
+
+
+def degraded_routes(state_dir) -> set[str]:
+    """Routes marked overloaded until their documented cooldown passes."""
+    return _routes_in_state(state_dir, "degraded")
 
 
 def select_implementation_route(state_dir, current: str, error,

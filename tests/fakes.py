@@ -32,6 +32,7 @@ PWD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
 assert PWD, "password must arrive in the environment"
 (st / "pwd-in-argv").write_text("yes" if PWD in " ".join(argv) else "no")
 MODE = os.environ.get("FAKE_OC_MODE", "ok")
+MODE_GO = os.environ.get("FAKE_OC_MODE_GO", "ok")
 DELAY = float(os.environ.get("FAKE_OC_DELAY", "0.3"))
 WRITE = os.environ.get("FAKE_OC_WRITE")
 EXPECT = "Basic " + base64.b64encode(("opencode:" + PWD).encode()).decode()
@@ -60,9 +61,23 @@ def assistant(sid, model, text="", error=None, finish="stop"):
 
 def run_turn(sid, model, directory, aborted):
     free = model.get("providerID") == "opencode"
-    mode = MODE if free else "ok"
+    mode = MODE if free else (MODE_GO if model.get("providerID") == "opencode-go" else "ok")
     with lock:
         status[sid] = {"type": "busy"}
+    if mode == "overloaded":
+        # The provider keeps retrying; attempts climb until the runner aborts.
+        attempt = 0
+        while not aborted.is_set():
+            attempt += 1
+            with lock:
+                status[sid] = {"type": "retry", "attempt": attempt, "message": "Provider overloaded",
+                               "action": {"reason": "rate_limit", "provider": model.get("providerID"),
+                                          "title": "t", "message": "m", "label": "l"}, "next": 1}
+            time.sleep(0.3)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
     if mode in ("free_limit", "hang"):
         if mode == "free_limit":
             with lock:
@@ -86,6 +101,10 @@ def run_turn(sid, model, directory, aborted):
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "rate limited", "statusCode": 429, "isRetryable": True,
             "responseBody": json.dumps({"type": "error", "error": {"type": "RateLimitError"}})}})
+    elif mode == "go_limit":
+        msg = assistant(sid, model, error={"name": "APIError", "data": {
+            "message": "go exceeded", "statusCode": 429, "isRetryable": False,
+            "responseBody": json.dumps({"type": "error", "error": {"type": "GoUsageLimitError"}})}})
     elif mode == "api_free_error":
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "free exceeded", "statusCode": 429, "isRetryable": False,

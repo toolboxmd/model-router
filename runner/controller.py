@@ -585,23 +585,28 @@ def _set_phase(state_dir, request_id: str, **fields) -> None:
         con.close()
 
 
-def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = True) -> dict:
+def _switch_route(state_dir, request_id: str, target: str, reason: str,
+                  evidence: dict | None = None, mark: tuple | None = None) -> dict:
+    """Move the job to ``target`` and, when ``mark`` is given, record the
+    old route's capacity state in the same transaction. ``mark`` is
+    (state, route, evidence, reset_at)."""
+    evidence = evidence or {}
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
         _lease_guard(con, request_id)
-        target = policy.next_pool_route("muse-spark-xhigh-free") or "muse-spark-xhigh-go"
-        con.execute("UPDATE jobs SET route=?, model=?, updated_at=? WHERE request_id=?",
-                    (target, adapters.opencode_model_for_route(target),
-                     core._utcnow(), request_id))
+        row = con.execute("SELECT route FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        prev = row["route"] if row is not None else None
+        model, variant, _agent = adapters.opencode_route_params(target)
+        con.execute("UPDATE jobs SET route=?, model=?, effort=?, updated_at=? WHERE request_id=?",
+                    (target, model, variant or "default", core._utcnow(), request_id))
         core._event(con, request_id, "route_switched",
-                    {"from": "muse-spark-xhigh-free", "to": target,
-                     "evidence": str(evidence.get("source") or evidence.get("class") or "provider")[:64]})
-        if record:
-            # Keep the original provider evidence; a memory-based switch
-            # never overwrites it.
-            core._record_capacity_locked(con, "muse-spark-xhigh-free", "exhausted",
-                                         evidence, core._trusted_reset_at(evidence))
+                    {"from": prev, "to": target, "reason": reason,
+                     "evidence": str(evidence.get("source") or evidence.get("class")
+                                     or evidence.get("name") or "provider")[:64]})
+        if mark is not None:
+            state, marked_route, mark_evidence, reset_at = mark
+            core._record_capacity_locked(con, marked_route, state, mark_evidence, reset_at)
         con.execute("COMMIT")
     except Exception:
         try:
@@ -611,7 +616,85 @@ def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = Tru
         raise
     finally:
         con.close()
-    return {"action": "transferred_to_go", "route": target}
+    action = "transferred_to_go" if target == "muse-spark-xhigh-go" else "route_switched"
+    return {"action": action, "route": target, "reason": reason}
+
+
+def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
+                       evidence: dict) -> dict:
+    """Exhaustion: zero retries, the same model on the next pool, else the
+    next family. Overload: the next family; the route rests for the
+    documented cooldown. Moves stay inside the job's stored lane and skip
+    one-turn routes already used. No eligible route blocks with a reason."""
+    job = core.get_job(state_dir, request_id)
+    lane = job.get("lane")
+    turns = _turns_by_route(state_dir, request_id)
+    exhausted = core.exhausted_routes(state_dir)
+    degraded = core.degraded_routes(state_dir)
+    if signal == "exhausted":
+        exhausted.add(route)
+        pool_target = policy.next_pool_route(route)
+        if pool_target and (pool_target in exhausted or policy.one_turn_routes_used(pool_target, turns)):
+            pool_target = None
+        target = pool_target or policy.next_family_route(route, exhausted, degraded, lane, turns)
+        reason = "pool_move" if target and target == pool_target else "lateral"
+        mark = ("exhausted", route, evidence, core._trusted_reset_at(evidence))
+    else:
+        degraded.add(route)
+        target = policy.next_family_route(route, exhausted, degraded, lane, turns)
+        reason = "lateral"
+        mark = ("degraded", route, evidence, core.degraded_until())
+    if target is None:
+        con = store.connect(state_dir)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            _lease_guard(con, request_id)
+            core._record_capacity_locked(con, mark[1], mark[0], mark[2], mark[3])
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        _mark_blocked(state_dir, request_id,
+                      f"capacity_exhausted: no eligible route after {signal} on {route}")
+        return {"action": "blocked", "reason": "capacity_exhausted"}
+    return _switch_route(state_dir, request_id, target, reason, evidence, mark=mark)
+
+
+def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
+    """Skip a route the capacity memory knows is exhausted or resting,
+    before any child starts. Never overwrites the original evidence."""
+    job = core.get_job(state_dir, request_id)
+    lane = job.get("lane")
+    turns = _turns_by_route(state_dir, request_id)
+    exhausted = core.exhausted_routes(state_dir)
+    degraded = core.degraded_routes(state_dir)
+    if route in exhausted:
+        target = policy.next_pool_route(route)
+        if not target or target in exhausted or policy.one_turn_routes_used(target, turns):
+            target = policy.next_family_route(route, exhausted, degraded, lane, turns)
+        reason = "preflight_exhausted"
+    elif route in degraded:
+        target = policy.next_family_route(route, exhausted, degraded, lane, turns)
+        reason = "preflight_degraded"
+    elif policy.one_turn_routes_used(route, turns):
+        # A $15 model already had its one turn in this job: move on before dispatch.
+        target = policy.next_family_route(route, exhausted, degraded, lane, turns)
+        reason = "preflight_one_turn"
+    else:
+        return None
+    if target is None:
+        _mark_blocked(state_dir, request_id,
+                      f"capacity_exhausted: no eligible route before dispatch on {route}")
+        return {"action": "blocked", "reason": "capacity_exhausted"}
+    return _switch_route(state_dir, request_id, target, reason,
+                         {"source": "capacity_memory", "route": route})
+
+
+def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = True) -> dict:
+    """Legacy name for the free-to-Go move used by the ``opencode run`` seam."""
+    if record:
+        return _move_after_signal(state_dir, request_id, "muse-spark-xhigh-free", "exhausted", evidence)
+    return _preflight_move(state_dir, request_id, "muse-spark-xhigh-free") or \
+        {"action": "blocked", "reason": "capacity_exhausted"}
 
 
 def _turns_by_route(state_dir, request_id: str) -> dict:
@@ -652,16 +735,10 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     attempted = any(i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
                     and json.loads(i.get("meta_json") or "{}").get("seq") == seq
                     for i in core._list_invocations(state_dir, request_id))
-    if not attempted and route == "muse-spark-xhigh-free" \
-            and route in core.exhausted_routes(state_dir):
-        return _switch_to_go(state_dir, request_id,
-                             {"source": "capacity_memory", "route": route}, record=False)
-    if not attempted and policy.one_turn_routes_used(route, _turns_by_route(state_dir, request_id)):
-        # A $15 Go model gets one turn per job. Refusing here keeps the mark
-        # enforced by the runner; lateral moves replace the refusal in #13.
-        _mark_blocked(state_dir, request_id,
-                      f"one_turn_per_job: {route} already ran once in this job")
-        return {"action": "blocked", "reason": "one_turn_per_job"}
+    if not attempted:
+        move = _preflight_move(state_dir, request_id, route)
+        if move is not None:
+            return move
     if use_owned_server:
         cmd = adapters.build_opencode_serve_cmd()
         rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
@@ -683,18 +760,23 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
             return {"action": "implementation_ok", "session": session_id,
                     "output": str(full.get("assistant_text") or ""),
                     "finish": full.get("finish"), "actual_model": full.get("actual_model")}
-        evidence = full.get("free_exhaustion_evidence")
+        evidence = full.get("free_exhaustion_evidence") or full.get("signal_evidence")
+        signal = full.get("signal") or ("exhausted" if full.get("quota") else None)
         _persist_error_evidence(state_dir, request_id,
                                 {"source": "opencode_control", "rc": rc,
                                  "error": full.get("error"), "quota": full.get("quota"),
-                                 "evidence": evidence,
+                                 "signal": signal, "evidence": evidence,
                                  "idle_confirmed": full.get("idle_confirmed")})
-        if full.get("quota") and isinstance(evidence, dict) and route == "muse-spark-xhigh-free":
+        if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
             if not full.get("idle_confirmed"):
+                if route == "muse-spark-xhigh-free" and signal == "exhausted":
+                    _mark_blocked(state_dir, request_id,
+                                  "go_transfer_abort_failed: free session not confirmed idle")
+                    return {"action": "blocked", "reason": "go_transfer_abort_failed"}
                 _mark_blocked(state_dir, request_id,
-                              "go_transfer_abort_failed: free session not confirmed idle")
-                return {"action": "blocked", "reason": "go_transfer_abort_failed"}
-            return _switch_to_go(state_dir, request_id, evidence)
+                              f"route_transfer_abort_failed: session not confirmed idle after {signal}")
+                return {"action": "blocked", "reason": "route_transfer_abort_failed"}
+            return _move_after_signal(state_dir, request_id, route, signal, evidence)
         _mark_blocked(state_dir, request_id,
                       f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
         return {"action": "blocked", "reason": "implementation_failed"}
@@ -737,7 +819,7 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                                                        "output": ((out or "") + (err or ""))[:2000]})
     # The run process owned the session and has exited, so it is idle.
     if route == "muse-spark-xhigh-free" and any(policy.classify_quota_exhaustion(e) for e in errors):
-        return _switch_to_go(state_dir, request_id, errors[-1])
+        return _move_after_signal(state_dir, request_id, route, "exhausted", errors[-1])
     _mark_blocked(state_dir, request_id, f"implementation_failed rc={rc}")
     return {"action": "blocked", "reason": "implementation_failed"}
 
@@ -974,7 +1056,7 @@ def run_controller_process(state_dir: str, request_id: str, token: str,
     # the spawn; a finished action is reused, never rerun.
     durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
     continuing = ("dispatched", "question-answered-resumed",
-                  "implementation-resumed", "transferred_to_go")
+                  "implementation-resumed", "transferred_to_go", "route_switched")
     for _ in range(MAX_LOOP_STEPS):
         try:
             res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token,

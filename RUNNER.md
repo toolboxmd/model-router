@@ -107,21 +107,35 @@ The supervisor polls `GET /session/status` for that session only and reads
 the new assistant messages when it is idle. The server group stops after
 every turn.
 
-Free to Go needs trusted provider evidence for the owned session:
+Provider signals are classified from structured evidence only, never from
+model-authored text:
 
-- a `retry` status with `action.reason` `free_tier_limit` and
-  `action.provider` `opencode`, or
-- an assistant `APIError` whose provider `responseBody` names
-  `FreeUsageLimitError`.
+- exhausted: a `retry` status with reason `free_tier_limit`, or an
+  `APIError` whose provider `responseBody` names `FreeUsageLimitError`,
+  `GoUsageLimitError`, or `insufficient_quota`. Zero retries: the session is
+  aborted and confirmed idle, the route is remembered exhausted with its
+  evidence and any trusted reset time, and the job moves the same model to
+  the next pool (free Muse to Go Muse, Go Grok to xAI Grok) or, without one,
+  to the next model family in its lane.
+- overloaded: a `retry` status with reason `overloaded`, `rate_limit`, or
+  `account_rate_limit`, an `APIError` naming `RateLimitError`,
+  `rate_limit_exceeded`, or `overloaded_error`, or HTTP 503 or 529. The
+  provider's own retries are allowed for at most 2 attempts inside 45
+  seconds; then the session is aborted and confirmed idle, the route rests
+  for 15 minutes (`degraded` with a cooldown end), and the job moves to the
+  next model family in its lane. The same family on another pool is not a
+  lateral move.
+- hard: `context_length_exceeded`, auth, region, and consent errors block the
+  job with the reason.
 
-On status evidence the session is aborted and confirmed idle before the
-route changes. The same session then continues on
-`opencode-go/muse-spark-1.3-contributor` with the same effort. Exhausted free
-capacity is remembered across jobs, with its original evidence, until a
-trusted reset time passes or an operator clears it; an unknown reset stays
-unknown. Model-authored text, generic 429,
-`account_rate_limit`, timeouts, consent, region, and auth errors never
-change the route. Zen balance overflow and direct paid APIs are disabled.
+Before a turn starts, a route the capacity memory knows as exhausted or
+resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`)
+without a child. No eligible route left in the lane blocks the job with
+`capacity_exhausted`. The `capacity` command lists remembered routes with
+pool, model, window, state, evidence, and reset time; `--clear ROUTE` is an
+operator action after checking the provider. Reset times come only from
+provider evidence or the documented cooldown; an unknown reset stays
+unknown. Zen balance overflow and direct paid APIs are disabled.
 
 ## Process ownership
 
@@ -268,10 +282,9 @@ Signal classes are defined in the policy and applied by later work: exhaustion
 (`free_tier_limit`, `FreeUsageLimitError`, `GoUsageLimitError`,
 `insufficient_quota`) moves the same model to the next pool; overload
 (`overloaded`, `rate_limit`, `account_rate_limit`, HTTP 503 and 529) moves to
-the next family after a bounded retry window; hard errors block. In this
-version the controller still moves only free Muse to Go on exact free
-exhaustion evidence; the legacy `opencode run` test seam supports the free and
-Go Muse routes only.
+the next family after a bounded retry window; hard errors block. The controller applies
+them on the owned-server path; the legacy `opencode run` test seam supports
+the free and Go Muse routes only.
 
 ## Verification
 
