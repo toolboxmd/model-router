@@ -346,6 +346,17 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
             self.assertEqual(job["effort"], expect_variant or "default")
         self._no_secret_leak()
 
+    def _go_mode(self, mode):
+        prev = os.environ.get("FAKE_OC_MODE_GO")
+        os.environ["FAKE_OC_MODE_GO"] = mode
+
+        def restore():
+            if prev is None:
+                os.environ.pop("FAKE_OC_MODE_GO", None)
+            else:
+                os.environ["FAKE_OC_MODE_GO"] = prev
+        self.addCleanup(restore)
+
     def _set_route(self, route):
         con = store.connect(self.sd)
         try:
@@ -365,9 +376,117 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         finally:
             con.close()
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
-        self.assertEqual((res2["action"], res2["reason"]), ("blocked", "one_turn_per_job"))
+        # The one-turn mark now yields a lateral move before dispatch, not a block.
+        self.assertEqual((res2["action"], res2["reason"], res2["route"]),
+                         ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
         prompts = [r for r in self._requests() if r["path"].endswith("/prompt_async")]
         self.assertEqual(len(prompts), 1)
+    def _capacity(self, route):
+        rows = [r for r in core.list_capacity(self.sd) if r["route"] == route]
+        return rows[0] if rows else None
+
+    def test_overload_moves_to_next_family_within_60s(self):
+        run = self._setup("overloaded")
+        started = time.monotonic()
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        elapsed = time.monotonic() - started
+        self.assertEqual(res["action"], "route_switched")
+        self.assertEqual(res["reason"], "lateral")
+        self.assertLess(elapsed, 60.0)
+        job = core.get_job(self.sd, "oc1")
+        # Same family (Go Muse) is skipped; the next family in the default lane is GLM.
+        self.assertEqual(job["route"], "glm-5.3-go")
+        self.assertTrue((self.fake_state / "aborted").exists())
+        self.assertIn('"signal": "overloaded"', job["last_error_json"])
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
+        self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+        cap = self._capacity("muse-spark-xhigh-free")
+        self.assertEqual((cap["state"], cap["pool"], cap["window"]), ("degraded", "zen-free", "cooldown"))
+        self.assertTrue(cap["reset_at"])
+        # The next turn runs on GLM in the same saved session.
+        session = job["opencode_session_id"]
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res2["action"], "implementation_ok")
+        prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual([m["providerID"] for m in prompts], ["opencode", "opencode-go"])
+        self.assertEqual(prompts[-1]["modelID"], "glm-5.3")
+        self.assertEqual(core.get_job(self.sd, "oc1")["opencode_session_id"], session)
+        self._no_secret_leak()
+
+    def test_go_exhaustion_moves_the_same_model_to_xai(self):
+        run = self._setup("ok")
+        self._go_mode("go_limit")
+        self._set_route("grok-4.6-go")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual((res["action"], res["reason"]), ("route_switched", "pool_move"))
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "grok-4.6-xai")
+        self.assertIn("grok-4.6-go", core.exhausted_routes(self.sd))
+        cap = self._capacity("grok-4.6-go")
+        self.assertEqual((cap["state"], cap["pool"], cap["model"]), ("exhausted", "go", "opencode-go/grok-4.6"))
+        self.assertIn("GoUsageLimitError", cap["evidence_json"])
+        self.assertIsNone(cap["reset_at"])  # no invented reset
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res2["action"], "implementation_ok")
+        prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual([m["providerID"] for m in prompts], ["opencode-go", "xai"])
+        self._no_secret_leak()
+
+    def test_exhaustion_without_next_route_blocks_with_reason(self):
+        run = self._setup("ok")
+        self._go_mode("go_limit")
+        self._set_route("glm-5.3-go")  # last route of the default lane, no next pool
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual((res["action"], res["reason"]), ("blocked", "capacity_exhausted"))
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("capacity_exhausted", job["block_reason"])
+        self.assertEqual(job["route"], "glm-5.3-go")
+        self.assertIn("glm-5.3-go", core.exhausted_routes(self.sd))
+
+    def test_hard_lane_moves_stay_in_the_hard_lane_and_respect_one_turn(self):
+        run = self._setup("overloaded")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET lane='implementation_hard', status='running' WHERE request_id='oc1'")
+        finally:
+            con.close()
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        # Overloaded free Muse in the hard lane moves to Kimi K3, not to GLM.
+        self.assertEqual((res["action"], res["route"]), ("route_switched", "kimi-k3-go"))
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res2["action"], "implementation_ok")
+        # The dispatcher asks for another turn (new seq). A second turn on the
+        # one-turn route is refused before dispatch: the job moves to the next
+        # family in the hard lane without contacting the provider.
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='oc1'",
+                        (json.dumps({"seq": 1, "last_action": {"action": "implementation"}}),))
+        finally:
+            con.close()
+        res3 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual((res3["action"], res3["reason"], res3["route"]),
+                         ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
+        prompts = [r["body"]["model"]["modelID"] for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual(prompts.count("kimi-k3"), 1)
+
+    def test_preflight_skips_degraded_and_exhausted_routes(self):
+        run = self._setup("ok")
+        core.record_capacity(self.sd, "muse-spark-xhigh-free", "degraded",
+                             {"source": "test", "class": "overloaded"}, reset_at=core.degraded_until())
+        core.record_capacity(self.sd, "muse-spark-xhigh-go", "exhausted", {"source": "test"})
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual((res["action"], res["reason"]), ("route_switched", "preflight_degraded"))
+        self.assertEqual(core.get_job(self.sd, "oc1")["route"], "glm-5.3-go")
+        self.assertEqual(self._requests(), [])  # nothing was dispatched to the resting routes
+        # Cooldown in the past means the route is eligible again.
+        core.record_capacity(self.sd, "glm-5.3-go", "degraded", {"source": "test"},
+                             reset_at="2000-01-01T00:00:00+00:00")
+        self.assertNotIn("glm-5.3-go", core.degraded_routes(self.sd))
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        self.assertEqual(res2["action"], "implementation_ok")
+        self._no_secret_leak()
 
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):
@@ -439,12 +558,17 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(res["action"], "transferred_to_go")
 
     def test_generic_rate_limit_never_transfers(self):
+        # A 429 rate limit is overload, not exhaustion: the free route is never
+        # marked exhausted and Go Muse is never selected; the job moves to the
+        # next family after the provider's own retries.
         run = self._setup("rate_limit")
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
-        self.assertEqual(res["action"], "blocked")
+        self.assertEqual((res["action"], res["reason"]), ("route_switched", "lateral"))
         job = core.get_job(self.sd, "oc1")
-        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        self.assertEqual(job["route"], "glm-5.3-go")
+        self.assertNotEqual(job["route"], "muse-spark-xhigh-go")
         self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
 
     def test_model_authored_text_is_not_provider_evidence(self):
         run = self._setup("model_text")

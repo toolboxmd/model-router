@@ -455,6 +455,10 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
               "ok": False}
     prompted_at = time.monotonic()
     seen_active = False
+    from . import policy as _policy
+    overload_spec = _policy.SIGNAL_CLASSES["overloaded"]
+    overload_first = None
+    overload_attempts = 0
 
     def abort_and_confirm():
         try:
@@ -487,6 +491,37 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             seen_active = True
             if typ == "retry":
                 result["last_retry"] = adapters.redact_nested(status)
+                cls = _policy.classify_signal(status)
+                if cls == "exhausted":
+                    # Exhaustion on a paid pool (for example GoUsageLimitError):
+                    # zero retries, abort, confirm idle, let the controller move pools.
+                    result.update(rc=3, quota=True, signal="exhausted",
+                                  signal_evidence=adapters.redact_nested(status),
+                                  error="provider allowance exhausted")
+                    abort_and_confirm()
+                    break
+                if cls == "overloaded":
+                    # The provider retries on its own; allow the policy's bounded
+                    # attempts and window, then abort and move to another family.
+                    overload_first = overload_first or time.monotonic()
+                    try:
+                        reported = int(status.get("attempt") or 0)
+                    except (TypeError, ValueError):
+                        reported = 0
+                    overload_attempts = max(overload_attempts + 1, reported)
+                    if overload_attempts > overload_spec["retries"] \
+                            or time.monotonic() - overload_first > overload_spec["window_secs"]:
+                        result.update(rc=4, signal="overloaded",
+                                      signal_evidence=adapters.redact_nested(status),
+                                      error="provider overloaded")
+                        abort_and_confirm()
+                        break
+                elif cls == "hard":
+                    result.update(rc=1, signal="hard",
+                                  signal_evidence=adapters.redact_nested(status),
+                                  error="hard provider error")
+                    abort_and_confirm()
+                    break
         else:
             new = adapters.assistant_messages_after(client.messages(saved), baseline)
             if new:
@@ -503,12 +538,22 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     result["actual_model"] = {"providerID": info.get("providerID"),
                                               "modelID": info.get("modelID"),
                                               "variant": info.get("variant")}
+                    cls = _policy.classify_signal(err) if err else None
                     if evidence:
                         # The session already ended idle with this error.
-                        result.update(rc=3, quota=True, free_exhaustion_evidence=evidence,
-                                      idle_confirmed=True)
+                        result.update(rc=3, quota=True, signal="exhausted",
+                                      free_exhaustion_evidence=evidence,
+                                      signal_evidence=evidence, idle_confirmed=True)
+                    elif cls == "exhausted":
+                        result.update(rc=3, quota=True, signal="exhausted",
+                                      signal_evidence=adapters.redact_nested(err),
+                                      error=adapters.redact_nested(err), idle_confirmed=True)
+                    elif cls == "overloaded":
+                        result.update(rc=4, signal="overloaded",
+                                      signal_evidence=adapters.redact_nested(err),
+                                      error=adapters.redact_nested(err), idle_confirmed=True)
                     elif err:
-                        result.update(rc=1, error=adapters.redact_nested(err))
+                        result.update(rc=1, signal=cls, error=adapters.redact_nested(err))
                     else:
                         result.update(rc=0, ok=True)
                     break
@@ -523,7 +568,8 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         time.sleep(1.0)
     summary = {k: result.get(k) for k in (
         "opencode_session_id", "ok", "rc", "quota", "idle_confirmed", "finish",
-        "actual_model", "error", "free_exhaustion_evidence", "assistant_text",
+        "actual_model", "error", "free_exhaustion_evidence", "signal", "signal_evidence",
+        "assistant_text",
         "assistant_messages", "model", "variant", "agent")}
     try:
         with open(stdout_path, "a", encoding="utf-8") as f:
