@@ -15,7 +15,7 @@ versioned route policy. It cannot grant new authority.
 ```
 python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
   --workspace PATH --planner-session SID [--planner-cwd PATH] \
-  [--planner-model M] [--planner-effort E] [--route R] [--max-attempts N] \
+  [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
   [--timeout-secs S] [--start | --no-start]
 python -m runner --state-dir DIR start --request-id ID
 python -m runner --state-dir DIR status --request-id ID
@@ -36,8 +36,11 @@ or lies inside the workspace of an active or cancelling job, or of a job
 that still owns a child process, is rejected. Workspaces are compared by
 device and inode along their ancestor chain, so symlinks, case variants,
 and firmlink aliases on macOS are the same workspace.
-`--route` accepts only the implementation routes
-`muse-spark-xhigh-free` and `muse-spark-xhigh-go`. `--start` launches a detached
+`--lane` picks an implementation lane (`default`, `small`, `hard`) and its
+first route; `--route` names one implementation route from the policy
+directly. Without either, the default lane's first route applies. The
+`critical` lane is planner-executed and `submit` rejects it: do that step in
+the planner session, then submit the remainder. `--start` launches a detached
 controller after the commit. `--planner-cwd` is the directory where the
 planner session was started, because Claude stores sessions per project
 directory; it defaults to the workspace.
@@ -94,8 +97,12 @@ workspace, subagents, interactive questions, doom-loop prompts, and web
 access. OpenCode does not confine Bash at the OS level; that remains a known
 limit.
 
-The prompt goes through `POST /session/{id}/prompt_async` with model
-`opencode/muse-spark-1.3-contributor-free`, variant `xhigh`, agent `build`.
+The prompt goes through `POST /session/{id}/prompt_async` with the job
+route's model, variant, and agent from the policy (free Muse is
+`opencode/muse-spark-1.3-contributor-free`, variant `xhigh`, agent `build`;
+GLM, Qwen, MiniMax, Kimi, and DeepSeek on Go use the provider default variant;
+Grok on Go or xAI uses `medium`). An unknown route is an error, never a
+substitution.
 The supervisor polls `GET /session/status` for that session only and reads
 the new assistant messages when it is idle. The server group stops after
 every turn.
@@ -238,17 +245,33 @@ request.
 
 ## Policy
 
-`runner/policy.py` (`durable-runner-policy-v1`) records the agreed roles:
-planning Fable 5.1 max (`claude-fable-5-1`) or Astra max in Codex; Luna max
-dispatch, Terra only after demonstrated coordination failure; Muse Spark 1.3
-Contributor xhigh free first, then Go included allowance; Go capacity order
-DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3, then MiMo 2.5 and LongCat
-2.0; one bounded correction, then Kimi K2.7 Code; recovery Grok 4.6 medium,
-Astra medium, Opus 5 high; independent Luna max review; Opus 5 high combined
-review. Only Luna dispatch, the Claude planner callback, and the two Muse
-routes have runner adapters. Other routes return a precise blocker and are
-never reported as a successful fallback. `claude-sonnet-5` / `medium` is an
-explicit test override only.
+`runner/policy.py` (`durable-runner-policy-v2`) is the single policy source:
+pools, routes, stages (lanes), each Go model's monthly dollar limit and its
+usage windows, signal classes, and provenance. The Codex skill reference
+`skills/model-routing/references/codex.md` is rendered from it with
+`python -c "from runner import policy; policy.main(['render-skill'])"` and a
+test keeps the two equal; `policy.main(['validate'])` checks the data.
+
+Stages in order: planning (Fable 5.1 in Claude Code, Sonnet medium only as
+the explicit live-test override), dispatch (Luna max on Codex, read-only),
+the implementation lanes default, small, and hard, critical
+(planner-executed), correction (Kimi K2.7 Code after the same session), recovery
+(Grok 4.6 on Go then on the xAI subscription), ticket review (Luna max), and
+final review (Opus 5 high when the planner asks). Worker pools in order: Zen
+free, Go, xAI; subscription logins only. Older generations of pooled models
+are never routes; $15-per-month Go models get one turn per job. Every route in
+the policy has an adapter today; the OpenCode adapter takes model, variant,
+and agent from the route. Go Luna as a dispatch fallback arrives with the
+adapter seam.
+
+Signal classes are defined in the policy and applied by later work: exhaustion
+(`free_tier_limit`, `FreeUsageLimitError`, `GoUsageLimitError`,
+`insufficient_quota`) moves the same model to the next pool; overload
+(`overloaded`, `rate_limit`, `account_rate_limit`, HTTP 503 and 529) moves to
+the next family after a bounded retry window; hard errors block. In this
+version the controller still moves only free Muse to Go on exact free
+exhaustion evidence; the legacy `opencode run` test seam supports the free and
+Go Muse routes only.
 
 ## Verification
 

@@ -456,7 +456,15 @@ def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int
 
 
 def opencode_model_for_route(route: str | None) -> str:
-    return OPENCODE_GO_MODEL if route == "muse-spark-xhigh-go" else OPENCODE_FREE_MODEL
+    """Policy-driven model for an OpenCode route; free Muse for unknown routes."""
+    from . import policy as _policy
+    return _policy.opencode_route_params(route)[0]
+
+
+def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
+    """(model, variant, agent) the policy assigns to an OpenCode route."""
+    from . import policy as _policy
+    return _policy.opencode_route_params(route)
 
 
 def opencode_model_for_allowance(allowance: str) -> str:
@@ -488,8 +496,10 @@ def build_opencode_cmd(workspace: str, prompt: str,
     """
     if not workspace:
         raise ValueError("missing workspace for opencode run")
-    if allowance not in ("free", "go-included"):
+    if allowance not in ("free", "go-included", "xai-subscription"):
         raise ValueError(f"unsupported allowance: {allowance!r}")
+    if allowance == "xai-subscription" and not (model or "").startswith("xai/"):
+        raise ValueError("allowance xai-subscription requires an xai/* model")
     # Back-compat: old callers passed model=muse-spark-... and
     # effort=xhigh positionally. Map them onto the provider-shaped route.
     if effort is not None and effort != OPENCODE_VARIANT:
@@ -513,9 +523,10 @@ def build_opencode_cmd(workspace: str, prompt: str,
            "--format", "json",
            "--pure",
            "--dir", workspace,
-           "--model", model,
-           "--variant", variant,
-           "--agent", agent]
+           "--model", model]
+    if variant:  # None means the provider default
+        cmd += ["--variant", variant]
+    cmd += ["--agent", agent]
     if session_id:
         cmd += ["--session", session_id]
     cmd += [prompt]
