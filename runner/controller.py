@@ -1,0 +1,1002 @@
+"""Controller flow (stdlib only). See RUNNER.md.
+
+One :func:`step` advances one useful transition: dispatch Luna, ask the
+saved planner, run one Muse turn, or complete. The detached
+:func:`run_controller_process` loops a bounded number of steps with the
+durable run command, so every child is supervised, recorded before spawn,
+and reused by action identity after a restart. Resume always reuses saved
+session IDs. ``run_cmd`` stays injectable for deterministic tests.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from . import adapters, core, policy, store
+
+MAX_LOOP_STEPS = 12
+
+# Lease token of the controller process that owns this job. Every durable
+# controller write checks it under the write lock; tests and helpers that
+# run without a controller leave it unset.
+_LEASE = {"token": None}
+_LOCK = {"fd": None}
+
+
+def _lease_guard(con, request_id: str) -> None:
+    token = _LEASE["token"]
+    if token is None:
+        return
+    row = con.execute("SELECT owner_token, cancel_requested, status FROM jobs WHERE request_id=?",
+                      (request_id,)).fetchone()
+    if row is None or row["owner_token"] != token or row["cancel_requested"] \
+            or row["status"] in store.TERMINAL:
+        con.execute("ROLLBACK")
+        raise core.LeaseLostError(f"job {request_id}: lease lost, cancelled, or terminal")
+
+
+def default_run_cmd(cmd: list[str], cwd: str | None = None,
+                    timeout: int = 120, **_kwargs) -> tuple[int, str, str]:
+    """Run a built-in adapter command (stdlib subprocess, no secrets logged)."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, cwd=cwd or None)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except FileNotFoundError as e:
+        return 127, "", f"command not found: {e}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timeout"
+    except OSError as e:
+        return 127, "", f"spawn failed: {e}"
+
+
+def parse_luna_action(output_text: str,
+                      last_message_text: str | None = None) -> dict | None:
+    """Extract a structured Luna action envelope.
+
+    Scans stdout plus the output-last-message envelope; last matching
+    valid ``action`` wins (deterministic). Back-compat: single-arg call
+    scans just ``output_text``.
+    """
+    return adapters.parse_luna_envelope_from_texts(output_text,
+                                                   last_message_text)
+
+
+def _task_summary(task_json: str) -> str:
+    """Full canonical task content (never silently clipped)."""
+    # The durable flow passes the complete task to Luna and adapters.
+    # Callers add the explicit action protocol via build_luna_prompt.
+    return task_json or ""
+
+
+def _full_luna_prompt(task_json: str, extra: str = "") -> str:
+    return adapters.build_luna_prompt(task_json or "", extra or "")
+
+
+def _last_message_path(state_dir, request_id: str, suffix: str) -> str:
+    """A 0600 file Codex writes its last message into."""
+    root = store.ensure_state_dir(state_dir)
+    path = root / "outputs" / f"{request_id}.{suffix}.json"
+    if not path.exists():
+        store.secure_write_text(path, "")
+    else:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return str(path)
+
+
+def _ensure_child_table(state_dir) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS child_calls ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " request_id TEXT NOT NULL,"
+            " ts TEXT NOT NULL,"
+            " kind TEXT NOT NULL,"
+            " cmd_json TEXT NOT NULL,"
+            " rc INTEGER,"
+            " session_id TEXT,"
+            " output_path TEXT)")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id)")
+    finally:
+        con.close()
+
+
+def _record_child(state_dir, request_id: str, kind: str,
+                  cmd: list[str], rc: int | None,
+                  session_id: str | None = None,
+                  output_text: str = "") -> None:
+    """Persist a durable child invocation record + file output."""
+    _ensure_child_table(state_dir)
+    out_path = ""
+    try:
+        root = store.ensure_state_dir(state_dir)
+        log = store.output_path_for(root, request_id)
+        snippet = f"[{kind} rc={rc}] {' '.join(str(c) for c in cmd[:6])}\n"
+        # Never log secrets: redact password-ish tokens from the snippet.
+        low_snippet = snippet
+        store.append_text(log, low_snippet)
+        # Model output stays in the private per-invocation files; the job
+        # log shown by `status` records only runner-authored markers.
+        out_path = str(log)
+    except OSError:
+        pass
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        # Redact argv secrets (passwords/tokens) before persisting.
+        safe_cmd = [("<redacted>" if any(s in str(c).lower() for s in ("password", "bearer", "token=")) else c) for c in cmd]
+        con.execute(
+            "INSERT INTO child_calls(request_id,ts,kind,cmd_json,rc,session_id,output_path)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (request_id, core._utcnow(), kind, json.dumps(safe_cmd),
+             rc, session_id, out_path))
+        core._event(con, request_id, f"child_{kind}",
+                    {"rc": rc, "session": (session_id or "")[:24]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
+def _load_controller_state(job: dict) -> dict:
+    raw = job.get("controller_state")
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _persist_envelope(state_dir, request_id: str, envelope: dict | None,
+                      phase: str) -> None:
+    """Persist the Luna action envelope BEFORE its side effect."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        cur = _load_controller_state(dict(job))
+        cur["phase"] = phase
+        cur["last_action"] = envelope
+        if envelope:
+            cur["last_action_name"] = envelope.get("action")
+            cur["seq"] = int(cur.get("seq") or 0) + 1
+        now = core._utcnow()
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(cur, sort_keys=True), now, request_id))
+        if envelope is not None:
+            core._event(con, request_id, "luna_action",
+                        {"action": str(envelope.get("action") or "unknown")[:64],
+                         "phase": phase})
+        else:
+            core._event(con, request_id, "luna_action_missing", {"phase": phase})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _persist_error_evidence(state_dir, request_id: str, raw_error) -> dict:
+    redacted = adapters.redact_nested(raw_error if isinstance(raw_error, dict) else {"error": str(raw_error)[:2000]})
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        now = core._utcnow()
+        con.execute("UPDATE jobs SET last_error_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(redacted, sort_keys=True)[:8000], now, request_id))
+        core._event(con, request_id, "provider_error_evidence", {"error_class": str(raw_error)[:200] if not isinstance(raw_error, dict) else str(raw_error.get("class") or raw_error.get("code") or raw_error.get("reason") or "error")[:200]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return redacted
+
+
+def _mark_blocked(state_dir, request_id: str, reason: str, extra: dict | None = None) -> dict:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        now = core._utcnow()
+        con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?",
+                    (reason, now, request_id))
+        payload = {"reason": reason}
+        if extra:
+            payload.update(store.redact_for_log(dict(extra)))
+        core._event(con, request_id, "blocked", payload)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return core.get_job(state_dir, request_id)
+
+
+def _save_codex_task(state_dir, request_id: str, task_id: str,
+                     model: str = adapters.CODEX_MODEL,
+                     effort: str = adapters.CODEX_EFFORT) -> dict:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        now = core._utcnow()
+        st = _load_controller_state(dict(job))
+        st.update({"phase": "dispatched", "codex_task_id": task_id})
+        con.execute("UPDATE jobs SET codex_task_id=?, adapter=?, model=?, effort=?,"
+                    " controller_state=?, updated_at=? WHERE request_id=?",
+                    (task_id, "codex", model, effort,
+                     json.dumps(st, sort_keys=True), now, request_id))
+        core._event(con, request_id, "codex_dispatched", {"task": task_id[:12] + "..."})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return core.get_job(state_dir, request_id)
+
+
+def _save_opencode_session(state_dir, request_id: str, session_id: str,
+                           route: str, adapter: str = "opencode",
+                           model: str = adapters.OPENCODE_MODEL,
+                           effort: str = adapters.OPENCODE_EFFORT) -> dict:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if job is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        now = core._utcnow()
+        con.execute("UPDATE jobs SET opencode_session_id=?, route=?, adapter=?, model=?, effort=?,"
+                    " updated_at=? WHERE request_id=?",
+                    (session_id, route, adapter, model, effort, now, request_id))
+        core._event(con, request_id, "opencode_session_saved", {"route": route})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return core.get_job(state_dir, request_id)
+
+
+def _prompt_digest(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
+    """Ensure Codex dispatch; persist the task ID before accepting."""
+    run_cmd = run_cmd or default_run_cmd
+    job = core.get_job(state_dir, request_id)
+    st = _load_controller_state(job)
+    if job.get("codex_task_id") and st.get("seq"):
+        return {"action": "already-dispatched", "codex_task_id": job["codex_task_id"],
+                "luna_action": st.get("last_action")}
+    # A saved thread without a saved action means the dispatch turn's
+    # result was not collected. Re-entering the same action reuses or
+    # adopts that invocation; it never starts a second dispatch.
+    workspace = job["workspace"]
+    prompt = _full_luna_prompt(job["task_json"])
+    last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
+    cmd = adapters.build_codex_dispatch_cmd(workspace, prompt,
+                                            last_message_path=last_path)
+    rc, out, err = run_cmd(cmd, workspace)
+    last_text = adapters.read_last_message_file(last_path)
+    task_id = adapters.parse_codex_task_id(out)
+    _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
+                  session_id=task_id, output_text=(out or "") + (err or ""))
+    if not task_id:
+        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted")
+        return {"action": "blocked", "reason": "codex_dispatch_failed"}
+    # The thread exists even when the turn failed: save it so recovery
+    # resumes it instead of creating a replacement task.
+    _save_codex_task(state_dir, request_id, task_id)
+    if rc != 0 or "turn.completed" not in (out or ""):
+        # A turn counts only with its completion event, as in recovery.
+        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: turn not completed")
+        return {"action": "blocked", "reason": "codex_dispatch_failed", "codex_task_id": task_id}
+    luna_action = adapters.parse_codex_agent_envelope(out, last_text)
+    # Persist the envelope before any side effect it commands.
+    _persist_envelope(state_dir, request_id, luna_action, "dispatched")
+    if luna_action is None:
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        return {"action": "blocked", "reason": "luna_missing_action",
+                "codex_task_id": task_id}
+    return {"action": "dispatched", "codex_task_id": task_id, "luna_action": luna_action}
+
+
+def _own_invocation_pids(state_dir, request_id: str) -> set:
+    pids = set()
+    for inv in core._list_invocations(state_dir, request_id):
+        if inv.get("state") in core.LIVE_INVOCATION_STATES:
+            for k in ("pid", "supervisor_pid"):
+                if inv.get(k):
+                    pids.add(int(inv[k]))
+    return pids
+
+
+def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
+                     run_cmd=None) -> dict:
+    """Persist question before Claude --resume; persist answer before resume.
+
+    Never forks a new planner session. A busy planner, a failed callback,
+    or a result from another session becomes a durable blocked state
+    with a reason; the question stays pending for ``answer`` + recover.
+    """
+    run_cmd = run_cmd or default_run_cmd
+    job = core.get_job(state_dir, request_id)
+    planner_session = job.get("planner_session_id")
+    if not planner_session:
+        _mark_blocked(state_dir, request_id, "missing planner session: refusing to fork a new session")
+        return {"action": "blocked", "reason": "missing_planner_session"}
+    # Persist the planner question before calling Claude.
+    try:
+        core.post_question(state_dir, request_id, qid, prompt, lease_token=_LEASE["token"])
+    except core.ConflictError as e:
+        _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
+        return {"action": "blocked", "reason": "question_conflict"}
+    # An earlier controller may already have asked; that attempt is
+    # adopted through its action key, so the busy checks do not apply.
+    asked = any(i.get("kind") == "claude_callback"
+                and json.loads(i.get("meta_json") or "{}").get("qid") == qid
+                for i in core._list_invocations(state_dir, request_id)
+                if i.get("state") != "abandoned")
+    busy = [] if asked else adapters.planner_session_in_use(
+        planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
+    if busy:
+        _mark_blocked(state_dir, request_id,
+                      f"planner_busy: session in use by pid {busy[0]}; answer the question and recover")
+        return {"action": "blocked", "reason": "planner_busy"}
+    if not asked and not adapters.wait_planner_quiet(planner_session):
+        _mark_blocked(state_dir, request_id,
+                      "planner_busy: session transcript is still changing; answer the question and recover")
+        return {"action": "blocked", "reason": "planner_busy"}
+    planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
+    planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
+    question = ("The runner dispatcher for your submitted request "
+                f"{request_id} asks (question {qid}):\n{prompt}\n\n"
+                "Answer briefly with the decision only. Do not run tools.")
+    try:
+        cmd = adapters.build_claude_cmd(planner_session, question,
+                                         model=planner_model, effort=planner_effort)
+    except ValueError as e:
+        _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
+        return {"action": "blocked", "reason": "planner_resume_refused"}
+    cwd = job.get("planner_cwd") or job["workspace"]
+    rc, out, err = run_cmd(cmd, cwd, None, kind="claude_callback", meta={"qid": qid})
+    parsed = adapters.parse_claude_result(out)
+    _record_child(state_dir, request_id, "claude_callback", cmd, rc,
+                  session_id=parsed.get("session_id") or planner_session,
+                  output_text=(parsed.get("answer") or "") + "\n" + (err or "")[-1000:])
+    stored = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
+              if q["qid"] == qid and q["status"] == "answered"]
+    if stored and (rc != 0 or not parsed.get("ok") or parsed.get("session_id") != planner_session):
+        # Answered publicly while the callback ran: the stored answer wins.
+        return {"action": "answered", "qid": qid}
+    if rc != 0 or not parsed.get("ok"):
+        reason = f"planner_callback_failed rc={rc}: {parsed.get('error') or 'error'}"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "claude_callback", "rc": rc,
+                                 "error": parsed.get("error"),
+                                 "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "planner_callback_failed"}
+    if parsed.get("session_id") != planner_session:
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "claude_callback",
+                                 "expected_session": planner_session,
+                                 "reported_session": parsed.get("session_id")})
+        _mark_blocked(state_dir, request_id,
+                      "planner_session_mismatch: resumed result came from another session")
+        return {"action": "blocked", "reason": "planner_session_mismatch"}
+    # Persist the answer before resuming the same Luna task.
+    try:
+        core.answer(state_dir, request_id, qid, parsed["answer"], lease_token=_LEASE["token"])
+    except core.ConflictError:
+        pass  # answered publicly meanwhile: the stored answer wins
+    return {"action": "answered", "qid": qid}
+
+
+def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
+                label: str = "CONTEXT") -> dict:
+    """Resume only the saved Luna task ID with new context (never fork)."""
+    run_cmd = run_cmd or default_run_cmd
+    job = core.get_job(state_dir, request_id)
+    task_id = job.get("codex_task_id")
+    if not task_id:
+        _mark_blocked(state_dir, request_id, "missing saved Codex task ID: refusing to fork")
+        return {"action": "blocked", "reason": "missing_codex_task"}
+    message = adapters.build_luna_followup(label, prompt)
+    last_path = _last_message_path(state_dir, request_id,
+                                   "codex-resume-" + _prompt_digest(message))
+    cmd = adapters.build_codex_resume_cmd(task_id, message,
+                                          last_message_path=last_path)
+    # Resume uses the saved workspace as cwd; never --cd/--reasoning.
+    rc, out, err = run_cmd(cmd, job["workspace"])
+    last_text = adapters.read_last_message_file(last_path)
+    resumed_id = adapters.parse_codex_task_id(out)
+    _record_child(state_dir, request_id, "codex_resume", cmd, rc,
+                  session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
+    if resumed_id != task_id:
+        _mark_blocked(state_dir, request_id,
+                      f"luna_task_mismatch: resume reported {str(resumed_id or 'no thread')[:24]}")
+        return {"action": "blocked", "reason": "luna_task_mismatch"}
+    if rc != 0 or "turn.completed" not in (out or ""):
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "codex_resume", "rc": rc,
+                                 "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_resume_failed rc={rc}: turn not completed")
+        return {"action": "blocked", "reason": "codex_resume_failed"}
+    luna_action = adapters.parse_codex_agent_envelope(out, last_text)
+    _persist_envelope(state_dir, request_id, luna_action, "resumed")
+    if luna_action is None:
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        return {"action": "blocked", "reason": "luna_missing_action"}
+    return {"action": "resumed", "luna_action": luna_action}
+
+
+def _route_allowance(route: str) -> str:
+    if route == "muse-spark-xhigh-go":
+        return "go-included"
+    return "free"
+
+
+WORKER_RULES = (
+    "WORKER RULES: you are the implementation worker for one runner job. "
+    "Edit only what the task and instructions allow, inside this "
+    "workspace. Run the task's proof command when it has one. Do not "
+    "start other agents, commit, push, or install anything. Finish with a "
+    "short report of changed files and proof results."
+)
+
+
+def _implementation_prompt(task_json: str, artifact, payload) -> str:
+    prompt = f"TASK (complete):\n{_task_summary(task_json)}\n"
+    if isinstance(payload, dict) and isinstance(payload.get("instructions"), str):
+        prompt += f"\nDISPATCHER INSTRUCTIONS:\n{payload['instructions']}\n"
+    if artifact:
+        prompt += f"\nartifact: {artifact}\n"
+    if payload:
+        try:
+            prompt += "\ncontext: " + json.dumps(payload, sort_keys=True) + "\n"
+        except Exception:
+            prompt += f"\ncontext: {payload!r}\n"
+    return prompt + "\n" + WORKER_RULES
+
+
+def _runner_result(out: str) -> dict | None:
+    found = None
+    for line in (out or "").splitlines():
+        if line.startswith("RUNNER_RESULT "):
+            try:
+                found = json.loads(line[len("RUNNER_RESULT "):])
+            except ValueError:
+                continue
+    return found
+
+
+def _structured_run_errors(out: str, err: str) -> list:
+    """Error objects from ``opencode run --format json`` (not model text)."""
+    found = []
+    for blob in (out or "", err or ""):
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") in ("text", "reasoning", "tool_use", "step_start", "step_finish"):
+                continue
+            if "error" in obj or "code" in obj or obj.get("type") == "error":
+                found.append(obj)
+    return found
+
+
+def _set_phase(state_dir, request_id: str, **fields) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        cur = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        st = {}
+        if cur is not None and cur["controller_state"]:
+            try:
+                st = json.loads(cur["controller_state"]) or {}
+            except ValueError:
+                st = {}
+        st.update(fields)
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "implementation_output",
+                    {"session": str(fields.get("opencode_session_id") or "")[:24],
+                     "phase": fields.get("phase")})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = True) -> dict:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        con.execute("UPDATE jobs SET route=?, model=?, updated_at=? WHERE request_id=?",
+                    ("muse-spark-xhigh-go", adapters.OPENCODE_GO_MODEL,
+                     core._utcnow(), request_id))
+        core._event(con, request_id, "route_switched",
+                    {"from": "muse-spark-xhigh-free", "to": "muse-spark-xhigh-go",
+                     "evidence": str(evidence.get("source") or evidence.get("class") or "provider")[:64]})
+        if record:
+            # Keep the original provider evidence; a memory-based switch
+            # never overwrites it.
+            core._record_capacity_locked(con, "muse-spark-xhigh-free", "exhausted",
+                                         evidence, core._trusted_reset_at(evidence))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"action": "transferred_to_go", "route": "muse-spark-xhigh-go"}
+
+
+def run_implementation(state_dir, request_id: str, artifact: str | None = None,
+                       payload: dict | None = None, run_cmd=None,
+                       use_owned_server: bool = False) -> dict:
+    """Run one Muse implementation turn for the current Luna action.
+
+    The public controller uses an owned ``opencode serve`` driven by the
+    supervisor. ``use_owned_server=False`` keeps the ``opencode run``
+    test seam. Free to Go needs trusted provider evidence; on the owned
+    server the old session must also be confirmed idle. Generic errors
+    never select Go.
+    """
+    run_cmd = run_cmd or default_run_cmd
+    job = core.get_job(state_dir, request_id)
+    workspace = job["workspace"]
+    route = job.get("route") or "muse-spark-xhigh-free"
+    allowance = _route_allowance(route)
+    model = adapters.opencode_model_for_allowance(allowance)
+    saved_session = job.get("opencode_session_id")
+    seq = _load_controller_state(job).get("seq", 0)
+    prompt = _implementation_prompt(job["task_json"], artifact, payload)
+    attempted = any(i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
+                    and json.loads(i.get("meta_json") or "{}").get("seq") == seq
+                    for i in core._list_invocations(state_dir, request_id))
+    if not attempted and route == "muse-spark-xhigh-free" \
+            and route in core.exhausted_routes(state_dir):
+        return _switch_to_go(state_dir, request_id,
+                             {"source": "capacity_memory", "route": route}, record=False)
+    if use_owned_server:
+        cmd = adapters.build_opencode_serve_cmd()
+        rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
+                               meta={"prompt": prompt, "allowance": allowance,
+                                     "model": model, "session_id": saved_session,
+                                     "seq": seq})
+        # The result line comes from this invocation's own output file.
+        full = _runner_result(out) or {}
+        session_id = full.get("opencode_session_id") or saved_session
+        _record_child(state_dir, request_id, "opencode_control", cmd, rc,
+                      session_id=session_id,
+                      output_text=json.dumps({k: full.get(k) for k in (
+                          "ok", "rc", "quota", "finish", "actual_model")}, sort_keys=True))
+        if rc == 0 and full.get("ok"):
+            _set_phase(state_dir, request_id, phase="implemented",
+                       opencode_session_id=session_id, artifact=artifact,
+                       implementation_output=str(full.get("assistant_text") or "")[-8000:])
+            return {"action": "implementation_ok", "session": session_id,
+                    "output": str(full.get("assistant_text") or ""),
+                    "finish": full.get("finish"), "actual_model": full.get("actual_model")}
+        evidence = full.get("free_exhaustion_evidence")
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "opencode_control", "rc": rc,
+                                 "error": full.get("error"), "quota": full.get("quota"),
+                                 "evidence": evidence,
+                                 "idle_confirmed": full.get("idle_confirmed")})
+        if full.get("quota") and isinstance(evidence, dict) and route == "muse-spark-xhigh-free":
+            if not full.get("idle_confirmed"):
+                _mark_blocked(state_dir, request_id,
+                              "go_transfer_abort_failed: free session not confirmed idle")
+                return {"action": "blocked", "reason": "go_transfer_abort_failed"}
+            return _switch_to_go(state_dir, request_id, evidence)
+        _mark_blocked(state_dir, request_id,
+                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
+        return {"action": "blocked", "reason": "implementation_failed"}
+
+    cmd = adapters.build_opencode_cmd(workspace, prompt, allowance=allowance,
+                                      session_id=saved_session)
+    rc, out, err = run_cmd(cmd, workspace)
+    errors = _structured_run_errors(out, err)
+    session_id = None
+    for blob in (out or "",):
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                for key in ("opencode_session_id", "sessionID", "session_id"):
+                    if isinstance(obj.get(key), str) and obj.get(key):
+                        session_id = obj[key]
+                        break
+            if session_id:
+                break
+    if session_id:
+        _save_opencode_session(state_dir, request_id, session_id, route,
+                               model=model)
+    _record_child(state_dir, request_id, "opencode_run", cmd, rc,
+                  session_id=(session_id or saved_session), output_text=(out or "") + (err or ""))
+    if rc == 0 and not errors:
+        _set_phase(state_dir, request_id, phase="implemented",
+                   opencode_session_id=session_id or saved_session, artifact=artifact,
+                   implementation_output=(out or "")[-8000:])
+        return {"action": "implementation_ok", "session": session_id or saved_session,
+                "output": (out or "")}
+    _persist_error_evidence(state_dir, request_id,
+                            errors[-1] if errors else {"source": "opencode", "rc": rc,
+                                                       "output": ((out or "") + (err or ""))[:2000]})
+    # The run process owned the session and has exited, so it is idle.
+    if route == "muse-spark-xhigh-free" and any(policy.classify_quota_exhaustion(e) for e in errors):
+        return _switch_to_go(state_dir, request_id, errors[-1])
+    _mark_blocked(state_dir, request_id, f"implementation_failed rc={rc}")
+    return {"action": "blocked", "reason": "implementation_failed"}
+
+
+def _complete_job(state_dir, request_id: str, token: str | None,
+                  output: str, artifact: str | None = None) -> dict:
+    """Persist the terminal result before acknowledgement (lease-held)."""
+    job = core.get_job(state_dir, request_id)
+    use_token = token or job.get("owner_token")
+    result_payload = {"output": output}
+    if artifact:
+        result_payload["artifact"] = artifact
+    if token:
+        # Public path: only the lease holder may complete; a stale
+        # controller never writes success.
+        try:
+            done = core.complete(state_dir, request_id, token,
+                                 json.dumps(result_payload, sort_keys=True))
+        except core.OwnershipError as e:
+            raise core.LeaseLostError(str(e))
+        except core.TerminalError:
+            return {"action": "noop-terminal", "status": core.get_job(state_dir, request_id)["status"]}
+        return {"action": "completed", "status": done["status"]}
+    if use_token:
+        try:
+            done = core.complete(state_dir, request_id, use_token,
+                                 json.dumps(result_payload, sort_keys=True))
+            return {"action": "completed", "status": done["status"]}
+        except (core.OwnershipError, core.TerminalError, core.NotFoundError):
+            pass
+    # Offline helper paths without a live lease: durable terminal write
+    # (still persists result + file before ack).
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        cur = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        if cur is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        if cur["status"] in store.TERMINAL:
+            con.execute("ROLLBACK")
+            return {"action": "noop-terminal", "status": cur["status"]}
+        now = core._utcnow()
+        con.execute("UPDATE jobs SET status='succeeded', result_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps({"ok": True, **result_payload}), now, request_id))
+        core._event(con, request_id, "completed", {"via": "controller"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    try:
+        root = store.ensure_state_dir(state_dir)
+        core._mirror_result(state_dir, request_id,
+                            json.dumps({"request_id": request_id, "status": "succeeded",
+                                        "result": result_payload}))
+        store.append_text(store.output_path_for(root, request_id), "[succeeded]\n")
+    except OSError:
+        pass
+    return {"action": "completed", "status": "succeeded"}
+
+
+def _handle_question_action(state_dir, request_id: str, envelope: dict,
+                            run_cmd) -> dict:
+    """Persist question -> Claude --resume exact planner session ->
+    persist answer -> resume exact Luna task. Never forks a session.
+    An answer already persisted (public ``answer`` or earlier callback)
+    is used without asking the planner again.
+    """
+    qid = str(envelope.get("qid") or envelope.get("question_id") or "q1")
+    prompt_q = str(envelope.get("prompt") or envelope.get("question") or
+                   envelope.get("text") or "Planner input requested.")
+    answer_text = None
+    for q in core.list_questions(state_dir, request_id, only_pending=False):
+        if q["qid"] == qid and q["status"] == "answered" and q.get("answer"):
+            answer_text = str(q["answer"])
+    if answer_text is None:
+        cb = planner_callback(state_dir, request_id, qid, prompt_q, run_cmd=run_cmd)
+        if cb.get("action") == "blocked":
+            return cb
+        for q in core.list_questions(state_dir, request_id, only_pending=False):
+            if q["qid"] == qid:
+                answer_text = q.get("answer") or ""
+    r = resume_luna(state_dir, request_id, f"question {qid}: {prompt_q}\nanswer: {answer_text}",
+                    run_cmd=run_cmd, label="PLANNER ANSWER")
+    if r.get("action") == "blocked":
+        return r
+    return {"action": "question-answered-resumed", "qid": qid,
+            "luna_action": r.get("luna_action")}
+
+
+def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
+                                  run_cmd, use_owned_server: bool = False) -> dict:
+    """One bounded implementation transition: OpenCode then Luna resume."""
+    artifact = envelope.get("artifact")
+    payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
+    impl = run_implementation(state_dir, request_id, artifact=artifact,
+                              payload=payload, run_cmd=run_cmd,
+                              use_owned_server=use_owned_server)
+    if impl.get("action") != "implementation_ok":
+        # transferred_to_go or blocked: the next step retries on the new
+        # route or stops; never fork a second writer here.
+        return impl
+    job = core.get_job(state_dir, request_id)
+    evidence = (f"worker route={job.get('route')} model={job.get('model')} "
+                f"session={impl.get('session') or ''} finish={impl.get('finish') or ''}\n"
+                f"worker report:\n{str(impl.get('output') or '')[-4000:]}\n"
+                "Inspect the workspace and run the proof before completion.")
+    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                    label="IMPLEMENTATION RESULT")
+    if r.get("action") == "blocked":
+        return r
+    return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
+
+
+def step(state_dir, request_id: str, run_cmd=None, token: str | None = None,
+         use_owned_server: bool = False) -> dict:
+    """Advance exactly one useful bounded controller transition."""
+    run_cmd = run_cmd or default_run_cmd
+    job = core.get_job(state_dir, request_id)
+    if job["status"] in store.TERMINAL:
+        return {"action": "noop-terminal", "status": job["status"]}
+    if job["cancel_requested"]:
+        return {"action": "cancelled", "status": job["status"]}
+    if job["status"] == "blocked":
+        return {"action": "blocked", "reason": job.get("block_reason")}
+    if not job.get("codex_task_id") or not _load_controller_state(job).get("seq"):
+        return dispatch(state_dir, request_id, run_cmd=run_cmd)
+    last = _load_controller_state(job).get("last_action")
+    if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no saved action to continue")
+        return {"action": "blocked", "reason": "luna_missing_action"}
+    action_name = last.get("action")
+    if action_name == "planner_question":
+        return _handle_question_action(state_dir, request_id, last, run_cmd)
+    if action_name == "implementation":
+        return _handle_implementation_action(state_dir, request_id, last, run_cmd,
+                                             use_owned_server=use_owned_server)
+    if action_name == "completion":
+        return _complete_job(state_dir, request_id, token,
+                             str(last.get("output") or "done"),
+                             last.get("artifact"))
+    # review/unknown: durable block, never spin.
+    _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
+    return {"action": "blocked", "reason": "unsupported_luna_action"}
+
+
+def _advertise(state_dir: str, request_id: str, token: str) -> None:
+    import datetime
+    import os
+    from pathlib import Path
+
+    root = Path(state_dir)
+    workers_dir = root / "workers"
+    outputs_dir = root / "outputs"
+    workers_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    outputs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    pid = os.getpid()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    from .supervisor import process_start_identity
+    payload = json.dumps({"token": token, "pid": pid, "updated": now,
+                          "start": process_start_identity(pid)})
+    ident = workers_dir / f"{request_id}.json"
+    tmp = ident.with_name(ident.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, ident)
+    try:
+        os.chmod(ident, 0o600)
+    except OSError:
+        pass
+    log = outputs_dir / f"{request_id}.log"
+    try:
+        if not log.exists():
+            log.write_text("", encoding="utf-8")
+            try:
+                os.chmod(log, 0o600)
+            except OSError:
+                pass
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"controller start request={request_id} pid={pid}\n")
+        try:
+            os.chmod(log, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def run_controller_process(state_dir: str, request_id: str, token: str,
+                           mode: str = "run-once", duration: float = 30.0) -> int:
+    """Detached controller entry point (stdlib only, no secrets logged).
+
+    ``run-once`` drives the bounded state machine with built-in
+    adapters: at most ``MAX_LOOP_STEPS`` single-transition :func:`step`
+    calls (dispatch -> question -> implementation -> completion),
+    stopping on terminal/blocked-awaiting states. ``sleep`` preserves
+    the offline lease seam for deterministic tests.
+    """
+    import time as _time
+
+    if mode == "sleep":
+        _advertise(state_dir, request_id, token)
+        end = _time.time() + max(0.0, duration)
+        while _time.time() < end:
+            _advertise(state_dir, request_id, token)
+            _time.sleep(0.2)
+        return 0
+    import os as _os
+    from .supervisor import process_start_identity as _psi
+    lock_fd = core.take_controller_lock(state_dir, request_id)
+    if lock_fd is None:
+        # Another controller holds the job; give back this launch's lease
+        # (guarded on this token) so recover can reconcile it.
+        core.release_controller(state_dir, request_id, token)
+        return 0
+    _LOCK["fd"] = lock_fd  # held until this process exits
+    if not core.acknowledge_controller(state_dir, request_id, token, _os.getpid(),
+                                       _psi(_os.getpid())):
+        return 0  # superseded launch: another controller owns the job
+    # Advertise only as the proven lease holder, after the lock.
+    _advertise(state_dir, request_id, token)
+    _LEASE["token"] = token
+    # Bounded durable loop with built-in adapters (normal submit/start).
+    # Every child spawn is file-backed, supervised, and recorded before
+    # the spawn; a finished action is reused, never rerun.
+    durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
+    continuing = ("dispatched", "question-answered-resumed",
+                  "implementation-resumed", "transferred_to_go")
+    for _ in range(MAX_LOOP_STEPS):
+        try:
+            res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token,
+                       use_owned_server=True)
+        except core.LeaseLostError:
+            return 0  # another controller owns the job; touch nothing
+        except Exception as e:  # noqa: BLE001 - persisted, never silent
+            try:
+                _mark_blocked(state_dir, request_id,
+                              f"controller_error: {type(e).__name__}: {str(e)[:300]}")
+            except Exception:
+                pass
+            break
+        try:
+            _advertise(state_dir, request_id, token)
+        except Exception:
+            pass
+        if (res or {}).get("action") not in continuing:
+            break
+    else:
+        try:
+            job = core.get_job(state_dir, request_id)
+            if job["status"] not in store.TERMINAL and job["status"] != "blocked":
+                _mark_blocked(state_dir, request_id,
+                              f"controller_step_budget_exhausted after {MAX_LOOP_STEPS} steps")
+        except Exception:
+            pass
+    core.release_controller(state_dir, request_id, token)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="runner.controller")
+    ap.add_argument("--state-dir", required=True)
+    ap.add_argument("--request-id", required=True)
+    ap.add_argument("--token", default=None,
+                    help="test seam; the launcher passes DURABLE_RUNNER_TOKEN")
+    ap.add_argument("--mode", default="run-once")
+    ap.add_argument("--duration", type=float, default=30.0)
+    args = ap.parse_args(argv)
+    import os
+    token = args.token or os.environ.pop("DURABLE_RUNNER_TOKEN", "")
+    if not token:
+        ap.error("missing lease token")
+    return run_controller_process(args.state_dir, args.request_id, token,
+                                  mode=args.mode, duration=args.duration)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
