@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-09-19
+
+### Changed
+
+- Record the confirmed Project Direction: Claude Code host, one policy for skill and runner, subscription pools
+
 ## [0.2.0] - 2026-09-17
 
 ### Added
