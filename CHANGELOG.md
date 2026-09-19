@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0] - 2026-09-19
+
+### Added
+
+- Signal classes applied: exhaustion moves pools with zero retries, overload moves families after a bounded window, capacity per pool, model, and window with a degraded state and preflight skips
+
 ## [0.4.0] - 2026-09-19
 
 ### Added

@@ -128,7 +128,10 @@ CREATE TABLE IF NOT EXISTS capacity (
   state TEXT NOT NULL,
   evidence_json TEXT,
   reset_at TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  pool TEXT,
+  model TEXT,
+  window TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
@@ -184,9 +187,12 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     first = not db.exists()
     con = sqlite3.connect(str(db), timeout=10.0, isolation_level=None)
     con.row_factory = sqlite3.Row
-    # Concurrent first connections may race on WAL setup; retry briefly.
+    # Concurrent first connections race on WAL setup while writers hold the
+    # lock; wait up to the same 10 seconds as the busy timeout, not a fixed
+    # count of short sleeps that a loaded machine can exhaust.
     last_err = None
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    while True:
         try:
             con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA synchronous=NORMAL;")
@@ -195,11 +201,9 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
             break
         except sqlite3.OperationalError as e:
             last_err = e
-            if "locked" not in str(e).lower():
-                raise
+            if "locked" not in str(e).lower() or time.monotonic() >= deadline:
+                raise last_err
             time.sleep(0.05)
-    else:
-        raise last_err or sqlite3.OperationalError("database locked during setup")
     # Lightweight migration for DBs created before owner lease columns.
     cols = {r["name"] for r in con.execute("PRAGMA table_info(jobs)").fetchall()}
     if "owner_token" not in cols:
@@ -222,6 +226,10 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     ):
         if _col not in cols:
             _add_column(con, "jobs", _col, _ddl)
+    cap_cols = {r["name"] for r in con.execute("PRAGMA table_info(capacity)").fetchall()}
+    for _col in ("pool", "model", "window"):
+        if _col not in cap_cols:
+            _add_column(con, "capacity", _col, "TEXT")
     inv_cols = {r["name"] for r in con.execute("PRAGMA table_info(invocations)").fetchall()}
     for _col, _ddl in (
         ("process_start", "TEXT"),
