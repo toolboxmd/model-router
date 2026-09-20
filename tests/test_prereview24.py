@@ -103,7 +103,7 @@ class TestOverloadEpisodes(OwnedBase):
         self.assertEqual(res["action"], "route_switched")
         self.assertEqual(res["reason"], "lateral")
         job = core.get_job(self.sd, "oc1")
-        self.assertEqual(job["route"], "glm-5.3-go")
+        self.assertEqual(job["route"], "glm-5.3-flash-go")
         last = json.loads(job["last_error_json"] or "{}")
         self.assertEqual(last.get("signal"), "overloaded")
         self.assertEqual(int(last.get("overload_retries") or 0), 3)

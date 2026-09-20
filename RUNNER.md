@@ -37,9 +37,21 @@ or lies inside the workspace of an active or cancelling job, or of a job
 that still owns a child process, is rejected. Workspaces are compared by
 device and inode along their ancestor chain, so symlinks, case variants,
 and firmlink aliases on macOS are the same workspace.
-`--lane` picks an implementation lane (`default`, `small`, `hard`) and its
-first route; `--route` names one implementation route from the policy
-directly. Without either, the default lane's first route applies. The
+`--lane` picks an implementation lane (`default`, `small`, `hard`). Every lane's
+first route is Muse on Zen free (`muse-spark-xhigh-free`), which carries no
+concurrency cap and takes every new job: parallel jobs open parallel Muse free
+sessions by design. The sticky-home `fewest running jobs` spread applies only
+among routes that carry a `max_concurrent` cap (ties go to the earlier route;
+a capped route already used by running jobs is excluded, as is a route the
+capacity memory knows as exhausted or resting). A job leaves Muse free only on
+provider evidence: a limit error moves the same model to the next pool (free
+Muse to Go Muse with no retries), overload moves to the next model family
+after the bounded retry window with the route degraded 15 minutes. A job walks
+the lane only on capacity evidence. An identical resubmission returns the stored job unchanged: the
+existing-request lookup runs first and only a new request computes a sticky
+home, counted inside the same write transaction that records the route so two
+submitters cannot both take a capped route. `--route` names one implementation route from the policy directly.
+Without either, the default lane's sticky home applies. The
 `critical` lane is planner-executed and `submit` rejects it: do that step in
 the planner session, then submit the remainder. `--start` launches a detached
 controller after the commit. `--planner-cwd` is the directory where the
@@ -98,8 +110,14 @@ command exits non-zero. The first failure leads to a correction in the same
 worker session on the same route. The second leads to a fresh correction on
 the correction stage's route (Kimi K2.7 Code). The third is the single
 escalation to the recovery stage (Grok 4.6 on Go, then on the xAI
-subscription if Go is exhausted; that pool move is not a second escalation).
-A fourth failure ends the job as `failed` with `ESCALATION_EXHAUSTED` and
+subscription if Go is exhausted or the rung was already used; that pool move
+is not a second escalation; recovery never reuses a rung the job already
+ran, and when every rung was used the job blocks with
+`recovery_exhausted`). After the escalation the evidence returns to the
+planner, which may itself choose a rung from the policy's planner-chosen
+rungs (Astra medium on Codex, Opus 5 high on the Claude harness) and run it
+in its own session; the runner never selects those automatically. A fourth
+failure ends the job as `failed` with `ESCALATION_EXHAUSTED` and
 the turn reports listed in `result`, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
 decides; the runner enforces the ceiling.
@@ -122,9 +140,17 @@ Each turn starts a fresh `opencode serve` with a random password in its
 environment only. The supervisor authenticates with Basic auth
 (`opencode:<password>`) and scopes every call with `directory=<workspace>`.
 It creates or reuses the saved session and saves the session ID before the
-model request. The session gets permission rules that deny access outside the
-workspace, subagents, interactive questions, doom-loop prompts, and web
-access. OpenCode does not confine Bash at the OS level; that remains a known
+model request. The session's permission rules are policy data, resolved per
+route by role. Implementation, correction, and recovery routes run with full
+access: outside-workspace writes, web fetch, web search, and doom-loop prompts
+are allowed as a per-route policy flag. Dispatch and review routes on OpenCode
+run read-only in plan mode (`luna-go/max`, `luna-go-review`): `edit`,
+outside-workspace writes, web fetch/search, and doom-loop prompts are denied
+because the coordinator role never needs them; the plan agent is kept. Two
+rules stay denied on every route: `question`, because an interactive question
+stalls a headless session forever, and `task`, because spawning subagents would
+bypass the policy and the runner's ownership and proof guarantees. OpenCode does not
+confine Bash at the OS level; that remains a known
 limit.
 
 The prompt goes through `POST /session/{id}/prompt_async` with the job
@@ -147,7 +173,7 @@ model-authored text:
   evidence and any trusted reset time, and the job moves the same model to
   the next pool where the route declares one (free Muse to Go Muse, Go Grok
   to xAI Grok); other Go routes (`glm-5.3-go`, `qwen3.8-flash-go`,
-  `minimax-m3-go`, `kimi-k3-go`, `deepseek-v4-pro-go` have no `next_pool`)
+  `minimax-m3-go`, `deepseek-v4.1-flash-go`, `deepseek-v4-pro-go` have no `next_pool`)
   move to the next model family in their lane.
 - overloaded: a `retry` status with reason `overloaded`, `rate_limit`, or
   `account_rate_limit`, an `APIError` naming `RateLimitError`,
@@ -162,8 +188,14 @@ model-authored text:
   turn as `implementation_failed` for the ladder; they never move routes.
 
 Before a turn starts, a route the capacity memory knows as exhausted or
-resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`)
-without a child. No eligible route left in the lane blocks the job with
+resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`),
+as is a route whose `max_concurrent` is already used by running jobs
+(`preflight_concurrent`), a one-turn route that already ran its turn
+(`preflight_one_turn`), and one with no turn left in this job — all without a
+child. The concurrency reservation is atomic: the target's running count is
+read inside the same write transaction that records the new route, and a full
+target moves to the next free route in the same transaction. The Go dispatch
+fallback (`luna-go/max`) reserves the same way before any child starts. No eligible route left in the lane blocks the job with
 `capacity_exhausted`. The `capacity` command lists remembered routes with
 pool, model, window, state, evidence, and reset time; `--clear ROUTE` is an
 operator action after checking the provider. Reset times come only from
@@ -351,15 +383,41 @@ usage windows, signal classes, and provenance. The Codex skill reference
 `python -c "from runner import policy; policy.main(['render-skill'])"` and a
 test keeps the two equal; `policy.main(['validate'])` checks the data.
 
-Stages in order: planning (Fable 5.1 in Claude Code, Sonnet medium only as
-the explicit live-test override), dispatch (Luna max on Codex read-only
-first; `luna-go/max` on Go in OpenCode plan mode as the recorded fallback),
-the implementation lanes default, small, and hard, critical
+Stages in order: planning (Fable 5.1 max in Claude Code, then Astra max on
+Codex; Sonnet medium only as the explicit live-test override), dispatch (Luna
+max on Codex read-only first; `luna-go/max` on Go in OpenCode plan mode as the
+recorded fallback; Terra max is a manual-only option), the implementation
+lanes default, small, and hard, planner-chosen rungs (Astra medium on Codex,
+Opus 5 high on the Claude harness; the planner itself chooses and runs them),
+critical
 (planner-executed), correction (Kimi K2.7 Code after the same session), recovery
-(Grok 4.6 on Go then on the xAI subscription), ticket review (Luna max), and
-final review (Opus 5 high when the planner asks). Worker pools in order: Zen
-free, Go, xAI; subscription logins only. Older generations of pooled models
-are never routes; $15-per-month Go models get one turn per job. Every route in
+(Grok 4.6 on Go then on the xAI subscription, skipping rungs the job already
+used), ticket review (Luna max on Codex, then Luna on OpenCode Go in plan
+mode), and final review (Opus 5 high on the Claude harness, then Astra high
+on Codex, then Luna max). Worker pools in order: Zen free, Go, xAI;
+subscription logins only. The default lane carries the full Go implementer
+chain in intelligence order: Muse xhigh on Zen free, Muse xhigh on Go, GLM
+5.3 Flash, Qwen 3.8 Flash, DeepSeek V4.1 Flash, Hy3, MiniMax M3, MiMo 2.5,
+MiniMax M2.7, LongCat 2.0, GLM 5.2, Kimi K2.6, GLM 5.1 (Qwen 3.7 Plus and
+Qwen 3.6 Plus are absent: no known tier); the small lane starts from Muse free,
+then Muse Go, then GLM 5.3 Flash onward; the hard lane runs Muse free, Muse Go, GLM-5.3, DeepSeek V4 Pro, Grok
+4.6 on Go, Grok 4.6 on xAI; correction is Kimi K2.7 Code. Muse on Zen free
+carries no concurrency cap and takes every new job (parallel Muse free
+sessions by design); the `fewest running jobs` spread applies only among
+capped routes. Never
+implementers on Go: Grok 4.6 outside the hard lane's last Go rung and
+recovery, Luna, Kimi K3, Qwen 3.8 Max, Qwen 3.7 Max. Each Go route carries
+its monthly tier (60, 30, or 15 USD); $15-per-month Go models get one turn
+per job and 15 and 30 USD tiers allow exactly one running job per route
+(`max_concurrent` is exactly 1), reserved atomically inside the same write
+transaction that records the job's route (first sticky selection, preflight
+move, dispatch fallback on `luna-go/max`, and recovery move count running jobs
+on the target inside the transaction, so two controllers cannot both take a
+capped route). Recovery moves (`grok-4.6-go`, `grok-4.6-xai`) are valid from any
+implementation lane and reason in the recovery stage. A manual or
+planner-chosen route inside an implementation lane, the recovery stage, or the
+dispatch order never validates. DeepSeek
+V4.1 Flash is a 15 USD route from 2026-09-20. Every route in
 the policy has an adapter today; the OpenCode adapter takes model, variant,
 and agent from the route. Go Luna as a dispatch fallback arrives with the
 adapter seam. Changing a stage's harness or model is a policy edit; adding a

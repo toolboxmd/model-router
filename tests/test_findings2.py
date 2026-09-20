@@ -95,11 +95,11 @@ class TestGoExhaustionDocs(unittest.TestCase):
         self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-xai")
         self.assertEqual(policy.next_pool_route("muse-spark-xhigh-free"), "muse-spark-xhigh-go")
         for route in ("glm-5.3-go", "qwen3.8-flash-go", "minimax-m3-go",
-                      "kimi-k3-go", "deepseek-v4-pro-go", "muse-spark-xhigh-go"):
+                      "deepseek-v4.1-flash-go", "deepseek-v4-pro-go", "muse-spark-xhigh-go"):
             self.assertIsNone(policy.next_pool_route(route), route)
         # Without a next pool the lane moves to the next family (or ends).
-        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free"), "glm-5.3-go")
-        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free", lane="hard"), "kimi-k3-go")
+        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free"), "glm-5.3-flash-go")
+        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free", lane="hard"), "glm-5.3-go")
 
     def test_skill_and_policy_state_declared_pools_only(self):
         rendered = policy.render_skill_table()

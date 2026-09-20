@@ -14,10 +14,11 @@ from __future__ import annotations
 import sys
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.0.0"
+POLICY_VERSION = "2.1.0"
 # Provenance: who decided this policy and where the evidence lives.
-POLICY_SOURCE = "human decision, toolboxmd/model-router#10 (amended 2026-09-19) and #12"
-POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/10"
+POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
+                 "#12, and #26 (Go plan, 2026-09-20)")
+POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/26"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
 ALLOW_ZEN_OVERFLOW = False
@@ -41,42 +42,68 @@ POOLS = {
 }
 WORKER_POOL_ORDER = ["zen-free", "go", "xai"]
 
-# Monthly dollar limits per Go model (opencode.ai/docs/go, 2026-09-19).
+# Monthly dollar limits per Go model (opencode.ai/docs/go Go plan, 2026-09-20).
 GO_MONTHLY_LIMIT_USD = {
     "muse-spark-1.3-contributor": 60, "glm-5.3-flash": 60, "glm-5.3": 15,
-    "kimi-k3": 15, "kimi-k2.7-code": 60, "minimax-m3": 60,
-    "qwen3.8-flash": 30, "deepseek-v4-pro": 15, "grok-4.6": 15,
+    "kimi-k3": 15, "kimi-k2.7-code": 60, "minimax-m3": 60, "hy3": 60,
+    "minimax-m2.7": 60, "mimo-v2.5": 60, "longcat-2.0": 60, "glm-5.2": 60,
+    "kimi-k2.6": 60, "glm-5.1": 60, "qwen3.8-flash": 30,
+    "deepseek-v4-flash": 30, "hy4-preview": 30, "deepseek-v4.1-flash": 15,
+    "deepseek-v4-pro": 15, "mimo-v2.5-pro": 15, "grok-4.6": 15,
     "gpt-5.6-luna": 15,
 }
+# DeepSeek V4.1 Flash drops to the $15 tier from this date (human decision,
+# 2026-09-20). Before it the tier was unknown and the route added only now.
+DEEPSEEK_V4_1_FLASH_TIER_FROM = "2026-09-20"
 SCARCE_MONTHLY_LIMIT_USD = 15  # such models get one turn per job
+# 15 and 30 USD tiers allow at most one running job at a time.
+CONCURRENT_CAP_TIERS_USD = (15, 30)
 
 # Older generations of pooled models are never routes.
 EXCLUDED_MODELS = (
-    "glm-5.1", "glm-5.2", "kimi-k2.6", "qwen3.6-plus", "qwen3.7-plus",
-    "qwen3.7-max", "muse-spark-1.2-contributor", "hy3", "minimax-m2.7",
-    "minimax-m2.5", "deepseek-v4-flash", "deepseek-v4.1-flash",
+    "muse-spark-1.2-contributor",
 )
+
+# The 2026-09-20 Go plan: never implementers on Go. grok-4.6 is allowed only
+# as the hard lane's last Go rung and as the recovery route's two rungs.
+GO_IMPLEMENTER_EXCLUDED = ("gpt-5.6-luna", "kimi-k3", "qwen3.8-max", "qwen3.7-max")
+GO_IMPLEMENTER_GROK_ROUTES = ("grok-4.6-go", "grok-4.6-xai")
 
 # Route fields: harness (codex|claude|opencode), pool, model (provider/model
 # for opencode), variant (None = provider default), agent (opencode agent),
 # role, family, next_pool (same model on the next pool), one_turn_per_job,
-# override_only, planner_requested.
+# max_concurrent (running jobs allowed on the route), override_only,
+# planner_requested, planner_chosen (the planner runs it itself, never a
+# dispatch route), manual (never selected automatically).
 ROUTES = {
     "fable-5.1/max": {"harness": "claude", "pool": "claude", "model": "claude-fable-5-1",
                       "variant": "max", "role": "planning", "family": "claude"},
+    "astra/max": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
+                  "variant": "max", "role": "planning", "family": "gpt",
+                  "note": "planning fallback on the Codex subscription"},
     "sonnet/medium": {"harness": "claude", "pool": "claude", "model": "claude-sonnet-5",
                       "variant": "medium", "role": "planning", "family": "claude",
                       "override_only": True,
                       "note": "explicit live-test override only, never a default"},
+    "terra/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-terra",
+                  "variant": "max", "role": "dispatch", "family": "gpt",
+                  "manual": True,
+                  "note": "manual-only option; never selected automatically"},
     "luna/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                  "variant": "max", "role": "dispatch", "family": "gpt",
                  "sandbox": "read-only"},
     "luna-go/max": {"harness": "opencode", "pool": "go", "model": "opencode-go/gpt-5.6-luna",
                     "variant": None, "agent": "plan", "role": "dispatch", "family": "gpt",
-                    "one_turn_per_job": True,
+                    "one_turn_per_job": True, "max_concurrent": 1,
                     "note": "dispatch fallback in OpenCode plan mode when Codex is unavailable"},
     "luna-max-review": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                         "variant": "max", "role": "review", "family": "gpt"},
+    "luna-go-review": {"harness": "opencode", "pool": "go", "model": "opencode-go/gpt-5.6-luna",
+                       "variant": None, "agent": "plan", "role": "review", "family": "gpt",
+                       "one_turn_per_job": True, "max_concurrent": 1,
+                       "note": "ticket review fallback in OpenCode plan mode"},
+    "astra/high-review": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
+                          "variant": "high", "role": "review", "family": "gpt"},
     "opus-5/high-review": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
                            "variant": "high", "role": "review", "family": "claude",
                            "planner_requested": True},
@@ -90,28 +117,63 @@ ROUTES = {
                             "family": "muse"},
     "glm-5.3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.3",
                    "variant": None, "agent": "build", "role": "implementation",
-                   "family": "glm", "one_turn_per_job": True},
+                   "family": "glm", "one_turn_per_job": True, "max_concurrent": 1},
+    "deepseek-v4-pro-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/deepseek-v4-pro",
+                           "variant": None, "agent": "build", "role": "implementation",
+                           "family": "deepseek", "one_turn_per_job": True,
+                           "max_concurrent": 1},
+    "kimi-k2.7-code-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k2.7-code",
+                          "variant": None, "agent": "build", "role": "correction",
+                          "family": "kimi"},
     "glm-5.3-flash-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.3-flash",
                          "variant": None, "agent": "build", "role": "implementation",
                          "family": "glm"},
     "qwen3.8-flash-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/qwen3.8-flash",
                          "variant": None, "agent": "build", "role": "implementation",
-                         "family": "qwen"},
+                       "family": "qwen", "max_concurrent": 1},
+    "deepseek-v4.1-flash-go": {"harness": "opencode", "pool": "go",
+                               "model": "opencode-go/deepseek-v4.1-flash",
+                               "variant": None, "agent": "build", "role": "implementation",
+                               "family": "deepseek",
+                               "one_turn_per_job": True, "max_concurrent": 1,
+                               "note": f"${GO_MONTHLY_LIMIT_USD['deepseek-v4.1-flash']} USD tier from "
+                                       f"{DEEPSEEK_V4_1_FLASH_TIER_FROM}"},
+    "hy3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/hy3",
+               "variant": None, "agent": "build", "role": "implementation",
+               "family": "hy"},
     "minimax-m3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/minimax-m3",
                       "variant": None, "agent": "build", "role": "implementation",
                       "family": "minimax"},
-    "kimi-k3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k3",
+    "mimo-v2.5-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/mimo-v2.5",
+                     "variant": None, "agent": "build", "role": "implementation",
+                     "family": "mimo"},
+    "minimax-m2.7-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/minimax-m2.7",
+                        "variant": None, "agent": "build", "role": "implementation",
+                        "family": "minimax"},
+    "longcat-2.0-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/longcat-2.0",
+                       "variant": None, "agent": "build", "role": "implementation",
+                       "family": "longcat"},
+    "glm-5.2-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.2",
                    "variant": None, "agent": "build", "role": "implementation",
-                   "family": "kimi", "one_turn_per_job": True},
-    "deepseek-v4-pro-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/deepseek-v4-pro",
-                           "variant": None, "agent": "build", "role": "implementation",
-                           "family": "deepseek", "one_turn_per_job": True},
-    "kimi-k2.7-code-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k2.7-code",
-                          "variant": None, "agent": "build", "role": "correction",
-                          "family": "kimi"},
+                   "family": "glm"},
+    "kimi-k2.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k2.6",
+                     "variant": None, "agent": "build", "role": "implementation",
+                     "family": "kimi"},
+    "glm-5.1-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.1",
+                   "variant": None, "agent": "build", "role": "implementation",
+                   "family": "glm"},
+    "astra/medium": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
+                     "variant": "medium", "role": "implementation", "family": "gpt",
+                     "planner_chosen": True,
+                     "note": "planner-chosen rung; runs in the planner's own session"},
+    "opus-5/high": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
+                    "variant": "high", "role": "implementation", "family": "claude",
+                    "planner_chosen": True,
+                    "note": "planner-chosen rung; runs in the planner's Claude session"},
     "grok-4.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/grok-4.6",
                     "variant": "medium", "agent": "build", "role": "recovery",
-                    "family": "grok", "next_pool": "grok-4.6-xai", "one_turn_per_job": True},
+                    "family": "grok", "next_pool": "grok-4.6-xai", "one_turn_per_job": True,
+                    "max_concurrent": 1},
     "grok-4.6-xai": {"harness": "opencode", "pool": "xai", "model": "xai/grok-4.6",
                      "variant": "medium", "agent": "build", "role": "recovery",
                      "family": "grok"},
@@ -121,26 +183,56 @@ ROUTES = {
 # native subagent), runner (dispatched by the runner), planner (done by the
 # planner itself, never dispatched).
 STAGES = {
-    "planning": {"executor": "host", "routes": ["fable-5.1/max"], "overrides": ["sonnet/medium"],
+    "planning": {"executor": "host",
+                 "routes": ["fable-5.1/max", "astra/max"],
+                 "overrides": ["sonnet/medium"],
                  "capabilities": ["session_resume"],
-                 "note": "Fable 5.1 in Claude Code; Sonnet medium only as the explicit live-test override"},
+                 "note": "Fable 5.1 in Claude Code, then Astra max on Codex; "
+                         "Sonnet medium only as the explicit live-test override"},
     "dispatch": {"executor": "runner", "routes": ["luna/max", "luna-go/max"],
+                 "manual": ["terra/max"],
                  "capabilities": ["read_only", "session_resume", "structured_output"],
                  "note": "read-only Codex sandbox first; the same model on Go in OpenCode plan mode "
-                         "when Codex cannot start the task"},
+                         "when Codex cannot start the task; Terra max is a manual-only option"},
     "implementation_default": {"executor": "runner",
-                               "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go"],
+                               "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
+                                          "glm-5.3-flash-go", "qwen3.8-flash-go",
+                                          "deepseek-v4.1-flash-go", "hy3-go", "minimax-m3-go",
+                                          "mimo-v2.5-go", "minimax-m2.7-go", "longcat-2.0-go",
+                                          "glm-5.2-go", "kimi-k2.6-go", "glm-5.1-go"],
                                "capabilities": ["workspace_write", "session_resume"],
-                               "note": "policy declares exhaustion moves the same model to the next pool where declared (free Muse to Go Muse, Go Grok to xAI Grok), otherwise to the next family; overload moves to the next model family within one minute"},
+                               "note": "the full Go implementer chain in intelligence order, every "
+                                        "new job starting on Muse free (no concurrency cap, "
+                                        "parallel sessions by design); "
+                                        "Qwen 3.7 Plus and 3.6 Plus are absent: no known tier. "
+                                        "Policy declares exhaustion moves the same model to the next pool "
+                                        "where declared (free Muse to Go Muse, Go Grok to xAI Grok), "
+                                        "otherwise to the next family; overload moves to the next model "
+                                        "family within one minute"},
     "implementation_small": {"executor": "runner",
-                             "routes": ["glm-5.3-flash-go", "qwen3.8-flash-go", "minimax-m3-go"],
-                             "capabilities": ["workspace_write", "session_resume"],
-                             "note": "small bounded edits; $60 and $30 models"},
+                              "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
+                                         "glm-5.3-flash-go", "qwen3.8-flash-go",
+                                         "deepseek-v4.1-flash-go", "hy3-go", "minimax-m3-go",
+                                         "mimo-v2.5-go", "minimax-m2.7-go", "longcat-2.0-go",
+                                         "glm-5.2-go", "kimi-k2.6-go", "glm-5.1-go"],
+                              "capabilities": ["workspace_write", "session_resume"],
+                              "note": "small bounded edits; every new job starts on Muse free "
+                                      "(no concurrency cap, parallel sessions by design), then "
+                                      "Muse Go, then from GLM 5.3 Flash onward"},
     "implementation_hard": {"executor": "runner",
-                            "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "kimi-k3-go",
-                                       "deepseek-v4-pro-go", "grok-4.6-xai"],
-                            "capabilities": ["workspace_write", "session_resume"],
-                            "note": "$15 models get one turn per job"},
+                            "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
+                                       "glm-5.3-go", "deepseek-v4-pro-go", "grok-4.6-go",
+                                       "grok-4.6-xai"],
+                             "capabilities": ["workspace_write", "session_resume"],
+                             "note": "$15 models get one turn per job; every new job starts on "
+                                     "Muse free (no cap); Grok 4.6 sits here as the "
+                                     "hard lane's last Go rung"},
+    "planner_rungs": {"executor": "planner",
+                      "routes": ["astra/medium", "opus-5/high"],
+                      "capabilities": [],
+                      "planner_selects": True,
+                      "note": "the planner itself chooses a rung and runs it in its own session; "
+                              "the runner never dispatches these"},
     "critical": {"executor": "planner", "routes": [], "capabilities": [],
                  "note": "a load-bearing step or prose the rest depends on is done by the planner "
                          "itself in its own host session; the runner never dispatches it"},
@@ -149,11 +241,16 @@ STAGES = {
                    "note": "once per job; the same worker session is tried first"},
     "recovery": {"executor": "runner", "routes": ["grok-4.6-go", "grok-4.6-xai"],
                  "capabilities": ["workspace_write"],
-                 "note": "one escalation per job, same model across two pools, then the planner"},
-    "review_ticket": {"executor": "host", "routes": ["luna-max-review"],
-                      "capabilities": ["read_only"], "note": "native Codex subagent"},
-    "review_final": {"executor": "host", "routes": ["opus-5/high-review"],
-                     "capabilities": ["read_only"], "note": "only when the planner asks"},
+                 "note": "one escalation per job, Grok 4.6 across two pools, then the planner; "
+                         "skips rungs the job already used"},
+    "review_ticket": {"executor": "host", "routes": ["luna-max-review", "luna-go-review"],
+                      "capabilities": ["read_only"],
+                      "note": "native Codex subagent first, then Luna on OpenCode Go in plan mode"},
+    "review_final": {"executor": "host",
+                     "routes": ["opus-5/high-review", "astra/high-review", "luna-max-review"],
+                     "capabilities": ["read_only"],
+                     "note": "the planner chooses; Opus 5 high on Claude, then Astra high on "
+                             "Codex, then Luna max"},
 }
 IMPLEMENTATION_LANES = ["implementation_default", "implementation_small", "implementation_hard"]
 LANE_ALIASES = {"default": "implementation_default", "small": "implementation_small",
@@ -260,10 +357,18 @@ def lane_default_route(lane: str) -> str:
 def lane_of_route(route: str, lane: str | None = None) -> str | None:
     """The lane to reason in. A route shared by lanes (Muse sits in the
     default and hard lanes) is ambiguous, so callers pass the job's stored
-    lane; without one, the first lane listing the route is used."""
+    lane; without one, the first lane listing the route is used. Recovery
+    moves are valid from any implementation lane: a job already on a recovery
+    route reasons in the recovery stage, never the original lane, and never
+    raises."""
     first = next((c for c in IMPLEMENTATION_LANES if route in STAGES[c]["routes"]), None)
     if lane:
         stage = resolve_lane(lane)
+        if stage == "recovery" and route in STAGES["recovery"]["routes"]:
+            return "recovery"
+        # A job already on a recovery route stays in recovery, from any lane.
+        if route in STAGES["recovery"]["routes"]:
+            return "recovery"
         if stage in IMPLEMENTATION_LANES and route in STAGES[stage]["routes"]:
             return stage
         if first is not None:
@@ -312,6 +417,67 @@ def one_turn_per_job(route: str) -> bool:
     return bool(route_spec(route).get("one_turn_per_job"))
 
 
+def route_max_concurrent(route: str) -> int | None:
+    """At most this many running jobs may sit on the route (exactly int 1
+    on the $15 and $30 Go tiers); None means the route has no concurrency
+    cap. Non-int caps (including bool True) return None so a type error
+    cannot masquerade as a unit cap."""
+    cap = route_spec(route).get("max_concurrent")
+    if cap is None:
+        return None
+    if type(cap) is int:
+        return cap
+    return None
+
+
+# Worker-session permission defaults, resolved per route by role.
+# Implementation, correction, and recovery routes run with full access;
+# ``question`` and ``task`` stay denied (headless stall; policy bypass).
+# Dispatch and review routes on OpenCode run read-only in plan mode: edit,
+# outside-workspace writes, web fetch/search, and doom-loop prompts are
+# denied because the coordinator/verifier role never needs them; ``question``
+# and ``task`` stay denied as well. The plan agent is kept.
+DEFAULT_SESSION_PERMISSIONS = (
+    {"permission": "external_directory", "pattern": "*", "action": "allow"},
+    {"permission": "webfetch", "pattern": "*", "action": "allow"},
+    {"permission": "websearch", "pattern": "*", "action": "allow"},
+    {"permission": "doom_loop", "pattern": "*", "action": "allow"},
+    {"permission": "question", "pattern": "*", "action": "deny"},
+    {"permission": "task", "pattern": "*", "action": "deny"},
+)
+
+READ_ONLY_SESSION_PERMISSIONS = (
+    {"permission": "edit", "pattern": "*", "action": "deny"},
+    {"permission": "external_directory", "pattern": "*", "action": "deny"},
+    {"permission": "webfetch", "pattern": "*", "action": "deny"},
+    {"permission": "websearch", "pattern": "*", "action": "deny"},
+    {"permission": "doom_loop", "pattern": "*", "action": "deny"},
+    {"permission": "question", "pattern": "*", "action": "deny"},
+    {"permission": "task", "pattern": "*", "action": "deny"},
+)
+
+
+def session_permissions(route: str | None = None) -> tuple[dict, ...]:
+    """The resolved permission rules for a route by role: implementation,
+    correction, and recovery routes get the full-access set; dispatch and
+    review routes get the read-only set. Unknown or missing routes get the
+    read-only set (least privilege). A route's own ``permissions``
+    overrides apply on top of its role base, in base order."""
+    spec: dict = route_spec(route) if route in ROUTES else {}
+    role = spec.get("role")
+    base = DEFAULT_SESSION_PERMISSIONS if role in ("implementation", "correction", "recovery") \
+        else READ_ONLY_SESSION_PERMISSIONS
+    overrides = {o["permission"]: o["action"]
+                 for o in spec.get("permissions", ()) if isinstance(o, dict)}
+    out = tuple(dict(r, action=overrides.get(r["permission"], r["action"]))
+                for r in base)
+    # A per-route override may add a permission absent from the base.
+    base_names = {r["permission"] for r in base}
+    extra = tuple({"permission": k, "pattern": "*", "action": v}
+                  for k, v in overrides.items() if k not in base_names)
+    return out + extra
+
+
 def next_pool_route(route: str) -> str | None:
     """Same model on the next pool, or None."""
     return route_spec(route).get("next_pool")
@@ -320,13 +486,26 @@ def next_pool_route(route: str) -> str | None:
 def next_family_route(route: str, exhausted=None, degraded=None, lane: str | None = None,
                       turns_by_route: dict | None = None) -> str | None:
     """Next route in the job's lane from a different model family that is
-    neither exhausted, degraded, nor a one-turn route already used."""
+    neither exhausted, degraded, nor a one-turn route already used. Recovery
+    is same-model across pools, so the recovery stage ignores the family
+    filter and skips any rung the job already used."""
     stage = lane_of_route(route, lane)
     if stage is None:
         return None
     skip = set(exhausted or ()) | set(degraded or ())
-    family = route_spec(route)["family"]
     order = STAGES[stage]["routes"]
+    if stage == "recovery":
+        used = turns_by_route or {}
+        for cand in order[order.index(route) + 1:]:
+            if cand in skip:
+                continue
+            if int(used.get(cand, 0)) >= 1:
+                continue
+            if one_turn_routes_used(cand, turns_by_route):
+                continue
+            return cand
+        return None
+    family = route_spec(route)["family"]
     for cand in order[order.index(route) + 1:]:
         if cand in skip or ROUTES[cand]["family"] == family:
             continue
@@ -354,18 +533,29 @@ def next_capacity_route(current: str | None, exhausted: set[str] | None = None,
     return None, None
 
 
-def next_recovery_route(current: str | None) -> str | None:
+def next_recovery_route(current: str | None, turns_by_route: dict | None = None) -> str | None:
     """Recovery order: one escalation to Grok 4.6, same model across the Go
-    and xAI pools, then the planner (None)."""
+    and xAI pools, then the planner (None). Rungs the job already ran
+    (present in ``turns_by_route``) are skipped."""
     order = STAGES["recovery"]["routes"]
+    used = turns_by_route or {}
     if current is None:
-        return order[0]
+        for i, cand in enumerate(order):
+            if int(used.get(cand, 0)) >= 1:
+                continue
+            return cand
+        return None
     if current in order:
         idx = order.index(current)
-        return order[idx + 1] if idx + 1 < len(order) else None
+        for cand in order[idx + 1:]:
+            if int(used.get(cand, 0)) >= 1:
+                continue
+            return cand
+        return None
     if current in implementation_routes() or current in STAGES["correction"]["routes"] \
             or current in ("luna/max", "sonnet/medium"):
-        return order[0]
+        first = next((cand for cand in order if int(used.get(cand, 0)) == 0), None)
+        return first
     return None
 
 
@@ -507,6 +697,14 @@ RECOVERY_ORDER = list(STAGES["recovery"]["routes"])
 def validate_policy() -> list[str]:
     """Problems in the policy data, empty when consistent."""
     problems: list[str] = []
+    if ROUTES.get("muse-spark-xhigh-free", {}).get("max_concurrent") is not None:
+        problems.append("muse-spark-xhigh-free: must carry no concurrency cap "
+                        "(parallel Muse free sessions by design)")
+    for lane in IMPLEMENTATION_LANES:
+        routes = STAGES[lane]["routes"]
+        if not routes or routes[0] != "muse-spark-xhigh-free":
+            problems.append(f"stage {lane}: first route must be muse-spark-xhigh-free "
+                            "(Muse free takes every new job)")
     for name, spec in ROUTES.items():
         if spec["harness"] not in ("codex", "claude", "opencode"):
             problems.append(f"{name}: unknown harness {spec['harness']}")
@@ -523,9 +721,19 @@ def validate_policy() -> list[str]:
             if model_id.removesuffix("-free") in EXCLUDED_MODELS:
                 problems.append(f"{name}: excluded older generation {model_id}")
             if spec["pool"] == "go":
-                scarce = GO_MONTHLY_LIMIT_USD.get(model_id, 0) <= SCARCE_MONTHLY_LIMIT_USD
+                limit = GO_MONTHLY_LIMIT_USD.get(model_id)
+                scarce = (limit or 0) <= SCARCE_MONTHLY_LIMIT_USD
                 if scarce != bool(spec.get("one_turn_per_job")):
                     problems.append(f"{name}: one_turn_per_job must be {scarce} for a "
+                                    f"${GO_MONTHLY_LIMIT_USD.get(model_id)} model")
+                allowed_cap = 1 if limit is not None and limit <= max(CONCURRENT_CAP_TIERS_USD) else None
+                cap = spec.get("max_concurrent")
+                if allowed_cap == 1:
+                    if type(cap) is not int or cap != 1:
+                        problems.append(f"{name}: max_concurrent must be 1 for a "
+                                        f"${GO_MONTHLY_LIMIT_USD.get(model_id)} model")
+                elif cap is not None:
+                    problems.append(f"{name}: max_concurrent must be None for a "
                                     f"${GO_MONTHLY_LIMIT_USD.get(model_id)} model")
         nxt = spec.get("next_pool")
         if nxt is not None:
@@ -534,11 +742,36 @@ def validate_policy() -> list[str]:
             elif ROUTES[nxt]["family"] != spec["family"] or \
                     POOLS[ROUTES[nxt]["pool"]]["order"] <= POOLS[spec["pool"]]["order"]:
                 problems.append(f"{name}: next_pool {nxt} is not the same model on a later pool")
+    # The 2026-09-20 Go plan: excluded implementers never sit in a lane.
+    implementer_routes = set(implementation_routes()) | set(STAGES["correction"]["routes"])
+    for route in sorted(implementer_routes):
+        spec = ROUTES.get(route)
+        if not spec or spec["pool"] != "go":
+            continue
+        model_id = spec["model"].split("/", 1)[1]
+        if model_id in GO_IMPLEMENTER_EXCLUDED:
+            problems.append(f"lane route {route}: {model_id} is a never-implementer on Go")
+        if model_id == "grok-4.6" and route not in GO_IMPLEMENTER_GROK_ROUTES:
+            problems.append(f"lane route {route}: grok-4.6 is allowed only on "
+                            f"{', '.join(GO_IMPLEMENTER_GROK_ROUTES)}")
     for stage, spec in STAGES.items():
+        if not spec.get("planner_selects"):
+            listed = set(spec["routes"])
+            guarded = [r for r in ROUTES if ROUTES[r].get("planner_chosen") or ROUTES[r].get("manual")]
+            overlap = listed & set(guarded)
+            if overlap:
+                problems.append(f"stage {stage}: {', '.join(sorted(overlap))} is never "
+                                "selected automatically")
+        for r in spec.get("manual", ()):
+            ms = ROUTES.get(r)
+            if ms is None:
+                problems.append(f"stage {stage}: unknown manual route {r}")
+            elif not ms.get("manual"):
+                problems.append(f"stage {stage}: {r} is not marked manual")
         for r in spec["routes"]:
             if r not in ROUTES:
                 problems.append(f"stage {stage}: unknown route {r}")
-        if spec["executor"] == "planner" and spec["routes"]:
+        if spec["executor"] == "planner" and spec["routes"] and not spec.get("planner_selects"):
             problems.append(f"stage {stage}: planner-executed stage lists routes")
         if stage in IMPLEMENTATION_LANES and not spec["routes"]:
             problems.append(f"stage {stage}: empty implementation lane")
@@ -558,10 +791,21 @@ def render_skill_table() -> str:
     ]
     for stage, spec in STAGES.items():
         routes = ", ".join(f"`{r}`" for r in spec["routes"]) or "planner itself"
+        if spec.get("planner_selects"):
+            routes += " (the planner chooses)"
         if spec.get("overrides"):
             routes += " (override: " + ", ".join(f"`{r}`" for r in spec["overrides"]) + ")"
+        if spec.get("manual"):
+            routes += " (manual-only: " + ", ".join(f"`{r}`" for r in spec["manual"]) + ")"
         lines.append(f"| {stage} | {routes} | {spec['executor']}; {spec['note']} |")
     lines += [
+        "",
+        "## Planner-chosen rungs",
+        "",
+        "The planner itself chooses one rung and runs it in its own session; "
+        "the runner never selects these automatically: "
+        + "; ".join(f"`{r}` = `{ROUTES[r]['model']}` {ROUTES[r]['variant']}"
+                    for r in STAGES["planner_rungs"]["routes"]) + ".",
         "",
         "Route models, in policy order: "
         + "; ".join(f"`{r}` = `{s['model']}`" + (f" {s['variant']}" if s.get("variant") else "")
@@ -593,8 +837,25 @@ def render_skill_table() -> str:
         "model family within one minute. "
         "Hard errors end the turn as `implementation_failed` for the ladder; they never move routes.",
         f"- Go models with a ${SCARCE_MONTHLY_LIMIT_USD} monthly limit get one turn per job. "
-        f"Windows: 5-hour {int(WINDOWS['5h'] * 100)} percent, weekly {int(WINDOWS['weekly'] * 100)} "
+        "Go routes on the "
+        f"${' and $'.join(str(t) for t in CONCURRENT_CAP_TIERS_USD)} tiers allow at most one "
+        "running job at a time (`max_concurrent`)."
+        " Muse on Zen free (`muse-spark-xhigh-free`) is the first route of every "
+        "implementation lane, carries no concurrency cap, and takes every new job "
+        "(parallel jobs open parallel Muse free sessions by design). The "
+        "`fewest running jobs` spread applies only among routes that carry a "
+        "`max_concurrent` cap; a job leaves Muse free only on evidence "
+        "(exhausted moves the same model to the next pool, overload moves to the "
+        "next family with the route degraded 15 minutes)."
+        " A job walks the lane only on evidence."
+        f" Windows: 5-hour {int(WINDOWS['5h'] * 100)} percent, weekly {int(WINDOWS['weekly'] * 100)} "
         "percent, monthly 100 percent of the model's limit.",
+        "- Implementation, correction, and recovery worker sessions run with full access: "
+        "outside-workspace writes, web fetch, web search, and doom-loop prompts are allowed "
+        "as a per-route policy flag; `question` and `task` stay denied (headless stall; "
+        "policy bypass). Dispatch and review routes on OpenCode run read-only in plan mode: "
+        "`edit`, outside-workspace writes, web fetch/search, doom-loop, `question` and `task` "
+        "stay denied (the coordinator role never needs them).",
         "- One escalation per job; afterwards evidence returns to the planner. No "
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",

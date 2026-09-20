@@ -217,8 +217,11 @@ class TestConsumption(Base):
 
 class TestCapacityMemory(Base):
     def test_memory_switch_keeps_original_evidence_and_operator_can_clear(self):
-        core.record_capacity(self.sd, "muse-spark-xhigh-free", "exhausted", FREE_STATUS)
+        # The job starts on Muse free (which takes every new job); capacity
+        # recorded afterwards moves it at preflight, keeping the evidence.
         core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], "muse-spark-xhigh-free")
+        core.record_capacity(self.sd, "muse-spark-xhigh-free", "exhausted", FREE_STATUS)
         res = controller.run_implementation(self.sd, "r1", run_cmd=lambda *a, **k: (0, "", ""))
         self.assertEqual(res["action"], "transferred_to_go")
         rows = core.list_capacity(self.sd)

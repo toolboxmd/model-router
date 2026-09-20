@@ -424,7 +424,11 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         return {"ok": False, "rc": 1, "error": f"opencode health failed: {health_err}"}, None, None
     saved = meta.get("session_id") or None
     if not saved:
-        created = client.create_session(title=f"model-router runner {request_id}")
+        from . import policy as _policy_perm
+        # Permission rules are resolved per route from the policy.
+        created = client.create_session(
+            title=f"model-router runner {request_id}",
+            permission=_policy_perm.session_permissions(meta.get("route")))
         saved = client.session_id_from(created)
         if not saved:
             return {"ok": False, "rc": 1,
