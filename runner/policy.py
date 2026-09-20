@@ -18,10 +18,11 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.2.0"
+POLICY_VERSION = "2.3.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
-                 "#12, #26 (Go plan, 2026-09-20), and #28/#29 (role kits, 2026-09-20)")
+                 "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
+                 "and #34 (usage probes, 2026-09-20)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -62,6 +63,44 @@ PROBE_MAX_DELAY_SECS = 6 * 3600
 # Where a capacity reset time came from: verbatim provider evidence, a
 # derived window assumption, or the documented overload cooldown.
 RESET_SOURCES = ("provider", "assumed", "cooldown")
+
+# Usage-probe readings (toolboxmd/model-router#34). Before choosing a route
+# the router knows each subscription window's usage and exact reset time
+# wherever the provider exposes it. A Reading carries used, limit,
+# reset_at, observed_at, and source in READING_SOURCES, keyed by pool,
+# model, and window in the capacity ledger:
+# provider_reported (Codex rateLimits/read, Claude /usage and OAuth usage,
+# Grok monthly billing, session-file quota records), measured (OpenCode Go
+# rolling cost sums against the tier windows, Zen free request counts),
+# derived (a limit computed from policy data, such as a Go window share of
+# the monthly tier), assumed (a window with no provider signal, such as
+# Grok weekly, reconciled by error evidence). A failed or slow probe
+# records used None (unknown) and never marks a route.
+READING_SOURCES = ("provider_reported", "measured", "derived", "assumed")
+# A window at or above this share of its limit marks the route degraded
+# for that window; 100 percent skips it until its reset_at. Below the
+# margin the reading is healthy.
+USAGE_DEGRADED_FRACTION = 0.8
+# Minimum seconds between proactive probes per harness. Codex
+# account/rateLimits/read runs every 300 seconds or on demand before a
+# dispatch; Claude /usage runs every 180 seconds at most, plus the free
+# statusline feed while a session runs; the OpenCode Go cost sums are a
+# cheap local-database read; the Grok monthly billing call is cached for
+# an hour. Research evidence lives on toolboxmd/model-router#34.
+CODEX_PROBE_INTERVAL_SECS = 300
+CLAUDE_PROBE_INTERVAL_SECS = 180
+OPENCODE_PROBE_INTERVAL_SECS = 60
+GROK_PROBE_INTERVAL_SECS = 3600
+PROBE_INTERVAL_SECS = {"codex": CODEX_PROBE_INTERVAL_SECS,
+                       "claude": CLAUDE_PROBE_INTERVAL_SECS,
+                       "opencode": OPENCODE_PROBE_INTERVAL_SECS,
+                       "grok": GROK_PROBE_INTERVAL_SECS}
+# Zen free names no allowance, so measured request counts are compared
+# against this assumed per-window cap (flagged in the reading detail).
+# Grok names no 5-hour or weekly allowance either: its weekly window is
+# assumed with error-driven cool-off, while the monthly billing call
+# reports provider data.
+ZEN_FREE_ASSUMED_REQUESTS = 50
 
 # Worker pools in preference order, then the two host pools.
 POOLS = {
@@ -1461,6 +1500,26 @@ def render_skill_table() -> str:
         "outcome is recorded for the observer.",
         "- Each invocation records its longest observed stream silence "
         "(`longest_silence_secs`), so the silence window is tuned on data through Agent Observer.",
+        "- Before choosing a route the router reads each subscription window's "
+        "usage and exact reset time wherever the provider exposes it: Codex "
+        "`account/rateLimits/read` (every 300 seconds, or on demand before a "
+        "dispatch), Claude `/usage` (every 180 seconds at most, plus the free "
+        "statusline feed), OpenCode Go rolling cost sums from the local "
+        "database against the tier windows, Zen free request counts against "
+        "an assumed cap, Grok monthly billing (provider-reported) with weekly "
+        "assumed and error-driven cool-off. Every reading carries its source "
+        f"({', '.join(READING_SOURCES)}) with `used`, `limit`, `reset_at`, "
+        "and `observed_at` per pool, model, and window, stored in the "
+        "capacity ledger and exposed by `capacity` and `status`.",
+        "- Readings and limit errors reconcile by fixed rules: an error "
+        "always overrides a probe for the window it names; a probe below 100 "
+        "percent never clears a provider exhaustion before its `reset_at`; "
+        "after `reset_at` the route needs one fresh probe or one successful "
+        "request to revalidate it before it is eligible again. A window at or above "
+        f"{int(USAGE_DEGRADED_FRACTION * 100)} percent marks the route degraded; "
+        "an exhausted window skips it until `reset_at`. A failing or slow "
+        "probe records `unknown` and never blocks routing: the route stays "
+        "eligible on error evidence alone.",
         f"- Go models with a ${SCARCE_MONTHLY_LIMIT_USD} monthly limit get one turn per job. "
         "Go routes on the "
         f"${' and $'.join(str(t) for t in CONCURRENT_CAP_TIERS_USD)} tiers allow at most one "

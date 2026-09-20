@@ -65,7 +65,8 @@ carry an optional `links` array of `{"rel": "...", "href": "..."}` objects
 routing and needs no runner flag.
 
 `capacity` lists remembered route capacity with its original provider
-evidence. `--clear ROUTE` is an operator action after checking the provider
+evidence, plus the latest usage-probe Reading per pool, model, and window.
+`--clear ROUTE` is an operator action after checking the provider
 allowance; the runner never invents a reset time.
 
 ## Flow
@@ -279,25 +280,41 @@ resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`),
 as is a route whose `max_concurrent` is already used by running jobs
 (`preflight_concurrent`), a one-turn route that already ran its turn
 (`preflight_one_turn`), and one with no turn left in this job — all without a
-child. The concurrency reservation is atomic: the target's running count is
+child. Preflight consults the usage-probe Readings too: a window at or above
+the policy margin (`USAGE_DEGRADED_FRACTION`, 80 percent of its limit) marks
+the route degraded for that window, and an exhausted window (100 percent)
+skips the route until its `reset_at`. The concurrency reservation is atomic: the target's running count is
 read inside the same write transaction that records the new route, and a full
 target moves to the next free route in the same transaction. The Go dispatch
 fallback (`luna-go/max`) reserves the same way before any child starts. No eligible route left in the lane blocks the job with
 `capacity_exhausted`. The `capacity` command lists remembered routes with
 pool, model, window, state, evidence, reset time, and reset source
-(`provider`, `assumed`, or `cooldown`); `--clear ROUTE` is an
+(`provider`, `assumed`, or `cooldown`), plus the latest Reading per pool,
+model, and window (`used`, `limit`, `reset_at`, `observed_at`, `source` in
+`provider_reported`, `measured`, `derived`, `assumed`); `--clear ROUTE` is an
 operator action after checking the provider. A provider-named reset is used
 verbatim (Codex `resets_at`, Go `Retry-After` seconds as the exact reset,
 Claude's reset time in text); a limit event with none assumes the named or
 default window (5-hour: now plus five hours; weekly plus seven days; monthly
-the next month boundary), flagged as assumed, honored by preflight, and
-retried once after it passes, with the retry's outcome on the ledger for the
-observer. Assumed weekly and monthly marks are re-probed on a lengthening
-schedule (one hour first, doubling, six-hour cap) and cleared on the first
-success; every probe outcome is recorded. Re-probing is operator-driven via
-`core.probe_due_routes`/`core.record_probe_outcome` (no sentinel process:
-an always-on observer is a non-goal); the mark itself still skips the route
-until its reset passes. The three Go windows stay separate,
+the next month boundary), flagged as assumed, honored by preflight.
+Readings and limit errors reconcile by fixed rules: an error always
+overrides a probe for the window it names; a probe below 100 percent never
+clears a provider exhaustion before its `reset_at` (the mark holds and the
+probe outcome stays on the ledger); after `reset_at` the route needs one
+fresh probe or one successful request to revalidate it before it is eligible
+again, so an expired mark stays until `record_probe_outcome`,
+a healthy fresh Reading, or `record_route_success` clears it (a successful
+worker turn revalidates the same way automatically). Assumed weekly and
+monthly marks are re-probed on a lengthening schedule (one hour first,
+doubling, six-hour cap) and cleared on the first success; every probe
+outcome is recorded. Re-probing is operator-driven via
+`core.probe_due_routes`/`core.record_probe_outcome`/`core.record_reading`/`core.record_route_success`
+(no sentinel process: an always-on observer is a non-goal).
+Probes never block routing: a failing or slow probe records `unknown`
+(`used` None with its source semantics kept) and the route stays eligible
+on error evidence alone, so the router still works with every probe
+failing. `status` and `result` expose the same `capacity` and `readings`
+tables Agent Observer reads. The three Go windows stay separate,
 so a weekly mark does not clear when the 5-hour mark expires. Zen balance
 overflow and direct paid APIs are disabled.
 
@@ -433,7 +450,8 @@ with `--replay-of`), the planner harness (only `claude`), the workspace
 commit at submit (`base_commit`) and completion (`head_commit`), and the
 optional task `links`. Events and invocations carry `schema_version` 2;
 Agent Observer reads this ledger directly. `status` and `result` show the
-measurements including native identities, variants, and schema versions;
+measurements including native identities, variants, and schema versions,
+plus the `capacity` marks and usage-probe `readings`;
 `status` keeps the redacted error evidence (signal, evidence, retry counts
 and caps) so CLI readers need not query the database directly;
 `result` also lists the turn reports.
@@ -469,6 +487,25 @@ per turn for stall detection on every harness), and usage measurement; the
 core and supervisor call
 these methods instead of branching on invocation kind. Each harness declares
 its capabilities, and each policy stage declares the capabilities it needs.
+Each harness also probes its subscription windows through the seam:
+Codex `account/rateLimits/read` (every 300 seconds, or on demand before a
+dispatch, via an optional probe hook that never blocks it), Claude `/usage`
+(every 180 seconds at most, plus the free statusline feed while a session
+runs), OpenCode Go rolling cost sums from the local session database against
+the policy tier windows, Zen free request counts against an assumed cap, and
+Grok monthly billing (provider-reported) with weekly assumed and
+error-driven cool-off. While a session runs, the harness reads the latest
+quota record from the session's own file instead of probing (Codex rollouts,
+Claude transcripts), treated as provider-reported with the file timestamp.
+Account-level probes fan out to one Reading per pool route model (Codex to
+every codex-pool model, Claude to every claude-pool model, Grok monthly to
+both xai-pool models; the Go Grok route keeps its own Go-dollar readings),
+so preflight sees each reading on every route that draws on the pool.
+Unrecognized Codex window durations are skipped and never stored; the Claude
+session window stays on the ledger for the observer but never degrades or
+exhausts a route. Every probe returns Reading dicts for `core.record_reading`
+to reconcile; a failure records unknown and the route stays eligible on
+error evidence alone.
 The harness also owns its action identity: a Grok turn resumed with
 `--resume` is the same logical turn, so a restarted controller reuses the
 finished attempt instead of starting a second writer.

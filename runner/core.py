@@ -2996,6 +2996,32 @@ def clear_capacity(state_dir, route: str) -> dict:
     return {"route": route, "cleared": True}
 
 
+def _probe_clears_mark(mark: dict, now_ts: float) -> bool:
+    """True when a healthy probe (or a successful request) revalidates an
+    exhausted capacity mark.
+
+    A probe below 100 percent never clears a provider exhaustion before its
+    reset_at; assumed and cooldown marks revalidate on any fresh healthy
+    probe, since the reset time itself was derived. Marks with no reset
+    time revalidate on the first healthy probe or success.
+    """
+    reset_at = mark.get("reset_at")
+    if not reset_at:
+        return True
+    try:
+        reset_ts = _parse_ts(reset_at)
+    except Exception:
+        return True
+    if reset_ts is None:
+        return True
+    if (mark.get("reset_source") or "") != "provider":
+        return True
+    try:
+        return float(now_ts) >= float(reset_ts)
+    except (TypeError, ValueError):
+        return False
+
+
 def record_probe_outcome(state_dir, route: str, window: str, ok: bool,
                           detail=None, now_ts: float | None = None) -> dict:
     """Record one probe of an assumed capacity mark.
@@ -3022,14 +3048,24 @@ def record_probe_outcome(state_dir, route: str, window: str, ok: bool,
         row = con.execute("SELECT * FROM capacity WHERE pool=? AND model=? AND window=?",
                           (pool, model, window)).fetchone()
         cleared = False
+        held = False
         next_probe_at = None
         if row is not None and row["state"] == "exhausted":
             if ok:
-                con.execute("DELETE FROM capacity WHERE pool=? AND model=? AND window=?",
-                            (pool, model, window))
-                cleared = True
-                _probe_event(con, "capacity_probe_cleared",
-                             {"route": route, "window": window})
+                if _probe_clears_mark(dict(row), now):
+                    con.execute("DELETE FROM capacity WHERE pool=? AND model=? AND window=?",
+                                (pool, model, window))
+                    cleared = True
+                    _probe_event(con, "capacity_probe_cleared",
+                                 {"route": route, "window": window})
+                else:
+                    # A probe below 100 percent never clears a provider
+                    # exhaustion before its reset_at: the mark holds and the
+                    # probe outcome stays on the ledger for the observer.
+                    held = True
+                    _probe_event(con, "capacity_probe_held",
+                                 {"route": route, "window": window,
+                                  "reset_at": row["reset_at"]})
             else:
                 failures = int(row["probe_failures"] or 0) + 1
                 next_probe_at = (datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
@@ -3051,7 +3087,7 @@ def record_probe_outcome(state_dir, route: str, window: str, ok: bool,
     finally:
         con.close()
     return {"route": route, "window": window, "ok": bool(ok),
-            "cleared": cleared, "next_probe_at": next_probe_at}
+            "cleared": cleared, "held": held, "next_probe_at": next_probe_at}
 
 
 def _probe_event(con, kind: str, payload: dict) -> None:
@@ -3066,22 +3102,408 @@ def _probe_event(con, kind: str, payload: dict) -> None:
         _event(con, row["request_id"], kind, payload)
 
 
+def _validate_reading(pool, model, window, used, limit, reset_at,
+                        observed_at, source) -> str:
+    """Validated observed_at ISO timestamp, or raise."""
+    if not isinstance(pool, str) or not pool.strip():
+        raise ValueError("reading needs a pool")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("reading needs a model")
+    if not isinstance(window, str) or not window.strip():
+        raise ValueError("reading needs a window")
+    if source not in policy.READING_SOURCES:
+        raise ValueError(f"invalid reading source: {source!r}")
+    for name, val in (("used", used), ("limit", limit)):
+        if val is None:
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"reading {name} must be a number or None")
+        if float(val) < 0:
+            raise ValueError(f"reading {name} must not be negative")
+    if reset_at is not None:
+        if not isinstance(reset_at, str) or not reset_at.strip() \
+                or _parse_ts(reset_at) is None:
+            raise ValueError(f"unparseable reading reset_at: {reset_at!r}")
+    if observed_at is None:
+        return _utcnow()
+    if not isinstance(observed_at, str) or _parse_ts(observed_at) is None:
+        raise ValueError(f"unparseable reading observed_at: {observed_at!r}")
+    return observed_at
+
+
+def _reading_fraction(reading: dict) -> float | None:
+    """used / limit, or None when the reading is unknown or has no limit."""
+    try:
+        used = reading.get("used")
+        limit = reading.get("limit")
+    except AttributeError:
+        return None
+    if used is None or limit is None:
+        return None
+    try:
+        if isinstance(used, bool) or isinstance(limit, bool):
+            return None
+        limit_f = float(limit)
+        if limit_f <= 0:
+            return None
+        return float(used) / limit_f
+    except (TypeError, ValueError):
+        return None
+
+
+def _reading_row_to_dict(row) -> dict:
+    d = dict(row)
+    d["limit"] = d.pop("limit_value", None)
+    return d
+
+
+def record_reading(state_dir, pool: str, model: str, window: str,
+                   used, limit, reset_at: str | None,
+                   observed_at: str | None = None,
+                   source: str = "measured", detail=None,
+                   now_ts: float | None = None) -> dict:
+    """Store one proactive usage-probe Reading in the capacity ledger.
+
+    Keyed by pool, model, and window: used, limit, reset_at, observed_at,
+    and source in {provider_reported, measured, derived, assumed}. used
+    None means unknown (a failed or slow probe): it never marks a route.
+    A healthy fresh reading revalidates an exhausted mark the same way a
+    successful probe does, so provider marks still hold before reset_at
+    while assumed marks learn the real boundary sooner. An exhausted
+    reading never creates a mark on its own: error evidence does that, so
+    an error always overrides a probe for the window it names.
+    """
+    observed = _validate_reading(pool, model, window, used, limit,
+                                 reset_at, observed_at, source)
+    observed_ts = _parse_ts(observed)
+    if observed_ts is None:
+        observed_ts = now_ts if now_ts is not None else time.time()
+    try:
+        detail_json = json.dumps(adapters.redact_nested(detail or {}), sort_keys=True)[:2000]
+    except Exception:
+        detail_json = json.dumps({"recorded": True})
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO readings(pool, model, window, used, limit_value, reset_at,"
+            " observed_at, source, detail_json, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pool, model, window) DO UPDATE SET"
+            " used=excluded.used, limit_value=excluded.limit_value,"
+            " reset_at=excluded.reset_at, observed_at=excluded.observed_at,"
+            " source=excluded.source, detail_json=excluded.detail_json,"
+            " updated_at=excluded.updated_at",
+            (pool, model, window,
+             None if used is None else float(used),
+             None if limit is None else float(limit),
+             reset_at, observed, source, detail_json, _utcnow()),
+        )
+        revalidated = None
+        fraction = _reading_fraction({"used": used, "limit": limit})
+        if fraction is not None and fraction < 1.0 and observed_ts is not None:
+            mark = con.execute("SELECT * FROM capacity WHERE pool=? AND model=? AND window=?",
+                               (pool, model, window)).fetchone()
+            if mark is not None and mark["state"] == "exhausted" \
+                    and _probe_clears_mark(dict(mark), observed_ts):
+                con.execute("DELETE FROM capacity WHERE pool=? AND model=? AND window=?",
+                            (pool, model, window))
+                revalidated = window
+                _probe_event(con, "capacity_probe_cleared",
+                             {"pool": pool, "model": model, "window": window,
+                              "via": "reading"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"pool": pool, "model": model, "window": window, "used": used,
+            "limit": limit, "reset_at": reset_at, "observed_at": observed,
+            "source": source, "revalidated": revalidated}
+
+
+def note_probe_failure(state_dir, route: str, window: str, source: str = "assumed",
+                       detail=None, observed_at: str | None = None) -> dict:
+    """A failing or slow probe records unknown and never marks a route.
+
+    The window's reading becomes used None (unknown) with its source
+    semantics kept, a failed probe outcome is logged for the observer, and
+    the route stays eligible on error evidence alone: capacity marks are
+    untouched, so error evidence still governs.
+    """
+    spec = policy.route_spec(route)
+    pool, model = spec["pool"], spec["model"]
+    if source not in policy.READING_SOURCES:
+        raise ValueError(f"invalid reading source: {source!r}")
+    observed = observed_at or _utcnow()
+    if _parse_ts(observed) is None:
+        raise ValueError(f"unparseable reading observed_at: {observed!r}")
+    try:
+        detail_json = json.dumps(adapters.redact_nested(detail or {}), sort_keys=True)[:2000]
+    except Exception:
+        detail_json = json.dumps({"recorded": True})
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO readings(pool, model, window, used, limit_value, reset_at,"
+            " observed_at, source, detail_json, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pool, model, window) DO UPDATE SET"
+            " used=NULL, limit_value=NULL, reset_at=NULL,"
+            " observed_at=excluded.observed_at, source=excluded.source,"
+            " detail_json=excluded.detail_json, updated_at=excluded.updated_at",
+            (pool, model, window, None, None, None,
+             observed, source, detail_json, _utcnow()),
+        )
+        con.execute(
+            "INSERT INTO capacity_probes(pool, model, window, ts, ok, detail_json)"
+            " VALUES(?,?,?,?,?,?)", (pool, model, window, observed, 0, detail_json))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"pool": pool, "model": model, "window": window, "used": None,
+            "limit": None, "reset_at": None, "observed_at": observed,
+            "source": source}
+
+
+def log_probe(state_dir, route: str, window: str, ok: bool, detail=None,
+              now_ts: float | None = None) -> dict:
+    """Append one usage-probe outcome to the probe log without touching
+    capacity marks or readings. Failing outcomes are unknown evidence."""
+    spec = policy.route_spec(route)
+    now = now_ts if now_ts is not None else time.time()
+    ts = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+    try:
+        detail_json = json.dumps(adapters.redact_nested(detail or {}), sort_keys=True)[:2000]
+    except Exception:
+        detail_json = json.dumps({"recorded": True})
+    con = store.connect(state_dir)
+    try:
+        con.execute(
+            "INSERT INTO capacity_probes(pool, model, window, ts, ok, detail_json)"
+            " VALUES(?,?,?,?,?,?)",
+            (spec["pool"], spec["model"], window, ts, 1 if ok else 0, detail_json))
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    return {"route": route, "window": window, "ok": bool(ok), "ts": ts}
+
+
+def list_readings(state_dir, route: str | None = None, pool: str | None = None,
+                  model: str | None = None, window: str | None = None) -> list[dict]:
+    """Usage-probe readings, optionally filtered. ``limit`` is exposed
+    under its ledger name (stored as limit_value: LIMIT is reserved)."""
+    clauses: list[str] = []
+    args: list = []
+    if route is not None:
+        spec = policy.route_spec(route)
+        pool, model = spec["pool"], spec["model"]
+    for col, val in (("pool", pool), ("model", model), ("window", window)):
+        if val is not None:
+            clauses.append(f"{col}=?")
+            args.append(val)
+    query = "SELECT * FROM readings" + (" WHERE " + " AND ".join(clauses) if clauses else "") \
+        + " ORDER BY pool, model, window"
+    con = store.connect(state_dir)
+    try:
+        return [_reading_row_to_dict(r) for r in con.execute(query, args).fetchall()]
+    finally:
+        con.close()
+
+
+def _routes_for_pool_model(pool: str, model: str) -> list[str]:
+    """Policy routes drawing on this pool and model."""
+    return [name for name, spec in policy.ROUTES.items()
+            if spec.get("pool") == pool and spec.get("model") == model]
+
+
+def _is_capacity_window(window) -> bool:
+    """True when a reading window drives preflight.
+
+    Only the policy's subscription windows (5h, weekly, monthly) skip or
+    degrade routes. Session records and any unrecognized window stay on the
+    ledger for the observer but never mark a route.
+    """
+    try:
+        return str(window) in policy.WINDOWS
+    except Exception:
+        return False
+
+
+def route_reading_states(state_dir, route: str, now_ts: float | None = None) -> dict:
+    """Per-window reading state for a route: exhausted, degraded, ok, or
+    unknown. A subscription window above the policy margin is degraded; 100
+    percent is exhausted until its reset_at. Session and unrecognized
+    windows are always ok (unknown when unreadable): they never mark a
+    route. Unknown readings and expired resets are eligible on error
+    evidence alone."""
+    policy.route_spec(route)
+    now = now_ts if now_ts is not None else time.time()
+    out: dict = {}
+    for reading in list_readings(state_dir, route=route):
+        window = reading["window"]
+        fraction = _reading_fraction(reading)
+        if fraction is None:
+            out[window] = "unknown"
+            continue
+        if not _is_capacity_window(window):
+            out[window] = "ok"
+            continue
+        reset_at = reading.get("reset_at")
+        reset_ts = _parse_ts(reset_at) if reset_at else None
+        if reset_ts is not None and now >= reset_ts:
+            out[window] = "ok"
+            continue
+        if fraction >= 1.0:
+            out[window] = "exhausted"
+        elif fraction >= float(policy.USAGE_DEGRADED_FRACTION):
+            out[window] = "degraded"
+        else:
+            out[window] = "ok"
+    return out
+
+
+def reading_exhausted_routes(state_dir, now_ts: float | None = None) -> set[str]:
+    """Routes with at least one exhausted subscription-window reading."""
+    now = now_ts if now_ts is not None else time.time()
+    out: set[str] = set()
+    con = store.connect(state_dir)
+    try:
+        rows = con.execute("SELECT pool, model, window, used, limit_value, reset_at"
+                           " FROM readings").fetchall()
+    finally:
+        con.close()
+    for r in rows:
+        if not _is_capacity_window(r["window"]):
+            continue
+        fraction = _reading_fraction({"used": r["used"], "limit": r["limit_value"]})
+        if fraction is None or fraction < 1.0:
+            continue
+        if r["reset_at"]:
+            reset_ts = _parse_ts(r["reset_at"])
+            if reset_ts is not None and now >= reset_ts:
+                continue
+        out.update(_routes_for_pool_model(r["pool"], r["model"]))
+    return out
+
+
+def reading_degraded_routes(state_dir, now_ts: float | None = None) -> set[str]:
+    """Routes with a subscription window at or above the policy margin."""
+    now = now_ts if now_ts is not None else time.time()
+    margin = float(policy.USAGE_DEGRADED_FRACTION)
+    out: set[str] = set()
+    con = store.connect(state_dir)
+    try:
+        rows = con.execute("SELECT pool, model, window, used, limit_value, reset_at"
+                           " FROM readings").fetchall()
+    finally:
+        con.close()
+    for r in rows:
+        if not _is_capacity_window(r["window"]):
+            continue
+        fraction = _reading_fraction({"used": r["used"], "limit": r["limit_value"]})
+        if fraction is None or fraction < margin or fraction >= 1.0:
+            continue
+        if r["reset_at"]:
+            reset_ts = _parse_ts(r["reset_at"])
+            if reset_ts is not None and now >= reset_ts:
+                continue
+        out.update(_routes_for_pool_model(r["pool"], r["model"]))
+    return out
+
+
+def record_route_success(state_dir, route: str, window: str | None = None,
+                         now_ts: float | None = None) -> dict:
+    """A successful request revalidates exhaustion marks the same way a
+    healthy probe does: assumed marks clear at once, provider marks only
+    after their reset_at. Future provider marks hold: success elsewhere
+    never invents a reset. Returns the cleared windows."""
+    spec = policy.route_spec(route)
+    pool, model = spec["pool"], spec["model"]
+    now = now_ts if now_ts is not None else time.time()
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        query = "SELECT * FROM capacity WHERE pool=? AND model=? AND state='exhausted'"
+        args: list = [pool, model]
+        if window is not None:
+            query += " AND window=?"
+            args.append(window)
+        cleared: list[str] = []
+        for mark in con.execute(query, args).fetchall():
+            if _probe_clears_mark(dict(mark), now):
+                con.execute("DELETE FROM capacity WHERE pool=? AND model=? AND window=?",
+                            (pool, model, mark["window"]))
+                cleared.append(mark["window"])
+        if cleared:
+            _probe_event(con, "capacity_success_cleared",
+                         {"route": route, "windows": sorted(cleared)})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"route": route, "cleared": sorted(cleared)}
+
+
+def probe_due_for(harness_name: str, observed_at: str | None,
+                  now_ts: float | None = None) -> bool:
+    """True when a harness usage probe is due: never probed, unparseable,
+    or older than the policy interval (Codex 300s, Claude 180s)."""
+    interval = policy.PROBE_INTERVAL_SECS.get(harness_name)
+    if interval is None:
+        raise ValueError(f"unknown harness for probing: {harness_name!r}")
+    now = now_ts if now_ts is not None else time.time()
+    if not observed_at:
+        return True
+    try:
+        obs_ts = _parse_ts(observed_at)
+    except Exception:
+        return True
+    if obs_ts is None:
+        return True
+    return (now - obs_ts) >= float(interval)
+
+
 def probe_due_routes(state_dir, now_ts: float | None = None) -> list[dict]:
-    """Assumed exhausted marks whose next probe is due. The mark itself
-    still skips the route until its reset passes; the probe only learns the
-    real boundary sooner."""
+    """Exhausted marks needing operator-driven revalidation.
+
+    Assumed weekly and monthly marks whose next probe is due (the probe
+    learns the real boundary sooner), plus any exhausted mark whose reset
+    has passed: after reset_at the route needs one fresh probe or one
+    successful request before it is eligible again, so expired marks stay
+    on this worklist until record_probe_outcome, a healthy fresh reading,
+    or record_route_success clears them.
+    """
     now = now_ts if now_ts is not None else time.time()
     con = store.connect(state_dir)
     try:
         rows = con.execute(
-            "SELECT * FROM capacity WHERE state='exhausted' AND next_probe_at IS NOT NULL"
-            " ORDER BY next_probe_at").fetchall()
+            "SELECT * FROM capacity WHERE state='exhausted'"
+            " ORDER BY COALESCE(next_probe_at, reset_at)").fetchall()
     finally:
         con.close()
     out = []
     for r in rows:
-        ts = _parse_ts(r["next_probe_at"])
-        if ts is not None and now >= ts:
+        probe_ts = _parse_ts(r["next_probe_at"]) if r["next_probe_at"] else None
+        if probe_ts is not None and now >= probe_ts:
+            out.append(dict(r))
+            continue
+        reset_ts = _parse_ts(r["reset_at"]) if r["reset_at"] else None
+        if reset_ts is not None and now >= reset_ts:
             out.append(dict(r))
     return out
 
@@ -3115,22 +3537,37 @@ def _routes_in_state(state_dir, state: str) -> set[str]:
     for r in rows:
         if r["state"] != state:
             continue
+        if state == "exhausted":
+            # Sticky (#34): an error always overrides a probe, so an
+            # exhaustion mark holds until one fresh probe or one successful
+            # request revalidates it, even past its reset_at. Degraded
+            # cooldowns still expire on their own below.
+            out.add(r["route"])
+            continue
         reset_at = r["reset_at"]
         if reset_at:
             ts = _parse_ts(reset_at)
             if ts is not None and now >= ts:
                 continue
         out.add(r["route"])
+    if state == "exhausted":
+        out |= reading_exhausted_routes(state_dir, now_ts=now)
+    elif state == "degraded":
+        out |= reading_degraded_routes(state_dir, now_ts=now)
     return out
 
 
 def exhausted_routes(state_dir) -> set[str]:
-    """Routes known exhausted until a trusted reset time has passed."""
+    """Routes known exhausted: sticky error marks plus exhausted window
+    readings. A mark holds past its reset_at until one fresh probe or one
+    successful request revalidates it; a probe below 100 percent never
+    clears it before reset_at."""
     return _routes_in_state(state_dir, "exhausted")
 
 
 def degraded_routes(state_dir) -> set[str]:
-    """Routes marked overloaded until their documented cooldown passes."""
+    """Routes resting (overload cooldowns) or with a window reading at or
+    above the policy margin but below 100 percent."""
     return _routes_in_state(state_dir, "degraded")
 
 
@@ -3180,22 +3617,51 @@ def route_concurrency_full(state_dir, route: str, exclude: str | None = None) ->
 def _capacity_sets_locked(con) -> tuple[set[str], set[str]]:
     """(exhausted, degraded) routes from the capacity memory, read inside the
     caller's write transaction so sticky selection and the route record are
-    atomic. Entries whose reset time has passed count as eligible again."""
+    atomic. Exhaustion marks are sticky past reset_at until revalidated;
+    degraded cooldowns expire on their own. Window readings join both sets
+    so preflight and sticky homes consult them atomically."""
     now = time.time()
     exhausted: set[str] = set()
     degraded: set[str] = set()
     for r in con.execute("SELECT route, state, reset_at FROM capacity").fetchall():
         if r["state"] not in ("exhausted", "degraded"):
             continue
+        if r["state"] == "exhausted":
+            exhausted.add(r["route"])
+            continue
         reset_at = r["reset_at"]
         if reset_at:
             ts = _parse_ts(reset_at)
             if ts is not None and now >= ts:
                 continue
-        if r["state"] == "exhausted":
-            exhausted.add(r["route"])
-        else:
-            degraded.add(r["route"])
+        degraded.add(r["route"])
+    try:
+        margin = float(policy.USAGE_DEGRADED_FRACTION)
+    except (TypeError, ValueError):
+        margin = 0.8
+    for rd in con.execute("SELECT pool, model, window, used, limit_value, reset_at"
+                          " FROM readings").fetchall():
+        if not _is_capacity_window(rd["window"]):
+            continue
+        used, limit = rd["used"], rd["limit_value"]
+        if used is None or limit is None:
+            continue
+        try:
+            if isinstance(used, bool) or isinstance(limit, bool) \
+                    or float(limit) <= 0:
+                continue
+            fraction = float(used) / float(limit)
+        except (TypeError, ValueError):
+            continue
+        if rd["reset_at"]:
+            reset_ts = _parse_ts(rd["reset_at"])
+            if reset_ts is not None and now >= reset_ts:
+                continue
+        for route in _routes_for_pool_model(rd["pool"], rd["model"]):
+            if fraction >= 1.0:
+                exhausted.add(route)
+            elif fraction >= margin:
+                degraded.add(route)
     return exhausted, degraded
 
 
@@ -3376,7 +3842,8 @@ def result_view(state_dir, request_id: str) -> dict:
             "result_path": str(store.result_path_for(root, request_id)),
             "base_commit": job.get("base_commit"), "head_commit": job.get("head_commit"),
             "job_kind": job.get("job_kind"), "replay_of": job.get("replay_of"),
-            "reports": reports, "measurements": invocation_measurements(state_dir, request_id)}
+            "reports": reports, "measurements": invocation_measurements(state_dir, request_id),
+            "capacity": list_capacity(state_dir), "readings": list_readings(state_dir)}
 
 
 def status_view(state_dir, request_id: str) -> dict:
@@ -3439,4 +3906,6 @@ def status_view(state_dir, request_id: str) -> dict:
         job_public["owner_token"] = "<redacted>"
     job_public["measurements"] = invocation_measurements(state_dir, request_id)
     return {"job": job_public, "launches": launches, "questions": questions,
-            "recent_events": events, "output_tail": tail}
+            "recent_events": events, "output_tail": tail,
+            "capacity": list_capacity(state_dir),
+            "readings": list_readings(state_dir)}

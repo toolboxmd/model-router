@@ -328,9 +328,9 @@ class TestAssumedResets(StallDrillBase):
         move = controller._preflight_move(self.sd, "oc1", "muse-spark-xhigh-free")
         self.assertIsNotNone(move)
         self.assertEqual(move["reason"], "preflight_exhausted")
-        # After the window passes the route is eligible again, and the
-        # retry's outcome is recorded on the ledger: the dispatcher's next
-        # turn (new seq, hence a new action identity) runs on the route.
+        # #34 reconciliation: after reset_at the route still needs one fresh
+        # probe or one successful request before it is eligible again, so the
+        # expired mark stays until revalidated and shows up as probe-due.
         con = store.connect(self.sd)
         try:
             con.execute("UPDATE capacity SET reset_at='2000-01-01T00:00:00+00:00'"
@@ -341,6 +341,12 @@ class TestAssumedResets(StallDrillBase):
                                      "last_action": {"action": "implementation"}}),))
         finally:
             con.close()
+        self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
+        self.assertTrue([r for r in core.probe_due_routes(self.sd)
+                         if r["route"] == "muse-spark-xhigh-free"])
+        out = core.record_probe_outcome(self.sd, "muse-spark-xhigh-free",
+                                        "unknown", True, {"revalidation": True})
+        self.assertTrue(out["cleared"])
         self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
         self.assertIsNone(controller._preflight_move(self.sd, "oc1", "muse-spark-xhigh-free"))
         os.environ["FAKE_OC_MODE"] = "ok"
