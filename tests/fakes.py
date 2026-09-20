@@ -8,7 +8,9 @@ runner: Basic auth ``opencode:<password>``, ``directory`` scoping,
 ``--output-format json`` result object. No model is called.
 
 Environment: ``FAKE_STATE`` (log directory), ``FAKE_OC_MODE`` (free-route
-behavior: ok, free_limit, api_free_error, rate_limit, model_text, hang),
+behavior: ok, free_limit, api_free_error, rate_limit, model_text, hang,
+stall, hard_error, context_error), ``FAKE_OC_MODE_GO`` (same for Go routes),
+``FAKE_OC_PROBE_MODE`` (stall-probe answer: ok, exhausted, overloaded),
 ``FAKE_OC_DELAY`` (seconds of busy time), ``FAKE_OC_WRITE`` (relative
 file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
 ``FAKE_CLAUDE_ANSWER``.
@@ -68,9 +70,45 @@ def assistant(sid, model, text="", error=None, finish="stop"):
     parts = [{"type": "text", "text": text}] if text else []
     return {"info": info, "parts": parts}
 
-def run_turn(sid, model, directory, aborted):
+def run_turn(sid, model, directory, aborted, prompt_text=""):
     free = model.get("providerID") == "opencode"
     mode = MODE if free else (MODE_GO if model.get("providerID") == "opencode-go" else "ok")
+    if "stall probe" in (prompt_text or "").lower():
+        # A stall probe answers fast on its own, never repeating the turn's
+        # mode: FAKE_OC_PROBE_MODE ok (default), exhausted, or overloaded.
+        pmode = os.environ.get("FAKE_OC_PROBE_MODE", "ok")
+        time.sleep(0.2)
+        if pmode == "exhausted":
+            msg = assistant(sid, model, error={"name": "APIError", "data": {
+                "message": "go exceeded", "statusCode": 429, "isRetryable": False,
+                "responseBody": json.dumps({"type": "error", "error": {"type": "GoUsageLimitError"}})}})
+        elif pmode == "overloaded":
+            msg = assistant(sid, model, error={"name": "APIError", "data": {
+                "message": "rate limited", "statusCode": 429, "isRetryable": True,
+                "responseBody": json.dumps({"type": "error", "error": {"type": "RateLimitError"}})}})
+        else:
+            msg = assistant(sid, model, text="ok")
+        with lock:
+            sessions[sid].append(msg)
+            status.pop(sid, None)
+        return
+    if mode == "stall":
+        # Stream a few parts, then go silent while reporting busy: the
+        # supervisor must end the turn on the silence window, not the timeout.
+        with lock:
+            status[sid] = {"type": "busy"}
+        for i in range(3):
+            time.sleep(0.5)
+            if aborted.is_set():
+                break
+            with lock:
+                sessions[sid].append(assistant(sid, model, text="stream part %d" % i))
+        while not aborted.is_set():
+            time.sleep(0.05)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
     with lock:
         status[sid] = {"type": "busy"}
     if mode in ("transport_503", "transport_529", "http_503", "http_529"):
@@ -177,6 +215,10 @@ def run_turn(sid, model, directory, aborted):
             "responseBody": json.dumps({"type": "error", "error": {"type": "RateLimitError"}})}})
     elif mode == "hard_error":
         msg = assistant(sid, model, error={"name": "APIError", "data": {
+            "message": "consent denied", "statusCode": 403, "isRetryable": False,
+            "responseBody": json.dumps({"type": "error", "error": {"type": "DataPolicyError"}})}})
+    elif mode == "context_error":
+        msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "context length exceeded", "statusCode": 400, "isRetryable": False,
             "responseBody": json.dumps({"type": "error", "error": {"type": "context_length_exceeded"}})}})
     elif mode == "go_limit":
@@ -266,7 +308,9 @@ class H(BaseHTTPRequestHandler):
             ev = threading.Event()
             aborts[sid] = ev
             globals()["AGENT"] = body.get("agent")
-            threading.Thread(target=run_turn, args=(sid, body.get("model") or {}, directory, ev), daemon=True).start()
+            parts = body.get("parts") or []
+            text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
+            threading.Thread(target=run_turn, args=(sid, body.get("model") or {}, directory, ev, text), daemon=True).start()
             return self._json(204)
         if path.endswith("/abort"):
             sid = path.split("/")[2]

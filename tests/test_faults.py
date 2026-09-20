@@ -446,7 +446,10 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         cap = self._capacity("grok-4.6-go")
         self.assertEqual((cap["state"], cap["pool"], cap["model"]), ("exhausted", "go", "opencode-go/grok-4.6"))
         self.assertIn("GoUsageLimitError", cap["evidence_json"])
-        self.assertIsNone(cap["reset_at"])  # no invented reset
+        # No provider reset: the 5-hour default is assumed and flagged, so
+        # preflight skips the route until it passes instead of forever.
+        self.assertIsNotNone(cap["reset_at"])
+        self.assertEqual(cap["reset_source"], "assumed")
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
@@ -579,7 +582,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         report = json.loads(Path(res["report"]["report_path"]).read_text())
         self.assertEqual(report["status"], "failed")
-        self.assertIn("context_length_exceeded", json.dumps(report["error"]))
+        self.assertIn("DataPolicyError", json.dumps(report["error"]))
         inv = [i for i in core._list_invocations(self.sd, "oc1") if i["kind"] == "opencode_control"][-1]
         self.assertEqual(inv["terminal_class"], "hard_error")
         controller._record_turn_outcome(self.sd, "oc1", res)

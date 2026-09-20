@@ -541,9 +541,13 @@ def _action_key(kind: str, cmd: list[str], meta: dict | None) -> str:
 
     Volatile values such as a saved session learned by an earlier
     attempt are excluded so a restarted controller finds the same key.
+    ``try`` numbers repeated worker turns for one dispatcher turn (seq),
+    so a bounded same-route retry after a stall is a new attempt, never a
+    silent reuse and never a duplicate writer. Only stalled failures take a
+    new number; every other outcome reuses its original identity.
     """
     m = dict(meta or {})
-    stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid")}
+    stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid", "try")}
     blob = json.dumps([kind, list(cmd), stable], sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1425,6 +1429,10 @@ def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
         return "quota"
     if signal_name == "overloaded":
         return "overloaded"
+    if signal_name == "stalled":
+        return "stalled"
+    if signal_name == "context":
+        return "context"
     if signal_name == "hard":
         return "hard_error"
     if rc == 0:
@@ -1480,6 +1488,20 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
     ended = _parse_ts(inv.get("ended_at")) or time.time()
     elapsed = round(max(0.0, ended - started), 3) if started is not None else None
     tclass = terminal_class_for(inv.get("rc"), result_obj, crashed=crashed)
+    longest = None
+    if isinstance(result_obj, dict):
+        # Owned-server turns nest the drive result under ``envelope``; CLI
+        # turns carry it top-level. Either way the longest observed silence
+        # lands on the invocation row for window tuning.
+        raw_longest = result_obj.get("longest_silence_secs")
+        if raw_longest is None and isinstance(result_obj.get("envelope"), dict):
+            raw_longest = result_obj["envelope"].get("longest_silence_secs")
+        try:
+            longest = float(raw_longest) if raw_longest is not None else None
+        except (TypeError, ValueError):
+            longest = None
+        if longest is not None and longest < 0:
+            longest = None
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -1487,10 +1509,11 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
             "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
             " observed_model=COALESCE(?, observed_model),"
             " observed_variant=COALESCE(?, observed_variant),"
-            " native_ids_json=?, schema_version=? WHERE invocation_id=?",
+            " native_ids_json=?, schema_version=?,"
+            " longest_silence_secs=COALESCE(?, longest_silence_secs) WHERE invocation_id=?",
             (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
              observed, variant, json.dumps(ids, sort_keys=True) if ids else None,
-             store.SCHEMA_VERSION, invocation_id))
+             store.SCHEMA_VERSION, longest, invocation_id))
         con.execute("COMMIT")
     except Exception:
         try:
@@ -1523,7 +1546,8 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
                     "harness_version": inv.get("harness_version"),
                     "schema_version": inv.get("schema_version"),
                     "report_path": inv.get("report_path"), "started_at": inv.get("started_at"),
-                    "ended_at": inv.get("ended_at")})
+                    "ended_at": inv.get("ended_at"),
+                    "longest_silence_secs": inv.get("longest_silence_secs")})
     return out
 
 
@@ -2790,10 +2814,39 @@ def recover_one(state_dir, request_id: str) -> dict:
         con.close()
 
 
+def reset_at_for_evidence(route, evidence, state: str, window: str | None = None,
+                            now_ts: float | None = None) -> tuple[str | None, str | None]:
+    """(reset_at, reset_source) for a capacity mark.
+
+    A provider-named reset wins verbatim (Codex ``resets_at``, Go
+    ``Retry-After`` seconds, Claude's reset time in text). A limit event
+    with none assumes the named or default window (5-hour, weekly, monthly),
+    flagged as assumed rather than provider-reported, so preflight honors it
+    and the route is retried once after it passes. The overload cooldown is
+    policy-derived. Anything else stays unknown.
+    """
+    if state == "degraded":
+        return degraded_until(now_ts), "cooldown"
+    if state == "exhausted":
+        moment = policy.parse_provider_reset(evidence, now_ts)
+        if moment is not None:
+            return moment, "provider"
+        win = window
+        if not isinstance(win, str) or not win:
+            win = evidence.get("window") if isinstance(evidence, dict) else None
+            if isinstance(evidence, dict) and isinstance(evidence.get("error"), dict):
+                win = win or evidence["error"].get("window")
+            if not isinstance(win, str) or not win:
+                win = policy.ASSUMED_WINDOW_DEFAULT
+        return policy.assumed_reset_at(win, now_ts), "assumed"
+    return None, None
+
+
 def _trusted_reset_at(evidence) -> str | None:
     """Return a provider reset timestamp only from explicit trusted evidence.
 
-    Unknown stays unknown. Never invent a daily reset or probe loop.
+    Unknown stays unknown. Assumed windows are derived separately by
+    :func:`reset_at_for_evidence` and flagged as assumed.
     """
     if not isinstance(evidence, dict):
         return None
@@ -2837,11 +2890,16 @@ def _capacity_windows_for(route: str, state: str, evidence, window: str | None) 
 
 def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
                             evidence=None, reset_at: str | None = None,
-                            window: str | None = None) -> None:
+                            window: str | None = None,
+                            reset_source: str | None = None) -> None:
     """Record capacity keyed by pool, model, and window. ``route`` names one
     pool and model and is kept for display; the primary key is
-    (pool, model, window). ``reset_at`` comes only from provider evidence,
-    the documented degraded cooldown, or an operator."""
+    (pool, model, window). ``reset_at`` comes from provider evidence
+    (verbatim), a flagged window assumption, the documented degraded
+    cooldown, or an operator. An assumed weekly or monthly mark also starts
+    its probe schedule: the first probe is due after one hour, lengthening
+    with each failure, so a days-too-long assumption is corrected by data.
+    """
     now = _utcnow()
     ev = None
     if evidence is not None:
@@ -2853,12 +2911,22 @@ def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
     pool = spec.get("pool") or "unknown"
     model = spec.get("model") or route
     for win in _capacity_windows_for(route, state, evidence, window):
+        next_probe = None
+        failures = None
+        if state == "exhausted" and reset_source == "assumed" and win in ("weekly", "monthly"):
+            failures = 0
+            next_probe = (datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc)
+                          + datetime.timedelta(seconds=policy.probe_delay_secs(0))).isoformat()
         con.execute(
-            "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at, pool, model, window)"
-            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(pool, model, window) DO UPDATE SET"
+            "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at, pool, model, window,"
+            " reset_source, next_probe_at, probe_failures)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pool, model, window) DO UPDATE SET"
             " route=excluded.route, state=excluded.state, evidence_json=excluded.evidence_json,"
-            " reset_at=excluded.reset_at, updated_at=excluded.updated_at",
-            (route, state, ev, reset_at, now, pool, model, win),
+            " reset_at=excluded.reset_at, updated_at=excluded.updated_at,"
+            " reset_source=excluded.reset_source, next_probe_at=excluded.next_probe_at,"
+            " probe_failures=excluded.probe_failures",
+            (route, state, ev, reset_at, now, pool, model, win,
+             reset_source, next_probe, failures),
         )
 
 
@@ -2871,14 +2939,18 @@ def degraded_until(now_ts: float | None = None) -> str:
 
 
 def record_capacity(state_dir, route: str, state: str, evidence=None,
-                    reset_at: str | None = None, window: str | None = None) -> None:
+                    reset_at: str | None = None, window: str | None = None,
+                    reset_source: str | None = None) -> None:
     policy.validate_route(route)
     if state not in CAPACITY_STATES:
         raise ValueError(f"invalid capacity state: {state!r}")
+    if reset_source is not None and reset_source not in policy.RESET_SOURCES:
+        raise ValueError(f"invalid reset source: {reset_source!r}")
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        _record_capacity_locked(con, route, state, evidence, reset_at, window)
+        _record_capacity_locked(con, route, state, evidence, reset_at, window,
+                                reset_source)
         con.execute("COMMIT")
     except Exception:
         try:
@@ -2924,6 +2996,114 @@ def clear_capacity(state_dir, route: str) -> dict:
     finally:
         con.close()
     return {"route": route, "cleared": True}
+
+
+def record_probe_outcome(state_dir, route: str, window: str, ok: bool,
+                          detail=None, now_ts: float | None = None) -> dict:
+    """Record one probe of an assumed capacity mark.
+
+    The first success clears the mark; a failure pushes the next probe out
+    on the lengthening schedule (one hour, doubling, six-hour cap). Every
+    outcome is kept in ``capacity_probes`` so the real window boundaries are
+    learned and handed to the observer.
+    """
+    spec = policy.route_spec(route)
+    pool, model = spec["pool"], spec["model"]
+    now = now_ts if now_ts is not None else time.time()
+    ts = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+    try:
+        detail_json = json.dumps(adapters.redact_nested(detail or {}), sort_keys=True)[:2000]
+    except Exception:
+        detail_json = json.dumps({"recorded": True})
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO capacity_probes(pool, model, window, ts, ok, detail_json)"
+            " VALUES(?,?,?,?,?,?)", (pool, model, window, ts, 1 if ok else 0, detail_json))
+        row = con.execute("SELECT * FROM capacity WHERE pool=? AND model=? AND window=?",
+                          (pool, model, window)).fetchone()
+        cleared = False
+        next_probe_at = None
+        if row is not None and row["state"] == "exhausted":
+            if ok:
+                con.execute("DELETE FROM capacity WHERE pool=? AND model=? AND window=?",
+                            (pool, model, window))
+                cleared = True
+                _probe_event(con, "capacity_probe_cleared",
+                             {"route": route, "window": window})
+            else:
+                failures = int(row["probe_failures"] or 0) + 1
+                next_probe_at = (datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+                                 + datetime.timedelta(
+                                     seconds=policy.probe_delay_secs(failures))).isoformat()
+                con.execute("UPDATE capacity SET probe_failures=?, next_probe_at=?, updated_at=?"
+                            " WHERE pool=? AND model=? AND window=?",
+                            (failures, next_probe_at, ts, pool, model, window))
+                _probe_event(con, "capacity_probe_failed",
+                             {"route": route, "window": window, "failures": failures,
+                              "next_probe_at": next_probe_at})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return {"route": route, "window": window, "ok": bool(ok),
+            "cleared": cleared, "next_probe_at": next_probe_at}
+
+
+def _probe_event(con, kind: str, payload: dict) -> None:
+    """A probe event on the oldest job's ledger, if any job exists.
+
+    Probes are route-level, not job-level, but the observer reads the event
+    ledger; without a job there is no ledger to hang the event on and the
+    ``capacity_probes`` table stays the record.
+    """
+    row = con.execute("SELECT request_id FROM jobs ORDER BY created_at LIMIT 1").fetchone()
+    if row is not None:
+        _event(con, row["request_id"], kind, payload)
+
+
+def probe_due_routes(state_dir, now_ts: float | None = None) -> list[dict]:
+    """Assumed exhausted marks whose next probe is due. The mark itself
+    still skips the route until its reset passes; the probe only learns the
+    real boundary sooner."""
+    now = now_ts if now_ts is not None else time.time()
+    con = store.connect(state_dir)
+    try:
+        rows = con.execute(
+            "SELECT * FROM capacity WHERE state='exhausted' AND next_probe_at IS NOT NULL"
+            " ORDER BY next_probe_at").fetchall()
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        ts = _parse_ts(r["next_probe_at"])
+        if ts is not None and now >= ts:
+            out.append(dict(r))
+    return out
+
+
+def list_probes(state_dir, route: str | None = None, window: str | None = None) -> list[dict]:
+    """Recorded probe outcomes, optionally for one route and window."""
+    con = store.connect(state_dir)
+    try:
+        if route is not None:
+            spec = policy.route_spec(route)
+            rows = con.execute(
+                "SELECT * FROM capacity_probes WHERE pool=? AND model=?"
+                + (" AND window=?" if window else "") + " ORDER BY id",
+                ((spec["pool"], spec["model"], window) if window
+                 else (spec["pool"], spec["model"],))).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM capacity_probes ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
 
 
 def _routes_in_state(state_dir, state: str) -> set[str]:
@@ -3246,7 +3426,8 @@ def status_view(state_dir, request_id: str) -> dict:
         le = None
     job_public["last_error_json"] = ({k: le.get(k) for k in ("source", "rc", "error", "quota", "signal",
                                                              "evidence", "idle_confirmed", "retry_next",
-                                                             "retry_next_capped", "overload_retries")}
+                                                             "retry_next_capped", "overload_retries",
+                                                             "probe_signal", "longest_silence_secs")}
                                      if isinstance(le, dict) else None)
     try:
         res = json.loads(job_public.get("result_json") or "null")

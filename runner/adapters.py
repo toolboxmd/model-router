@@ -600,11 +600,70 @@ SESSION_PERMISSION_RULES = tuple(_policy.DEFAULT_SESSION_PERMISSIONS)
 SESSION_PERMISSIONS = _policy.session_permissions
 
 
+def _retry_after_from_headers(headers) -> str | None:
+    """Retry-After delay from HTTP headers (case-insensitive), or None."""
+    if not headers:
+        return None
+    try:
+        items = headers.items() if hasattr(headers, "items") else []
+    except Exception:
+        return None
+    for k, v in items:
+        try:
+            if str(k).lower() in ("retry-after", "retry_after", "retryafter"):
+                text = str(v).strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return None
+
+
 class OpenCodeHTTPError(RuntimeError):
-    def __init__(self, status: int, body: str):
+    def __init__(self, status: int, body: str, headers=None):
         super().__init__(f"opencode server HTTP {status}")
         self.status = status
         self.body = (body or "")[:2000]
+        try:
+            self.headers = dict(headers.items()) if hasattr(headers, "items") else dict(headers or {})
+        except Exception:
+            self.headers = {}
+        self.retry_after = _retry_after_from_headers(self.headers)
+
+
+def http_error_evidence(exc: "OpenCodeHTTPError") -> dict:
+    """Transport evidence that preserves provider reset carriers.
+
+    The Go ``Retry-After`` header (the exact reset) is kept as
+    ``retry_after`` so :func:`policy.parse_provider_reset` reads it first;
+    a JSON body carrying explicit reset fields (for example Codex
+    ``resets_at``) is merged verbatim alongside the truncated body.
+    """
+    evidence: dict = {"source": "transport", "status": exc.status,
+                      "body": (exc.body or "")[:500]}
+    retry = getattr(exc, "retry_after", None)
+    if retry is not None:
+        evidence["retry_after"] = retry
+        evidence["Retry-After"] = retry
+    body = getattr(exc, "body", "") or ""
+    if isinstance(body, str) and body.strip().startswith("{"):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("resets_at", "reset_at", "resetAt", "provider_reset_at",
+                        "quota_reset_at", "resetsAt", "retry_after", "retryAfter",
+                        "Retry-After", "retry_after_secs", "retryAfterSeconds",
+                        "message", "reason", "text"):
+                if parsed.get(key) is not None and key not in evidence:
+                    val = parsed[key]
+                    evidence[key] = val if not isinstance(val, str) else val[:500]
+            nested = parsed.get("error")
+            if isinstance(nested, dict):
+                evidence.setdefault("error", {k: (v[:500] if isinstance(v, str) else v)
+                                              for k, v in nested.items()})
+    return evidence
 
 
 class OpenCodeClient:
@@ -660,7 +719,11 @@ class OpenCodeClient:
                 detail = e.read().decode("utf-8", errors="replace")
             except Exception:
                 detail = ""
-            raise OpenCodeHTTPError(e.code, detail) from None
+            try:
+                hdrs = dict(e.headers.items()) if getattr(e, "headers", None) else {}
+            except Exception:
+                hdrs = {}
+            raise OpenCodeHTTPError(e.code, detail, hdrs) from None
         if not raw.strip():
             return {}
         try:

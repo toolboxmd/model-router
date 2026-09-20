@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0] - 2026-09-20
+
+### Added
+
+- Stall detection from stream activity: abort a silent worker turn within minutes, not at the timeout
+
 ## [0.9.0] - 2026-09-20
 
 ### Added

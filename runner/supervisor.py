@@ -288,6 +288,8 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     control_result = None
     from . import harnesses
     harness = harnesses.harness_for(kind)
+    tracker = None
+    stall_info = None
     try:
         if harness.drives(kind):
             try:
@@ -315,6 +317,13 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                     pass
         else:
             stop_sent = False
+            # The same silence rule as the worker turns, through the harness
+            # seam: a live child whose JSON-line stream stops past the window
+            # is stalled, while the per-turn timeout stays the outer budget.
+            tracker = harness.new_activity_tracker(time.monotonic())
+            window = harness.stall_window_secs(meta)
+            poll_secs = min(1.0, max(0.2, window / 2.0))
+            next_check = time.monotonic() + poll_secs
             while True:
                 if _STOP["requested"] and not stop_sent:
                     stop_child()
@@ -330,6 +339,53 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                                          sid, skind, job)
                 if rc is not None:
                     break
+                now = time.monotonic()
+                if now >= next_check:
+                    next_check = now + poll_secs
+                    _changed, _detail = harness.note_cli_output(
+                        tracker, stdout_acc, stderr_acc, now)
+                    age = tracker.silence(now)
+                    if age > window:
+                        stall_info = {
+                            "silence_secs": round(age, 1),
+                            "longest_silence_secs": round(max(tracker.longest, age), 3),
+                            "lines_seen": _detail.get("lines", 0),
+                            "window_secs": window,
+                        }
+                        try:
+                            os.killpg(int(pgid or pid), 15)
+                        except Exception:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                        try:
+                            rc = proc.wait(timeout=5)
+                        except Exception:
+                            rc = None
+                        if rc is None:
+                            try:
+                                os.killpg(int(pgid or pid), 9)
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                            try:
+                                rc = proc.wait(timeout=5)
+                            except Exception:
+                                rc = 4
+                        rc = 4
+                        try:
+                            with open(stderr_path, "a", encoding="utf-8") as f:
+                                f.write(
+                                    "runner: stalled: no harness output for "
+                                    f"{age:.0f}s (window {window:.0f}s, "
+                                    f"{_detail.get('lines', 0)} lines seen, longest "
+                                    f"silence {max(tracker.longest, age):.1f}s)\n")
+                        except OSError:
+                            pass
+                        break
                 if time.monotonic() > deadline:
                     try:
                         os.killpg(int(pgid or pid), 9)
@@ -372,6 +428,17 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
         "session_kind": captured_kind,
         "envelope": envelope,
     }
+    if tracker is not None and not harness.drives(kind):
+        # Every invocation records its longest observed silence for window
+        # tuning; a stalled turn also records the signal with its evidence.
+        result["longest_silence_secs"] = round(
+            max(tracker.longest, tracker.silence(time.monotonic())), 3)
+        if stall_info is not None:
+            result.update(
+                signal="stalled",
+                signal_evidence={"source": "stream_silence", **stall_info},
+                error=("harness turn stalled: no output for "
+                       f"{stall_info['silence_secs']}s"))
     state = "completed" if rc == 0 else "failed"
     _finish(state_dir, invocation_id, request_id, rc, state,
             captured_session, captured_kind, extra_result=result)
@@ -380,6 +447,147 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
         # Secrets stay out of DB/logs; drop the local reference.
         generated_password = None
     return 0 if rc == 0 else int(rc or 1)
+
+
+def _probe_silent_route(client, model, variant, agent, route, deadline):
+    """A fresh minimal request on the same route when a turn goes silent.
+
+    A stall can be exhaustion in disguise (the provider stops streaming
+    instead of reporting the limit), so the probe's answer is recorded as
+    the signal evidence: ``exhausted`` moves pools, ``overloaded`` moves
+    family, ``unknown`` keeps the stall handling. Never raises: an
+    inconclusive probe is ``unknown`` with its error noted. The probe
+    session is aborted and left idle before returning.
+    """
+    from . import adapters
+    from . import harnesses as _harnesses
+    from . import policy as _policy
+    outcome: dict = {"signal": "unknown",
+                     "evidence": {"source": "stall_probe", "route": route}}
+    harness = _harnesses.harness_named("opencode")
+    try:
+        budget = min(float(_policy.STALL_PROBE_TIMEOUT_SECS),
+                     max(1.0, deadline - time.monotonic()))
+        started = time.monotonic()
+        created = client.create_session(
+            title="model-router stall probe",
+            permission=_policy.session_permissions(route))
+        psid = client.session_id_from(created)
+        if not psid:
+            outcome["evidence"]["error"] = "probe session create returned no id"
+            return outcome
+        baseline: set = set()
+        try:
+            for m in client.messages(psid):
+                info = m.get("info") if isinstance(m, dict) else None
+                if isinstance(info, dict) and info.get("id"):
+                    baseline.add(info["id"])
+        except Exception:  # noqa: BLE001 - an unreadable baseline probes anyway
+            pass
+        try:
+            client.prompt_async(psid, _policy.STALL_PROBE_PROMPT,
+                                model=model, variant=variant, agent=agent)
+        except adapters.OpenCodeHTTPError as e:
+            cls = harness.classify_signal(e)
+            if cls in ("exhausted", "overloaded"):
+                outcome["signal"] = cls
+            outcome["evidence"]["transport_status"] = e.status
+            outcome["evidence"]["transport_evidence"] = adapters.http_error_evidence(e)
+            for key in ("retry_after", "Retry-After", "resets_at", "reset_at",
+                        "resetAt", "message", "reason", "text"):
+                val = adapters.http_error_evidence(e).get(key)
+                if val is not None:
+                    outcome["evidence"][key] = val
+            try:
+                client.abort(psid)
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+            try:
+                client.wait_idle(psid, timeout=10.0)
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+            return outcome
+        while time.monotonic() < min(deadline, started + budget):
+            if _STOP["requested"]:
+                outcome["evidence"]["error"] = "probe terminated with the turn"
+                break
+            try:
+                status = client.session_status(psid)
+            except adapters.OpenCodeHTTPError as e:
+                cls = harness.classify_signal(e)
+                if cls in ("exhausted", "overloaded"):
+                    outcome["signal"] = cls
+                outcome["evidence"]["transport_status"] = e.status
+                outcome["evidence"]["transport_evidence"] = adapters.http_error_evidence(e)
+                for key in ("retry_after", "Retry-After", "resets_at", "reset_at",
+                            "resetAt", "message", "reason", "text"):
+                    val = adapters.http_error_evidence(e).get(key)
+                    if val is not None:
+                        outcome["evidence"][key] = val
+                break
+            if adapters.trusted_free_exhaustion(status=status):
+                outcome["signal"] = "exhausted"
+                outcome["evidence"]["free_exhaustion"] = True
+                outcome["evidence"]["status"] = adapters.redact_nested(status)
+                break
+            cls = harness.classify_signal(status)
+            if cls in ("exhausted", "overloaded"):
+                outcome["signal"] = cls
+                outcome["evidence"]["status"] = adapters.redact_nested(status)
+                break
+            if (status.get("type") if isinstance(status, dict) else None) not in (
+                    "busy", "retry"):
+                try:
+                    msgs = client.messages(psid)
+                except Exception:  # noqa: BLE001 - inconclusive probe
+                    outcome["evidence"]["error"] = "probe messages unreadable"
+                    break
+                new = adapters.assistant_messages_after(msgs, baseline)
+                if new:
+                    err = (new[-1].get("info") or {}).get("error")
+                    cls = harness.classify_signal(err) if err else None
+                    if cls in ("exhausted", "overloaded"):
+                        outcome["signal"] = cls
+                        outcome["evidence"]["message_error"] = True
+                        outcome["evidence"]["message_error_detail"] = adapters.redact_nested(err)
+                        if isinstance(err, dict):
+                            for key in ("resets_at", "reset_at", "resetAt",
+                                        "provider_reset_at", "quota_reset_at", "resetsAt",
+                                        "retry_after", "retryAfter", "Retry-After",
+                                        "retry_after_secs", "retryAfterSeconds",
+                                        "message", "reason", "text", "window"):
+                                if err.get(key) is not None:
+                                    outcome["evidence"][key] = adapters.redact_nested(err.get(key))
+                            data = err.get("data") if isinstance(err.get("data"), dict) else None
+                            if isinstance(data, dict):
+                                for key in ("resets_at", "reset_at", "message"):
+                                    if data.get(key) is not None:
+                                        outcome["evidence"][key] = adapters.redact_nested(data.get(key))
+                    else:
+                        outcome["evidence"]["answered"] = True
+                    break
+                # Idle but nothing arrived yet: the answer is still coming.
+                # Keep polling inside the probe budget instead of giving up.
+                time.sleep(0.5)
+                continue
+            time.sleep(0.5)
+        else:
+            outcome["evidence"]["error"] = "probe timed out without an answer"
+        try:
+            client.abort(psid)
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            pass
+        try:
+            client.wait_idle(psid, timeout=10.0)
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            pass
+    except Exception as e:  # noqa: BLE001 - never fail the turn on the probe
+        outcome["evidence"]["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    try:
+        outcome["evidence"] = adapters.redact_nested(outcome["evidence"])
+    except Exception:  # noqa: BLE001 - keep the raw shape before redaction
+        pass
+    return outcome
 
 
 def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
@@ -457,9 +665,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             result = {"opencode_session_id": saved, "model": model,
                       "variant": variant, "agent": agent, "ok": False,
                       "rc": 4, "signal": "overloaded",
-                      "signal_evidence": {"source": "transport",
-                                          "status": e.status,
-                                          "body": (e.body or "")[:500]},
+                      "signal_evidence": adapters.http_error_evidence(e),
                       "error": f"transport HTTP {e.status}"}
             try:
                 client.abort(saved)
@@ -474,6 +680,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             return result, saved, "opencode_session_id"
         return ({"ok": False, "rc": 1, "opencode_session_id": saved,
                  "signal": cls,
+                 "signal_evidence": adapters.http_error_evidence(e),
                  "error": f"transport HTTP {e.status}"}, saved, "opencode_session_id")
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
@@ -486,9 +693,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             result = {"opencode_session_id": saved, "model": model,
                       "variant": variant, "agent": agent, "ok": False,
                       "rc": 4, "signal": "overloaded",
-                      "signal_evidence": {"source": "transport",
-                                          "status": e.status,
-                                          "body": (e.body or "")[:500]},
+                      "signal_evidence": adapters.http_error_evidence(e),
                       "error": f"transport HTTP {e.status}"}
             try:
                 client.abort(saved)
@@ -503,6 +708,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             return result, saved, "opencode_session_id"
         return ({"ok": False, "rc": 1, "opencode_session_id": saved,
                  "signal": cls,
+                 "signal_evidence": adapters.http_error_evidence(e),
                  "error": f"transport HTTP {e.status}"}, saved, "opencode_session_id")
     result = {"opencode_session_id": saved, "model": model,
               "variant": variant, "agent": agent,
@@ -510,6 +716,13 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     prompted_at = time.monotonic()
     seen_active = False
     from . import policy as _policy
+    # Stream activity from part polling at the loop's short interval: every
+    # part creation or update (text, reasoning, tool) refreshes the
+    # last-activity timestamp, and a tool part in running state counts as
+    # activity while its process is alive.
+    tracker = harness.new_activity_tracker(time.monotonic())
+    window = harness.stall_window_secs(meta)
+    route = meta.get("route")
     overload_spec = _policy.SIGNAL_CLASSES["overloaded"]
     overload_first = None
     overload_attempts = 0
@@ -545,15 +758,12 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             cls = harness.classify_signal(e)
             if cls == "overloaded":
                 result.update(rc=4, signal="overloaded",
-                              signal_evidence={"source": "transport",
-                                               "status": e.status,
-                                               "body": (e.body or "")[:500]},
+                              signal_evidence=adapters.http_error_evidence(e),
                               error=f"transport HTTP {e.status}")
                 abort_and_confirm()
                 break
             result.update(rc=1, signal=cls,
-                          signal_evidence={"source": "transport",
-                                           "status": e.status},
+                          signal_evidence=adapters.http_error_evidence(e),
                           error=f"transport HTTP {e.status}")
             abort_and_confirm()
             break
@@ -562,9 +772,39 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             result.update(rc=3, quota=True, free_exhaustion_evidence=evidence)
             abort_and_confirm()
             break
+        now = time.monotonic()
+        try:
+            _poll_msgs = client.messages(saved)
+        except Exception:  # noqa: BLE001 - no activity data this poll
+            _poll_msgs = None
+        if _poll_msgs is not None:
+            harness.note_part_activity(tracker, _poll_msgs, baseline, now)
         typ = status.get("type")
         if typ in ("busy", "retry"):
             seen_active = True
+            age = tracker.silence(now)
+            if age > window:
+                # Silent past the window while busy: probe the same route
+                # with a fresh minimal request first, so a stall that is
+                # exhaustion in disguise moves pools instead of retrying.
+                probe = _probe_silent_route(client, model, variant, agent,
+                                            route, deadline)
+                longest = round(max(tracker.longest, age), 3)
+                result.update(
+                    rc=4, ok=False, signal="stalled",
+                    probe_signal=probe.get("signal", "unknown"),
+                    signal_evidence={
+                        "source": "stream_silence",
+                        "silence_secs": round(age, 1),
+                        "last_part_type": tracker.last_part_type or "none",
+                        "parts_observed": tracker.events,
+                        "probe": adapters.redact_nested(probe),
+                    },
+                    longest_silence_secs=longest,
+                    error=(f"worker turn stalled: no stream activity for "
+                           f"{age:.0f}s"))
+                abort_and_confirm()
+                break
             if typ == "retry":
                 result["last_retry"] = adapters.redact_nested(status)
                 cls = harness.classify_signal(status)
@@ -605,6 +845,12 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                                       error="provider overloaded")
                         abort_and_confirm()
                         break
+                elif cls == "context":
+                    result.update(rc=3, signal="context",
+                                  signal_evidence=adapters.redact_nested(status),
+                                  error="context length exceeded")
+                    abort_and_confirm()
+                    break
                 elif cls == "hard":
                     result.update(rc=1, signal="hard",
                                   signal_evidence=adapters.redact_nested(status),
@@ -635,13 +881,13 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                 cls = harness.classify_signal(e)
                 if cls == "overloaded":
                     result.update(rc=4, signal="overloaded",
-                                  signal_evidence={"source": "transport",
-                                                   "status": e.status,
-                                                   "body": (e.body or "")[:500]},
+                                  signal_evidence=adapters.http_error_evidence(e),
                                   error=f"transport HTTP {e.status}")
                     abort_and_confirm()
                     break
-                result.update(rc=1, signal=cls, error=f"transport HTTP {e.status}")
+                result.update(rc=1, signal=cls,
+                              signal_evidence=adapters.http_error_evidence(e),
+                              error=f"transport HTTP {e.status}")
                 abort_and_confirm()
                 break
             new = adapters.assistant_messages_after(_msgs, baseline)
@@ -669,12 +915,13 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                         cls = harness.classify_signal(e)
                         if cls == "overloaded":
                             result.update(rc=4, signal="overloaded",
-                                          signal_evidence={"source": "transport",
-                                                           "status": e.status},
+                                          signal_evidence=adapters.http_error_evidence(e),
                                           error=f"transport HTTP {e.status}")
                             abort_and_confirm()
                             break
-                        result.update(rc=1, signal=cls, error=f"transport HTTP {e.status}")
+                        result.update(rc=1, signal=cls,
+                                      signal_evidence=adapters.http_error_evidence(e),
+                                      error=f"transport HTTP {e.status}")
                         abort_and_confirm()
                         break
                     user_ids = [m["info"].get("id") for m in all_msgs
@@ -702,25 +949,42 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                         result.update(rc=4, signal="overloaded",
                                       signal_evidence=adapters.redact_nested(err),
                                       error=adapters.redact_nested(err), idle_confirmed=True)
+                    elif cls == "context":
+                        # A capacity signal, not a hard failure: the
+                        # controller moves to a larger-context route.
+                        result.update(rc=3, signal="context",
+                                      signal_evidence=adapters.redact_nested(err),
+                                      error=adapters.redact_nested(err), idle_confirmed=True)
                     elif err:
                         result.update(rc=1, signal=cls, error=adapters.redact_nested(err))
                     else:
                         result.update(rc=0, ok=True)
+                    result["longest_silence_secs"] = round(
+                        max(tracker.longest,
+                            tracker.silence(time.monotonic())), 3)
                     break
             elif not seen_active and time.monotonic() - prompted_at > 60:
                 result.update(rc=1, error="prompt was not accepted within 60 seconds")
                 abort_and_confirm()
                 break
         if time.monotonic() > deadline:
-            result.update(rc=124, error="implementation turn timed out")
+            result.update(rc=124, error="implementation turn timed out",
+                          longest_silence_secs=round(
+                              max(tracker.longest,
+                                  tracker.silence(time.monotonic())), 3))
             abort_and_confirm()
             break
         time.sleep(1.0)
+    # Every turn records its longest observed silence for window tuning,
+    # whatever ended it; branches above may already carry a fresher value.
+    result.setdefault("longest_silence_secs", round(
+        max(tracker.longest, tracker.silence(time.monotonic())), 3))
     summary = {k: result.get(k) for k in (
         "opencode_session_id", "ok", "rc", "quota", "idle_confirmed", "finish",
         "actual_model", "error", "free_exhaustion_evidence", "signal", "signal_evidence",
         "usage", "native_ids", "assistant_text", "last_retry_next",
-        "last_retry_next_capped", "overload_retries",
+        "last_retry_next_capped", "overload_retries", "longest_silence_secs",
+        "probe_signal",
         "assistant_messages", "model", "variant", "agent")}
     try:
         with open(stdout_path, "a", encoding="utf-8") as f:
