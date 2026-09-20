@@ -13,6 +13,8 @@ import subprocess
 
 from . import adapters, policy
 
+from pathlib import Path as _KitPath
+
 # Invocation kinds are labels on ledger rows; each maps to one harness.
 KIND_CODEX_DISPATCH = "codex_dispatch"
 KIND_CODEX_RESUME = "codex_resume"
@@ -223,6 +225,43 @@ def _jsonl(stdout: str):
             yield obj
 
 
+def _kit_meta(inv) -> dict:
+    try:
+        meta = json.loads((inv or {}).get("meta_json") or "{}")
+    except ValueError:
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _kit_state_dir(inv):
+    try:
+        p = _KitPath(str((inv or {}).get("stdout_path") or ""))
+        if p.parent.name == "outputs":
+            return p.parent.parent
+    except Exception:
+        pass
+    return None
+
+
+def _kit_name_for_inv(inv, default: str | None = None) -> str | None:
+    meta = _kit_meta(inv)
+    route = meta.get("route")
+    if isinstance(route, str) and route in policy.ROUTES:
+        try:
+            return policy.kit_name_for_route(route)
+        except ValueError:
+            pass
+    stage = meta.get("stage")
+    if stage == "dispatch":
+        return "dispatcher"
+    if stage in ("implementation", "correction", "recovery"):
+        try:
+            return policy.kit_name_for_route(route) if isinstance(route, str) and route in policy.ROUTES else default
+        except ValueError:
+            return default
+    return default
+
+
 class CodexCLI(Harness):
     name = "codex"
     kinds = (KIND_CODEX_DISPATCH, KIND_CODEX_RESUME)
@@ -231,6 +270,25 @@ class CodexCLI(Harness):
     timeouts = {KIND_CODEX_DISPATCH: 1800, KIND_CODEX_RESUME: 1800}
     stages = {KIND_CODEX_DISPATCH: "dispatch", KIND_CODEX_RESUME: "dispatch"}
     session_kind = "codex_task_id"
+
+    def spawn_spec(self, inv, env):
+        """Codex sessions run on the route's kit via an isolated CODEX_HOME.
+
+        The kit directory is generated from policy (see ``runner/kits.py``);
+        nothing is inherited from the user's Codex configuration.
+        """
+        from . import kits as _kits
+
+        env = dict(env)
+        kit_name = _kit_name_for_inv(inv, default="dispatcher")
+        state_dir = _kit_state_dir(inv)
+        if kit_name is not None and state_dir is not None:
+            request_id = str((inv or {}).get("request_id") or "job")
+            invocation_id = str((inv or {}).get("invocation_id") or "inv")
+            kit_dir = _kits.kit_dir_for(str(state_dir), request_id, invocation_id, kit_name)
+            _kits.materialize_codex_kit(kit_name, kit_dir)
+            env.update(_kits.codex_kit_env(kit_dir))
+        return env, None
 
     def parse_session(self, kind, stdout, stderr, job):
         sid = adapters.parse_codex_task_id(stdout, stderr)
@@ -387,6 +445,25 @@ class ClaudeCLI(Harness):
             return "planner_session_mismatch (consumed by recovery)"
         return None
 
+    def spawn_spec(self, inv, env):
+        """The planner keeps the user's own session: never isolate it.
+
+        ``claude_callback`` resumes the saved planner session with the
+        user's ``CLAUDE_CONFIG_DIR`` untouched. Kit equivalents for other
+        Claude sessions (if any) travel in an isolated ``CLAUDE_CONFIG_DIR``
+        built by ``runner/kits.py``; use ``kits.materialize_claude_kit`` and
+        ``kits.claude_kit_env`` for those manual runs.
+        """
+        return dict(env), None
+
+    @staticmethod
+    def kit_spec_for_manual_run(kit_name: str, dest) -> dict:
+        """Kit equivalent for a manual Claude session (not the planner)."""
+        from . import kits as _kits
+
+        kit_dir = _kits.materialize_claude_kit(kit_name, dest)
+        return _kits.claude_kit_env(kit_dir)
+
     def default_route(self, kind, job):
         model = (job or {}).get("planner_model")
         return "sonnet/medium" if model == adapters.CLAUDE_LIVE_MODEL else policy.stage_routes("planning")[0]
@@ -403,10 +480,39 @@ class OpenCodeServer(Harness):
     session_kind = "opencode_session_id"
 
     def spawn_spec(self, inv, env):
+        """Owned server runs on the route's kit, never ``--pure``.
+
+        The configuration directory is generated from policy
+        (``runner/kits.py``): ``OPENCODE_CONFIG_DIR``, ``XDG_CONFIG_HOME``
+        (shadow), and ``OPENCODE_CONFIG`` point at it, so the kit's
+        plugins, skills, and MCP subset are allowed and nothing is
+        inherited from the user's configuration.
+        """
+        from . import kits as _kits
+
         password = adapters.generate_control_password()
         env = dict(env)
         env["OPENCODE_SERVER_PASSWORD"] = password
+        kit_name = _kit_name_for_inv(inv, default="worker")
+        state_dir = _kit_state_dir(inv)
+        if kit_name is not None and state_dir is not None:
+            meta = _kit_meta(inv)
+            route = meta.get("route")
+            route_or_none = route if isinstance(route, str) and route in policy.ROUTES else None
+            request_id = str((inv or {}).get("request_id") or "job")
+            invocation_id = str((inv or {}).get("invocation_id") or "inv")
+            kit_dir = _kits.kit_dir_for(str(state_dir), request_id, invocation_id, kit_name)
+            _kits.materialize_opencode_kit(kit_name, kit_dir, route=route_or_none)
+            env.update(_kits.opencode_kit_env(kit_dir))
         return env, password
+
+    @staticmethod
+    def grok_kit_spec_for_manual_run(kit_name: str, dest) -> dict:
+        """Kit equivalent for a Grok Build session (``GROK_HOME``)."""
+        from . import kits as _kits
+
+        kit_dir = _kits.materialize_grok_kit(kit_name, dest)
+        return _kits.grok_kit_env(kit_dir)
 
     def drives(self, kind):
         return kind == KIND_OPENCODE_CONTROL
@@ -604,6 +710,25 @@ class GrokBuildCLI(Harness):
     timeouts = {KIND_GROK_CONTROL: 1800}
     stages = {KIND_GROK_CONTROL: "implementation"}
     session_kind = "grok_session_id"
+
+    def spawn_spec(self, inv, env):
+        """Grok sessions run on the route's kit via an isolated GROK_HOME.
+
+        The kit directory is generated from policy (see ``runner/kits.py``);
+        nothing is inherited from the user's Grok configuration.
+        """
+        from . import kits as _kits
+
+        env = dict(env)
+        kit_name = _kit_name_for_inv(inv, default="worker")
+        state_dir = _kit_state_dir(inv)
+        if kit_name is not None and state_dir is not None:
+            request_id = str((inv or {}).get("request_id") or "job")
+            invocation_id = str((inv or {}).get("invocation_id") or "inv")
+            kit_dir = _kits.kit_dir_for(str(state_dir), request_id, invocation_id, kit_name)
+            _kits.materialize_grok_kit(kit_name, kit_dir)
+            env.update(_kits.grok_kit_env(kit_dir))
+        return env, None
 
     def parse_session(self, kind, stdout, stderr, job):
         # The headless JSON result carries the session; anything else

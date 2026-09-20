@@ -1180,7 +1180,9 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
     grok_h = harnesses.harness_named("grok")
     model, effort = policy.grok_route_params(route)
     saved_session = job.get("grok_session_id")
-    cmd = adapters.build_grok_cmd(prompt, workspace, model, effort, saved_session)
+    # The live turn's kit arrives via the harness spawn_spec (GROK_HOME);
+    # the spec env returned here is the manual-run equivalent.
+    cmd, _grok_kit_env = adapters.build_grok_cmd(prompt, workspace, model, effort, saved_session)
     rc, out, err = run_cmd(cmd, workspace, None, kind="grok_control",
                            meta={"prompt": prompt, "model": model, "variant": effort,
                                  "session_id": saved_session, "seq": seq,

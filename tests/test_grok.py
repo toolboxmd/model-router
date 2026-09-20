@@ -94,7 +94,8 @@ def worker_calls(fake_state):
 
 class GrokCmd(unittest.TestCase):
     def test_spawn_spec_is_headless_single_prompt(self):
-        cmd = adapters.build_grok_cmd("do it", "/tmp/ws", "grok-4.6", "medium")
+        cmd, env = adapters.build_grok_cmd("do it", "/tmp/ws", "grok-4.6", "medium")
+        self.assertEqual(env, {})
         self.assertEqual(cmd[0], "grok")
         self.assertIn("-p", cmd)
         self.assertEqual(cmd[cmd.index("-p") + 1], "do it")
@@ -109,9 +110,15 @@ class GrokCmd(unittest.TestCase):
         self.assertNotIn("--resume", cmd)
 
     def test_resume_names_the_saved_session(self):
-        cmd = adapters.build_grok_cmd("do it", "/tmp/ws", "grok-4.6", "medium",
-                                      "ses_saved_1")
+        cmd, _env = adapters.build_grok_cmd("do it", "/tmp/ws", "grok-4.6", "medium",
+                                            "ses_saved_1")
         self.assertEqual(cmd[cmd.index("--resume") + 1], "ses_saved_1")
+
+    def test_kit_env_points_at_config_dir(self):
+        cmd, env = adapters.build_grok_cmd("do it", "/tmp/ws", "grok-4.6", "medium",
+                                           config_dir="/tmp/grok-kit")
+        self.assertEqual(cmd[cmd.index("--cwd") + 1], "/tmp/ws")
+        self.assertEqual(env.get("GROK_HOME"), "/tmp/grok-kit")
 
     def test_missing_fields_refuse(self):
         for kw in ({"prompt": ""}, {"workspace": ""}, {"model": ""}):
@@ -566,7 +573,7 @@ class GrokDurable(GrokBase):
 
     def test_timeout_kills_the_worker_and_records_it(self):
         run = self._setup("hang")
-        cmd = adapters.build_grok_cmd("hang on", str(self.ws), "grok-4.6", "medium")
+        cmd, _env = adapters.build_grok_cmd("hang on", str(self.ws), "grok-4.6", "medium")
         rc, out, err = run(cmd, str(self.ws), 2, kind="grok_control",
                            meta={"stage": "implementation", "route": "grok-4.6-build",
                                  "reason": "test", "seq": 0})
@@ -578,7 +585,7 @@ class GrokDurable(GrokBase):
 
     def test_finished_action_reuses_without_a_second_writer(self):
         run = self._setup("ok")
-        cmd = adapters.build_grok_cmd("same turn", str(self.ws), "grok-4.6", "medium")
+        cmd, _env = adapters.build_grok_cmd("same turn", str(self.ws), "grok-4.6", "medium")
         meta = {"stage": "implementation", "route": "grok-4.6-build",
                 "reason": "test", "seq": 0, "prompt": "same turn"}
         rc1, out1, _ = run(cmd, str(self.ws), 30, kind="grok_control", meta=meta)
