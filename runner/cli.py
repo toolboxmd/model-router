@@ -172,7 +172,8 @@ def main(argv=None) -> int:
         if args.cmd == "capacity":
             if args.clear:
                 return _out(core.clear_capacity(sd, args.clear))
-            return _out({"capacity": core.list_capacity(sd)})
+            return _out({"capacity": core.list_capacity(sd),
+                         "readings": core.list_readings(sd)})
         if args.cmd == "result":
             return _out(core.result_view(sd, args.request_id))
         if args.cmd == "status":

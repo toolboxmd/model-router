@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.13.0] - 2026-09-20
+
+### Added
+
+- Usage probes per harness: proactive window readings with reset times, reconciled with limit errors
+
 ## [0.12.0] - 2026-09-20
 
 ### Added

@@ -335,8 +335,15 @@ def _prompt_digest(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
-def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
-    """Ensure Codex dispatch; persist the task ID before accepting."""
+def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
+    """Ensure Codex dispatch; persist the task ID before accepting.
+
+    ``probe`` is an optional on-demand usage probe
+    ``probe(state_dir, request_id, route)`` (for example Codex
+    ``account/rateLimits/read`` before a dispatch). It runs best-effort:
+    a failing or slow probe records unknown and never blocks the
+    dispatch, which stays eligible on error evidence alone.
+    """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
     st = _load_controller_state(job)
@@ -350,6 +357,11 @@ def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
     prompt = _full_luna_prompt(job["task_json"])
     last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
     dispatch_route = policy.stage_routes("dispatch")[0]
+    if probe is not None:
+        try:
+            probe(state_dir, request_id, dispatch_route)
+        except Exception:
+            pass  # probes never block routing
     dispatch = policy.ROUTES[dispatch_route]
     if harnesses.route_uses_owned_server(dispatch_route):
         return _dispatch_on_opencode(state_dir, request_id, dispatch_route, prompt, run_cmd, "initial")
@@ -1093,6 +1105,9 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
                    opencode_session_id=session_id, artifact=artifact,
                    report_path=report.get("report_path"),
                    implementation_output=adapters.redact_text(str(full.get("assistant_text") or ""))[-8000:])
+        # A successful request revalidates the route's exhaustion marks the
+        # same way a healthy probe does (provider marks only past reset).
+        core.record_route_success(state_dir, route)
         return {"action": "implementation_ok", "session": session_id,
                 "output": str(full.get("assistant_text") or ""),
                 "finish": full.get("finish"), "actual_model": full.get("actual_model"),
@@ -1214,6 +1229,9 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
                    grok_session_id=session_id, artifact=artifact,
                    report_path=report.get("report_path"),
                    implementation_output=adapters.redact_text(str(full.get("assistant_text") or ""))[-8000:])
+        # A successful request revalidates the route's exhaustion marks the
+        # same way a healthy probe does (provider marks only past reset).
+        core.record_route_success(state_dir, route)
         return {"action": "implementation_ok", "session": session_id,
                 "output": str(full.get("assistant_text") or ""),
                 "finish": full.get("finish"), "actual_model": full.get("actual_model"),

@@ -7,9 +7,12 @@ harness lacks one.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import re
 import subprocess
+import time
 
 from . import adapters, policy
 
@@ -200,6 +203,28 @@ class Harness:
 
     _version_cache: dict = {}
 
+    def probe_interval_secs(self) -> float:
+        """Minimum seconds between proactive usage probes on this harness
+        (Codex 300, Claude 180; the policy owns the values)."""
+        return float(policy.PROBE_INTERVAL_SECS.get(self.name, 300))
+
+    def probe_due(self, observed_at: str | None, now_ts: float | None = None) -> bool:
+        """True when a usage probe is due: never probed or older than the
+        harness interval. Probes never block routing: a due probe runs
+        best-effort and a failure records unknown."""
+        now = now_ts if now_ts is not None else time.time()
+        if not observed_at:
+            return True
+        try:
+            obs = datetime.datetime.fromisoformat(
+                str(observed_at).replace("Z", "+00:00"))
+            if obs.tzinfo is None:
+                obs = obs.replace(tzinfo=datetime.timezone.utc)
+            obs_ts = obs.timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return True
+        return (now - obs_ts) >= self.probe_interval_secs()
+
     def version(self) -> str | None:
         if self.binary not in Harness._version_cache:
             try:
@@ -374,6 +399,23 @@ class CodexCLI(Harness):
     def default_route(self, kind, job):
         return policy.stage_routes("dispatch")[0]
 
+    def probe_rate_limits(self, payload, observed_at: str,
+                          plan: str | None = None) -> list[dict]:
+        """Readings from ``account/rateLimits/read`` (every 300 seconds,
+        or on demand before a dispatch). Raises on misshapen payloads so
+        the caller records unknown."""
+        readings = parse_codex_rate_limits(payload, observed_at, plan)
+        if not readings:
+            raise ValueError("codex rate-limits payload carried no window")
+        return readings
+
+    def read_rollout(self, path, observed_at: str | None = None) -> list[dict]:
+        """Zero-cost readings from the session's own rollout file."""
+        readings = read_codex_rollout_reading(path, observed_at)
+        if not readings:
+            raise ValueError("codex rollout carried no rate record")
+        return readings
+
 
 class ClaudeCLI(Harness):
     name = "claude"
@@ -467,6 +509,36 @@ class ClaudeCLI(Harness):
     def default_route(self, kind, job):
         model = (job or {}).get("planner_model")
         return "sonnet/medium" if model == adapters.CLAUDE_LIVE_MODEL else policy.stage_routes("planning")[0]
+
+    def probe_oauth_usage(self, payload: dict, observed_at: str,
+                          model: str | None = None) -> list[dict]:
+        """Readings from the OAuth usage endpoint or the free statusline
+        feed (every 180 seconds at most). Raises when no window parses so
+        the caller records unknown."""
+        readings = parse_claude_oauth_usage(payload, observed_at, model)
+        if not readings:
+            raise ValueError("claude usage payload carried no window")
+        return readings
+
+    def probe_statusline(self, payload: dict, observed_at: str,
+                         model: str | None = None) -> list[dict]:
+        """The statusline stdin JSON carries the OAuth fields for free."""
+        return self.probe_oauth_usage(payload, observed_at, model)
+
+    def probe_usage_text(self, text: str, observed_at: str,
+                         model: str | None = None) -> list[dict]:
+        """Readings from ``claude -p \"/usage\"`` at zero quota cost."""
+        readings = parse_claude_usage_text(text, observed_at, model)
+        if not readings:
+            raise ValueError("claude /usage text carried no window")
+        return readings
+
+    def read_transcript(self, path, observed_at: str | None = None) -> list[dict]:
+        """Zero-cost readings from the session's own transcript file."""
+        readings = read_claude_transcript_reading(path, observed_at)
+        if not readings:
+            raise ValueError("claude transcript carried no quota record")
+        return readings
 
 
 class OpenCodeServer(Harness):
@@ -689,6 +761,30 @@ class OpenCodeServer(Harness):
     def default_route(self, kind, job):
         return (job or {}).get("route")
 
+    def probe_go_costs(self, cost_rows, model: str, observed_at: str,
+                       pool: str = "go", now_ts: float | None = None) -> list[dict]:
+        """Measured Go readings from local-database cost rows against the
+        policy tier windows. Raises when the tier is unknown so the
+        caller records unknown."""
+        try:
+            tier = policy.GO_MONTHLY_LIMIT_USD[model.split("/", 1)[1]]
+        except (KeyError, IndexError, AttributeError):
+            raise ValueError(f"go probe: no monthly tier for {model!r}")
+        return probe_opencode_go_readings(cost_rows, tier, model,
+                                          observed_at, pool, now_ts)
+
+    def probe_zen_free(self, request_epochs, window: str, observed_at: str,
+                       cap: float | None = None,
+                       now_ts: float | None = None) -> dict:
+        """Measured Zen free request count against the assumed cap."""
+        return probe_zen_free_reading(request_epochs, window, observed_at,
+                                      cap, now_ts)
+
+    @staticmethod
+    def read_cost_rows(db_path, model: str | None = None) -> list[dict]:
+        """Best-effort cost rows from the OpenCode local database."""
+        return read_opencode_cost_rows(db_path, model)
+
 
 class GrokBuildCLI(Harness):
     """Native Grok Build CLI on the xAI subscription (``grok -p`` headless).
@@ -770,11 +866,17 @@ class GrokBuildCLI(Harness):
             nested = detail.get("message")
             if isinstance(nested, str) and nested != evidence["message"]:
                 evidence["detail_message"] = nested[:1000]
+        signal = self.classify_signal(evidence)
+        if signal == "exhausted":
+            # Grok names no window and no reset for the weekly limit: the
+            # exhaustion is assumed weekly with error-driven cool-off, so
+            # the assumed-window rule and its re-probe schedule apply.
+            evidence["window"] = "weekly"
         return {"grok_session_id": sid, "ok": False,
                 "assistant_text": "", "finish": parsed.get("stop_reason"),
                 "actual_model": None, "usage": usage, "native_ids": ids,
                 "blockers": [], "error": evidence["message"] or "grok turn failed",
-                "signal": self.classify_signal(evidence),
+                "signal": signal,
                 "signal_evidence": evidence}
 
     def measure(self, kind, stdout, stderr, meta):
@@ -845,6 +947,9 @@ class GrokBuildCLI(Harness):
                              "out of credit", "out of credits", "no credits",
                              "credit exhausted", "credits exhausted",
                              "billing", "subscription expired", "plan quota",
+                             "weekly limit", "weekly_limit", "monthly limit",
+                             "monthly_limit", "allowance exceeded",
+                             "allowance_exceeded",
                              "usage limit exceeded")
         if any(m in blob for m in exhausted_markers):
             return "exhausted"
@@ -855,6 +960,10 @@ class GrokBuildCLI(Harness):
                               "429", "503", "529")
         if code == 429 or any(m in blob for m in overloaded_markers):
             return "overloaded"
+        if code == 402:
+            # Payment/quota refusal on the xAI subscription: exhausted,
+            # never a hard auth error.
+            return "exhausted"
         if code in (401, 403):
             return "hard"
         return None
@@ -886,6 +995,19 @@ class GrokBuildCLI(Harness):
     def default_route(self, kind, job):
         return (job or {}).get("route")
 
+    def probe_billing(self, payload: dict, observed_at: str,
+                      model: str | None = None) -> list[dict]:
+        """Monthly Grok allowance readings from the internal billing call
+        (provider_reported): one per xai-pool Grok route model, so both the
+        native Build route and OpenCode's xAI provider skip together. No
+        5-hour or weekly window exists: weekly stays assumed with
+        error-driven cool-off. Raises when the payload carries no allowance
+        so the caller records unknown."""
+        readings = parse_grok_billing(payload, observed_at, model)
+        if not readings:
+            raise ValueError("grok billing payload carried no allowance")
+        return readings
+
     def action_key(self, kind, cmd, meta):
         """A resumed turn is the same logical turn: the ``--resume``
         session learned after the first attempt started is volatile, so a
@@ -896,6 +1018,590 @@ class GrokBuildCLI(Harness):
             i = stable_cmd.index("--resume")
             del stable_cmd[i:i + 2]
         return super().action_key(kind, stable_cmd, meta)
+
+
+# ---------------------------------------------------------------------------
+# Usage probes (toolboxmd/model-router#34). Each probe returns Reading dicts
+# (pool, model, window, used, limit, reset_at, observed_at, source) for
+# core.record_reading, or raises on failure so the caller records unknown
+# and the route stays eligible on error evidence alone. Live execution
+# (subprocess CLIs, token reads, database paths) stays with the operator
+# and the release task; these parsers are the deterministic seam.
+# ---------------------------------------------------------------------------
+
+def _probe_reading(pool: str, model: str, window: str, used, limit,
+                   reset_at: str | None, observed_at: str,
+                   source: str, detail: dict | None = None) -> dict:
+    if source not in policy.READING_SOURCES:
+        raise ValueError(f"invalid reading source: {source!r}")
+    return {"pool": pool, "model": model, "window": window, "used": used,
+            "limit": limit, "reset_at": reset_at, "observed_at": observed_at,
+            "source": source, "detail": detail or {}}
+
+
+def _pool_route_models(pool: str) -> list[str]:
+    """Distinct route models on a pool, in policy order.
+
+    Account-level probes (Codex rate limits, Claude usage, Grok monthly
+    billing) report subscription windows, not per-model counters, so each
+    window fans out to every route model on its pool. Exact-match joins in
+    ``core`` then see the reading on every route that draws on the pool.
+    """
+    seen: list[str] = []
+    for spec in policy.ROUTES.values():
+        if spec.get("pool") == pool:
+            model = spec.get("model")
+            if isinstance(model, str) and model and model not in seen:
+                seen.append(model)
+    return seen
+
+
+def _minutes_to_window(mins) -> str | None:
+    try:
+        mins = int(float(mins))
+    except (TypeError, ValueError):
+        return None
+    if mins <= 0:
+        return None
+    if 240 <= mins <= 360:
+        return "5h"
+    if 9000 <= mins <= 11000:
+        return "weekly"
+    if 40000 <= mins <= 47000:
+        return "monthly"
+    # Unrecognized provider durations are skipped by the caller: storing an
+    # arbitrary '<n>min' window would pollute the ledger and feed preflight
+    # on a window the policy never defined.
+    return None
+
+
+def parse_codex_rate_limits(payload, observed_at: str, plan: str | None = None) -> list[dict]:
+    """Readings from Codex ``account/rateLimits/read``.
+
+    Each limit window carries ``usedPercent``, ``windowDurationMins``,
+    ``resetsAt`` (epoch or ISO), plus the plan type. Limits are
+    account-level, so every window fans out to one provider_reported Reading
+    per codex-pool route model; exact-match joins in ``core`` then see it on
+    every Codex route. An entry naming a route model already in the policy
+    stays on that single model. Unrecognized window durations are skipped.
+    Empty or misshapen payloads yield no readings: the caller records
+    unknown.
+    """
+    if isinstance(payload, dict):
+        windows = (payload.get("windows") or payload.get("rate_limits")
+                   or payload.get("rateLimits") or [])
+        plan = plan or payload.get("plan") or payload.get("plan_type")
+    elif isinstance(payload, list):
+        windows = payload
+    else:
+        return []
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            str(observed_at).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    pool_models = _pool_route_models("codex")
+    out: list[dict] = []
+    for entry in windows:
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("usedPercent", entry.get("used_percent"))
+        mins = entry.get("windowDurationMins", entry.get("window_minutes"))
+        reset = entry.get("resetsAt", entry.get("resets_at",
+                         entry.get("reset_at", entry.get("resetAt"))))
+        window = _minutes_to_window(mins)
+        if window is None or used is None:
+            continue
+        try:
+            if isinstance(used, bool):
+                continue
+            used_f = float(used)
+        except (TypeError, ValueError):
+            continue
+        reset_iso = policy._coerce_reset_moment(reset, now_ts)
+        entry_model = entry.get("model")
+        if isinstance(entry_model, str) and entry_model in pool_models:
+            models = [entry_model]
+        else:
+            models = pool_models
+        for model in models:
+            out.append(_probe_reading(
+                "codex", str(model), window, used_f, 100.0, reset_iso,
+                observed_at, "provider_reported",
+                {"window_minutes": mins,
+                 "plan": entry.get("plan_type", plan)}))
+    return out
+
+
+def read_codex_rollout_reading(path, observed_at: str | None = None) -> list[dict]:
+    """Zero-cost Codex readings from the session's own rollout file.
+
+    Rollouts carry ``rate_limits.primary`` (``used_percent``,
+    ``window_minutes``, ``resets_at``, ``plan_type``). The latest such
+    record fans out to one provider_reported Reading per codex-pool route
+    model with the file's timestamp as observed_at: no probe call, no quota
+    cost. Unrecognized window durations yield no readings. Missing files or
+    records yield no readings.
+    """
+    try:
+        text = open(str(path), encoding="utf-8").read()
+    except OSError:
+        return []
+    if observed_at is None:
+        try:
+            mtime = os.path.getmtime(str(path))
+            observed_at = datetime.datetime.fromtimestamp(
+                mtime, datetime.timezone.utc).isoformat()
+        except OSError:
+            observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            observed_at.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    last: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        primary = (obj.get("rate_limits") or {}).get("primary") \
+            if isinstance(obj.get("rate_limits"), dict) else None
+        if primary is None and isinstance(obj.get("primary"), dict):
+            primary = obj.get("primary")
+        if isinstance(primary, dict) and primary.get("used_percent") is not None:
+            last = primary
+    if last is None:
+        return []
+    window = _minutes_to_window(last.get("window_minutes"))
+    if window is None:
+        return []
+    try:
+        used_f = float(last["used_percent"])
+        if isinstance(last["used_percent"], bool):
+            return []
+    except (TypeError, ValueError, KeyError):
+        return []
+    reset_iso = policy._coerce_reset_moment(last.get("resets_at"), now_ts)
+    pool_models = _pool_route_models("codex")
+    entry_model = last.get("model")
+    if isinstance(entry_model, str) and entry_model in pool_models:
+        models = [entry_model]
+    else:
+        models = pool_models
+    return [_probe_reading("codex", str(model), window, used_f, 100.0,
+                           reset_iso, observed_at, "provider_reported",
+                           {"via": "rollout"})
+            for model in models]
+
+
+_CLAUDE_WINDOW_NAMES = {"five_hour": "5h", "five-hour": "5h", "5h": "5h",
+                        "seven_day": "weekly", "seven-day": "weekly",
+                        "weekly": "weekly", "session": "session",
+                        "monthly": "monthly"}
+
+
+def parse_claude_oauth_usage(payload: dict, observed_at: str,
+                             model: str | None = None) -> list[dict]:
+    """Readings from the Claude OAuth usage endpoint.
+
+    Structured ``five_hour`` and ``seven_day`` entries with ``utilization``
+    and ``resets_at`` (needs the login token and the CLI user agent; 180
+    seconds minimum between calls). The statusline stdin JSON carries the
+    same fields for free while a session runs and parses through this
+    same function. Usage is subscription-level, so every window fans out to
+    one Reading per claude-pool route model unless the caller names a route
+    model already in the policy.
+    """
+    if not isinstance(payload, dict):
+        return []
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            str(observed_at).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    pool_models = _pool_route_models("claude")
+    explicit = model or payload.get("model")
+    if isinstance(explicit, str) and explicit in pool_models:
+        models = [explicit]
+    else:
+        models = pool_models
+    out: list[dict] = []
+    for key, window in _CLAUDE_WINDOW_NAMES.items():
+        entry = payload.get(key)
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("utilization", entry.get("used_percent",
+                 entry.get("usedPercent")))
+        if used is None or isinstance(used, bool):
+            continue
+        try:
+            used_f = float(used)
+        except (TypeError, ValueError):
+            continue
+        reset_iso = policy._coerce_reset_moment(
+            entry.get("resets_at", entry.get("resetsAt")), now_ts)
+        for route_model in models:
+            out.append(_probe_reading(
+                "claude", str(route_model),
+                window, used_f, 100.0, reset_iso, observed_at,
+                "provider_reported", {"endpoint": "oauth"}))
+    return out
+
+
+_USAGE_PERCENT_RE = re.compile(
+    r"(?i)(session|five[\s_-]?hour|5[\s_-]?hour|5h|seven[\s_-]?day|weekly|week|monthly|month)"
+    r"[^\n%]{0,80}?(\d+(?:\.\d+)?)\s*%")
+_ISO_MOMENT_RE = re.compile(
+    r"20\d\d-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:?\d\d)?")
+
+
+def _claude_text_window(label: str) -> str:
+    low = label.lower().replace("_", " ").replace("-", " ")
+    if "session" in low:
+        return "session"
+    if "five" in low or "5h" in low or "5hour" in low or "5 hour" in low:
+        return "5h"
+    if "seven" in low or "week" in low:
+        return "weekly"
+    if "month" in low:
+        return "monthly"
+    return "unknown"
+
+
+def parse_claude_usage_text(text: str, observed_at: str,
+                            model: str | None = None) -> list[dict]:
+    """Readings from ``claude -p \"/usage\" --output-format json``.
+
+    The command costs zero quota; its human-readable text names the
+    session and weekly percentages with reset times. Each labeled
+    percentage fans out to one provider_reported Reading per claude-pool
+    route model (unless the caller names one), paired in order with the ISO
+    reset moments in the same text (a window without a moment keeps reset
+    None and the assumed rule applies on errors). Unparseable text yields
+    no readings: the caller records unknown.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    found = _USAGE_PERCENT_RE.findall(text)
+    moments = _ISO_MOMENT_RE.findall(text)
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            str(observed_at).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    pool_models = _pool_route_models("claude")
+    if isinstance(model, str) and model in pool_models:
+        models = [model]
+    else:
+        models = pool_models
+    out: list[dict] = []
+    for i, (label, pct) in enumerate(found):
+        window = _claude_text_window(label)
+        if window == "unknown":
+            continue
+        try:
+            used_f = float(pct)
+        except (TypeError, ValueError):
+            continue
+        reset_iso = None
+        if i < len(moments):
+            reset_iso = policy._coerce_reset_moment(moments[i], now_ts)
+        for route_model in models:
+            out.append(_probe_reading(
+                "claude", str(route_model), window, used_f, 100.0,
+                reset_iso, observed_at, "provider_reported",
+                {"via": "cli-/usage"}))
+    return out
+
+
+def read_claude_transcript_reading(path, observed_at: str | None = None) -> list[dict]:
+    """Zero-cost Claude readings from the session's own transcript file.
+
+    Transcripts carry ``quotaLimits`` (``rateLimitType`` five_hour,
+    ``resetsAt``). The latest such record fans out to one provider_reported
+    Reading per claude-pool route model with the file's timestamp as
+    observed_at. Unknown rate-limit types yield no readings.
+    """
+    try:
+        text = open(str(path), encoding="utf-8").read()
+    except OSError:
+        return []
+    if observed_at is None:
+        try:
+            mtime = os.path.getmtime(str(path))
+            observed_at = datetime.datetime.fromtimestamp(
+                mtime, datetime.timezone.utc).isoformat()
+        except OSError:
+            observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            observed_at.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    last: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        quota = obj.get("quotaLimits") or obj.get("quota_limits")
+        if isinstance(quota, dict):
+            last = quota
+        elif isinstance(quota, list) and quota \
+                and isinstance(quota[0], dict):
+            last = quota[0]
+    if last is None:
+        return []
+    rate_type = str(last.get("rateLimitType") or last.get("rate_limit_type") or "")
+    window = _CLAUDE_WINDOW_NAMES.get(rate_type)
+    if window is None:
+        return []
+    used = last.get("utilization", last.get("used_percent",
+             last.get("usedPercent")))
+    used_f = None
+    limit_f = None
+    if used is not None and not isinstance(used, bool):
+        try:
+            used_f = float(used)
+            limit_f = 100.0
+        except (TypeError, ValueError):
+            used_f, limit_f = None, None
+    reset_iso = policy._coerce_reset_moment(
+        last.get("resetsAt", last.get("resets_at")), now_ts)
+    pool_models = _pool_route_models("claude")
+    entry_model = last.get("model")
+    if isinstance(entry_model, str) and entry_model in pool_models:
+        models = [entry_model]
+    else:
+        models = pool_models
+    return [_probe_reading("claude", str(route_model), window, used_f, limit_f,
+                           reset_iso, observed_at, "provider_reported",
+                           {"via": "transcript"})
+            for route_model in models]
+
+
+GO_WINDOW_SECS = {"5h": 5 * 3600, "weekly": 7 * 24 * 3600,
+                  "monthly": 30 * 24 * 3600}
+
+
+def probe_opencode_go_readings(cost_rows, tier_usd: float, model: str,
+                               observed_at: str, pool: str = "go",
+                               now_ts: float | None = None) -> list[dict]:
+    """Measured Go readings from the local database's cost per model.
+
+    Go limits are dollar limits, so rolling cost sums over the 5-hour
+    (20 percent), weekly (50 percent), and monthly (100 percent) windows
+    are comparable. Each window becomes one measured Reading; rolling
+    windows name no exact reset, so reset stays None and error evidence
+    governs exhaustion. ``cost_rows`` are ``{"cost": float, "ts": epoch}``
+    dicts (the model match already applied by the caller); tier_usd is
+    the policy's monthly dollar limit for the model.
+    """
+    try:
+        tier = float(tier_usd)
+        if tier <= 0:
+            return []
+    except (TypeError, ValueError):
+        return []
+    now = now_ts if now_ts is not None else time.time()
+    costs: list[tuple[float, float]] = []
+    for row in cost_rows or []:
+        if isinstance(row, dict):
+            cost, ts = row.get("cost"), row.get("ts")
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            cost, ts = row[0], row[1]
+        else:
+            continue
+        try:
+            if isinstance(cost, bool) or isinstance(ts, bool):
+                continue
+            costs.append((float(cost), float(ts)))
+        except (TypeError, ValueError):
+            continue
+    out: list[dict] = []
+    for window, share in policy.WINDOWS.items():
+        secs = GO_WINDOW_SECS[window]
+        used = round(sum(c for c, ts in costs if now - ts <= secs), 6)
+        out.append(_probe_reading(
+            pool, str(model), window, used, round(tier * float(share), 6),
+            None, observed_at, "measured",
+            {"tier_usd": tier, "share": float(share),
+             "window_secs": secs, "samples": len(costs)}))
+    return out
+
+
+def read_opencode_cost_rows(db_path, model: str | None = None) -> list[dict]:
+    """Best-effort cost rows from the OpenCode local session database.
+
+    Reads per-assistant-message cost records ``{"cost": float, "ts": epoch,
+    "model": str}`` for probe_opencode_go_readings. The local schema is
+    versioned by OpenCode, so known table and column shapes are tried in
+    order; anything unreadable yields no rows and the caller records
+    unknown instead of blocking routing.
+    """
+    import sqlite3 as _sqlite
+
+    try:
+        con = _sqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except Exception:
+        return []
+    rows: list[dict] = []
+    try:
+        try:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        except Exception:
+            return []
+        for table in ("message", "messages", "assistant_message",
+                      "assistant_messages", "session_message"):
+            if table not in tables:
+                continue
+            try:
+                cols = {r[1] for r in con.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
+            except Exception:
+                continue
+            cost_col = next((c for c in ("cost", "costUsd", "cost_usd",
+                                         "total_cost") if c in cols), None)
+            ts_col = next((c for c in ("created", "createdAt", "created_at",
+                                       "timestamp", "ts", "time") if c in cols), None)
+            model_col = next((c for c in ("model", "modelID", "model_id",
+                                          "providerModel") if c in cols), None)
+            if cost_col is None or ts_col is None:
+                continue
+            select = f"SELECT {cost_col} AS cost, {ts_col} AS ts"
+            if model_col is not None:
+                select += f", {model_col} AS model"
+            select += f" FROM {table}"
+            try:
+                for rec in con.execute(select).fetchall():
+                    try:
+                        cost = float(rec[0])
+                    except (TypeError, ValueError):
+                        continue
+                    ts = rec[1]
+                    try:
+                        ts_f = float(ts)
+                    except (TypeError, ValueError):
+                        try:
+                            ts_f = datetime.datetime.fromisoformat(
+                                str(ts).replace("Z", "+00:00")).timestamp()
+                        except (ValueError, TypeError, OverflowError):
+                            continue
+                    got_model = rec[2] if len(rec) > 2 else None
+                    if model is not None and got_model not in (None, model):
+                        continue
+                    rows.append({"cost": cost, "ts": ts_f,
+                                 "model": got_model})
+                if rows:
+                    return rows
+            except Exception:
+                continue
+        return rows
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def probe_zen_free_reading(request_epochs, window: str, observed_at: str,
+                           cap: float | None = None,
+                           now_ts: float | None = None) -> dict:
+    """Measured Zen free reading: request counts against an assumed cap.
+
+    Zen names no allowance, so the window count is measured and the cap
+    is assumed (flagged in the detail); the source stays measured because
+    the count itself is observed.
+    """
+    secs = GO_WINDOW_SECS.get(window)
+    if secs is None:
+        raise ValueError(f"unsupported zen window: {window!r}")
+    now = now_ts if now_ts is not None else time.time()
+    count = 0
+    for ts in request_epochs or []:
+        try:
+            if isinstance(ts, bool):
+                continue
+            if now - float(ts) <= secs:
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    limit = float(cap) if cap is not None else float(policy.ZEN_FREE_ASSUMED_REQUESTS)
+    return _probe_reading("zen-free",
+                          "opencode/muse-spark-1.3-contributor-free",
+                          window, float(count), limit, None, observed_at,
+                          "measured",
+                          {"assumed_cap": cap is None,
+                           "window_secs": secs})
+
+
+def parse_grok_billing(payload: dict, observed_at: str,
+                       model: str | None = None) -> list[dict]:
+    """Monthly Grok allowance readings from the internal billing call.
+
+    The allowance data behind the TUI modal (``creditUsagePercent``,
+    ``includedUsed``, ``monthlyLimit``, ``billingPeriodStart`` and
+    ``billingPeriodEnd``) fans out to one provider_reported monthly Reading
+    per xai-pool Grok route model (native Build and OpenCode's xAI
+    provider share the xAI subscription; the Go Grok route keeps its own
+    Go-dollar readings and is never overwritten here). Internal and may
+    change; failure yields no readings so the caller records unknown. No
+    5-hour or weekly window and no weekly reset exist: weekly stays assumed
+    with error-driven cool-off.
+    """
+    if not isinstance(payload, dict):
+        return []
+    now_ts = time.time()
+    try:
+        now_ts = datetime.datetime.fromisoformat(
+            str(observed_at).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    used = payload.get("creditUsagePercent", payload.get("credit_usage_percent"))
+    limit: float | None = 100.0
+    if used is not None and not isinstance(used, bool):
+        try:
+            used_f = float(used)
+        except (TypeError, ValueError):
+            return []
+    else:
+        taken = payload.get("includedUsed", payload.get("included_used"))
+        cap = payload.get("monthlyLimit", payload.get("monthly_limit"))
+        try:
+            if taken is None or cap is None or float(cap) <= 0:
+                return []
+            used_f, limit = float(taken), float(cap)
+        except (TypeError, ValueError):
+            return []
+    reset_iso = policy._coerce_reset_moment(
+        payload.get("billingPeriodEnd", payload.get("billing_period_end")),
+        now_ts)
+    pool_models = _pool_route_models("xai")
+    if isinstance(model, str) and model in pool_models:
+        models = [model]
+    else:
+        models = pool_models
+    return [_probe_reading("xai", str(route_model), "monthly", used_f, limit,
+                           reset_iso, observed_at, "provider_reported",
+                           {"via": "billing"})
+            for route_model in models]
 
 
 HARNESSES = {h.name: h for h in (CodexCLI(), ClaudeCLI(), OpenCodeServer(), GrokBuildCLI())}

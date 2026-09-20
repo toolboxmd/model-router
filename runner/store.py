@@ -167,6 +167,19 @@ CREATE TABLE IF NOT EXISTS capacity_probes (
   ok INTEGER NOT NULL,
   detail_json TEXT
 );
+CREATE TABLE IF NOT EXISTS readings (
+  pool TEXT NOT NULL,
+  model TEXT NOT NULL,
+  window TEXT NOT NULL,
+  used REAL,
+  limit_value REAL,
+  reset_at TEXT,
+  observed_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  detail_json TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (pool, model, window)
+);
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
 CREATE INDEX IF NOT EXISTS idx_questions_req ON questions(request_id);
@@ -174,6 +187,7 @@ CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_request ON invocations(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_state ON invocations(state);
 CREATE INDEX IF NOT EXISTS idx_probes_route ON capacity_probes(pool, model, window);
+CREATE INDEX IF NOT EXISTS idx_readings_pool ON readings(pool, model, window);
 """
 
 # Ledger contract version for events and invocations; Agent Observer reads
