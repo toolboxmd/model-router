@@ -398,6 +398,11 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                         rc = proc.wait(timeout=5)
                     except Exception:
                         rc = 124
+                    if rc == -_signal.SIGKILL:
+                        # The deadline kill above: report the runner's
+                        # timeout code, as direct runs do, so the ledger
+                        # records a timeout instead of a bare signal death.
+                        rc = 124
                     break
                 time.sleep(0.05)
     finally:

@@ -97,12 +97,14 @@ EXCLUDED_MODELS = (
 )
 
 # The 2026-09-20 Go plan: never implementers on Go. grok-4.6 is allowed only
-# as the hard lane's last Go rung and as the recovery route's two rungs.
+# as the hard lane's last Go rung and as a recovery rung.
 GO_IMPLEMENTER_EXCLUDED = ("gpt-5.6-luna", "kimi-k3", "qwen3.8-max", "qwen3.7-max")
 GO_IMPLEMENTER_GROK_ROUTES = ("grok-4.6-go", "grok-4.6-xai")
 
-# Route fields: harness (codex|claude|opencode), pool, model (provider/model
-# for opencode), variant (None = provider default), agent (opencode agent),
+# Route fields: harness (codex|claude|opencode|grok), pool, model
+# (provider/model for opencode, bare model id for the native grok harness),
+# variant (None = provider default; the grok harness sends it as
+# --effort), agent (opencode agent; grok runs headless without one),
 # role, family, next_pool (same model on the next pool), one_turn_per_job,
 # max_concurrent (running jobs allowed on the route), override_only,
 # planner_requested, planner_chosen (the planner runs it itself, never a
@@ -217,11 +219,18 @@ ROUTES = {
                     "note": "planner-chosen rung; runs in the planner's Claude session"},
     "grok-4.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/grok-4.6",
                     "variant": "medium", "agent": "build", "role": "recovery",
-                    "family": "grok", "next_pool": "grok-4.6-xai", "one_turn_per_job": True,
+                    "family": "grok", "next_pool": "grok-4.6-build", "one_turn_per_job": True,
                     "max_concurrent": 1, "context_window": 2_000_000},
+    "grok-4.6-build": {"harness": "grok", "pool": "xai", "model": "grok-4.6",
+                       "variant": "medium", "role": "recovery",
+                       "family": "grok", "next_pool": "grok-4.6-xai",
+                       "context_window": 2_000_000,
+                       "note": "native Grok Build CLI on the xAI subscription; "
+                               "OpenCode's xAI provider is the next_pool fallback"},
     "grok-4.6-xai": {"harness": "opencode", "pool": "xai", "model": "xai/grok-4.6",
                      "variant": "medium", "agent": "build", "role": "recovery",
-                     "family": "grok", "context_window": 2_000_000},
+                     "family": "grok", "context_window": 2_000_000,
+                     "note": "OpenCode xAI provider fallback for the native Grok Build route"},
 }
 
 # Stages in flow order. executor: host (the human-facing session or its
@@ -267,11 +276,12 @@ STAGES = {
     "implementation_hard": {"executor": "runner",
                             "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
                                        "glm-5.3-go", "deepseek-v4-pro-go", "grok-4.6-go",
-                                       "grok-4.6-xai"],
+                                       "grok-4.6-build", "grok-4.6-xai"],
                              "capabilities": ["workspace_write", "session_resume"],
                              "note": "$15 models get one turn per job; every new job starts on "
                                      "Muse free (no cap); Grok 4.6 sits here as the "
-                                     "hard lane's last Go rung"},
+                                     "hard lane's last Go rung, then native Grok Build on "
+                                     "the xAI subscription, then OpenCode's xAI provider"},
     "planner_rungs": {"executor": "planner",
                       "routes": ["astra/medium", "opus-5/high"],
                       "capabilities": [],
@@ -284,9 +294,11 @@ STAGES = {
     "correction": {"executor": "runner", "routes": ["kimi-k2.7-code-go"],
                    "capabilities": ["workspace_write", "session_resume"],
                    "note": "once per job; the same worker session is tried first"},
-    "recovery": {"executor": "runner", "routes": ["grok-4.6-go", "grok-4.6-xai"],
+    "recovery": {"executor": "runner", "routes": ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"],
                  "capabilities": ["workspace_write"],
-                 "note": "one escalation per job, Grok 4.6 across two pools, then the planner; "
+                 "note": "one escalation per job, Grok 4.6 on Go, then native Grok Build on "
+                         "the xAI subscription, then OpenCode's xAI provider; pool moves "
+                         "are not second escalations, then the planner; "
                          "skips rungs the job already used"},
     "review_ticket": {"executor": "host", "routes": ["luna-max-review", "luna-go-review"],
                       "capabilities": ["read_only"],
@@ -460,6 +472,26 @@ def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
     return spec["model"], spec.get("variant"), spec.get("agent") or "build"
 
 
+def grok_route_params(route: str | None) -> tuple[str, str | None]:
+    """(model, effort) the native Grok Build CLI sends for a route.
+    Unknown routes and routes on other harnesses raise: the runner never
+    substitutes a model silently."""
+    spec = route_spec(route or "")
+    if spec.get("harness") != "grok":
+        raise ValueError(f"route {route!r} runs on {spec.get('harness')}, not on the Grok Build CLI")
+    return spec["model"], spec.get("variant")
+
+
+def worker_model_variant(route: str | None) -> tuple[str, str | None]:
+    """(model, variant) a worker route carries, on either worker harness.
+    Dispatch and review routes raise: only implementation, correction, and
+    recovery routes run worker turns."""
+    spec = route_spec(route or "")
+    if spec.get("harness") not in ("opencode", "grok"):
+        raise ValueError(f"route {route!r} runs on {spec.get('harness')}, not on a worker harness")
+    return spec["model"], spec.get("variant")
+
+
 def monthly_limit_usd(route: str) -> int | None:
     spec = route_spec(route)
     if spec["pool"] != "go":
@@ -535,7 +567,8 @@ def session_permissions(route: str | None = None) -> tuple[dict, ...]:
 
 
 def next_pool_route(route: str) -> str | None:
-    """Same model on the next pool, or None."""
+    """Same model on the next pool (or the same pool through another
+    harness for a compat fallback), or None."""
     return route_spec(route).get("next_pool")
 
 
@@ -978,13 +1011,22 @@ def validate_policy() -> list[str]:
             problems.append(f"stage {lane}: first route must be muse-spark-xhigh-free "
                             "(Muse free takes every new job)")
     for name, spec in ROUTES.items():
-        if spec["harness"] not in ("codex", "claude", "opencode"):
+        if spec["harness"] not in ("codex", "claude", "opencode", "grok"):
             problems.append(f"{name}: unknown harness {spec['harness']}")
         if spec["pool"] not in POOLS:
             problems.append(f"{name}: unknown pool {spec['pool']}")
         size = spec.get("context_window")
         if type(size) is not int or size <= 0:
             problems.append(f"{name}: context_window must be a positive int of tokens")
+        if spec["harness"] == "grok":
+            if spec["pool"] != "xai":
+                problems.append(f"{name}: the native Grok Build harness serves the xai pool, "
+                                f"not {spec['pool']}")
+            if not spec.get("model") or "/" in spec["model"]:
+                problems.append(f"{name}: grok harness model must be a bare model id, "
+                                f"got {spec.get('model')!r}")
+            if spec.get("agent"):
+                problems.append(f"{name}: the grok harness runs headless without an agent")
         if spec["harness"] == "opencode":
             provider, sep, model_id = spec["model"].partition("/")
             if not sep or provider != POOLS[spec["pool"]]["provider"]:
@@ -1014,9 +1056,15 @@ def validate_policy() -> list[str]:
         if nxt is not None:
             if nxt not in ROUTES:
                 problems.append(f"{name}: next_pool {nxt} unknown")
-            elif ROUTES[nxt]["family"] != spec["family"] or \
-                    POOLS[ROUTES[nxt]["pool"]]["order"] <= POOLS[spec["pool"]]["order"]:
-                problems.append(f"{name}: next_pool {nxt} is not the same model on a later pool")
+            elif ROUTES[nxt]["family"] != spec["family"] or not (
+                    POOLS[ROUTES[nxt]["pool"]]["order"] > POOLS[spec["pool"]]["order"]
+                    # Same model on the same pool through another harness is a
+                    # compat fallback (native Grok Build to OpenCode's xAI
+                    # provider), not a pool advance.
+                    or (ROUTES[nxt]["pool"] == spec["pool"]
+                        and ROUTES[nxt]["harness"] != spec["harness"])):
+                problems.append(f"{name}: next_pool {nxt} is not the same model on a later pool "
+                                "or the same pool through another harness")
     # The 2026-09-20 Go plan: excluded implementers never sit in a lane.
     implementer_routes = set(implementation_routes()) | set(STAGES["correction"]["routes"])
     for route in sorted(implementer_routes):

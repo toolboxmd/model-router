@@ -50,6 +50,13 @@ OPENCODE_GO_MODEL = _MUSE_GO["model"]
 OPENCODE_VARIANT = _MUSE_FREE["variant"]
 OPENCODE_AGENT = _MUSE_FREE.get("agent") or "build"
 
+GROK_BIN = "grok"
+# Native worker default from the first xAI pool route (Grok Build first,
+# OpenCode's xAI provider as the next_pool fallback).
+_GROK_BUILD = _policy.ROUTES["grok-4.6-build"]
+GROK_MODEL = _GROK_BUILD["model"]
+GROK_EFFORT = _GROK_BUILD["variant"]
+
 # Explicit structured-action protocol embedded in every Luna prompt.
 # Luna must reply with exactly one JSON envelope as its final message.
 LUNA_ACTION_PROTOCOL = (
@@ -466,6 +473,110 @@ def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
     """(model, variant, agent) the policy assigns to an OpenCode route."""
     from . import policy as _policy
     return _policy.opencode_route_params(route)
+
+
+def grok_route_params(route: str | None) -> tuple[str, str | None]:
+    """(model, effort) the policy assigns to a native Grok Build route."""
+    from . import policy as _policy
+    return _policy.grok_route_params(route)
+
+
+def build_grok_cmd(prompt: str, workspace: str, model: str = GROK_MODEL,
+                   effort: str | None = GROK_EFFORT,
+                   session_id: str | None = None) -> list[str]:
+    """Headless single-turn Grok Build worker command.
+
+    ``grok -p PROMPT --verbatim --cwd WS -m MODEL --effort EFFORT
+    --always-approve --disable-web-search --no-subagents --output-format
+    json [--resume SESSION]``. Tools run without prompts (headless cannot
+    approve); web access and subagents stay off so one worker cannot block
+    on approval or fork a second writer. Resume names the saved session
+    and never forks: a resume reporting another session is rejected by
+    the harness identity check.
+    """
+    if not workspace:
+        raise ValueError("missing workspace for grok worker turn")
+    if not model:
+        raise ValueError("missing model for grok worker turn")
+    if not prompt:
+        raise ValueError("missing prompt for grok worker turn")
+    cmd = [GROK_BIN, "-p", prompt, "--verbatim", "--cwd", workspace,
+           "-m", model,
+           "--always-approve", "--disable-web-search", "--no-subagents",
+           "--output-format", "json"]
+    if effort:
+        cmd += ["--effort", effort]
+    if session_id:
+        cmd += ["--resume", session_id]
+    return cmd
+
+
+def parse_grok_result(stdout: str) -> dict:
+    """Parse headless ``grok --output-format json`` stdout.
+
+    Returns ``{ok, text, session_id, stop_reason, error}``. Only a JSON
+    object is read, and only from stdout: the last JSON object wins so a
+    leading log line cannot shadow the result. Exit 0 alone is not an
+    answer; a non-``end_turn`` stop reason (``max_tokens``,
+    ``max_turn_requests``, ``cancelled``, ``refusal``) is incomplete.
+    An ``{"type": "error", "message": ...}`` object is a provider error
+    and never worker text.
+    """
+    obj = None
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            cand = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(cand, dict):
+            obj = cand
+            break
+    if not isinstance(obj, dict):
+        # The whole stdout may be one JSON object without trailing newline.
+        try:
+            obj = json.loads((stdout or "").strip())
+        except ValueError:
+            obj = None
+    if not isinstance(obj, dict):
+        return {"ok": False, "text": None, "session_id": None,
+                "stop_reason": None, "error": "grok output is not a JSON result"}
+    if obj.get("type") == "error":
+        return {"ok": False, "text": None, "session_id": None,
+                "stop_reason": None, "error": str(obj.get("message") or "grok error")[:1000],
+                "detail": obj}
+    sid = obj.get("sessionId")
+    if not isinstance(sid, str) or not sid:
+        for key in ("session_id", "sessionID", "id"):
+            val = obj.get(key)
+            if isinstance(val, str) and val:
+                sid = val
+                break
+        else:
+            sid = None
+    text = obj.get("text")
+    stop = obj.get("stopReason")
+    if not isinstance(text, str) or not text.strip():
+        return {"ok": False, "text": None, "session_id": sid,
+                "stop_reason": stop if isinstance(stop, str) else None,
+                "error": "grok result has no text"}
+    if stop is not None and stop != "end_turn":
+        return {"ok": False, "text": text.strip(), "session_id": sid,
+                "stop_reason": stop,
+                "error": f"grok turn incomplete: {str(stop)[:80]}"}
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
+    out = {"ok": True, "text": text.strip(), "session_id": sid,
+           "stop_reason": stop if isinstance(stop, str) else "end_turn",
+           "error": None}
+    if usage is not None:
+        out["usage"] = usage
+    if isinstance(obj.get("num_turns"), int):
+        out["num_turns"] = obj["num_turns"]
+    if isinstance(obj.get("model"), str) and obj["model"]:
+        out["model"] = obj["model"]
+    return out
 
 
 

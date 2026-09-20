@@ -5,7 +5,12 @@ runner: Basic auth ``opencode:<password>``, ``directory`` scoping,
 ``POST /session``, ``POST /session/{id}/prompt_async``, the
 ``GET /session/status`` map, ``POST /session/{id}/abort``, and
 ``GET /session/{id}/message``. ``FAKE_CLAUDE`` prints the
-``--output-format json`` result object. No model is called.
+``--output-format json`` result object. ``FAKE_GROK`` mirrors the Grok
+Build headless contract: ``grok -p PROMPT --cwd WS -m MODEL
+--output-format json [--resume SESSION]`` printing one JSON result with
+``text``, ``stopReason``, ``sessionId`` and ``num_turns``, or
+``{"type": "error", "message": ...}`` with a non-zero exit. No model is
+called.
 
 Environment: ``FAKE_STATE`` (log directory), ``FAKE_OC_MODE`` (free-route
 behavior: ok, free_limit, api_free_error, rate_limit, model_text, hang,
@@ -13,7 +18,10 @@ stall, hard_error, context_error), ``FAKE_OC_MODE_GO`` (same for Go routes),
 ``FAKE_OC_PROBE_MODE`` (stall-probe answer: ok, exhausted, overloaded),
 ``FAKE_OC_DELAY`` (seconds of busy time), ``FAKE_OC_WRITE`` (relative
 file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
-``FAKE_CLAUDE_ANSWER``.
+``FAKE_CLAUDE_ANSWER``, ``FAKE_GROK_MODE`` (ok, exhaustion, overload,
+hard_error, hang, hold), ``FAKE_GROK_DELAY`` (seconds before success),
+``FAKE_GROK_WRITE`` (relative file the fake worker writes),
+``FAKE_GROK_RELEASE`` (hold mode waits for this file, then succeeds).
 """
 
 FAKE_OPENCODE = r'''
@@ -351,6 +359,70 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "session_id": sid, "uuid": "fake-result-uuid", "duration_ms": 12,
                   "num_turns": 1, "total_cost_usd": 0.0,
                   "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 0}}))
+'''
+
+
+FAKE_GROK = r'''
+import json, os, sys, time
+from pathlib import Path
+st = Path(os.environ["FAKE_STATE"])
+st.mkdir(parents=True, exist_ok=True)
+argv = sys.argv[1:]
+with open(st / "grok.log", "a") as f:
+    f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else None
+
+assert "--cwd" in argv, argv
+assert "--output-format" in argv and flag("--output-format") == "json", argv
+assert "-p" in argv or "--prompt-file" in argv, argv
+cwd = Path(flag("--cwd"))
+model = flag("-m") or flag("--model") or "grok-4.6"
+resume = flag("--resume")
+MODE = os.environ.get("FAKE_GROK_MODE", "ok")
+WRITE = os.environ.get("FAKE_GROK_WRITE")
+sessions = st / "grok-sessions"
+sessions.mkdir(exist_ok=True)
+if resume:
+    sid = resume
+else:
+    sid = "ses_grok_%06d" % (len(list(sessions.iterdir())) + 1)
+    (sessions / sid).write_text("created")
+
+def success():
+    if WRITE:
+        (cwd / WRITE).write_text("implemented by fake grok worker\n")
+    print(json.dumps({"text": "IMPLEMENTED by fake grok worker", "stopReason": "end_turn",
+                      "sessionId": sid, "num_turns": 1, "model": model,
+                      "usage": {"input_tokens": 60, "output_tokens": 12}}))
+
+if MODE == "hang":
+    time.sleep(120)
+    success()
+elif MODE == "hold":
+    release = os.environ.get("FAKE_GROK_RELEASE", "")
+    end = time.monotonic() + 120
+    while time.monotonic() < end:
+        if release and Path(release).exists():
+            break
+        time.sleep(0.05)
+    success()
+elif MODE == "exhaustion":
+    print(json.dumps({"type": "error",
+                      "message": "xAI subscription quota exceeded: insufficient_quota"}))
+    sys.exit(1)
+elif MODE == "overload":
+    print(json.dumps({"type": "error",
+                      "message": "xAI rate limit exceeded: RateLimitError, retry later"}))
+    sys.exit(1)
+elif MODE == "hard_error":
+    print(json.dumps({"type": "error",
+                      "message": "context_length_exceeded: maximum context length exceeded"}))
+    sys.exit(1)
+else:
+    time.sleep(float(os.environ.get("FAKE_GROK_DELAY", "0.2")))
+    success()
 '''
 
 

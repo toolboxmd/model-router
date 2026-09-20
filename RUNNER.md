@@ -109,15 +109,15 @@ capacity signal, which moves routes instead; hard errors end the turn as
 command exits non-zero. The first failure leads to a correction in the same
 worker session on the same route. The second leads to a fresh correction on
 the correction stage's route (Kimi K2.7 Code). The third is the single
-escalation to the recovery stage (Grok 4.6 on Go, then on the xAI
-subscription if Go is exhausted or the rung was already used; that pool move
-is not a second escalation; recovery never reuses a rung the job already
-ran, and when every rung was used the job blocks with
-`recovery_exhausted`). After the escalation the evidence returns to the
-planner, which may itself choose a rung from the policy's planner-chosen
-rungs (Astra medium on Codex, Opus 5 high on the Claude harness) and run it
-in its own session; the runner never selects those automatically. A fourth
-failure ends the job as `failed` with `ESCALATION_EXHAUSTED` and
+escalation to the recovery stage (Grok 4.6 on Go, then native Grok Build on
+the xAI subscription, then OpenCode's xAI provider; those pool moves are not
+second escalations; recovery never reuses a rung the job already ran, and
+when every rung was used the job blocks with `recovery_exhausted`). After
+the escalation the evidence returns to the planner, which may itself choose
+a rung from the policy's planner-chosen rungs (Astra medium on Codex, Opus 5
+high on the Claude harness) and run it in its own session; the runner never
+selects those automatically. A fourth failure ends the job as `failed` with
+`ESCALATION_EXHAUSTED` and
 the turn reports listed in `result`, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
 decides; the runner enforces the ceiling.
@@ -182,6 +182,21 @@ stays unset in production, where the policy value governs. Every invocation
 records its longest observed stream silence (`longest_silence_secs`) so the
 window is tuned on data through Agent Observer. The server group stops after
 every turn.
+
+A turn on the native Grok Build route runs one headless
+`grok -p PROMPT --verbatim --cwd WS -m grok-4.6 --effort medium
+--always-approve --disable-web-search --no-subagents --output-format json`
+process (plus `--resume SESSION` when a saved Grok session exists) through
+the same supervisor path: the exited process is the turn boundary, so no
+abort or idle confirmation applies. The JSON result carries the worker
+text, the stop reason, the session id, and counters where reported; only
+the JSON error object classifies signals, never worker text. The saved
+session is stored as `grok_session_id` and cleared on rung changes like
+the OpenCode session. Web access and subagents stay off so one worker
+cannot block on approval or fork a second writer. The Grok host carries
+AgentsMD through `worker-kits/grok/ensure.py`, which keeps the
+configuration directory's `AGENTS.md` link and `project-direction` hook
+(`--check` reports without writing).
 
 Provider signals are classified from structured evidence only, never from
 model-authored text:
@@ -400,15 +415,19 @@ request.
 
 `runner/harnesses.py` defines the seam between the runner and the harnesses
 that execute turns. A `Harness` base class declares the interface; `CodexCLI`,
-`ClaudeCLI`, and `OpenCodeServer` are the concrete adapters. A registry holds
+`ClaudeCLI`, `OpenCodeServer`, and `GrokBuildCLI` are the concrete adapters. A registry holds
 one instance per harness with lookup helpers: `HARNESSES` by name, `harness_for`
-by invocation kind, `harness_named` by name, and `kind_for_cmd` from a command
-line. A harness provides spawn specs, session and report parsing, provider
+by invocation kind, `harness_named` by name, `kind_for_cmd` from a command
+line, and `worker_control_kinds` for the implementation-turn kinds across
+harnesses. A harness provides spawn specs, session and report parsing, provider
 signal classification, stream-activity tracking (last-activity timestamps
 per turn for stall detection on every harness), and usage measurement; the
 core and supervisor call
 these methods instead of branching on invocation kind. Each harness declares
 its capabilities, and each policy stage declares the capabilities it needs.
+The harness also owns its action identity: a Grok turn resumed with
+`--resume` is the same logical turn, so a restarted controller reuses the
+finished attempt instead of starting a second writer.
 `route_capability_blocker(route, stage)` names any capability the route's
 harness lacks; a dispatch then fails with `RunnerError("route_capability_mismatch: ...")`
 before any child starts. Dispatch has one fallback route: when the Codex CLI
@@ -434,8 +453,9 @@ lanes default, small, and hard, planner-chosen rungs (Astra medium on Codex,
 Opus 5 high on the Claude harness; the planner itself chooses and runs them),
 critical
 (planner-executed), correction (Kimi K2.7 Code after the same session), recovery
-(Grok 4.6 on Go then on the xAI subscription, skipping rungs the job already
-used), ticket review (Luna max on Codex, then Luna on OpenCode Go in plan
+(Grok 4.6 on Go, then native Grok Build on the xAI subscription, then
+OpenCode's xAI provider; pool moves inside recovery are not second
+escalations; recovery skips rungs the job already used), ticket review (Luna max on Codex, then Luna on OpenCode Go in plan
 mode), and final review (Opus 5 high on the Claude harness, then Astra high
 on Codex, then Luna max). Worker pools in order: Zen free, Go, xAI;
 subscription logins only. The default lane carries the full Go implementer
@@ -444,7 +464,7 @@ chain in intelligence order: Muse xhigh on Zen free, Muse xhigh on Go, GLM
 MiniMax M2.7, LongCat 2.0, GLM 5.2, Kimi K2.6, GLM 5.1 (Qwen 3.7 Plus and
 Qwen 3.6 Plus are absent: no known tier); the small lane starts from Muse free,
 then Muse Go, then GLM 5.3 Flash onward; the hard lane runs Muse free, Muse Go, GLM-5.3, DeepSeek V4 Pro, Grok
-4.6 on Go, Grok 4.6 on xAI; correction is Kimi K2.7 Code. Muse on Zen free
+4.6 on Go, native Grok Build on the xAI subscription, Grok 4.6 on xAI; correction is Kimi K2.7 Code. Muse on Zen free
 carries no concurrency cap and takes every new job (parallel Muse free
 sessions by design); the `fewest running jobs` spread applies only among
 capped routes. Never
@@ -456,20 +476,24 @@ per job and 15 and 30 USD tiers allow exactly one running job per route
 transaction that records the job's route (first sticky selection, preflight
 move, dispatch fallback on `luna-go/max`, and recovery move count running jobs
 on the target inside the transaction, so two controllers cannot both take a
-capped route). Recovery moves (`grok-4.6-go`, `grok-4.6-xai`) are valid from any
+capped route). Recovery moves (`grok-4.6-go`, `grok-4.6-build`, `grok-4.6-xai`) are valid from any
 implementation lane and reason in the recovery stage. A manual or
 planner-chosen route inside an implementation lane, the recovery stage, or the
 dispatch order never validates. DeepSeek
 V4.1 Flash is a 15 USD route from 2026-09-20. Every route in
 the policy has an adapter today; the OpenCode adapter takes model, variant,
-and agent from the route. Go Luna as a dispatch fallback arrives with the
+and agent from the route, the Grok Build adapter takes the bare model id and
+effort. The xAI pool names the native harness first (`grok-4.6-build`) with
+OpenCode's xAI provider as its `next_pool` fallback (`grok-4.6-xai`); the
+hard lane's last rung and recovery use both. Go Luna as a dispatch fallback arrives with the
 adapter seam. Changing a stage's harness or model is a policy edit; adding a
 role needs a policy row plus a report contract.
 
 Signal classes are defined in the policy and applied by later work: exhaustion
 (`free_tier_limit`, `FreeUsageLimitError`, `GoUsageLimitError`,
 `insufficient_quota`) moves the same model to the next pool where the route
-declares one (free Muse to Go Muse, Go Grok to xAI Grok), otherwise to the
+declares one (free Muse to Go Muse, Go Grok to native xAI Grok Build, Build
+to OpenCode's xAI provider), otherwise to the
 next family; overload
 (`overloaded`, `rate_limit`, `account_rate_limit`, HTTP 503 and 529) moves to
 the next family after a bounded retry window; stalled (stream silence past
@@ -477,8 +501,10 @@ the window, with a same-route probe first) retries bounded like overload,
 then moves laterally; context (`context_length_exceeded`) moves to a
 larger-context route in the lane; hard errors (auth, region, consent) end the
 turn as `implementation_failed` for the ladder and never move routes. The
-controller applies them on the owned-server path, driven through the harness
-seam.
+Grok Build harness classifies the CLI's JSON error objects into the same classes
+(quota and credit wording as exhausted, rate-limit wording and 429/503/529
+as overloaded, context and auth wording as hard). The controller
+applies them on both worker paths, driven through the harness seam.
 
 ## Verification
 
@@ -487,8 +513,10 @@ python -m unittest discover -s tests
 python -m compileall -q runner tests
 ```
 
-The suite uses fake `codex`, `claude`, and `opencode` executables shaped like
-the real contracts (`tests/fakes.py`) and real detached processes. It covers
+The suite uses fake `codex`, `claude`, `opencode`, and `grok` executables shaped like
+the real contracts (`tests/fakes.py`) and real detached processes. The fake
+`grok` covers ok, xAI exhaustion, overload, hard errors, hangs, and a held
+turn for controller-death drills. It covers
 duplicate and concurrent submission, workspace conflicts, launch races,
 controller and worker death, killed supervisors, pending questions,
 answer-plus-recover, cancellation, timeouts, trusted and untrusted quota

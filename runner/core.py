@@ -539,17 +539,15 @@ def _redact_meta(meta: dict) -> dict:
 def _action_key(kind: str, cmd: list[str], meta: dict | None) -> str:
     """Identity of one logical side effect, stable across controllers.
 
-    Volatile values such as a saved session learned by an earlier
-    attempt are excluded so a restarted controller finds the same key.
+    The harness behind ``kind`` decides what is stable: volatile values
+    such as a saved session learned by an earlier attempt are excluded
+    so a restarted controller finds the same key.
     ``try`` numbers repeated worker turns for one dispatcher turn (seq),
     so a bounded same-route retry after a stall is a new attempt, never a
     silent reuse and never a duplicate writer. Only stalled failures take a
     new number; every other outcome reuses its original identity.
     """
-    m = dict(meta or {})
-    stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid", "try")}
-    blob = json.dumps([kind, list(cmd), stable], sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return harnesses.harness_for(kind).action_key(kind, cmd, meta)
 
 
 def _read_invocation_output(inv: dict) -> tuple[str, str]:
@@ -1766,8 +1764,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
-             policy.opencode_route_params(route)[0],
-             policy.opencode_route_params(route)[1] or "default", pcwd, lane_stage,
+              policy.worker_model_variant(route)[0],
+              policy.worker_model_variant(route)[1] or "default", pcwd, lane_stage,
              job_kind, replay_of, planner_harness, base_commit),
         )
         _event(con, request_id, "submitted", {

@@ -202,11 +202,13 @@ class TestSubmit(Base):
 
 class TestPolicy(Base):
     def test_recovery_order_bounded(self):
-        # One escalation: Grok 4.6 on Go, the same model on the xAI pool, then
-        # the planner. Astra and Opus are no longer automatic recovery routes.
+        # One escalation: Grok 4.6 on Go, native Grok Build on the xAI pool,
+        # then OpenCode's xAI provider, then the planner. Pool moves inside
+        # recovery are not second escalations.
         self.assertEqual(policy.next_recovery_route(None), "grok-4.6-go")
         self.assertEqual(policy.next_recovery_route("muse-spark-xhigh-free"), "grok-4.6-go")
-        self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-xai")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-build")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-build"), "grok-4.6-xai")
         self.assertIsNone(policy.next_recovery_route("grok-4.6-xai"))
         self.assertIsNone(policy.next_recovery_route("opus-5/high-review"))
 

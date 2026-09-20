@@ -441,7 +441,10 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "pool_move"))
         job = core.get_job(self.sd, "oc1")
-        self.assertEqual(job["route"], "grok-4.6-xai")
+        # Go exhaustion lands on the native Grok Build route first; the
+        # OpenCode xAI provider is its next_pool fallback (covered end to
+        # end in test_grok.py).
+        self.assertEqual(job["route"], "grok-4.6-build")
         self.assertIn("grok-4.6-go", core.exhausted_routes(self.sd))
         cap = self._capacity("grok-4.6-go")
         self.assertEqual((cap["state"], cap["pool"], cap["model"]), ("exhausted", "go", "opencode-go/grok-4.6"))
@@ -450,6 +453,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         # preflight skips the route until it passes instead of forever.
         self.assertIsNotNone(cap["reset_at"])
         self.assertEqual(cap["reset_source"], "assumed")
+        self._set_route("grok-4.6-xai")
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]

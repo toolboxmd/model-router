@@ -21,7 +21,7 @@ class Seam(unittest.TestCase):
             self.assertIsNone(pattern.search(src), name)
 
     def test_three_harnesses_behind_one_interface(self):
-        self.assertEqual(set(harnesses.HARNESSES), {"codex", "claude", "opencode"})
+        self.assertEqual(set(harnesses.HARNESSES), {"codex", "claude", "opencode", "grok"})
         for h in harnesses.HARNESSES.values():
             for method in ("spawn_spec", "drive", "parse_session", "parse_report", "classify_signal",
                            "measure", "capabilities"):
@@ -29,9 +29,16 @@ class Seam(unittest.TestCase):
         self.assertIs(harnesses.harness_for("codex_resume"), harnesses.HARNESSES["codex"])
         self.assertIs(harnesses.harness_for("claude_callback"), harnesses.HARNESSES["claude"])
         self.assertIs(harnesses.harness_for("opencode_control"), harnesses.HARNESSES["opencode"])
+        self.assertIs(harnesses.harness_for("grok_control"), harnesses.HARNESSES["grok"])
         self.assertTrue(harnesses.HARNESSES["opencode"].owned_server)
+        self.assertTrue(harnesses.HARNESSES["grok"].headless_worker)
+        self.assertFalse(harnesses.HARNESSES["grok"].owned_server)
+        self.assertFalse(harnesses.route_uses_owned_server("grok-4.6-build"))
         self.assertEqual(harnesses.kind_for_cmd(["opencode", "serve"]), "opencode_serve")
         self.assertEqual(harnesses.kind_for_cmd(["claude", "--resume", "x"]), "claude_callback")
+        self.assertEqual(harnesses.kind_for_cmd(["grok", "-p", "hi"]), "grok_control")
+        self.assertIn("grok_control", harnesses.worker_control_kinds())
+        self.assertIn("opencode_control", harnesses.worker_control_kinds())
 
     def test_every_stage_route_has_its_capabilities(self):
         for stage, spec in policy.STAGES.items():
@@ -240,11 +247,13 @@ class ControllerThroughSeam(unittest.TestCase):
     def test_no_direct_harness_parsing_in_controller(self):
         src = (ROOT / "runner" / "controller.py").read_text()
         for banned in ("adapters.parse_codex_task_id", "adapters.parse_codex_agent_envelope",
-                       "adapters.parse_claude_result", "adapters.read_last_message_file",
+                       "adapters.parse_claude_result", "adapters.parse_grok_result",
+                       "adapters.read_last_message_file",
                        "adapters.last_message_path_from_cmd", "_runner_result("):
             self.assertNotIn(banned, src, banned)
         for required in ('harness_named("codex")', 'harness_named("opencode")',
-                         'harness_named("claude")', ".parse_session(", ".parse_report(",
+                         'harness_named("claude")', 'harness_named("grok")',
+                         ".parse_session(", ".parse_report(",
                          ".luna_action(", ".turn_ok(", ".identity_ok("):
             self.assertIn(required, src, required)
 

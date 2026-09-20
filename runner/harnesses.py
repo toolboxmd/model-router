@@ -19,6 +19,7 @@ KIND_CODEX_RESUME = "codex_resume"
 KIND_CLAUDE_CALLBACK = "claude_callback"
 KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
+KIND_GROK_CONTROL = "grok_control"
 
 
 class StreamActivity:
@@ -60,6 +61,7 @@ class Harness:
     kinds: tuple = ()
     capabilities: frozenset = frozenset()
     owned_server = False  # a server process the runner owns per turn
+    headless_worker = False  # one headless CLI process per worker turn
     binary = ""
     timeouts: dict = {}
     stages: dict = {}
@@ -69,6 +71,23 @@ class Harness:
     def spawn_spec(self, inv: dict, env: dict) -> tuple[dict, str | None]:
         """(environment for the child, generated secret or None)."""
         return env, None
+
+    def action_key(self, kind: str, cmd: list, meta: dict | None) -> str:
+        """Identity of one logical side effect, stable across controllers.
+
+        Volatile values such as a saved session learned by an earlier
+        attempt are excluded so a restarted controller finds the same key.
+        ``try`` numbers repeated worker turns for one dispatcher turn (seq),
+        so a bounded same-route retry after a stall is a new attempt, never a
+        silent reuse and never a duplicate writer. Only stalled failures take a
+        new number; every other outcome reuses its original identity.
+        """
+        import hashlib as _hashlib
+        import json as _json
+        m = dict(meta or {})
+        stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid", "try")}
+        blob = _json.dumps([kind, list(cmd), stable], sort_keys=True)
+        return _hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def drives(self, kind: str) -> bool:
         return False
@@ -565,9 +584,211 @@ class OpenCodeServer(Harness):
         return (job or {}).get("route")
 
 
-HARNESSES = {h.name: h for h in (CodexCLI(), ClaudeCLI(), OpenCodeServer())}
+class GrokBuildCLI(Harness):
+    """Native Grok Build CLI on the xAI subscription (``grok -p`` headless).
+
+    One process per worker turn: headless single prompt in the workspace
+    with the route's model and effort as JSON, resumed by saved session id.
+    No owned server, so the generic supervisor path (spawn, wait, kill on
+    timeout) applies; there is no session to abort and confirm idle, the
+    process exit is the turn boundary. ``grok usage`` style counters are
+    not read: usage is recorded only where the turn's own JSON reports it.
+    """
+
+    name = "grok"
+    kinds = (KIND_GROK_CONTROL,)
+    capabilities = frozenset({"workspace_write", "session_resume", "structured_output"})
+    owned_server = False
+    headless_worker = True
+    binary = adapters.GROK_BIN
+    timeouts = {KIND_GROK_CONTROL: 1800}
+    stages = {KIND_GROK_CONTROL: "implementation"}
+    session_kind = "grok_session_id"
+
+    def parse_session(self, kind, stdout, stderr, job):
+        # The headless JSON result carries the session; anything else
+        # (empty output, plain text, an error object) means no session,
+        # never a match.
+        parsed = adapters.parse_grok_result(stdout)
+        sid = parsed.get("session_id")
+        return (sid, "grok_session_id") if sid else (None, None)
+
+    def parse_report(self, kind, stdout, cmd):
+        """Normalized turn summary for the controller's report path.
+
+        Success carries the worker text, the stop reason, and any
+        reported counters; failure carries the provider error object as
+        signal evidence with its signal class. Model-authored text is
+        never signal evidence: only the JSON error object counts.
+        """
+        parsed = adapters.parse_grok_result(stdout)
+        sid = parsed.get("session_id")
+        usage, observed, _variant, ids = self.measure(kind, stdout, stderr="", meta=None)
+        if parsed.get("ok"):
+            actual = None
+            if observed and "/" in observed:
+                provider, _, model_id = observed.partition("/")
+                actual = {"providerID": provider, "modelID": model_id, "variant": None}
+            return {"grok_session_id": sid, "ok": True,
+                    "assistant_text": parsed.get("text") or "",
+                    "finish": parsed.get("stop_reason") or "end_turn",
+                    "actual_model": actual, "usage": usage, "native_ids": ids,
+                    "blockers": [], "error": None,
+                    "signal": None, "signal_evidence": None}
+        evidence: dict = {"source": "grok",
+                          "message": str(parsed.get("error") or "")[:1000]}
+        detail = parsed.get("detail")
+        if isinstance(detail, dict):
+            for key in ("status", "statusCode", "code"):
+                if detail.get(key) is not None:
+                    evidence[key] = detail[key]
+            nested = detail.get("message")
+            if isinstance(nested, str) and nested != evidence["message"]:
+                evidence["detail_message"] = nested[:1000]
+        return {"grok_session_id": sid, "ok": False,
+                "assistant_text": "", "finish": parsed.get("stop_reason"),
+                "actual_model": None, "usage": usage, "native_ids": ids,
+                "blockers": [], "error": evidence["message"] or "grok turn failed",
+                "signal": self.classify_signal(evidence),
+                "signal_evidence": evidence}
+
+    def measure(self, kind, stdout, stderr, meta):
+        """(usage, observed_model, observed_variant, native_ids).
+
+        Counters verbatim under the ``grok`` source label, only where the
+        turn's own JSON reports them; unreported usage stays None. The
+        native CLI serves the xAI subscription, so a reported model id is
+        recorded under provider ``xai``. Elapsed time comes from the
+        invocation row itself.
+        """
+        parsed = adapters.parse_grok_result(stdout)
+        counters: dict = {}
+        if isinstance(parsed.get("usage"), dict):
+            counters.update(parsed["usage"])
+        if isinstance(parsed.get("num_turns"), int):
+            counters["num_turns"] = parsed["num_turns"]
+        usage = {"source": "grok", **counters} if counters else None
+        observed = None
+        if isinstance(parsed.get("model"), str) and parsed["model"]:
+            observed = f"xai/{parsed['model']}"
+        ids: dict = {}
+        if parsed.get("session_id"):
+            ids["session_id"] = parsed["session_id"]
+        return usage, observed, None, ids
+
+    def classify_signal(self, evidence):
+        """xAI provider errors into the policy's signal classes.
+
+        Standard policy shapes (retry reasons, APIError bodies, status
+        codes) classify first; then the Grok JSON error object's message
+        and status: quota and credit exhaustion, rate-limit and overload,
+        and hard errors (context, auth, region, consent). Only the error
+        object counts, never worker text.
+        """
+        cls = policy.classify_signal(evidence)
+        if cls is not None:
+            return cls
+        if not isinstance(evidence, dict):
+            return None
+        blob = ""
+        for key in ("message", "error", "detail_message"):
+            val = evidence.get(key)
+            if isinstance(val, str):
+                blob += " " + val.lower()
+        detail = evidence.get("detail")
+        if isinstance(detail, dict):
+            for key in ("message", "type", "code"):
+                val = detail.get(key)
+                if isinstance(val, str):
+                    blob += " " + val.lower()
+        code = evidence.get("status", evidence.get("statusCode", evidence.get("code")))
+        try:
+            code = int(code) if code is not None and str(code).strip() else None
+        except (TypeError, ValueError):
+            code = None
+        if code in policy.SIGNAL_CLASSES["overloaded"].get("status_codes", ()):
+            return "overloaded"
+        hard_markers = ("context_length_exceeded", "context length exceeded",
+                        "maximum context", "authentication", "unauthorized",
+                        "invalid api key", "invalid_api_key", "forbidden",
+                        "region not supported", "region_not_supported", "consent",
+                        "datapolicy", "data policy")
+        if any(m in blob for m in hard_markers):
+            return "hard"
+        exhausted_markers = ("insufficient_quota", "insufficient quota",
+                             "quota exceeded", "quota_exceeded", "quota exhausted",
+                             "out of credit", "out of credits", "no credits",
+                             "credit exhausted", "credits exhausted",
+                             "billing", "subscription expired", "plan quota",
+                             "usage limit exceeded")
+        if any(m in blob for m in exhausted_markers):
+            return "exhausted"
+        overloaded_markers = ("rate_limit", "rate limit", "ratelimit",
+                              "rate limited", "ratelimiterror", "overloaded",
+                              "overload", "too many requests", "too_many_requests",
+                              "server busy", "temporarily unavailable", "try again later",
+                              "429", "503", "529")
+        if code == 429 or any(m in blob for m in overloaded_markers):
+            return "overloaded"
+        if code in (401, 403):
+            return "hard"
+        return None
+
+    def infer_rc(self, kind, stdout, cmd=None):
+        return 0 if adapters.parse_grok_result(stdout).get("ok") else 1
+
+    def turn_ok(self, kind, rc, stdout, cmd=None):
+        return rc == 0 and bool(adapters.parse_grok_result(stdout).get("ok"))
+
+    def identity_ok(self, kind, sid, saved) -> bool:
+        # A worker turn counts only from the saved Grok session: a missing
+        # session or a forked session never applies, on the live path and
+        # in recovery alike.
+        return bool(sid) and (saved is None or sid == saved)
+
+    def record_session(self, con, request_id, sid, skind, kind, job, meta, now):
+        if skind != "grok_session_id":
+            return
+        try:
+            model, effort = policy.grok_route_params((job or {}).get("route"))
+        except ValueError:
+            model, effort = adapters.GROK_MODEL, adapters.GROK_EFFORT
+        con.execute(
+            "UPDATE jobs SET grok_session_id=COALESCE(grok_session_id, ?), adapter='grok',"
+            " model=?, effort=?, updated_at=? WHERE request_id=?",
+            (sid, model, effort or "default", now, request_id))
+
+    def default_route(self, kind, job):
+        return (job or {}).get("route")
+
+    def action_key(self, kind, cmd, meta):
+        """A resumed turn is the same logical turn: the ``--resume``
+        session learned after the first attempt started is volatile, so a
+        restarted controller reuses the finished attempt instead of
+        starting a second writer."""
+        stable_cmd = list(cmd or [])
+        if "--resume" in stable_cmd:
+            i = stable_cmd.index("--resume")
+            del stable_cmd[i:i + 2]
+        return super().action_key(kind, stable_cmd, meta)
+
+
+HARNESSES = {h.name: h for h in (CodexCLI(), ClaudeCLI(), OpenCodeServer(), GrokBuildCLI())}
 KIND_TO_HARNESS = {kind: h for h in HARNESSES.values() for kind in h.kinds}
 INVOCATION_KINDS = tuple(KIND_TO_HARNESS)
+
+
+def kinds_for_stage(stage: str | None) -> list[str]:
+    """Invocation kinds whose harness serves ``stage`` (worker turns share
+    the implementation stage across harnesses)."""
+    if not stage:
+        return []
+    return [kind for kind, h in KIND_TO_HARNESS.items() if h.stage_for(kind) == stage]
+
+
+def worker_control_kinds() -> list[str]:
+    """Kinds that run implementation worker turns, on any harness."""
+    return kinds_for_stage("implementation")
 
 
 def harness_for(kind: str | None) -> Harness:
@@ -593,6 +814,8 @@ def kind_for_cmd(cmd: list) -> str:
         return KIND_CLAUDE_CALLBACK
     if name == "opencode":
         return KIND_OPENCODE_SERVE if "serve" in args else KIND_OPENCODE_CONTROL
+    if name == "grok":
+        return KIND_GROK_CONTROL
     return "unknown"
 
 

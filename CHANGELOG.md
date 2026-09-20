@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.0] - 2026-09-20
+
+### Added
+
+- Grok Build CLI harness for the xAI pool
+
 ## [0.10.0] - 2026-09-20
 
 ### Added
