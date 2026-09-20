@@ -29,5 +29,10 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Planner-chosen rung | A policy-listed route (Astra medium on Codex, Opus 5 high on Claude) the planner itself chooses and runs; never selected automatically by the runner. | automatic recovery |
 | Report contract | The fields every role's report must carry. | schema |
 | Worker kit | The checked-in setup that gives a worker host its AgentsMD link and hook; the Grok kit lives in `worker-kits/grok`. | host setup |
+| Direction block | The installed AgentsMD loader's verbatim output for a workspace: status, VISION.md, MISSION.md, OBJECTIVE.md with hashes, the core instruction link, plus the workspace's own AGENTS.md when present. Never fabricated. | context block |
+| Supply mechanism | How a session received direction: `runner` (owned OpenCode server, attached verbatim), `hook` (host hook supplied, recorded without duplication), `none` (loader missing/failed, reason recorded, job continues). | direction source |
+| Kit identity | The role kit name and its content hash (`kit_hash`) recorded per invocation. | role tag |
+| Skills loaded | The kit's skills recorded per invocation as what the session may invoke. | loaded plugins |
+| Tools called | Distinct tool part names observed in the turn's assistant messages (empty on text-only turns). | tool usage |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |
 | Policy | The versioned data in `runner/policy.py` that defines pools, routes, stages, windows, and signal classes. The skill table is rendered from it. | config |

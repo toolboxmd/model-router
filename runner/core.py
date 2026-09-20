@@ -685,10 +685,59 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
 
     job = get_job(state_dir, request_id)
     workspace = cwd or job["workspace"]
+    # Direction supply through the harness seam (ISSUE_30): the installed
+    # AgentsMD loader owns the block. The owned OpenCode server gets the
+    # verbatim block in its session input (runner); hook hosts record the
+    # hash without duplication (hook); a missing/failed loader records
+    # none with its reason and the job continues. Computed before the
+    # insert so every invocation row carries kit, supply, and hashes; the
+    # action key above stays on the original prompt (direction fields are
+    # extra keys the harness seam ignores), so retries keep one identity.
+    _dir_info: dict = {"ok": False, "block": None, "status": "gap",
+                       "reason": "loader missing"}
+    _dir_supply = "none"
+    _dir_hash: str | None = None
+    _kit_name: str | None = None
+    _kit_hash: str | None = None
+    _kit_skills: list = []
+    try:
+        from . import direction as _direction
+        _harness_name = getattr(harness, "name", None) or "opencode"
+        try:
+            _dir_info = _direction.load_direction(workspace, host=_harness_name)
+        except Exception:
+            _dir_info = {"ok": False, "block": None, "status": "gap",
+                         "reason": "loader failed: exception"}
+        _dir_supply = _direction.supply_for_harness(_harness_name, bool(_dir_info.get("ok")))
+        if bool(_dir_info.get("ok")) and _dir_info.get("block"):
+            _dir_hash = _direction.block_hash(_dir_info.get("block"))
+        _kit_name, _kit_hash, _kit_skills = _direction.kit_for_invocation(
+            route_name or (meta or {}).get("route"), stage_name)
+    except Exception:
+        pass
+    _meta_store = dict(meta or {})
+    # Supervisor re-reads the prompt plus the verbatim block from this row;
+    # the block stays in the private database (0600), never in public logs.
+    try:
+        if _dir_info.get("block"):
+            _meta_store["direction_block"] = _dir_info.get("block")
+    except Exception:
+        pass
+    _meta_store["direction_supply"] = _dir_supply
+    if _dir_hash:
+        _meta_store["direction_hash"] = _dir_hash
+    if _dir_info.get("status"):
+        _meta_store["direction_status"] = _dir_info.get("status")
+    if _dir_info.get("reason"):
+        _meta_store["direction_reason"] = _dir_info.get("reason")
+    if _kit_name:
+        _meta_store["kit"] = _kit_name
+    if _kit_hash:
+        _meta_store["kit_hash"] = _kit_hash
     # Key redaction cannot see inside free-text values (for example a
     # credential in the task prompt), so mask secret shapes as well. No
     # truncation: the supervisor re-reads this prompt from the ledger.
-    meta_json = json.dumps(_redact_meta(dict(meta or {})), sort_keys=True)
+    meta_json = json.dumps(_redact_meta(_meta_store), sort_keys=True)
     # One writer per job: any other live child (a different action from a
     # previous controller) is adopted by waiting, never run beside.
     _wait_other_invocations(state_dir, request_id, key)
@@ -721,20 +770,31 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             if reused is not None:
                 return reused
             raise OwnershipError(f"job {request_id}: action already has an attempt; run recover")
+        try:
+            _skills_json = json.dumps(_kit_skills, sort_keys=True)
+        except Exception:
+            _skills_json = "[]"
         con.execute(
             "INSERT INTO invocations("
             " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
             " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
             " state, task_json, timeout_secs, meta_json, action_key,"
-            " stage, requested_route, policy_version, reason, harness_version, schema_version"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?)",
+            " stage, requested_route, policy_version, reason, harness_version, schema_version,"
+            " kit, kit_hash, direction_supply, direction_reason, direction_hash,"
+            " direction_status, skills_json, tools_json"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,"
+            "?,?,?,?,?,?,?,?)",
             (invocation_id, request_id, kind, json.dumps(list(cmd)),
              workspace, owner_token, str(stdout_path), str(stderr_path),
              started_at, job.get("task_json"), int(timeout), meta_json, key,
              (meta or {}).get("stage") or harness.stage_for(kind),
              (meta or {}).get("route") or harness.default_route(kind, job),
              policy.POLICY_VERSION, (meta or {}).get("reason") or "initial",
-             harness.version(), store.SCHEMA_VERSION),
+             harness.version(), store.SCHEMA_VERSION,
+             _kit_name, _kit_hash, _dir_supply,
+             str(_dir_info.get("reason") or "") or None,
+             _dir_hash, str(_dir_info.get("status") or "gap"),
+             _skills_json, "[]"),
         )
         _event(con, request_id, "invocation_attempting",
                {"invocation_id": invocation_id[:16], "kind": kind})
@@ -1500,6 +1560,24 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
             longest = None
         if longest is not None and longest < 0:
             longest = None
+    tools: list = []
+    try:
+        if isinstance(result_obj, dict):
+            for container in (result_obj,
+                              result_obj.get("envelope") if isinstance(result_obj.get("envelope"), dict) else {}):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("tools_called", "tools"):
+                    val = container.get(key)
+                    if isinstance(val, list) and all(isinstance(v, str) for v in val):
+                        tools = sorted(set(tools) | set(val))
+                        break
+    except Exception:
+        pass
+    try:
+        tools_json = json.dumps(tools, sort_keys=True)
+    except Exception:
+        tools_json = "[]"
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -1508,10 +1586,18 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
             " observed_model=COALESCE(?, observed_model),"
             " observed_variant=COALESCE(?, observed_variant),"
             " native_ids_json=?, schema_version=?,"
-            " longest_silence_secs=COALESCE(?, longest_silence_secs) WHERE invocation_id=?",
+            " longest_silence_secs=COALESCE(?, longest_silence_secs),"
+            " tools_json=COALESCE(NULLIF(tools_json,'[]'), ?)"
+            " WHERE invocation_id=?",
             (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
              observed, variant, json.dumps(ids, sort_keys=True) if ids else None,
-             store.SCHEMA_VERSION, longest, invocation_id))
+             store.SCHEMA_VERSION, longest, tools_json, invocation_id))
+        # First measurement wins for tools when the row still holds the
+        # insert-time empty list; later measures keep observed tools.
+        con.execute(
+            "UPDATE invocations SET tools_json=? WHERE invocation_id=?"
+            " AND (tools_json IS NULL OR tools_json='[]')",
+            (tools_json, invocation_id))
         con.execute("COMMIT")
     except Exception:
         try:
@@ -1523,7 +1609,12 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
 
 
 def invocation_measurements(state_dir, request_id: str) -> list[dict]:
-    """Per-invocation measurements for ``status`` and ``result``."""
+    """Per-invocation measurements for ``status`` and ``result``.
+
+    Agent Observer mapping: kit identity and hash, supply mechanism
+    (hook, runner, none), hash of the supplied block, skills loaded, and
+    tools called, alongside the existing route, model, and usage fields.
+    """
     out = []
     for inv in _list_invocations(state_dir, request_id):
         try:
@@ -1534,6 +1625,27 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
             native_ids = json.loads(inv.get("native_ids_json") or "null")
         except ValueError:
             native_ids = None
+        try:
+            skills = json.loads(inv.get("skills_json") or "null")
+        except ValueError:
+            skills = None
+        if not isinstance(skills, list):
+            # Backfill from the kit row when the invocation predates the
+            # skills column: the kit's skills are what the session loaded.
+            skills = None
+            try:
+                from . import direction as _direction
+                _kn, _kh, _sk = _direction.kit_for_invocation(
+                    inv.get("requested_route"), inv.get("stage"))
+                skills = _sk
+            except Exception:
+                skills = []
+        try:
+            tools = json.loads(inv.get("tools_json") or "null")
+        except ValueError:
+            tools = None
+        if not isinstance(tools, list):
+            tools = []
         out.append({"invocation": inv["invocation_id"][:8], "kind": inv.get("kind"),
                     "stage": inv.get("stage"), "requested_route": inv.get("requested_route"),
                     "policy_version": inv.get("policy_version"), "reason": inv.get("reason"),
@@ -1545,7 +1657,13 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
                     "schema_version": inv.get("schema_version"),
                     "report_path": inv.get("report_path"), "started_at": inv.get("started_at"),
                     "ended_at": inv.get("ended_at"),
-                    "longest_silence_secs": inv.get("longest_silence_secs")})
+                    "longest_silence_secs": inv.get("longest_silence_secs"),
+                    "kit": inv.get("kit"), "kit_hash": inv.get("kit_hash"),
+                    "supply": inv.get("direction_supply"),
+                    "supply_reason": inv.get("direction_reason"),
+                    "direction_hash": inv.get("direction_hash"),
+                    "direction_status": inv.get("direction_status"),
+                    "skills_loaded": skills, "tools_called": tools})
     return out
 
 

@@ -690,8 +690,35 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
                 "opencode_session_id": saved}, saved, "opencode_session_id"
+    # Direction supply (ISSUE_30): the owned server has no working hook, so
+    # the runner prepends the loader's verbatim block (status, three files
+    # with hashes, core link, project AGENTS.md) or the three-file fallback
+    # when the loader is missing. Hook hosts never reach this drive path.
+    _final_prompt = meta.get("prompt") or ""
     try:
-        client.prompt_async(saved, meta.get("prompt") or "", model=model, variant=variant, agent=agent)
+        from . import direction as _direction
+        _stored_block = meta.get("direction_block")
+        if isinstance(_stored_block, str) and _stored_block:
+            _stored_payload = None
+            try:
+                import json as _json
+                _inner = _stored_block[len(_direction.BLOCK_START):-len(_direction.BLOCK_END)].strip()
+                _stored_payload = _json.loads(_inner)
+            except Exception:
+                _stored_payload = None
+            _din = {"ok": True, "block": _stored_block, "payload": _stored_payload,
+                    "status": meta.get("direction_status") or "ready",
+                    "reason": meta.get("direction_reason")}
+        else:
+            _din = {"ok": False, "block": None,
+                    "status": meta.get("direction_status") or "gap",
+                    "reason": meta.get("direction_reason") or "loader missing"}
+        _final_prompt, _supply_rec = _direction.session_input(
+            meta.get("prompt") or "", workspace, "opencode", _din)
+    except Exception:
+        pass
+    try:
+        client.prompt_async(saved, _final_prompt, model=model, variant=variant, agent=agent)
     except adapters.OpenCodeHTTPError as e:
         cls = harness.classify_signal(e)
         if cls == "overloaded":
@@ -940,6 +967,38 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     result["native_ids"] = {"session_id": saved,
                                             "assistant_message_ids": [(m.get("info") or {}).get("id") for m in new],
                                             "user_message_ids": user_ids}
+                    # Skills loaded and tools called (ISSUE_30): the kit's
+                    # skills are what the session may invoke; tools are the
+                    # distinct tool part names in this turn's assistant
+                    # messages (empty on the fake and on text-only turns).
+                    try:
+                        from . import direction as _direction2
+                        _rroute = meta.get("route") or ((job or {}).get("route") if isinstance(job, dict) else None)
+                        _rsize = meta.get("stage") or "implementation"
+                        _kn2, _kh2, _sk2 = _direction2.kit_for_invocation(_rroute, _rsize)
+                        result["skills_loaded"] = list(_sk2)
+                        result["kit"] = _kn2
+                        result["kit_hash"] = _kh2
+                    except Exception:
+                        pass
+                    _tools: set = set()
+                    try:
+                        for _m in new:
+                            for _p in (_m.get("parts") or []):
+                                if not isinstance(_p, dict):
+                                    continue
+                                if _p.get("type") != "tool":
+                                    continue
+                                for _k in ("name", "tool", "toolName", "function", "id"):
+                                    _v = _p.get(_k)
+                                    if isinstance(_v, str) and _v.strip():
+                                        _tools.add(_v.strip()[:120])
+                                        break
+                                else:
+                                    _tools.add("tool")
+                    except Exception:
+                        pass
+                    result["tools_called"] = sorted(_tools)
                     cls = harness.classify_signal(err) if err else None
                     if evidence:
                         # The session already ended idle with this error.
