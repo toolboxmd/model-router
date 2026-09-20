@@ -58,11 +58,8 @@ def _prepare_spawn(inv: dict, adapters):
         except ValueError:
             meta = {}
     kind = inv.get("kind") or "unknown"
-    env = adapters.child_harness_env()
-    generated_password = None
-    if kind in ("opencode_serve", "opencode_control"):
-        generated_password = adapters.generate_control_password()
-        env["OPENCODE_SERVER_PASSWORD"] = generated_password
+    from . import harnesses
+    env, generated_password = harnesses.harness_for(kind).spawn_spec(inv, adapters.child_harness_env())
     return (cmd, inv["stdout_path"], inv["stderr_path"], inv.get("workspace"), timeout_f,
             meta, kind, env, generated_password)
 
@@ -289,10 +286,12 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     except Exception:
         job = None
     control_result = None
+    from . import harnesses
+    harness = harnesses.harness_for(kind)
     try:
-        if kind == "opencode_control":
+        if harness.drives(kind):
             try:
-                control_result, captured_session, captured_kind = _drive_opencode_control(
+                control_result, captured_session, captured_kind = harness.drive(
                     state_dir, request_id, invocation_id, proc,
                     stdout_path, stderr_path, generated_password, meta, job,
                     deadline, workspace)
@@ -364,10 +363,8 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
             _persist_session(state_dir, request_id, invocation_id, sid, skind, job)
 
     envelope = control_result
-    if envelope is None and kind in ("codex_dispatch", "codex_resume"):
-        envelope = adapters.parse_codex_agent_envelope(
-            stdout_text, adapters.read_last_message_file(
-                adapters.last_message_path_from_cmd(cmd)))
+    if envelope is None:
+        envelope = harness.parse_report(kind, stdout_text, cmd)
 
     result = {
         "rc": rc,
@@ -379,8 +376,8 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     _finish(state_dir, invocation_id, request_id, rc, state,
             captured_session, captured_kind, extra_result=result)
 
-    if kind in ("opencode_serve", "opencode_control") and generated_password:
-        # Password stays out of DB/logs; drop local reference.
+    if generated_password:
+        # Secrets stay out of DB/logs; drop the local reference.
         generated_password = None
     return 0 if rc == 0 else int(rc or 1)
 
@@ -434,27 +431,89 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     "error": "opencode session create returned no id"}, None, None
     _persist_session(state_dir, request_id, invocation_id, saved,
                      "opencode_session_id", job)
-    allowance = meta.get("allowance") or "free"
-    model = meta.get("model") or adapters.opencode_model_for_allowance(allowance)
+    from . import harnesses as _harnesses
+    from . import policy as _policy_routes
+    harness = _harnesses.harness_named("opencode")
+    model = meta.get("model") or _policy_routes.opencode_route_params(
+        (job or {}).get("route") if isinstance(job, dict) else None)[0]
     # Variant and agent come from the route through the controller's meta;
     # a missing key keeps the legacy Muse defaults, an explicit None omits the
     # variant so the provider default applies.
     variant = meta["variant"] if "variant" in meta else adapters.OPENCODE_VARIANT
     agent = meta.get("agent") or adapters.OPENCODE_AGENT
     baseline = set()
-    for m in client.messages(saved):
-        info = m.get("info") if isinstance(m, dict) else None
-        if isinstance(info, dict) and info.get("id"):
-            baseline.add(info["id"])
+    try:
+        for m in client.messages(saved):
+            info = m.get("info") if isinstance(m, dict) else None
+            if isinstance(info, dict) and info.get("id"):
+                baseline.add(info["id"])
+    except adapters.OpenCodeHTTPError as e:
+        cls = harness.classify_signal(e)
+        if cls == "overloaded":
+            result = {"opencode_session_id": saved, "model": model,
+                      "variant": variant, "agent": agent, "ok": False,
+                      "rc": 4, "signal": "overloaded",
+                      "signal_evidence": {"source": "transport",
+                                          "status": e.status,
+                                          "body": (e.body or "")[:500]},
+                      "error": f"transport HTTP {e.status}"}
+            try:
+                client.abort(saved)
+            except Exception:
+                pass
+            try:
+                idle = client.wait_idle(saved, timeout=30.0)
+            except Exception as ie:  # noqa: BLE001
+                idle = {"idle": False, "error": f"{type(ie).__name__}: {str(ie)[:200]}"}
+            result["idle_confirmed"] = bool(idle.get("idle"))
+            result["idle_status"] = adapters.redact_nested(idle.get("status"))
+            return result, saved, "opencode_session_id"
+        return ({"ok": False, "rc": 1, "opencode_session_id": saved,
+                 "signal": cls,
+                 "error": f"transport HTTP {e.status}"}, saved, "opencode_session_id")
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
                 "opencode_session_id": saved}, saved, "opencode_session_id"
-    client.prompt_async(saved, meta.get("prompt") or "", model=model, variant=variant, agent=agent)
+    try:
+        client.prompt_async(saved, meta.get("prompt") or "", model=model, variant=variant, agent=agent)
+    except adapters.OpenCodeHTTPError as e:
+        cls = harness.classify_signal(e)
+        if cls == "overloaded":
+            result = {"opencode_session_id": saved, "model": model,
+                      "variant": variant, "agent": agent, "ok": False,
+                      "rc": 4, "signal": "overloaded",
+                      "signal_evidence": {"source": "transport",
+                                          "status": e.status,
+                                          "body": (e.body or "")[:500]},
+                      "error": f"transport HTTP {e.status}"}
+            try:
+                client.abort(saved)
+            except Exception:
+                pass
+            try:
+                idle = client.wait_idle(saved, timeout=30.0)
+            except Exception as ie:  # noqa: BLE001
+                idle = {"idle": False, "error": f"{type(ie).__name__}: {str(ie)[:200]}"}
+            result["idle_confirmed"] = bool(idle.get("idle"))
+            result["idle_status"] = adapters.redact_nested(idle.get("status"))
+            return result, saved, "opencode_session_id"
+        return ({"ok": False, "rc": 1, "opencode_session_id": saved,
+                 "signal": cls,
+                 "error": f"transport HTTP {e.status}"}, saved, "opencode_session_id")
     result = {"opencode_session_id": saved, "model": model,
               "variant": variant, "agent": agent,
               "ok": False}
     prompted_at = time.monotonic()
     seen_active = False
+    from . import policy as _policy
+    overload_spec = _policy.SIGNAL_CLASSES["overloaded"]
+    overload_first = None
+    overload_attempts = 0
+    # One attempt per retry episode: entering a retry status, or the
+    # provider reporting a new attempt number. Polling the same retry
+    # status must never count again.
+    prev_was_retry = False
+    prev_attempt = None
 
     def abort_and_confirm():
         try:
@@ -476,7 +535,24 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         if proc.poll() is not None:
             result.update(rc=1, error="opencode serve exited during the turn")
             break
-        status = client.session_status(saved)
+        try:
+            status = client.session_status(saved)
+        except adapters.OpenCodeHTTPError as e:
+            cls = harness.classify_signal(e)
+            if cls == "overloaded":
+                result.update(rc=4, signal="overloaded",
+                              signal_evidence={"source": "transport",
+                                               "status": e.status,
+                                               "body": (e.body or "")[:500]},
+                              error=f"transport HTTP {e.status}")
+                abort_and_confirm()
+                break
+            result.update(rc=1, signal=cls,
+                          signal_evidence={"source": "transport",
+                                           "status": e.status},
+                          error=f"transport HTTP {e.status}")
+            abort_and_confirm()
+            break
         evidence = adapters.trusted_free_exhaustion(status=status)
         if evidence:
             result.update(rc=3, quota=True, free_exhaustion_evidence=evidence)
@@ -487,8 +563,84 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             seen_active = True
             if typ == "retry":
                 result["last_retry"] = adapters.redact_nested(status)
+                cls = harness.classify_signal(status)
+                if cls == "exhausted":
+                    # Exhaustion on a paid pool (for example GoUsageLimitError):
+                    # zero retries, abort, confirm idle, let the controller move pools.
+                    result.update(rc=3, quota=True, signal="exhausted",
+                                  signal_evidence=adapters.redact_nested(status),
+                                  error="provider allowance exhausted")
+                    abort_and_confirm()
+                    break
+                if cls == "overloaded":
+                    # The provider retries on its own; allow the policy's bounded
+                    # attempts and window, with the provider's `next` hint
+                    # capped at `next_cap_secs`, then abort and move family.
+                    # One attempt per retry episode: entering retry, or the
+                    # provider reporting a new attempt number. Re-polling the
+                    # same retry status never counts again.
+                    overload_first = overload_first or time.monotonic()
+                    try:
+                        reported = int(status.get("attempt") or 0)
+                    except (TypeError, ValueError):
+                        reported = 0
+                    if (not prev_was_retry) or (reported != prev_attempt):
+                        overload_attempts += 1
+                    prev_was_retry = True
+                    prev_attempt = reported
+                    next_raw, next_capped = harness.capped_retry_next(status)
+                    result["last_retry_next"] = next_raw
+                    result["last_retry_next_capped"] = next_capped
+                    result["overload_retries"] = overload_attempts
+                    result["overload_elapsed"] = time.monotonic() - overload_first
+                    if overload_attempts > overload_spec["retries"] \
+                            or time.monotonic() - overload_first > overload_spec["window_secs"] \
+                            or next_raw > float(overload_spec.get("next_cap_secs", 20)):
+                        result.update(rc=4, signal="overloaded",
+                                      signal_evidence=adapters.redact_nested(status),
+                                      error="provider overloaded")
+                        abort_and_confirm()
+                        break
+                elif cls == "hard":
+                    result.update(rc=1, signal="hard",
+                                  signal_evidence=adapters.redact_nested(status),
+                                  error="hard provider error")
+                    abort_and_confirm()
+                    break
+                else:
+                    # A retry without a known signal is still a retry: stay
+                    # in the episode so a later overloaded poll in the same
+                    # block does not count as a new attempt.
+                    try:
+                        prev_attempt = int(status.get("attempt") or 0)
+                    except (TypeError, ValueError):
+                        prev_attempt = 0
+                    prev_was_retry = True
+            else:
+                # Busy is active but not a retry: the next retry is a new episode.
+                prev_was_retry = False
+                prev_attempt = None
         else:
-            new = adapters.assistant_messages_after(client.messages(saved), baseline)
+            # Idle (or another non-busy status) ends the retry episode: the
+            # next retry is a new attempt.
+            prev_was_retry = False
+            prev_attempt = None
+            try:
+                _msgs = client.messages(saved)
+            except adapters.OpenCodeHTTPError as e:
+                cls = harness.classify_signal(e)
+                if cls == "overloaded":
+                    result.update(rc=4, signal="overloaded",
+                                  signal_evidence={"source": "transport",
+                                                   "status": e.status,
+                                                   "body": (e.body or "")[:500]},
+                                  error=f"transport HTTP {e.status}")
+                    abort_and_confirm()
+                    break
+                result.update(rc=1, signal=cls, error=f"transport HTTP {e.status}")
+                abort_and_confirm()
+                break
+            new = adapters.assistant_messages_after(_msgs, baseline)
             if new:
                 last = new[-1]
                 info = last.get("info") or {}
@@ -496,19 +648,58 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     err = info.get("error")
                     evidence = adapters.trusted_free_exhaustion(message_error=err)
                     texts = [adapters.message_text(m) for m in new]
+                    # The full worker text is kept: worker.txt must hold the
+                    # complete report, not a truncated tail.
                     result["assistant_text"] = next(
-                        (t for t in reversed(texts) if t.strip()), "")[-8000:]
+                        (t for t in reversed(texts) if t.strip()), "")
                     result["finish"] = info.get("finish")
                     result["assistant_messages"] = len(new)
                     result["actual_model"] = {"providerID": info.get("providerID"),
                                               "modelID": info.get("modelID"),
                                               "variant": info.get("variant")}
+                    # Counters verbatim per assistant message, never folded,
+                    # plus the native message identities for deduplication.
+                    try:
+                        all_msgs = client.messages(saved)
+                    except adapters.OpenCodeHTTPError as e:
+                        cls = harness.classify_signal(e)
+                        if cls == "overloaded":
+                            result.update(rc=4, signal="overloaded",
+                                          signal_evidence={"source": "transport",
+                                                           "status": e.status},
+                                          error=f"transport HTTP {e.status}")
+                            abort_and_confirm()
+                            break
+                        result.update(rc=1, signal=cls, error=f"transport HTTP {e.status}")
+                        abort_and_confirm()
+                        break
+                    user_ids = [m["info"].get("id") for m in all_msgs
+                                if isinstance(m, dict) and isinstance(m.get("info"), dict)
+                                and m["info"].get("role") == "user"
+                                and m["info"].get("id") not in baseline]
+                    result["usage"] = {"source": "opencode", "messages": [
+                        {"id": (m.get("info") or {}).get("id"),
+                         "tokens": (m.get("info") or {}).get("tokens"),
+                         "cost": (m.get("info") or {}).get("cost")} for m in new]}
+                    result["native_ids"] = {"session_id": saved,
+                                            "assistant_message_ids": [(m.get("info") or {}).get("id") for m in new],
+                                            "user_message_ids": user_ids}
+                    cls = harness.classify_signal(err) if err else None
                     if evidence:
                         # The session already ended idle with this error.
-                        result.update(rc=3, quota=True, free_exhaustion_evidence=evidence,
-                                      idle_confirmed=True)
+                        result.update(rc=3, quota=True, signal="exhausted",
+                                      free_exhaustion_evidence=evidence,
+                                      signal_evidence=evidence, idle_confirmed=True)
+                    elif cls == "exhausted":
+                        result.update(rc=3, quota=True, signal="exhausted",
+                                      signal_evidence=adapters.redact_nested(err),
+                                      error=adapters.redact_nested(err), idle_confirmed=True)
+                    elif cls == "overloaded":
+                        result.update(rc=4, signal="overloaded",
+                                      signal_evidence=adapters.redact_nested(err),
+                                      error=adapters.redact_nested(err), idle_confirmed=True)
                     elif err:
-                        result.update(rc=1, error=adapters.redact_nested(err))
+                        result.update(rc=1, signal=cls, error=adapters.redact_nested(err))
                     else:
                         result.update(rc=0, ok=True)
                     break
@@ -523,7 +714,9 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         time.sleep(1.0)
     summary = {k: result.get(k) for k in (
         "opencode_session_id", "ok", "rc", "quota", "idle_confirmed", "finish",
-        "actual_model", "error", "free_exhaustion_evidence", "assistant_text",
+        "actual_model", "error", "free_exhaustion_evidence", "signal", "signal_evidence",
+        "usage", "native_ids", "assistant_text", "last_retry_next",
+        "last_retry_next_capped", "overload_retries",
         "assistant_messages", "model", "variant", "agent")}
     try:
         with open(stdout_path, "a", encoding="utf-8") as f:
@@ -542,26 +735,20 @@ def _persist_session(state_dir, request_id, invocation_id, sid, skind, job) -> N
             "UPDATE invocations SET session_id=?, session_kind=? WHERE invocation_id=?",
             (sid, skind, invocation_id),
         )
-        kind_row = con.execute("SELECT kind FROM invocations WHERE invocation_id=?",
+        kind_row = con.execute("SELECT kind, meta_json FROM invocations WHERE invocation_id=?",
                                (invocation_id,)).fetchone()
         inv_kind = kind_row["kind"] if kind_row is not None else None
-        if skind == "codex_task_id" and inv_kind == "codex_dispatch":
-            # Only the dispatch turn names the Luna task, and never twice.
-            # A resume reporting another thread is recorded on its own row.
-            con.execute(
-                "UPDATE jobs SET codex_task_id=COALESCE(codex_task_id, ?), adapter='codex',"
-                " model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, core._utcnow(), request_id),
-            )
-        elif skind == "opencode_session_id":
-            row = con.execute("SELECT route FROM jobs WHERE request_id=?",
-                              (request_id,)).fetchone()
-            route = (row["route"] if row is not None else None) or "muse-spark-xhigh-free"
-            r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
-            con.execute(
-                "UPDATE jobs SET opencode_session_id=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, r_model, r_variant or "default", core._utcnow(), request_id),
-            )
+        try:
+            inv_meta = json.loads(kind_row["meta_json"] or "{}") if kind_row is not None else {}
+        except ValueError:
+            inv_meta = {}
+        job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        # Only the dispatch turn names the dispatcher task, and never twice;
+        # a resume reporting another thread is recorded on its own row.
+        from . import harnesses
+        harnesses.harness_for(inv_kind).record_session(
+            con, request_id, sid, skind, inv_kind, dict(job_row) if job_row is not None else None,
+            inv_meta, core._utcnow())
         core._event(con, request_id, "invocation_session_captured",
                     {"invocation_id": invocation_id[:16],
                      "session_kind": skind, "session": sid[:24]})

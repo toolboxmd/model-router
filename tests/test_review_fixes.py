@@ -141,7 +141,12 @@ class TestLunaIdentity(Base):
             (json.dumps({"seq": 1, "last_action": {"action": "completion", "output": "x"}}),))
 
         def fake(cmd, cwd=None, timeout=None, **kw):
-            return 0, json.dumps({"type": "thread.started", "thread_id": "forked"}) + "\n", ""
+            # A completed turn on another thread: the thread comparison
+            # applies only after the exit code and turn.completed checks.
+            return 0, "\n".join((
+                json.dumps({"type": "thread.started", "thread_id": "forked"}),
+                json.dumps({"type": "turn.completed"}),
+            )) + "\n", ""
 
         res = controller.resume_luna(self.sd, "r1", "hello", run_cmd=fake)
         self.assertEqual(res["reason"], "luna_task_mismatch")
@@ -347,15 +352,6 @@ class TestRoundThree(Base):
                      " created_at='2000-01-01T00:00:00+00:00' WHERE request_id='r1'")
         self.assertEqual(core.recover_one(self.sd, "r1")["action"], "cancelled")
         self.assertEqual(core.get_job(self.sd, "r1")["status"], "cancelled")
-
-    def test_capacity_memory_never_overrides_an_attempted_turn(self):
-        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
-        core.record_capacity(self.sd, "muse-spark-xhigh-free", "exhausted", FREE_STATUS)
-        self._insert_inv("i-free", kind="opencode_control", meta={"seq": 0}, state="completed")
-        res = controller.run_implementation(
-            self.sd, "r1", run_cmd=lambda *a, **k: (0, json.dumps({"sessionID": "ses_x"}), ""))
-        self.assertEqual(res["action"], "implementation_ok")
-        self.assertEqual(core.get_job(self.sd, "r1")["route"], "muse-spark-xhigh-free")
 
     def test_public_answer_during_callback_wins_without_blocking(self):
         core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")

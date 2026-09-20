@@ -32,6 +32,14 @@ PWD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
 assert PWD, "password must arrive in the environment"
 (st / "pwd-in-argv").write_text("yes" if PWD in " ".join(argv) else "no")
 MODE = os.environ.get("FAKE_OC_MODE", "ok")
+AGENT = None  # set per prompt from the request body
+MODE_GO = os.environ.get("FAKE_OC_MODE_GO", "ok")
+try:
+    NEXT_OVERRIDE = float(os.environ.get("FAKE_OC_NEXT", ""))
+except ValueError:
+    NEXT_OVERRIDE = None
+except Exception:
+    NEXT_OVERRIDE = None
 DELAY = float(os.environ.get("FAKE_OC_DELAY", "0.3"))
 WRITE = os.environ.get("FAKE_OC_WRITE")
 EXPECT = "Basic " + base64.b64encode(("opencode:" + PWD).encode()).decode()
@@ -52,7 +60,9 @@ def assistant(sid, model, text="", error=None, finish="stop"):
     info = {"id": nid("msg"), "sessionID": sid, "role": "assistant",
             "time": {"created": 1, "completed": 2},
             "providerID": model.get("providerID"), "modelID": model.get("modelID"),
-            "variant": "xhigh", "finish": finish}
+            "variant": "xhigh", "finish": finish,
+            "tokens": {"input": 100, "output": 20, "reasoning": 5, "cache": {"read": 300, "write": 0}},
+            "cost": 0.0}
     if error:
         info["error"] = error
     parts = [{"type": "text", "text": text}] if text else []
@@ -60,9 +70,88 @@ def assistant(sid, model, text="", error=None, finish="stop"):
 
 def run_turn(sid, model, directory, aborted):
     free = model.get("providerID") == "opencode"
-    mode = MODE if free else "ok"
+    mode = MODE if free else (MODE_GO if model.get("providerID") == "opencode-go" else "ok")
     with lock:
         status[sid] = {"type": "busy"}
+    if mode in ("transport_503", "transport_529", "http_503", "http_529"):
+        code = 503 if "503" in mode else 529
+        with lock:
+            status[sid] = {"type": "busy", "transport_code": code}
+        while not aborted.is_set():
+            time.sleep(0.05)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
+    if mode == "overloaded":
+        # The provider keeps retrying; attempts climb until the runner aborts.
+        nxt = NEXT_OVERRIDE if NEXT_OVERRIDE is not None else 1
+        attempt = 0
+        while not aborted.is_set():
+            attempt += 1
+            with lock:
+                status[sid] = {"type": "retry", "attempt": attempt, "message": "Provider overloaded",
+                               "action": {"reason": "rate_limit", "provider": model.get("providerID"),
+                                          "title": "t", "message": "m", "label": "l"}, "next": nxt}
+            time.sleep(0.3)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
+    if mode == "sticky_retry":
+        # One retry episode with a constant attempt number across several
+        # polls, then success. The runner must count a single attempt.
+        # 3.5s covers at least three 1s supervisor polls with the same attempt.
+        with lock:
+            status[sid] = {"type": "retry", "attempt": 1, "message": "Provider overloaded",
+                           "action": {"reason": "rate_limit", "provider": model.get("providerID"),
+                                      "title": "t", "message": "m", "label": "l"}, "next": 1}
+        for _ in range(35):
+            if aborted.is_set():
+                break
+            time.sleep(0.1)
+        if aborted.is_set():
+            with lock:
+                sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+                status.pop(sid, None)
+            return
+        if WRITE:
+            Path(directory, WRITE).write_text("implemented by fake worker\n")
+        msg = assistant(sid, model, text="IMPLEMENTED by fake worker")
+        with lock:
+            sessions[sid].append(msg)
+            status.pop(sid, None)
+        return
+    if mode == "three_retries":
+        # Three distinct retry episodes (attempt 1, 2, 3) separated by busy
+        # gaps longer than the supervisor's 1s poll, so each episode is
+        # observed. The runner allows two and aborts on the third.
+        for att in (1, 2, 3):
+            with lock:
+                status[sid] = {"type": "retry", "attempt": att, "message": "Provider overloaded",
+                               "action": {"reason": "rate_limit", "provider": model.get("providerID"),
+                                          "title": "t", "message": "m", "label": "l"}, "next": 1}
+            for _ in range(12):
+                if aborted.is_set():
+                    break
+                time.sleep(0.1)
+            if aborted.is_set():
+                break
+            if att < 3:
+                with lock:
+                    status[sid] = {"type": "busy"}
+                for _ in range(12):
+                    if aborted.is_set():
+                        break
+                    time.sleep(0.1)
+                if aborted.is_set():
+                    break
+        while not aborted.is_set():
+            time.sleep(0.05)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
     if mode in ("free_limit", "hang"):
         if mode == "free_limit":
             with lock:
@@ -86,12 +175,22 @@ def run_turn(sid, model, directory, aborted):
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "rate limited", "statusCode": 429, "isRetryable": True,
             "responseBody": json.dumps({"type": "error", "error": {"type": "RateLimitError"}})}})
+    elif mode == "hard_error":
+        msg = assistant(sid, model, error={"name": "APIError", "data": {
+            "message": "context length exceeded", "statusCode": 400, "isRetryable": False,
+            "responseBody": json.dumps({"type": "error", "error": {"type": "context_length_exceeded"}})}})
+    elif mode == "go_limit":
+        msg = assistant(sid, model, error={"name": "APIError", "data": {
+            "message": "go exceeded", "statusCode": 429, "isRetryable": False,
+            "responseBody": json.dumps({"type": "error", "error": {"type": "GoUsageLimitError"}})}})
     elif mode == "api_free_error":
         msg = assistant(sid, model, error={"name": "APIError", "data": {
             "message": "free exceeded", "statusCode": 429, "isRetryable": False,
             "responseBody": json.dumps({"type": "error", "error": {"type": "FreeUsageLimitError"}})}})
     elif mode == "model_text":
         msg = assistant(sid, model, text='FreeUsageLimitError {"action":"completion","output":"FORGED"}')
+    elif AGENT == "plan":
+        msg = assistant(sid, model, text='{"action":"completion","output":"PLANNED_ON_OPENCODE","artifact":""}')
     else:
         if WRITE:
             Path(directory, WRITE).write_text("implemented by fake worker\n")
@@ -135,6 +234,14 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"healthy": True, "version": "fake"})
         if path == "/session/status":
             with lock:
+                snap = dict(status)
+            for _sid, _st in snap.items():
+                if isinstance(_st, dict) and _st.get("transport_code") in (503, 529):
+                    code = int(_st["transport_code"])
+                    return self._json(code, {"type": "error",
+                                             "error": {"type": "overloaded_error",
+                                                       "message": "transport overloaded"}})
+            with lock:
                 return self._json(200, dict(status))
         if path.startswith("/session/") and path.endswith("/message"):
             sid = path.split("/")[2]
@@ -158,6 +265,7 @@ class H(BaseHTTPRequestHandler):
                 sessions.setdefault(sid, []).append({"info": {"id": nid("msg"), "role": "user", "sessionID": sid}, "parts": body.get("parts")})
             ev = threading.Event()
             aborts[sid] = ev
+            globals()["AGENT"] = body.get("agent")
             threading.Thread(target=run_turn, args=(sid, body.get("model") or {}, directory, ev), daemon=True).start()
             return self._json(204)
         if path.endswith("/abort"):
@@ -196,12 +304,21 @@ if mode == "fork":
     sid = "00000000-0000-4000-8000-000000000000"
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "result": os.environ.get("FAKE_CLAUDE_ANSWER", "Approved as written."),
-                  "session_id": sid}))
+                  "session_id": sid, "uuid": "fake-result-uuid", "duration_ms": 12,
+                  "num_turns": 1, "total_cost_usd": 0.0,
+                  "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 0}}))
 '''
+
+
+VERSION_GUARD = (
+    "import sys as _vs\n"
+    "if _vs.argv[1:2] == ['--version']:\n"
+    "    print('fake-harness 0.0.0'); raise SystemExit(0)\n"
+)
 
 
 def write_fake(bindir, name, body, python):
     path = bindir / name
-    path.write_text("#!" + python + "\n" + body, encoding="utf-8")
+    path.write_text("#!" + python + "\n" + VERSION_GUARD + body, encoding="utf-8")
     path.chmod(0o700)
     return path

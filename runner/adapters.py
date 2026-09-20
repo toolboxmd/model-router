@@ -5,8 +5,7 @@
 - Claude planner: ``claude --resume SID --output-format json --tools ""``
   on the exact saved session; the result must come from that session.
 - Implementation: an owned ``opencode serve`` per turn, driven through
-  :class:`OpenCodeClient`. ``build_opencode_cmd`` (``opencode run``) is kept
-  as a deterministic test seam only.
+  :class:`OpenCodeClient` by the OpenCode harness.
 """
 from __future__ import annotations
 
@@ -50,10 +49,6 @@ OPENCODE_FREE_MODEL = _MUSE_FREE["model"]
 OPENCODE_GO_MODEL = _MUSE_GO["model"]
 OPENCODE_VARIANT = _MUSE_FREE["variant"]
 OPENCODE_AGENT = _MUSE_FREE.get("agent") or "build"
-# Back-compat aliases: old single-model/effort names now map to the
-# free route. New code uses FREE/GO models + variant.
-OPENCODE_MODEL = OPENCODE_FREE_MODEL
-OPENCODE_EFFORT = OPENCODE_VARIANT
 
 # Explicit structured-action protocol embedded in every Luna prompt.
 # Luna must reply with exactly one JSON envelope as its final message.
@@ -473,70 +468,8 @@ def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
     return _policy.opencode_route_params(route)
 
 
-def opencode_model_for_allowance(allowance: str) -> str:
-    """Map a durable allowance to the installed provider/model route."""
-    if allowance == "free":
-        return OPENCODE_FREE_MODEL
-    if allowance == "go-included":
-        return OPENCODE_GO_MODEL
-    raise ValueError(f"unsupported allowance: {allowance!r}")
 
 
-def build_opencode_cmd(workspace: str, prompt: str,
-                       model: str | None = None,
-                       effort: str | None = None,
-                       allowance: str = "free",
-                       variant: str = OPENCODE_VARIANT,
-                       agent: str = OPENCODE_AGENT,
-                       session_id: str | None = None) -> list[str]:
-    """Default implementation command using the installed CLI contract.
-
-    ``opencode run --format json --pure --dir WS
-    --model opencode/muse-spark-1.3-contributor-free --variant xhigh
-    --agent build <prompt>`` free-first; Go uses
-    ``opencode-go/muse-spark-1.3-contributor`` only after exact free
-    exhaustion. ``allowance`` always selects the model route unless an
-    explicit non-default ``model`` is given. ``session_id`` adds
-    ``--session`` to resume the saved OpenCode session. Never emits
-    nonexistent ``--effort`` or ``--cd``.
-    """
-    if not workspace:
-        raise ValueError("missing workspace for opencode run")
-    if allowance not in ("free", "go-included", "xai-subscription"):
-        raise ValueError(f"unsupported allowance: {allowance!r}")
-    if allowance == "xai-subscription" and not (model or "").startswith("xai/"):
-        raise ValueError("allowance xai-subscription requires an xai/* model")
-    # Back-compat: old callers passed model=muse-spark-... and
-    # effort=xhigh positionally. Map them onto the provider-shaped route.
-    if effort is not None and effort != OPENCODE_VARIANT:
-        # Old --effort values map to --variant; only xhigh is supported.
-        if effort in ("xhigh", "max", "high", "medium", "low"):
-            variant = effort if effort == "xhigh" else OPENCODE_VARIANT
-        else:
-            raise ValueError(f"unsupported variant: {effort!r}")
-    if model is None or model in (OPENCODE_MODEL, "muse-spark-1.3-contributor",
-                                  OPENCODE_FREE_MODEL, OPENCODE_GO_MODEL):
-        # Allowance drives the route for default/legacy model spellings.
-        resolved = opencode_model_for_allowance(allowance)
-        # An explicit Go model spelling always wins (never downgrade).
-        if model == OPENCODE_GO_MODEL:
-            resolved = OPENCODE_GO_MODEL
-        model = resolved
-    elif allowance == "go-included" and "opencode-go/" not in model:
-        raise ValueError(
-            f"allowance go-included requires an opencode-go/* model, got {model!r}")
-    cmd = [OPENCODE_BIN, "run",
-           "--format", "json",
-           "--pure",
-           "--dir", workspace,
-           "--model", model]
-    if variant:  # None means the provider default
-        cmd += ["--variant", variant]
-    cmd += ["--agent", agent]
-    if session_id:
-        cmd += ["--session", session_id]
-    cmd += [prompt]
-    return cmd
 
 
 def build_luna_prompt(task_json_text: str, extra: str = "") -> str:
@@ -558,7 +491,12 @@ def is_planner_busy(output_text: str) -> bool:
 
 
 def redact_nested(obj):
-    """Recursively redact secret-bearing keys; never log credentials."""
+    """Recursively redact secret-bearing keys and free-text secret shapes.
+
+    Key-based redaction cannot see inside free-text values (for example
+    ``class=password=hunter2``), so every string also passes through
+    :func:`redact_text` before it is persisted or forwarded.
+    """
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -572,9 +510,39 @@ def redact_nested(obj):
         return out
     if isinstance(obj, list):
         return [redact_nested(v) for v in obj]
-    if isinstance(obj, str) and len(obj) > 4000:
-        return obj[:4000] + "...<truncated>"
+    if isinstance(obj, str):
+        masked = redact_text(obj)
+        if len(masked) > 4000:
+            return masked[:4000] + "...<truncated>"
+        return masked
     return obj
+
+
+def redact_text(text: str) -> str:
+    """Best-effort redaction of credential-like substrings in free text.
+
+    Worker prose and proof output are model- or command-authored and can
+    echo secrets. Structured key redaction cannot see inside them, so mask
+    common secret shapes before persisting or forwarding the text.
+    """
+    import re as _re
+
+    if not isinstance(text, str) or not text:
+        return text
+    redacted = text
+    # k=v style secrets: password=..., secret: ..., api_key=..., token=...
+    redacted = _re.sub(
+        r"(?i)(password|secret|passwd|api[_-]?key|apikey|credential|auth[_-]?token|access[_-]?token"
+        r"|authorization|cookie|set-cookie)\s*[:=]\s*\S+",
+        r"\1=<redacted>", redacted)
+    redacted = _re.sub(r"(?i)Bearer\s+\S+", "Bearer <redacted>", redacted)
+    redacted = _re.sub(r"(?i)Basic\s+[A-Za-z0-9+/=]{8,}", "Basic <redacted>", redacted)
+    redacted = _re.sub(r"sk-[A-Za-z0-9\-_]{8,}", "sk-<redacted>", redacted)
+    redacted = _re.sub(r"gh[pousr]_[A-Za-z0-9]{8,}", "gh-<redacted>", redacted)
+    redacted = _re.sub(r"xox[bap]-" r"[A-Za-z0-9\-]+", "xox-<redacted>", redacted)
+    redacted = _re.sub(r"AKIA[0-9A-Z]{16}", "AKIA<redacted>", redacted)
+    redacted = _re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----", "-----BEGIN <redacted> PRIVATE KEY-----", redacted)
+    return redacted
 
 
 def generate_control_password(nbytes: int = 24) -> str:
@@ -758,12 +726,24 @@ class OpenCodeClient:
 
     def wait_idle(self, session_id: str, timeout: float = 30.0,
                   interval: float = 0.5) -> dict:
-        """Poll until the saved session is idle. Returns the last status."""
+        """Poll until the saved session is idle. Returns the last status.
+
+        Transport HTTP errors (for example 503/529 while the provider is
+        overloaded) count as not-idle and are waited through until the
+        timeout; only an idle status confirms."""
         import time as _time
         end = _time.monotonic() + max(0.0, timeout)
-        last = {"type": "unknown"}
+        last: dict = {"type": "unknown"}
         while True:
-            last = self.session_status(session_id)
+            try:
+                last = self.session_status(session_id)
+            except OpenCodeHTTPError as e:
+                last = {"type": "transport_error", "status": e.status,
+                        "body": (e.body or "")[:500]}
+                if _time.monotonic() >= end:
+                    return {"idle": False, "status": last}
+                _time.sleep(interval)
+                continue
             if last.get("type") == "idle":
                 return {"idle": True, "status": last}
             if _time.monotonic() >= end:

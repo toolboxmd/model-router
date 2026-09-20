@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from tests.fakes import VERSION_GUARD  # noqa: E402
 
 from runner import core, store  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
@@ -137,7 +138,8 @@ class TestPublicLoopProof(unittest.TestCase):
         for name, body in (("codex", FAKE_CODEX), ("claude", FAKE_CLAUDE),
                            ("opencode", FAKE_OPENCODE)):
             p = fake_bin / name
-            p.write_text(body, encoding="utf-8")
+            shebang, _, rest = body.partition("\n")
+            p.write_text(shebang + "\n" + VERSION_GUARD + rest, encoding="utf-8")
             os.chmod(p, 0o755)
         env = dict(os.environ)
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
@@ -297,6 +299,9 @@ class TestPublicLoopProof(unittest.TestCase):
         thread_id = "crash-repro-thread-001"
 
         fake_codex = '''#!/usr/bin/env python3
+import sys as _vs
+if _vs.argv[1:2] == ['--version']:
+    print('fake-harness 0.0.0'); raise SystemExit(0)
 import json, os, time
 from pathlib import Path
 p = Path(os.environ["CRASH_REPRO_CALLS"])
@@ -431,6 +436,9 @@ time.sleep(60)
         thread_id = "cancel-repro-thread-001"
 
         fake_codex = '''#!/usr/bin/env python3
+import sys as _vs
+if _vs.argv[1:2] == ['--version']:
+    print('fake-harness 0.0.0'); raise SystemExit(0)
 import json, os, time
 from pathlib import Path
 p = Path(os.environ["CRASH_REPRO_CALLS"])

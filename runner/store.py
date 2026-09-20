@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   error_class TEXT,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0,
-  max_attempts INTEGER NOT NULL DEFAULT 3,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
   timeout_secs INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -53,14 +53,20 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_error_json TEXT,
   planner_cwd TEXT,
   owner_start TEXT,
-  lane TEXT
+  lane TEXT,
+  job_kind TEXT,
+  replay_of TEXT,
+  planner_harness TEXT,
+  base_commit TEXT,
+  head_commit TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL,
   ts TEXT NOT NULL,
   kind TEXT NOT NULL,
-  payload_json TEXT NOT NULL
+  payload_json TEXT NOT NULL,
+  schema_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS launches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,14 +127,31 @@ CREATE TABLE IF NOT EXISTS invocations (
   timeout_secs INTEGER,
   meta_json TEXT,
   supervisor_start TEXT,
-  action_key TEXT
+  action_key TEXT,
+  stage TEXT,
+  requested_route TEXT,
+  policy_version TEXT,
+  reason TEXT,
+  terminal_class TEXT,
+  harness_version TEXT,
+  usage_json TEXT,
+  observed_model TEXT,
+  observed_variant TEXT,
+  elapsed_secs REAL,
+  native_ids_json TEXT,
+  report_path TEXT,
+  schema_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS capacity (
-  route TEXT PRIMARY KEY,
+  route TEXT NOT NULL,
   state TEXT NOT NULL,
   evidence_json TEXT,
   reset_at TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  pool TEXT NOT NULL,
+  model TEXT NOT NULL,
+  window TEXT NOT NULL,
+  PRIMARY KEY (pool, model, window)
 );
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
@@ -137,6 +160,10 @@ CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_request ON invocations(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_state ON invocations(state);
 """
+
+# Ledger contract version for events and invocations; Agent Observer reads
+# the ledger directly and checks this before importing.
+SCHEMA_VERSION = 2
 
 TERMINAL = ("succeeded", "failed", "cancelled")
 ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked", "cancelling")
@@ -184,9 +211,12 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     first = not db.exists()
     con = sqlite3.connect(str(db), timeout=10.0, isolation_level=None)
     con.row_factory = sqlite3.Row
-    # Concurrent first connections may race on WAL setup; retry briefly.
+    # Concurrent first connections race on WAL setup while writers hold the
+    # lock; wait up to the same 10 seconds as the busy timeout, not a fixed
+    # count of short sleeps that a loaded machine can exhaust.
     last_err = None
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    while True:
         try:
             con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA synchronous=NORMAL;")
@@ -195,11 +225,9 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
             break
         except sqlite3.OperationalError as e:
             last_err = e
-            if "locked" not in str(e).lower():
-                raise
+            if "locked" not in str(e).lower() or time.monotonic() >= deadline:
+                raise last_err
             time.sleep(0.05)
-    else:
-        raise last_err or sqlite3.OperationalError("database locked during setup")
     # Lightweight migration for DBs created before owner lease columns.
     cols = {r["name"] for r in con.execute("PRAGMA table_info(jobs)").fetchall()}
     if "owner_token" not in cols:
@@ -219,9 +247,85 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("planner_cwd", "TEXT"),
         ("owner_start", "TEXT"),
         ("lane", "TEXT"),
+        ("job_kind", "TEXT"),
+        ("replay_of", "TEXT"),
+        ("planner_harness", "TEXT"),
+        ("base_commit", "TEXT"),
+        ("head_commit", "TEXT"),
     ):
         if _col not in cols:
             _add_column(con, "jobs", _col, _ddl)
+    ev_cols = {r["name"] for r in con.execute("PRAGMA table_info(events)").fetchall()}
+    if "schema_version" not in ev_cols:
+        _add_column(con, "events", "schema_version", "INTEGER")
+    cap_cols = {r["name"] for r in con.execute("PRAGMA table_info(capacity)").fetchall()}
+    for _col in ("pool", "model", "window"):
+        if _col not in cap_cols:
+            _add_column(con, "capacity", _col, "TEXT")
+    # Migrate pre-v2 capacity keyed by route to the (pool, model, window)
+    # key. Go 5-hour, weekly, and monthly windows coexist; a route PK
+    # would overwrite them.
+    try:
+        _cap_sql_row = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='capacity'"
+        ).fetchone()
+    except Exception:
+        _cap_sql_row = None
+    _cap_sql = _cap_sql_row["sql"] if _cap_sql_row is not None and _cap_sql_row["sql"] else ""
+    if "PRIMARY KEY (pool" not in _cap_sql:
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS capacity_new ("
+                " route TEXT NOT NULL,"
+                " state TEXT NOT NULL,"
+                " evidence_json TEXT,"
+                " reset_at TEXT,"
+                " updated_at TEXT NOT NULL,"
+                " pool TEXT NOT NULL,"
+                " model TEXT NOT NULL,"
+                " window TEXT NOT NULL,"
+                " PRIMARY KEY (pool, model, window))"
+            )
+            try:
+                from . import policy as _cap_policy
+            except Exception:
+                _cap_policy = None
+            for _r in con.execute("SELECT * FROM capacity").fetchall():
+                try:
+                    _d = dict(_r)
+                except Exception:
+                    continue
+                _route = _d.get("route") or ""
+                _pool = _d.get("pool")
+                _model = _d.get("model")
+                _window = _d.get("window")
+                if (_pool is None or _model is None) and _cap_policy is not None:
+                    try:
+                        _spec = _cap_policy.ROUTES.get(_route) or {}
+                    except Exception:
+                        _spec = {}
+                    _pool = _pool or _spec.get("pool") or "unknown"
+                    _model = _model or _spec.get("model") or _route or "unknown"
+                _pool = _pool or "unknown"
+                _model = _model or (_route or "unknown")
+                _window = _window or ("cooldown" if _d.get("state") == "degraded" else "unknown")
+                con.execute(
+                    "INSERT OR IGNORE INTO capacity_new"
+                    "(route, state, evidence_json, reset_at, updated_at, pool, model, window)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (_route, _d.get("state") or "unknown", _d.get("evidence_json"),
+                     _d.get("reset_at"), _d.get("updated_at") or "",
+                     _pool, _model, _window),
+                )
+            con.execute("DROP TABLE capacity")
+            con.execute("ALTER TABLE capacity_new RENAME TO capacity")
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
     inv_cols = {r["name"] for r in con.execute("PRAGMA table_info(invocations)").fetchall()}
     for _col, _ddl in (
         ("process_start", "TEXT"),
@@ -233,6 +337,19 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("meta_json", "TEXT"),
         ("supervisor_start", "TEXT"),
         ("action_key", "TEXT"),
+        ("stage", "TEXT"),
+        ("requested_route", "TEXT"),
+        ("policy_version", "TEXT"),
+        ("reason", "TEXT"),
+        ("terminal_class", "TEXT"),
+        ("harness_version", "TEXT"),
+        ("usage_json", "TEXT"),
+        ("observed_model", "TEXT"),
+        ("observed_variant", "TEXT"),
+        ("elapsed_secs", "REAL"),
+        ("native_ids_json", "TEXT"),
+        ("report_path", "TEXT"),
+        ("schema_version", "INTEGER"),
     ):
         if _col not in inv_cols:
             _add_column(con, "invocations", _col, _ddl)
@@ -284,6 +401,11 @@ def append_text(path: Path, text: str) -> None:
 
 def output_path_for(root: Path, request_id: str) -> Path:
     return root / "outputs" / f"{request_id}.log"
+
+
+def job_dir_for(root: Path, request_id: str) -> Path:
+    """Per-job directory holding turn reports, proof logs, and diffs."""
+    return root / "outputs" / request_id
 
 
 def result_path_for(root: Path, request_id: str) -> Path:

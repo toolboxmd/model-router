@@ -39,7 +39,7 @@ class PolicyData(unittest.TestCase):
 
     def test_scarce_models_get_one_turn(self):
         self.assertEqual({r for r in policy.ROUTES if policy.one_turn_per_job(r)},
-                         {"glm-5.3-go", "kimi-k3-go", "deepseek-v4-pro-go", "grok-4.6-go"})
+                         {"glm-5.3-go", "kimi-k3-go", "deepseek-v4-pro-go", "grok-4.6-go", "luna-go/max"})
         self.assertTrue(policy.ROUTES["kimi-k3-go"]["one_turn_per_job"])
         self.assertTrue(policy.one_turn_routes_used("kimi-k3-go", {"kimi-k3-go": 1}))
         self.assertFalse(policy.one_turn_routes_used("kimi-k3-go", {}))
@@ -59,7 +59,8 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(s["implementation_hard"]["routes"][-1], "grok-4.6-xai")
         self.assertEqual(s["correction"]["routes"], ["kimi-k2.7-code-go"])
         self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-xai"])
-        self.assertEqual(s["dispatch"]["routes"], ["luna/max"])
+        self.assertEqual(s["dispatch"]["routes"], ["luna/max", "luna-go/max"])
+        self.assertEqual(policy.ROUTES["luna-go/max"]["agent"], "plan")
         self.assertEqual(s["critical"]["executor"], "planner")
         self.assertEqual(s["critical"]["routes"], [])
         self.assertEqual(policy.ROUTES["luna/max"]["sandbox"], "read-only")

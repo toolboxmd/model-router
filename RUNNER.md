@@ -16,10 +16,11 @@ versioned route policy. It cannot grant new authority.
 python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
   --workspace PATH --planner-session SID [--planner-cwd PATH] \
   [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
-  [--timeout-secs S] [--start | --no-start]
+  [--timeout-secs S] [--job-kind ordinary|experiment|replay] [--replay-of ID] \
+  [--planner-harness claude] [--start | --no-start]
 python -m runner --state-dir DIR start --request-id ID
 python -m runner --state-dir DIR status --request-id ID
-python -m runner --state-dir DIR questions --request-id ID [--all]
+python -m runner --state-dir DIR questions --request-id ID [--all | --clear QID]
 python -m runner --state-dir DIR answer --request-id ID --qid Q --answer TEXT
 python -m runner --state-dir DIR cancel --request-id ID
 python -m runner --state-dir DIR recover (--request-id ID | --all)
@@ -44,10 +45,12 @@ the planner session, then submit the remainder. `--start` launches a detached
 controller after the commit. `--planner-cwd` is the directory where the
 planner session was started, because Claude stores sessions per project
 directory; it defaults to the workspace.
-
-`launch`, `post-question`, `complete`, and `fail` are worker-internal helpers
-used by the offline lease tests. A worker-reported failure never changes the
-route or capacity memory.
+`--job-kind` is `ordinary`, `experiment`, or `replay`; a replay names the
+request it repeats with `--replay-of`. `--planner-harness` names the harness
+hosting the planner session; only `claude` is implemented. The task JSON may
+carry an optional `links` array of `{"rel": "...", "href": "..."}` objects
+(references for the worker, kept verbatim in the stored task); it changes no
+routing and needs no runner flag.
 
 `capacity` lists remembered route capacity with its original provider
 evidence. `--clear ROUTE` is an operator action after checking the provider
@@ -80,7 +83,34 @@ allowance; the runner never invents a reset time.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
 but cannot edit. The controller runs at most 12 transitions per launch and
-then blocks with a reason instead of spinning.
+then blocks with `controller_step_budget_exhausted`; `recover` restarts such
+a job with a fresh launch budget. A job blocked only by
+`controller_step_budget_exhausted` therefore continues via `recover`.
+A job budget of 48 transitions across all
+launches blocks with `job_step_budget_exhausted`, which stays blocked.
+The default attempt budget is 5 controller launches, so five 12-step
+launches cover the 48-step job budget before launch-budget exhaustion.
+
+Escalation ladder. A turn fails when the worker or provider errors (not a
+capacity signal, which moves routes instead; hard errors end the turn as
+`implementation_failed` for this ladder) or when the task's own proof
+command exits non-zero. The first failure leads to a correction in the same
+worker session on the same route. The second leads to a fresh correction on
+the correction stage's route (Kimi K2.7 Code). The third is the single
+escalation to the recovery stage (Grok 4.6 on Go, then on the xAI
+subscription if Go is exhausted; that pool move is not a second escalation).
+A fourth failure ends the job as `failed` with `ESCALATION_EXHAUSTED` and
+the turn reports listed in `result`, which is the planner's to act on. A
+failed turn does not block the job: the dispatcher receives the report and
+decides; the runner enforces the ceiling.
+
+A stored answer is reused only when the stored prompt matches the
+dispatcher's prompt; a reused `qid` with a different prompt blocks with
+`planner_question_conflict`, cleared by `questions --clear QID` or by the
+dispatcher using a new qid. When the live planner callback fails or reports
+another session after the question was answered publicly through `answer`,
+the stored public answer wins. A resume that fails before `thread.started`
+records `codex_resume_failed` with its exit code, as recovery does.
 
 Before resuming the planner, the runner also waits up to 30 seconds for the
 session transcript to be unchanged for 5 seconds; a planner still writing
@@ -107,21 +137,38 @@ The supervisor polls `GET /session/status` for that session only and reads
 the new assistant messages when it is idle. The server group stops after
 every turn.
 
-Free to Go needs trusted provider evidence for the owned session:
+Provider signals are classified from structured evidence only, never from
+model-authored text:
 
-- a `retry` status with `action.reason` `free_tier_limit` and
-  `action.provider` `opencode`, or
-- an assistant `APIError` whose provider `responseBody` names
-  `FreeUsageLimitError`.
+- exhausted: a `retry` status with reason `free_tier_limit`, or an
+  `APIError` whose provider `responseBody` names `FreeUsageLimitError`,
+  `GoUsageLimitError`, or `insufficient_quota`. Zero retries: the session is
+  aborted and confirmed idle, the route is remembered exhausted with its
+  evidence and any trusted reset time, and the job moves the same model to
+  the next pool where the route declares one (free Muse to Go Muse, Go Grok
+  to xAI Grok); other Go routes (`glm-5.3-go`, `qwen3.8-flash-go`,
+  `minimax-m3-go`, `kimi-k3-go`, `deepseek-v4-pro-go` have no `next_pool`)
+  move to the next model family in their lane.
+- overloaded: a `retry` status with reason `overloaded`, `rate_limit`, or
+  `account_rate_limit`, an `APIError` naming `RateLimitError`,
+  `rate_limit_exceeded`, or `overloaded_error`, or transport HTTP 503 or 529.
+  The provider's own retries are allowed for at most 2 attempts inside 45
+  seconds with `next` capped at 20 seconds (a `next` larger than the cap
+  aborts instead of waiting); then the session is aborted and
+  confirmed idle, the route rests for 15 minutes (`degraded` with a cooldown
+  end), and the job moves to the next model family in its lane. The same
+  family on another pool is not a lateral move.
+- hard: `context_length_exceeded`, auth, region, and consent errors end the
+  turn as `implementation_failed` for the ladder; they never move routes.
 
-On status evidence the session is aborted and confirmed idle before the
-route changes. The same session then continues on
-`opencode-go/muse-spark-1.3-contributor` with the same effort. Exhausted free
-capacity is remembered across jobs, with its original evidence, until a
-trusted reset time passes or an operator clears it; an unknown reset stays
-unknown. Model-authored text, generic 429,
-`account_rate_limit`, timeouts, consent, region, and auth errors never
-change the route. Zen balance overflow and direct paid APIs are disabled.
+Before a turn starts, a route the capacity memory knows as exhausted or
+resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`)
+without a child. No eligible route left in the lane blocks the job with
+`capacity_exhausted`. The `capacity` command lists remembered routes with
+pool, model, window, state, evidence, and reset time; `--clear ROUTE` is an
+operator action after checking the provider. Reset times come only from
+provider evidence or the documented cooldown; an unknown reset stays
+unknown. Zen balance overflow and direct paid APIs are disabled.
 
 ## Process ownership
 
@@ -228,11 +275,44 @@ that completed before `recover` ran keeps its result. A timeout finalizes as
 
 ## State
 
+Each worker turn writes `outputs/<request_id>/turn-<seq>/` (retries on the
+same seq use `turn-<seq>-1`, ... so no turn overwrites another):
+`report.json` (route, policy version, observed model and variant as separate
+fields, session, changed files, proof command and exit code, tokens verbatim
+with a source label including reasoning and cache read and write, native
+message identities, blockers, a redacted worker summary), `proof.log` (the
+redacted output of the task's own `proof` command, run by the runner in the
+workspace), `diff.patch` (`git diff HEAD` plus untracked files, or a note
+when the workspace is not a checkout), and `worker.txt` (the worker's full
+text, redacted). Harness-reported worker questions travel in the report's
+blockers (redacted), never as live questions; the implementation harness
+denies question permission, so blockers are typically empty. The dispatcher's resume message carries these paths and the
+structured fields (route, policy version, models, variants, status, tokens,
+native identities) instead of the worker's prose.
+
+Every invocation records its stage, requested route, policy version, route
+reason, harness version, elapsed time, terminal class (completed, failed,
+crashed, cancelled, timeout, quota, overloaded, hard_error), usage counters
+verbatim under a source label, the observed model and the observed variant as
+separate fields, and native identities (Codex thread and turn ids, Claude
+session and result ids with the callback's prompt digest, OpenCode session
+and message ids). Jobs record their kind (`ordinary`, `experiment`, `replay`
+with `--replay-of`), the planner harness (only `claude`), the workspace
+commit at submit (`base_commit`) and completion (`head_commit`), and the
+optional task `links`. Events and invocations carry `schema_version` 2;
+Agent Observer reads this ledger directly. `status` and `result` show the
+measurements including native identities, variants, and schema versions;
+`status` keeps the redacted error evidence (signal, evidence, retry counts
+and caps) so CLI readers need not query the database directly;
+`result` also lists the turn reports.
+
 `--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is made absolute and is
 `0700`. Detached controllers and supervisors start from the package
 directory, so the CLI works from any working directory. `jobs.db` (SQLite,
 WAL), `outputs/*`, and `workers/*.json` are `0600`. Passwords and credentials are never written to the
-database, events, or logs.
+database, events, or logs; worker text, proof output, error evidence, and
+report errors are redacted for secret keys and free-text secret shapes
+before they are persisted or forwarded.
 
 States: `pending -> running <-> question_pending -> succeeded | failed |
 cancelled`, with `cancelling` while children stop; the last stored stop
@@ -242,6 +322,25 @@ reports, the completion report, and child output stay in the private
 database and output files. It does show Luna's planner questions and block
 reasons, which can include redacted provider or exception text. `result` prints the full terminal result on
 request.
+
+## Harness seam
+
+`runner/harnesses.py` defines the seam between the runner and the harnesses
+that execute turns. A `Harness` base class declares the interface; `CodexCLI`,
+`ClaudeCLI`, and `OpenCodeServer` are the concrete adapters. A registry holds
+one instance per harness with lookup helpers: `HARNESSES` by name, `harness_for`
+by invocation kind, `harness_named` by name, and `kind_for_cmd` from a command
+line. A harness provides spawn specs, session and report parsing, provider
+signal classification, and usage measurement; the core and supervisor call
+these methods instead of branching on invocation kind. Each harness declares
+its capabilities, and each policy stage declares the capabilities it needs.
+`route_capability_blocker(route, stage)` names any capability the route's
+harness lacks; a dispatch then fails with `RunnerError("route_capability_mismatch: ...")`
+before any child starts. Dispatch has one fallback route: when the Codex CLI
+dispatch route cannot start a task, the controller dispatches Luna on OpenCode
+Go (`luna-go/max`, agent `plan`, one turn per job) through the owned OpenCode
+server (`_dispatch_on_opencode` in `runner/controller.py`). Later turns resume
+that OpenCode session while the saved dispatch route stays OpenCode.
 
 ## Policy
 
@@ -253,7 +352,8 @@ usage windows, signal classes, and provenance. The Codex skill reference
 test keeps the two equal; `policy.main(['validate'])` checks the data.
 
 Stages in order: planning (Fable 5.1 in Claude Code, Sonnet medium only as
-the explicit live-test override), dispatch (Luna max on Codex, read-only),
+the explicit live-test override), dispatch (Luna max on Codex read-only
+first; `luna-go/max` on Go in OpenCode plan mode as the recorded fallback),
 the implementation lanes default, small, and hard, critical
 (planner-executed), correction (Kimi K2.7 Code after the same session), recovery
 (Grok 4.6 on Go then on the xAI subscription), ticket review (Luna max), and
@@ -262,16 +362,18 @@ free, Go, xAI; subscription logins only. Older generations of pooled models
 are never routes; $15-per-month Go models get one turn per job. Every route in
 the policy has an adapter today; the OpenCode adapter takes model, variant,
 and agent from the route. Go Luna as a dispatch fallback arrives with the
-adapter seam.
+adapter seam. Changing a stage's harness or model is a policy edit; adding a
+role needs a policy row plus a report contract.
 
 Signal classes are defined in the policy and applied by later work: exhaustion
 (`free_tier_limit`, `FreeUsageLimitError`, `GoUsageLimitError`,
-`insufficient_quota`) moves the same model to the next pool; overload
+`insufficient_quota`) moves the same model to the next pool where the route
+declares one (free Muse to Go Muse, Go Grok to xAI Grok), otherwise to the
+next family; overload
 (`overloaded`, `rate_limit`, `account_rate_limit`, HTTP 503 and 529) moves to
-the next family after a bounded retry window; hard errors block. In this
-version the controller still moves only free Muse to Go on exact free
-exhaustion evidence; the legacy `opencode run` test seam supports the free and
-Go Muse routes only.
+the next family after a bounded retry window; hard errors end the turn as
+`implementation_failed` for the ladder and never move routes. The controller
+applies them on the owned-server path, driven through the harness seam.
 
 ## Verification
 
