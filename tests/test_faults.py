@@ -875,7 +875,10 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
                                  in ("succeeded", "failed", "blocked"), 25))
         job = core.get_job(self.sd, "ib1")
         self.assertEqual(job["status"], "succeeded", job.get("block_reason"))
-        self.assertEqual(len(self._lines("claude.log")), 1, "the planner is asked once")
+        lines = self._lines("claude.log")
+        self.assertEqual(len(lines), 2,
+                         "one compact plus one planner callback")
+        self.assertEqual(sum("/compact" in line for line in lines), 1)
         qs = core.list_questions(self.sd, "ib1", only_pending=False)
         self.assertEqual([(q["qid"], q["status"], q["answer"]) for q in qs],
                          [("q1", "answered", "Descending.")])

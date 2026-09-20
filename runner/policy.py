@@ -18,11 +18,11 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.3.0"
+POLICY_VERSION = "2.4.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
-                 "and #34 (usage probes, 2026-09-20)")
+                 "#34 (usage probes, 2026-09-20), and #38 (planner handoff, 2026-09-20)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -101,6 +101,25 @@ PROBE_INTERVAL_SECS = {"codex": CODEX_PROBE_INTERVAL_SECS,
 # assumed with error-driven cool-off, while the monthly billing call
 # reports provider data.
 ZEN_FREE_ASSUMED_REQUESTS = 50
+
+# Planner handoff (toolboxmd/model-router#38). After the planner submits a
+# job, its session is compacted around that job, so a callback hours later
+# resumes a small context instead of re-reading the whole planning
+# conversation at cold-cache prices. The job also carries a durable handoff
+# summary, so a callback can be answered from the ledger alone, including
+# by the Astra fallback planner in a fresh session with no resume.
+# Verified 2026-09-20: `claude -p --resume <sid> "/compact <focus>"`
+# returns local_command compact and persists the summary in the transcript.
+COMPACT_FOCUS_TEMPLATE = (
+    "job {request_id} (Issue {issue}): keep the decisions and the "
+    "proof command, drop the planning noise. "
+    "Decisions: {decisions}. Proof: {proof}. Summary: {summary}"
+)
+# One flag per planner harness: the Claude planner session compacts
+# headlessly after submit with --start; the Astra fallback on the Codex
+# harness never compacts and instead answers from the stored handoff
+# summary in a fresh session with no resume.
+COMPACT_ON_SUBMIT = {"claude": True, "codex": False}
 
 # Worker pools in preference order, then the two host pools.
 POOLS = {
@@ -1239,6 +1258,34 @@ def probe_delay_secs(failures: int) -> float:
                      PROBE_MAX_DELAY_SECS))
 
 
+def compact_enabled(harness: str | None) -> bool:
+    """True when this planner harness compacts after submit with --start.
+
+    The Claude planner session compacts headlessly; the Astra fallback on
+    the Codex harness never compacts and answers from the stored handoff
+    summary in a fresh session with no resume. Unknown harnesses never
+    compact: the job still proceeds, only without a compacted session.
+    """
+    return bool(COMPACT_ON_SUBMIT.get(harness or ""))
+
+
+def compact_focus(request_id: str, issue: str = "", decisions: str = "",
+                  proof: str = "", summary: str = "") -> str:
+    """Focus instruction for the headless post-submit compaction.
+
+    Names the job (request id, Issue, decisions, proof command) so the
+    resumed session keeps the decisions and drops the planning noise.
+    Missing fields render as `-` so the template never fails to format.
+    """
+    def _clean(value) -> str:
+        text = str(value or "").strip()
+        return text if text else "-"
+    return COMPACT_FOCUS_TEMPLATE.format(
+        request_id=_clean(request_id), issue=_clean(issue),
+        decisions=_clean(decisions), proof=_clean(proof),
+        summary=_clean(summary))
+
+
 def next_implementation_route(current: str, error) -> str | None:
     """Same model on the next pool, only on exact exhaustion evidence."""
     validate_route(current)
@@ -1312,6 +1359,27 @@ def validate_policy() -> list[str]:
         problems.append("ASSUMED_WINDOW_DEFAULT must name a window in WINDOW_SECS")
     if not (0 < PROBE_FIRST_DELAY_SECS <= PROBE_MAX_DELAY_SECS):
         problems.append("probe schedule must start positive and cap at or above the start")
+    if not isinstance(COMPACT_FOCUS_TEMPLATE, str) or "{request_id}" not in COMPACT_FOCUS_TEMPLATE:
+        problems.append("COMPACT_FOCUS_TEMPLATE must name the job request id")
+    for _token in ("{issue}", "{decisions}", "{proof}", "{summary}"):
+        if _token not in COMPACT_FOCUS_TEMPLATE:
+            problems.append(f"COMPACT_FOCUS_TEMPLATE must carry {_token}")
+    try:
+        _probe_focus = compact_focus("r-probe", issue="i", decisions="d", proof="p", summary="s")
+    except Exception as _e:  # noqa: BLE001
+        problems.append(f"COMPACT_FOCUS_TEMPLATE does not format: {_e}")
+    else:
+        for _need in ("r-probe", "i", "d", "p", "s"):
+            if _need not in _probe_focus:
+                problems.append("compact_focus must carry request id, Issue, decisions, proof, and summary")
+                break
+    if not isinstance(COMPACT_ON_SUBMIT, dict):
+        problems.append("COMPACT_ON_SUBMIT must map each planner harness to a flag")
+    else:
+        if COMPACT_ON_SUBMIT.get("claude") is not True:
+            problems.append("COMPACT_ON_SUBMIT must compact the claude planner harness")
+        if COMPACT_ON_SUBMIT.get("codex") is not False:
+            problems.append("COMPACT_ON_SUBMIT must leave the codex (Astra fallback) harness uncompacted")
     if ROUTES.get("muse-spark-xhigh-free", {}).get("max_concurrent") is not None:
         problems.append("muse-spark-xhigh-free: must carry no concurrency cap "
                         "(parallel Muse free sessions by design)")
@@ -1543,6 +1611,18 @@ def render_skill_table() -> str:
         "- One escalation per job; afterwards evidence returns to the planner. No "
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",
+        "- After a successful submit with `--start`, the Claude planner session "
+        "compacts headlessly around the job (`claude -p --resume <sid> "
+        "\"/compact <focus>\"`, focus from `COMPACT_FOCUS_TEMPLATE` naming the "
+        "request id, Issue, decisions, and proof command), recorded as a "
+        "`claude_compact` invocation with elapsed time and usage; a compact "
+        "failure is recorded and never blocks the job, and `COMPACT_ON_SUBMIT` "
+        "leaves the Codex (Astra fallback) harness uncompacted. Every callback "
+        "prompt carries the stored handoff summary before the question, and its "
+        "`claude_callback` invocation records input, cache-read, and "
+        "cache-creation tokens so the saving is visible per job; the Astra "
+        "fallback answers from the handoff summary in a fresh session with no "
+        "resume.",
         "- Record the policy version, the requested and observed route, and any "
         "override or escalation in the existing handoff. Instructions describe "
         "the policy and its required evidence.",

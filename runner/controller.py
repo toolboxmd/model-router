@@ -553,6 +553,12 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     question = ("The runner dispatcher for your submitted request "
                 f"{request_id} asks (question {qid}):\n{prompt}\n\n"
                 "Answer briefly with the decision only. Do not run tools.")
+    summary = (job.get("handoff_summary") or "").strip()
+    if summary:
+        # The durable handoff summary travels before the question so the
+        # resumed (possibly compacted) session answers from the ledger,
+        # and the Astra fallback can answer from this prompt alone.
+        question = (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n" + question)
     try:
         cmd = adapters.build_claude_cmd(planner_session, question,
                                          model=planner_model, effort=planner_effort)
@@ -597,6 +603,21 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     except core.ConflictError:
         pass  # answered publicly meanwhile: the stored answer wins
     return {"action": "answered", "qid": qid}
+
+
+def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> str:
+    """Prompt for the Astra fallback planner in a fresh session, no resume.
+
+    The Codex-harness Astra fallback never compacts and never resumes the
+    Claude planner session: it answers from the job's durable handoff
+    summary carried before the dispatcher's question. Run it as a fresh
+    Astra turn and persist the answer with ``answer`` plus ``recover``.
+    """
+    job = core.get_job(state_dir, request_id)
+    summary = (job.get("handoff_summary") or "").strip() or "-"
+    return (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n"
+            f"The runner dispatcher asks (question {qid}):\n{prompt}\n\n"
+            "Answer briefly with the decision only. Do not run tools.")
 
 
 def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,

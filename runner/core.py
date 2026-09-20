@@ -1667,6 +1667,84 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
     return out
 
 
+def _derive_handoff_summary(task, request_id: str,
+                            handoff_summary: str | None = None) -> str:
+    """Durable handoff summary stored on the job.
+
+    An explicit summary wins; a task packet carrying ``handoff_summary``
+    is next; otherwise the summary is derived from the packet's Issue,
+    decisions, proof command, and goal so a callback can be answered from
+    the ledger alone, including by the Astra fallback in a fresh session.
+    Free-text secrets are masked before persisting.
+    """
+    if isinstance(handoff_summary, str) and handoff_summary.strip():
+        return adapters.redact_text(handoff_summary.strip())
+    obj = None
+    if isinstance(task, dict):
+        obj = task
+    elif isinstance(task, str):
+        try:
+            obj = json.loads(task)
+        except ValueError:
+            obj = None
+    if isinstance(obj, dict):
+        explicit = obj.get("handoff_summary")
+        if isinstance(explicit, str) and explicit.strip():
+            return adapters.redact_text(explicit.strip())
+        issue = obj.get("issue", obj.get("issue_id", obj.get("github_issue", "")))
+        decisions = obj.get("decisions", obj.get("decision", obj.get("notes", "")))
+        proof = obj.get("proof", obj.get("proof_command", ""))
+        goal = obj.get("goal", obj.get("objective", obj.get("task", "")))
+        parts = [f"request {request_id}"]
+        if isinstance(issue, (str, int)) and str(issue).strip():
+            parts.append(f"Issue {str(issue).strip()}")
+        if isinstance(goal, str) and goal.strip():
+            parts.append(f"goal: {goal.strip()}")
+        if isinstance(decisions, str) and decisions.strip():
+            parts.append(f"decisions: {decisions.strip()}")
+        elif isinstance(decisions, list) and decisions:
+            parts.append("decisions: " + "; ".join(str(d) for d in decisions))
+        if isinstance(proof, str) and proof.strip():
+            parts.append(f"proof: {proof.strip()}")
+        if len(parts) > 1:
+            return adapters.redact_text("\n".join(parts))
+    try:
+        canonical = _canonical_task(task)
+    except Exception:
+        canonical = str(task)
+    return adapters.redact_text(canonical)
+
+
+def _compact_task_fields(task_json: str) -> tuple[str, str, str]:
+    """(issue, decisions, proof) extracted from the stored task packet."""
+    try:
+        obj = json.loads(task_json or "null")
+    except ValueError:
+        return "", "", ""
+    if not isinstance(obj, dict):
+        return "", "", ""
+    def _str(*keys) -> str:
+        for key in keys:
+            val = obj.get(key)
+            if isinstance(val, (str, int)) and str(val).strip():
+                return str(val).strip()
+            if isinstance(val, list) and val:
+                return "; ".join(str(v) for v in val)
+        return ""
+    return (_str("issue", "issue_id", "github_issue", "number"),
+            _str("decisions", "decision", "notes"),
+            _str("proof", "proof_command"))
+
+
+def compact_focus_for_job(job: dict) -> str:
+    """Focus instruction for this job from policy data and the packet."""
+    issue, decisions, proof = _compact_task_fields(job.get("task_json") or "")
+    return policy.compact_focus(
+        str(job.get("request_id") or ""), issue=issue,
+        decisions=decisions, proof=proof,
+        summary=str(job.get("handoff_summary") or ""))
+
+
 def submit(state_dir, request_id: str, task, workspace: str,
            planner_session_id: str, route: str | None = None,
            policy_id: str | None = None, max_attempts: int = 5,
@@ -1676,13 +1754,16 @@ def submit(state_dir, request_id: str, task, workspace: str,
            planner_cwd: str | None = None,
            lane: str | None = None,
            job_kind: str = "ordinary", replay_of: str | None = None,
-           planner_harness: str = "claude") -> dict:
+           planner_harness: str = "claude",
+           handoff_summary: str | None = None) -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Built-in defaults mean no executor/callback commands are required:
     only the prepared task, workspace, stable request ID, and original
     planner session ID are needed. Planner model/effort default to the
-    policy's planning route and may be overridden explicitly.
+    policy's planning route and may be overridden explicitly. The handoff
+    summary is stored on the job (explicit argument wins, else derived
+    from the task packet) so a callback prompt can carry it.
     """
     _validate_request_id(request_id)
     if not planner_session_id:
@@ -1741,6 +1822,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
     planner_effort = planner_effort or _pe_default
     task_json = _canonical_task(task)
     thash = _task_hash(task_json)
+    summary = _derive_handoff_summary(task, request_id, handoff_summary)
     pcwd = _canonical_workspace(planner_cwd, must_exist=False) if planner_cwd else ws
     root = store.ensure_state_dir(state_dir)
     out_path = str(store.output_path_for(root, request_id))
@@ -1794,12 +1876,42 @@ def submit(state_dir, request_id: str, task, workspace: str,
                     existing["job_kind"] != job_kind or existing["replay_of"] != replay_of
                     or existing["planner_harness"] != planner_harness):
                 same = False
+            try:
+                _hs = existing["handoff_summary"]
+            except Exception:
+                _hs = None
+            if _hs is not None and _hs != summary:
+                same = False
             # An explicit route that differs is a different payload; a sticky
             # resubmission with the same payload returns the stored job.
             if explicit_route is not None and existing["route"] != explicit_route:
                 same = False
             con.execute("ROLLBACK")
             if same:
+                # Pre-#38 rows store NULL: backfill the derived summary so
+                # later callbacks carry HANDOFF SUMMARY.
+                if _hs is None and summary:
+                    try:
+                        _con2 = store.connect(state_dir)
+                        try:
+                            _con2.execute("BEGIN IMMEDIATE")
+                            _con2.execute(
+                                "UPDATE jobs SET handoff_summary=?, updated_at=? WHERE request_id=?",
+                                (summary, _utcnow(), request_id))
+                            _con2.execute("COMMIT")
+                        except Exception:
+                            try:
+                                _con2.execute("ROLLBACK")
+                            except Exception:
+                                pass
+                        finally:
+                            _con2.close()
+                    except Exception:
+                        pass
+                    try:
+                        return get_job(state_dir, request_id)
+                    except Exception:
+                        return _row_to_job(existing)
                 return _row_to_job(existing)
             raise ConflictError(f"request ID {request_id!r} already used with a different payload")
         # New request: sticky-home selection inside the same write
@@ -1876,15 +1988,15 @@ def submit(state_dir, request_id: str, task, workspace: str,
             "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,planner_session_id,"
             "executor_session_id,output_path,status,route,cancel_requested,attempts,max_attempts,timeout_secs,created_at,"
             "updated_at,planner_model,planner_effort,adapter,model,effort,planner_cwd,lane,"
-            "job_kind,replay_of,planner_harness,base_commit)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "job_kind,replay_of,planner_harness,base_commit,handoff_summary)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
               policy.worker_model_variant(route)[0],
               policy.worker_model_variant(route)[1] or "default", pcwd, lane_stage,
-             job_kind, replay_of, planner_harness, base_commit),
+             job_kind, replay_of, planner_harness, base_commit, summary),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
@@ -1911,6 +2023,153 @@ def submit(state_dir, request_id: str, task, workspace: str,
     return get_job(state_dir, request_id)
 
 
+def _default_compact_run(cmd: list[str], cwd: str | None = None,
+                           timeout: int | None = None, **_kwargs) -> tuple[int, str, str]:
+    """Direct subprocess run for the headless compact turn (stdlib only)."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout or 900, cwd=cwd or None,
+                              stdin=subprocess.DEVNULL)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except FileNotFoundError as e:
+        return 127, "", f"command not found: {e}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timeout"
+    except OSError as e:
+        return 127, "", f"spawn failed: {e}"
+
+
+def compact_planner_session(state_dir, request_id: str, run_cmd=None) -> dict:
+    """Compact the planner session headlessly after submit with --start.
+
+    Runs ``claude -p --resume SID "/compact <focus>"`` with the policy
+    focus template naming the job (request id, Issue, decisions, proof
+    command), recorded as a ``claude_compact`` invocation with elapsed
+    time and usage. A compact failure is recorded and never blocks the
+    job. One compact per job: a second call reuses the first attempt.
+    No compaction when the policy flag for the planner harness is off.
+    """
+    job = get_job(state_dir, request_id)
+    harness_name = job.get("planner_harness") or "claude"
+    if not policy.compact_enabled(harness_name):
+        return {"action": "skipped", "reason": "compact_disabled"}
+    planner_session = job.get("planner_session_id")
+    if not planner_session:
+        return {"action": "skipped", "reason": "missing_planner_session"}
+    prior = [i for i in _list_invocations(state_dir, request_id)
+             if i.get("kind") == harnesses.KIND_CLAUDE_COMPACT
+             and i.get("state") != "abandoned"]
+    if prior:
+        return {"action": "already-compacted",
+                "invocation": prior[-1]["invocation_id"][:8]}
+    focus = compact_focus_for_job(job)
+    try:
+        cmd = adapters.build_claude_compact_cmd(planner_session, focus)
+    except ValueError as e:
+        return {"action": "failed", "reason": str(e)[:200]}
+    run_cmd = run_cmd or _default_compact_run
+    harness = harnesses.harness_named("claude")
+    route = harness.default_route(harnesses.KIND_CLAUDE_COMPACT, job)
+    meta = {"stage": "planning", "route": route, "reason": "compact_after_submit",
+            "prompt": focus,
+            "focus_sha256": hashlib.sha256(focus.encode("utf-8")).hexdigest()}
+    key = _action_key(harnesses.KIND_CLAUDE_COMPACT, cmd, meta)
+    root = store.ensure_state_dir(state_dir)
+    invocation_id = secrets.token_hex(8)
+    stdout_path, stderr_path = _invocation_output_paths(root, request_id, invocation_id)
+    store.secure_write_text(stdout_path, "")
+    store.secure_write_text(stderr_path, "")
+    started_at = _utcnow()
+    owner_token = job.get("owner_token") or "submit"
+    cwd = job.get("planner_cwd") or job["workspace"]
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO invocations("
+            " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
+            " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
+            " state, task_json, timeout_secs, meta_json, action_key,"
+            " stage, requested_route, policy_version, reason, harness_version, schema_version"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?)",
+            (invocation_id, request_id, harnesses.KIND_CLAUDE_COMPACT,
+             json.dumps([c.replace("\x00", "") for c in cmd]),
+             cwd, owner_token, str(stdout_path), str(stderr_path),
+             started_at, job.get("task_json"), 900,
+             json.dumps(_redact_meta(dict(meta)), sort_keys=True), key,
+             "planning", route, policy.POLICY_VERSION, "compact_after_submit",
+             harness.version(), store.SCHEMA_VERSION),
+        )
+        _event(con, request_id, "invocation_attempting",
+               {"invocation_id": invocation_id[:16], "kind": harnesses.KIND_CLAUDE_COMPACT})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    try:
+        rc, out, err = run_cmd(cmd, cwd, 900, kind=harnesses.KIND_CLAUDE_COMPACT,
+                               meta=dict(meta))
+    except Exception as e:  # noqa: BLE001 - recorded, never raised
+        rc, out, err = 1, "", f"compact spawn failed: {type(e).__name__}: {e}"
+    try:
+        store.secure_write_text(Path(stdout_path), out or "")
+    except OSError:
+        pass
+    try:
+        store.secure_write_text(Path(stderr_path), err or "")
+    except OSError:
+        pass
+    parsed = adapters.parse_claude_compact_result(out or "")
+    failure_reason = harness.compact_failure_reason(
+        harnesses.KIND_CLAUDE_COMPACT, rc, out or "", job)
+    ok = failure_reason is None
+    state = "completed" if ok else "failed"
+    now = _utcnow()
+    error_text = None if ok else (parsed.get("error") or failure_reason)
+    result_payload: dict = {"rc": rc, "ok": ok,
+                            "session_id": parsed.get("session_id"),
+                            "error": error_text}
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "UPDATE invocations SET rc=?, state=?, ended_at=?, consumed_at=?, result_json=?,"
+            " session_id=COALESCE(?, session_id),"
+            " session_kind=COALESCE(?, session_kind) WHERE invocation_id=?",
+            (rc, state, now, now, json.dumps(result_payload, sort_keys=True),
+             parsed.get("session_id"), "planner_session_id", invocation_id),
+        )
+        _event(con, request_id,
+               "planner_compacted" if ok else "planner_compact_failed",
+               {"invocation_id": invocation_id[:16], "rc": rc,
+                "reason": (str(error_text or "")[:120]) if not ok else "compacted"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    _measure_invocation(state_dir, request_id, invocation_id)
+    try:
+        log = store.output_path_for(root, request_id)
+        store.append_text(log, f"[claude_compact invocation={invocation_id[:8]} rc={rc}]\n")
+    except OSError:
+        pass
+    if ok:
+        return {"action": "compacted", "invocation": invocation_id[:8]}
+    return {"action": "failed",
+            "reason": str(error_text or f"planner_compact_failed rc={rc}")[:200],
+            "invocation": invocation_id[:8]}
+
+
 def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_session_id: str, route: str | None = None,
                      policy_id: str | None = None, max_attempts: int = 5,
@@ -1921,22 +2180,27 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_cwd: str | None = None,
                      lane: str | None = None,
                      job_kind: str = "ordinary", replay_of: str | None = None,
-                     planner_harness: str = "claude") -> dict:
-    """Persist first, then launch a detached controller with built-ins.
+                     planner_harness: str = "claude",
+                     handoff_summary: str | None = None,
+                     run_cmd=None) -> dict:
+    """Persist first, compact the planner session, then launch the controller.
 
     The durable row commits before any spawn, so controller death leaves
-    recoverable state. ``launcher`` is a legacy test-only seam
+    recoverable state. The headless compaction runs before the controller
+    launch (best-effort: a failure is recorded and never blocks the job).
+    ``launcher`` is a legacy test-only seam
     ``(state_dir, request_id) -> dict``; ``spawn`` is the preferred
     test-only seam ``(cmd) -> pid`` that keeps durable attempt rows
-    while staying offline. Default spawns a detached controller process
-    using built-in adapters.
+    while staying offline; ``run_cmd`` is the test-only seam for the
+    compact turn ``(cmd, cwd, timeout, kind, meta) -> (rc, out, err)``.
+    Default spawns a detached controller process using built-in adapters.
     """
     job = submit(state_dir, request_id, task, workspace, planner_session_id,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
                  timeout_secs=timeout_secs, planner_model=planner_model,
                  planner_effort=planner_effort, planner_cwd=planner_cwd,
                  lane=lane, job_kind=job_kind, replay_of=replay_of,
-                 planner_harness=planner_harness)
+                 planner_harness=planner_harness, handoff_summary=handoff_summary)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.
@@ -1944,6 +2208,12 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
         return job
     if job["status"] in store.TERMINAL:
         return job
+    # The planner session compacts around the submitted job before the
+    # controller starts asking questions; a failure never blocks the job.
+    try:
+        compact_planner_session(state_dir, request_id, run_cmd=run_cmd)
+    except Exception:
+        pass
     # A repeated submission returns the existing job; it never forces a
     # second launch (use recover for ownership reconciliation).
     try:

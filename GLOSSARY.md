@@ -35,4 +35,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Skills loaded | The kit's skills recorded per invocation as what the session may invoke. | loaded plugins |
 | Tools called | Distinct tool part names observed in the turn's assistant messages (empty on text-only turns). | tool usage |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |
-| Policy | The versioned data in `runner/policy.py` that defines pools, routes, stages, windows, and signal classes. The skill table is rendered from it. | config |
+| Handoff summary | The durable summary stored on the job at submit (explicit or derived from the task packet) and carried before every callback question; the Astra fallback answers from it in a fresh session with no resume. | handoff note |
+| Compaction | The headless post-submit `claude -p --resume SID "/compact <focus>"` around the job (request id, Issue, decisions, proof command from policy data), recorded as a `claude_compact` invocation; failure never blocks the job. | compress |
+| Resumed context | A callback's measured input, cache-read, and cache-creation tokens on its `claude_callback` invocation, visible per job in the Observer mapping. | cached context |
+| Policy | The versioned data in `runner/policy.py` that defines pools, routes, stages, windows, signal classes, and the compaction focus template with its per-harness flag. The skill table is rendered from it. | config |

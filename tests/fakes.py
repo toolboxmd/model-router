@@ -16,8 +16,8 @@ Environment: ``FAKE_STATE`` (log directory), ``FAKE_OC_MODE`` (free-route
 behavior: ok, free_limit, api_free_error, rate_limit, model_text, hang,
 stall, hard_error, context_error), ``FAKE_OC_MODE_GO`` (same for Go routes),
 ``FAKE_OC_PROBE_MODE`` (stall-probe answer: ok, exhausted, overloaded),
-``FAKE_OC_DELAY`` (seconds of busy time), ``FAKE_OC_WRITE`` (relative
-file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
+``FAKE_OC_DELAY`` (seconds of busy time), ``FAKE_OC_WRITE`` (relative file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
+``FAKE_CLAUDE_COMPACT_MODE`` (ok, fail, fork for ``/compact`` turns),
 ``FAKE_CLAUDE_ANSWER``, ``FAKE_GROK_MODE`` (ok, exhaustion, overload,
 hard_error, hang, hold), ``FAKE_GROK_DELAY`` (seconds before success),
 ``FAKE_GROK_WRITE`` (relative file the fake worker writes),
@@ -68,6 +68,8 @@ except Exception:
     NEXT_OVERRIDE = None
 DELAY = float(os.environ.get("FAKE_OC_DELAY", "0.3"))
 WRITE = os.environ.get("FAKE_OC_WRITE")
+# Placeholder to keep the module docstring accurate; compact behavior is
+# documented there (FAKE_CLAUDE_COMPACT_MODE ok/fail/fork).
 EXPECT = "Basic " + base64.b64encode(("opencode:" + PWD).encode()).decode()
 lock = threading.Lock()
 sessions = {}
@@ -365,21 +367,42 @@ argv = sys.argv[1:]
 with open(st / "claude.log", "a") as f:
     f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
 assert "--resume" in argv and "--fork-session" not in argv, argv
-assert argv[argv.index("--output-format") + 1] == "json", argv
+is_compact = any("/compact" in str(a) for a in argv)
+if not is_compact:
+    assert argv[argv.index("--output-format") + 1] == "json", argv
 sid = argv[argv.index("--resume") + 1]
-mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
 import time
 time.sleep(float(os.environ.get("FAKE_CLAUDE_DELAY", "0")))
-if mode == "fail":
-    sys.stderr.write("planner failed\n")
-    sys.exit(1)
-if mode == "fork":
-    sid = "00000000-0000-4000-8000-000000000000"
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                  "result": os.environ.get("FAKE_CLAUDE_ANSWER", "Approved as written."),
-                  "session_id": sid, "uuid": "fake-result-uuid", "duration_ms": 12,
-                  "num_turns": 1, "total_cost_usd": 0.0,
-                  "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 0}}))
+if is_compact:
+    # Headless `claude -p --resume <sid> "/compact <focus>"` shape: the
+    # live CLI returns local_command compact and persists the summary.
+    cmode = os.environ.get("FAKE_CLAUDE_COMPACT_MODE", "ok")
+    if cmode == "fail":
+        sys.stderr.write("compact failed\n")
+        sys.exit(1)
+    if cmode == "fork":
+        sid = "00000000-0000-4000-8000-000000000000"
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": "local_command: compact",
+                      "session_id": sid, "uuid": "fake-compact-uuid", "duration_ms": 8,
+                      "num_turns": 1, "total_cost_usd": 0.0,
+                      "usage": {"input_tokens": 50, "output_tokens": 5,
+                                "cache_read_input_tokens": 400,
+                                "cache_creation_input_tokens": 20}}))
+else:
+    mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
+    if mode == "fail":
+        sys.stderr.write("planner failed\n")
+        sys.exit(1)
+    if mode == "fork":
+        sid = "00000000-0000-4000-8000-000000000000"
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": os.environ.get("FAKE_CLAUDE_ANSWER", "Approved as written."),
+                      "session_id": sid, "uuid": "fake-result-uuid", "duration_ms": 12,
+                      "num_turns": 1, "total_cost_usd": 0.0,
+                      "usage": {"input_tokens": 10, "output_tokens": 3,
+                                "cache_read_input_tokens": 120,
+                                "cache_creation_input_tokens": 7}}))
 '''
 
 
