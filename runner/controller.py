@@ -332,7 +332,10 @@ def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
     workspace = job["workspace"]
     prompt = _full_luna_prompt(job["task_json"])
     last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
-    cmd = adapters.build_codex_dispatch_cmd(workspace, prompt,
+    dispatch_route = policy.stage_routes("dispatch")[0]
+    dispatch = policy.ROUTES[dispatch_route]
+    cmd = adapters.build_codex_dispatch_cmd(workspace, prompt, model=dispatch["model"],
+                                            effort=dispatch["variant"],
                                             last_message_path=last_path)
     rc, out, err = run_cmd(cmd, workspace)
     last_text = adapters.read_last_message_file(last_path)
@@ -345,7 +348,8 @@ def dispatch(state_dir, request_id: str, run_cmd=None) -> dict:
         return {"action": "blocked", "reason": "codex_dispatch_failed"}
     # The thread exists even when the turn failed: save it so recovery
     # resumes it instead of creating a replacement task.
-    _save_codex_task(state_dir, request_id, task_id)
+    _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
+                     effort=dispatch["variant"])
     if rc != 0 or "turn.completed" not in (out or ""):
         # A turn counts only with its completion event, as in recovery.
         _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000]})
@@ -465,8 +469,9 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     message = adapters.build_luna_followup(label, prompt)
     last_path = _last_message_path(state_dir, request_id,
                                    "codex-resume-" + _prompt_digest(message))
-    cmd = adapters.build_codex_resume_cmd(task_id, message,
-                                          last_message_path=last_path)
+    dispatch = policy.ROUTES[policy.stage_routes("dispatch")[0]]
+    cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
+                                          model=dispatch["model"], effort=dispatch["variant"])
     # Resume uses the saved workspace as cwd; never --cd/--reasoning.
     rc, out, err = run_cmd(cmd, job["workspace"])
     last_text = adapters.read_last_message_file(last_path)
@@ -492,9 +497,7 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
 
 
 def _route_allowance(route: str) -> str:
-    if route == "muse-spark-xhigh-go":
-        return "go-included"
-    return "free"
+    return policy.route_allowance(route) if policy.is_supported(route) else "free"
 
 
 WORKER_RULES = (
@@ -587,11 +590,12 @@ def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = Tru
     try:
         con.execute("BEGIN IMMEDIATE")
         _lease_guard(con, request_id)
+        target = policy.next_pool_route("muse-spark-xhigh-free") or "muse-spark-xhigh-go"
         con.execute("UPDATE jobs SET route=?, model=?, updated_at=? WHERE request_id=?",
-                    ("muse-spark-xhigh-go", adapters.OPENCODE_GO_MODEL,
+                    (target, adapters.opencode_model_for_route(target),
                      core._utcnow(), request_id))
         core._event(con, request_id, "route_switched",
-                    {"from": "muse-spark-xhigh-free", "to": "muse-spark-xhigh-go",
+                    {"from": "muse-spark-xhigh-free", "to": target,
                      "evidence": str(evidence.get("source") or evidence.get("class") or "provider")[:64]})
         if record:
             # Keep the original provider evidence; a memory-based switch
@@ -607,7 +611,22 @@ def _switch_to_go(state_dir, request_id: str, evidence: dict, record: bool = Tru
         raise
     finally:
         con.close()
-    return {"action": "transferred_to_go", "route": "muse-spark-xhigh-go"}
+    return {"action": "transferred_to_go", "route": target}
+
+
+def _turns_by_route(state_dir, request_id: str) -> dict:
+    """Implementation turns already run per route, for the one-turn rule."""
+    counts: dict = {}
+    for inv in core._list_invocations(state_dir, request_id):
+        if inv.get("kind") not in ("opencode_control", "opencode_run") or inv.get("state") == "abandoned":
+            continue
+        try:
+            route = (json.loads(inv.get("meta_json") or "{}") or {}).get("route")
+        except ValueError:
+            route = None
+        if route:
+            counts[route] = counts.get(route, 0) + 1
+    return counts
 
 
 def run_implementation(state_dir, request_id: str, artifact: str | None = None,
@@ -626,7 +645,7 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     workspace = job["workspace"]
     route = job.get("route") or "muse-spark-xhigh-free"
     allowance = _route_allowance(route)
-    model = adapters.opencode_model_for_allowance(allowance)
+    model, variant, agent = adapters.opencode_route_params(route)
     saved_session = job.get("opencode_session_id")
     seq = _load_controller_state(job).get("seq", 0)
     prompt = _implementation_prompt(job["task_json"], artifact, payload)
@@ -637,12 +656,19 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
             and route in core.exhausted_routes(state_dir):
         return _switch_to_go(state_dir, request_id,
                              {"source": "capacity_memory", "route": route}, record=False)
+    if not attempted and policy.one_turn_routes_used(route, _turns_by_route(state_dir, request_id)):
+        # A $15 Go model gets one turn per job. Refusing here keeps the mark
+        # enforced by the runner; lateral moves replace the refusal in #13.
+        _mark_blocked(state_dir, request_id,
+                      f"one_turn_per_job: {route} already ran once in this job")
+        return {"action": "blocked", "reason": "one_turn_per_job"}
     if use_owned_server:
         cmd = adapters.build_opencode_serve_cmd()
         rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
                                meta={"prompt": prompt, "allowance": allowance,
-                                     "model": model, "session_id": saved_session,
-                                     "seq": seq})
+                                     "model": model, "variant": variant, "agent": agent,
+                                     "session_id": saved_session, "seq": seq,
+                                     "route": route})
         # The result line comes from this invocation's own output file.
         full = _runner_result(out) or {}
         session_id = full.get("opencode_session_id") or saved_session
@@ -673,9 +699,10 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                       f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
         return {"action": "blocked", "reason": "implementation_failed"}
 
-    cmd = adapters.build_opencode_cmd(workspace, prompt, allowance=allowance,
-                                      session_id=saved_session)
-    rc, out, err = run_cmd(cmd, workspace)
+    cmd = adapters.build_opencode_cmd(workspace, prompt, model=model, variant=variant, agent=agent,
+                                      allowance=allowance, session_id=saved_session)
+    rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_run",
+                           meta={"route": route, "allowance": allowance, "model": model})
     errors = _structured_run_errors(out, err)
     session_id = None
     for blob in (out or "",):
@@ -696,7 +723,7 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                 break
     if session_id:
         _save_opencode_session(state_dir, request_id, session_id, route,
-                               model=model)
+                               model=model, effort=variant or "default")
     _record_child(state_dir, request_id, "opencode_run", cmd, rc,
                   session_id=(session_id or saved_session), output_text=(out or "") + (err or ""))
     if rc == 0 and not errors:

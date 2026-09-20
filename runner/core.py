@@ -1056,10 +1056,11 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             )
         elif sid and skind == "opencode_session_id":
             route = job.get("route") or "muse-spark-xhigh-free"
+            r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
             con.execute(
                 "UPDATE jobs SET opencode_session_id=COALESCE(opencode_session_id, ?),"
                 " adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, adapters.opencode_model_for_route(route), adapters.OPENCODE_VARIANT, now, request_id),
+                (sid, r_model, r_variant or "default", now, request_id),
             )
         job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         job_status = job_row["status"] if job_row else None
@@ -1250,9 +1251,10 @@ def _capture_invocation_sessions(state_dir, request_id: str,
                     )
                 elif skind == "opencode_session_id":
                     route = job.get("route") or "muse-spark-xhigh-free"
+                    r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
                     con.execute(
                         "UPDATE jobs SET opencode_session_id=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                        (sid, adapters.opencode_model_for_route(route), adapters.OPENCODE_VARIANT, _utcnow(), request_id),
+                        (sid, r_model, r_variant or "default", _utcnow(), request_id),
                     )
                 _event(con, request_id, "invocation_session_reconciled",
                        {"invocation_id": inv["invocation_id"][:16],
@@ -1416,18 +1418,19 @@ def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -
 
 
 def submit(state_dir, request_id: str, task, workspace: str,
-           planner_session_id: str, route: str = "muse-spark-xhigh-free",
+           planner_session_id: str, route: str | None = None,
            policy_id: str | None = None, max_attempts: int = 3,
            timeout_secs: int | None = None,
            planner_model: str | None = None,
            planner_effort: str | None = None,
-           planner_cwd: str | None = None) -> dict:
+           planner_cwd: str | None = None,
+           lane: str | None = None) -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Built-in defaults mean no executor/callback commands are required:
     only the prepared task, workspace, stable request ID, and original
-    planner session ID are needed. Planner model/effort default to
-    claude-sonnet-5 / medium and may be overridden explicitly.
+    planner session ID are needed. Planner model/effort default to the
+    policy's planning route and may be overridden explicitly.
     """
     _validate_request_id(request_id)
     if not planner_session_id:
@@ -1435,21 +1438,30 @@ def submit(state_dir, request_id: str, task, workspace: str,
     # An existing request is compared first, so an identical resubmission
     # returns it even if its directory was removed since.
     ws = _canonical_workspace(workspace, must_exist=False)
+    # The lane picks the first route of an implementation lane unless an
+    # explicit route is given; the critical lane is planner-executed and
+    # raises here so the planner keeps that step.
+    if lane:
+        lane_route = policy.lane_default_route(lane)
+        route = route or lane_route
+    route = route or policy.lane_default_route(policy.DEFAULT_LANE)
     policy.validate_implementation_route(route)
+    # The job remembers its lane: Muse sits in two lanes, so later moves
+    # must not guess from the route alone. An explicit route must belong
+    # to the explicit lane.
+    lane_stage = policy.lane_of_route(route, lane)  # raises on a lane mismatch
     pid = policy_id or policy.POLICY_ID
     if not pid:
         raise ValueError("missing policy identity")
     if max_attempts < 1 or max_attempts > 10:
         raise ValueError("max_attempts must be 1..10")
-    # Planner defaults: production Fable 5.1 max; explicit overrides
-    # preserved verbatim (Sonnet medium is only the bounded live-test
-    # override). Never fork a new session implicitly.
-    try:
-        from . import adapters as _adapters
-        _pm_default = _adapters.CLAUDE_MODEL
-        _pe_default = _adapters.CLAUDE_EFFORT
-    except Exception:
-        _pm_default, _pe_default = "claude-fable-5-1", "max"
+    # Planner defaults come from the first route in the policy's planning
+    # stage; explicit overrides are preserved verbatim. Never fork a new
+    # session implicitly.
+    _planning_route = policy.STAGES["planning"]["routes"][0]
+    _planning_spec = policy.route_spec(_planning_route)
+    _pm_default = _planning_spec["model"]
+    _pe_default = _planning_spec["variant"]
     planner_model = planner_model or _pm_default
     planner_effort = planner_effort or _pe_default
     task_json = _canonical_task(task)
@@ -1485,6 +1497,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
             if _ee is not None and _ee != planner_effort:
                 same = False
             if existing["planner_cwd"] is not None and existing["planner_cwd"] != pcwd:
+                same = False
+            if existing["lane"] is not None and existing["lane"] != lane_stage:
                 same = False
             con.execute("ROLLBACK")
             if same:
@@ -1543,13 +1557,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
             "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,"
             "planner_session_id,executor_session_id,output_path,status,route,"
             "cancel_requested,attempts,max_attempts,timeout_secs,created_at,updated_at,"
-            "planner_model,planner_effort,adapter,model,effort,planner_cwd)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?)",
+            "planner_model,planner_effort,adapter,model,effort,planner_cwd,lane)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
-             adapters.opencode_model_for_route(route), "xhigh", pcwd),
+             adapters.opencode_route_params(route)[0],
+             adapters.opencode_route_params(route)[1] or "default", pcwd, lane_stage),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
@@ -1577,13 +1592,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
 
 
 def submit_and_start(state_dir, request_id: str, task, workspace: str,
-                     planner_session_id: str, route: str = "muse-spark-xhigh-free",
+                     planner_session_id: str, route: str | None = None,
                      policy_id: str | None = None, max_attempts: int = 3,
                      timeout_secs: int | None = None,
                      planner_model: str | None = None,
                      planner_effort: str | None = None,
                      launcher=None, spawn=None,
-                     planner_cwd: str | None = None) -> dict:
+                     planner_cwd: str | None = None,
+                     lane: str | None = None) -> dict:
     """Persist first, then launch a detached controller with built-ins.
 
     The durable row commits before any spawn, so controller death leaves
@@ -1596,7 +1612,8 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
     job = submit(state_dir, request_id, task, workspace, planner_session_id,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
                  timeout_secs=timeout_secs, planner_model=planner_model,
-                 planner_effort=planner_effort, planner_cwd=planner_cwd)
+                 planner_effort=planner_effort, planner_cwd=planner_cwd,
+                 lane=lane)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.
@@ -2787,17 +2804,16 @@ def exhausted_routes(state_dir) -> set[str]:
     return out
 
 
-def select_implementation_route(state_dir, current: str, error) -> tuple[str | None, str | None]:
-    """Pick the next implementation route, skipping known-exhausted ones.
-
-    Returns (route, blocker). A precise blocker is recorded when the next
-    eligible route is not operational. Does not wait on an exhausted route.
+def select_implementation_route(state_dir, current: str, error,
+                                lane: str | None = None) -> tuple[str | None, str | None]:
+    """Pick the next implementation route in the job's lane, skipping
+    known-exhausted ones. Returns (route, blocker); blocker is None because
+    every policy route has an adapter. Does not wait on an exhausted route.
     """
     exhausted = exhausted_routes(state_dir)
     if policy.classify_quota_exhaustion(error):
         exhausted.add(current)
-        nxt, blocker = policy.next_capacity_route(current, exhausted)
-        return nxt, blocker
+        return policy.next_capacity_route(current, exhausted, lane)
     return None, None
 
 

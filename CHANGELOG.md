@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0] - 2026-09-19
+
+### Added
+
+- Policy v2 as data with lanes, subscription pools, and signal classes; skill table generated from the policy; glossary
+
 ## [0.3.0] - 2026-09-18
 
 ### Added

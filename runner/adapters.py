@@ -19,27 +19,37 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import policy as _policy
+
+# Harness defaults come from the policy's stage routes, so editing
+# runner/policy.py changes live dispatch, planning, and worker defaults.
+_DISPATCH = _policy.ROUTES[_policy.stage_routes("dispatch")[0]]
+_PLANNING = _policy.ROUTES[_policy.stage_routes("planning")[0]]
+_PLANNING_OVERRIDE = _policy.ROUTES[_policy.STAGES["planning"]["overrides"][0]]
+_MUSE_FREE = _policy.ROUTES["muse-spark-xhigh-free"]
+_MUSE_GO = _policy.ROUTES["muse-spark-xhigh-go"]
+
 CODEX_BIN = "codex"
-CODEX_MODEL = "gpt-5.6-luna"
-CODEX_EFFORT = "max"
-CODEX_REASONING_CONFIG = 'model_reasoning_effort="max"'
+CODEX_MODEL = _DISPATCH["model"]
+CODEX_EFFORT = _DISPATCH["variant"]
+CODEX_REASONING_CONFIG = f'model_reasoning_effort="{CODEX_EFFORT}"'
 # The dispatcher coordinates and verifies; it never edits. Codex enforces
 # this with its OS sandbox. Implementation belongs to the Muse worker.
 CODEX_SANDBOX = "read-only"
 
 CLAUDE_BIN = "claude"
-# Production planner default: Fable 5.1 max. Sonnet medium is only the
-# explicit bounded live-test override.
-CLAUDE_MODEL = "claude-fable-5-1"
-CLAUDE_EFFORT = "max"
-CLAUDE_LIVE_MODEL = "claude-sonnet-5"
-CLAUDE_LIVE_EFFORT = "medium"
+# Production planner default from the planning stage; the override route is
+# the explicit bounded live-test override only.
+CLAUDE_MODEL = _PLANNING["model"]
+CLAUDE_EFFORT = _PLANNING["variant"]
+CLAUDE_LIVE_MODEL = _PLANNING_OVERRIDE["model"]
+CLAUDE_LIVE_EFFORT = _PLANNING_OVERRIDE["variant"]
 
 OPENCODE_BIN = "opencode"
-OPENCODE_FREE_MODEL = "opencode/muse-spark-1.3-contributor-free"
-OPENCODE_GO_MODEL = "opencode-go/muse-spark-1.3-contributor"
-OPENCODE_VARIANT = "xhigh"
-OPENCODE_AGENT = "build"
+OPENCODE_FREE_MODEL = _MUSE_FREE["model"]
+OPENCODE_GO_MODEL = _MUSE_GO["model"]
+OPENCODE_VARIANT = _MUSE_FREE["variant"]
+OPENCODE_AGENT = _MUSE_FREE.get("agent") or "build"
 # Back-compat aliases: old single-model/effort names now map to the
 # free route. New code uses FREE/GO models + variant.
 OPENCODE_MODEL = OPENCODE_FREE_MODEL
@@ -117,16 +127,12 @@ def build_codex_dispatch_cmd(workspace: str, prompt: str,
     """
     if not workspace:
         raise ValueError("missing workspace for codex dispatch")
-    if effort != CODEX_EFFORT:
-        # Effort is encoded via -c model_reasoning_effort; keep the
-        # parameter for seam compat but always emit the proved form.
-        pass
     out_path = last_message_path or default_last_message_path()
     return [CODEX_BIN, "exec",
             "--json",
             "--output-last-message", out_path,
             "--model", model,
-            "-c", CODEX_REASONING_CONFIG,
+            "-c", f'model_reasoning_effort="{effort or CODEX_EFFORT}"',
             "--sandbox", CODEX_SANDBOX,
             "--cd", workspace,
             prompt]
@@ -134,7 +140,8 @@ def build_codex_dispatch_cmd(workspace: str, prompt: str,
 
 def build_codex_resume_cmd(task_id: str, prompt: str = "",
                            last_message_path: str | None = None,
-                           model: str = CODEX_MODEL) -> list[str]:
+                           model: str = CODEX_MODEL,
+                           effort: str = CODEX_EFFORT) -> list[str]:
     """Resume only the saved Codex thread/task ID (never fork).
 
     ``codex exec resume ID --json -m gpt-5.6-luna -c
@@ -145,7 +152,7 @@ def build_codex_resume_cmd(task_id: str, prompt: str = "",
     if not task_id:
         raise ValueError("missing saved Codex task ID for resume")
     cmd = [CODEX_BIN, "exec", "resume", task_id, "--json",
-           "-m", model, "-c", CODEX_REASONING_CONFIG,
+           "-m", model, "-c", f'model_reasoning_effort="{effort or CODEX_EFFORT}"',
            "-c", f'sandbox_mode="{CODEX_SANDBOX}"']
     if last_message_path:
         cmd += ["--output-last-message", last_message_path]
@@ -203,7 +210,6 @@ def last_message_path_from_cmd(cmd) -> str | None:
 
 
 def _envelope_from_message_text(text: str) -> dict | None:
-    from . import policy as _policy
     text = (text or "").strip()
     if not text:
         return None
@@ -456,7 +462,15 @@ def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int
 
 
 def opencode_model_for_route(route: str | None) -> str:
-    return OPENCODE_GO_MODEL if route == "muse-spark-xhigh-go" else OPENCODE_FREE_MODEL
+    """Policy-driven model for an OpenCode route; free Muse for unknown routes."""
+    from . import policy as _policy
+    return _policy.opencode_route_params(route)[0]
+
+
+def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
+    """(model, variant, agent) the policy assigns to an OpenCode route."""
+    from . import policy as _policy
+    return _policy.opencode_route_params(route)
 
 
 def opencode_model_for_allowance(allowance: str) -> str:
@@ -488,8 +502,10 @@ def build_opencode_cmd(workspace: str, prompt: str,
     """
     if not workspace:
         raise ValueError("missing workspace for opencode run")
-    if allowance not in ("free", "go-included"):
+    if allowance not in ("free", "go-included", "xai-subscription"):
         raise ValueError(f"unsupported allowance: {allowance!r}")
+    if allowance == "xai-subscription" and not (model or "").startswith("xai/"):
+        raise ValueError("allowance xai-subscription requires an xai/* model")
     # Back-compat: old callers passed model=muse-spark-... and
     # effort=xhigh positionally. Map them onto the provider-shaped route.
     if effort is not None and effort != OPENCODE_VARIANT:
@@ -513,9 +529,10 @@ def build_opencode_cmd(workspace: str, prompt: str,
            "--format", "json",
            "--pure",
            "--dir", workspace,
-           "--model", model,
-           "--variant", variant,
-           "--agent", agent]
+           "--model", model]
+    if variant:  # None means the provider default
+        cmd += ["--variant", variant]
+    cmd += ["--agent", agent]
     if session_id:
         cmd += ["--session", session_id]
     cmd += [prompt]
