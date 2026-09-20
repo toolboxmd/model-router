@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from . import adapters
+from . import harnesses
 from . import policy
 from . import store
 
@@ -249,32 +250,18 @@ RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
 
-INVOCATION_KINDS = (
-    "codex_dispatch", "codex_resume", "claude_callback",
-    "opencode_run", "opencode_serve", "opencode_control",
-)
+INVOCATION_KINDS = harnesses.INVOCATION_KINDS
 LIVE_INVOCATION_STATES = ("running", "cancelling")
 
 
 def _infer_invocation_kind(cmd: list[str]) -> str:
     """Infer the invocation kind from a built-in adapter command."""
-    if not cmd:
-        return "unknown"
-    name = os.path.basename(cmd[0]).lower() if cmd[0] else ""
-    if name == "codex":
-        if any(a == "resume" for a in cmd[1:]):
-            return "codex_resume"
-        return "codex_dispatch"
-    if name == "claude":
-        return "claude_callback"
-    if name == "opencode":
-        if any(a == "serve" for a in cmd[1:]):
-            return "opencode_serve"
-        if any(a == "control" for a in cmd[1:]):
-            return "opencode_control"
-        return "opencode_run"
-    return "unknown"
+    return harnesses.kind_for_cmd(cmd)
 
+
+def _is_dispatch_row(inv: dict) -> bool:
+    """A ledger row that ran the dispatcher, on whichever harness."""
+    return inv.get("stage") == "dispatch" or harnesses.harness_for(inv.get("kind")).is_dispatch(inv.get("kind"))
 
 def _process_start_identity(pid: int | None) -> str | None:
     from .supervisor import process_start_identity
@@ -412,13 +399,13 @@ def _invocation_ownership(inv: dict) -> str:
         return "unresolved" if not _supervisor_alive(inv) else "live"
     if child == "match" or (child == "mismatch" and _is_pgid_alive(pgid)
                             and not _is_pid_alive_as_leader(pid, pgid)):
-        if inv.get("kind") in ("opencode_control", "opencode_serve") \
+        if harnesses.harness_for(inv.get("kind")).owned_server \
                 and inv.get("supervisor_pid") and _supervisor_state(inv) in ("dead", "mismatch"):
             return "orphaned"
         return "live"
     if child == "dead" and _is_pgid_alive(pgid):
         # The leader exited but group members remain.
-        if inv.get("kind") in ("opencode_control", "opencode_serve") \
+        if harnesses.harness_for(inv.get("kind")).owned_server \
                 and _supervisor_state(inv) in ("dead", "mismatch"):
             return "orphaned"
         return "live"
@@ -514,45 +501,8 @@ def _invocation_output_paths(root: Path, request_id: str, invocation_id: str) ->
 
 def _parse_session_from_output(kind: str, stdout: str, stderr: str,
                                job: dict | None = None) -> tuple[str | None, str | None]:
-    """Return (session_id, session_kind) extracted from streamed child output."""
-    if kind in ("codex_dispatch", "codex_resume"):
-        sid = adapters.parse_codex_task_id(stdout, stderr)
-        if sid:
-            return sid, "codex_task_id"
-        return None, None
-    if kind == "claude_callback":
-        # The session identity is the exact planner session we resumed.
-        if job is not None:
-            sid = job.get("planner_session_id")
-            if sid:
-                return sid, "planner_session_id"
-        return None, None
-    if kind == "opencode_run":
-        for blob in (stdout, stderr):
-            if not blob:
-                continue
-            text = blob.strip()
-            for line in text.splitlines():
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                for key in ("opencode_session_id", "session_id", "sessionId", "session"):
-                    val = obj.get(key)
-                    if isinstance(val, str) and val:
-                        return val, "opencode_session_id"
-                    if isinstance(val, dict):
-                        for sub in ("id", "session_id", "sessionId"):
-                            if isinstance(val.get(sub), str) and val.get(sub):
-                                return val.get(sub), "opencode_session_id"
-        return None, None
-    return None, None
-
+    """(session_id, session_kind) as the harness behind ``kind`` reports it."""
+    return harnesses.harness_for(kind).parse_session(kind, stdout, stderr, job)
 
 def _redact_cmd(cmd: list[str]) -> list[str]:
     return [
@@ -561,14 +511,29 @@ def _redact_cmd(cmd: list[str]) -> list[str]:
     ]
 
 
-DEFAULT_KIND_TIMEOUTS = {
-    "codex_dispatch": 1800, "codex_resume": 1800,
-    "claude_callback": 900,
-    "opencode_control": 1800, "opencode_serve": 1800, "opencode_run": 1800,
-}
 # A failed model turn is never replayed automatically: the job blocks
 # with its reason. Replaying could fork a task or repeat a side effect.
 MAX_FAILED_ATTEMPTS_PER_ACTION = 1
+
+
+def _redact_meta(meta: dict) -> dict:
+    """Key redaction plus free-text secret shapes, without truncation.
+
+    The supervisor re-reads the prompt from this ledger row, so the
+    value stays complete while credentials are masked.
+    """
+    redacted = store.redact_for_log(dict(meta or {}))
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            return {k: _walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_walk(v) for v in obj]
+        if isinstance(obj, str):
+            return adapters.redact_text(obj)
+        return obj
+
+    return _walk(redacted)
 
 
 def _action_key(kind: str, cmd: list[str], meta: dict | None) -> str:
@@ -697,8 +662,15 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     only the controller cannot destroy output, IDs, or completion. A
     finished attempt of the same action is reused, never rerun.
     """
+    harness = harnesses.harness_for(kind)
     if timeout is None:
-        timeout = DEFAULT_KIND_TIMEOUTS.get(kind, 1800)
+        timeout = harness.timeout_for(kind)
+    stage_name = (meta or {}).get("stage") or harness.stage_for(kind)
+    route_name = (meta or {}).get("route")
+    if route_name:
+        blocker = harnesses.route_capability_blocker(route_name, stage_name)
+        if blocker:
+            raise RunnerError(f"route_capability_mismatch: {blocker}")
     key = _action_key(kind, cmd, meta)
     reused = _prior_action_result(state_dir, request_id, key)
     if reused is not None:
@@ -711,7 +683,10 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
 
     job = get_job(state_dir, request_id)
     workspace = cwd or job["workspace"]
-    meta_json = json.dumps(store.redact_for_log(dict(meta or {})), sort_keys=True)
+    # Key redaction cannot see inside free-text values (for example a
+    # credential in the task prompt), so mask secret shapes as well. No
+    # truncation: the supervisor re-reads this prompt from the ledger.
+    meta_json = json.dumps(_redact_meta(dict(meta or {})), sort_keys=True)
     # One writer per job: any other live child (a different action from a
     # previous controller) is adopted by waiting, never run beside.
     _wait_other_invocations(state_dir, request_id, key)
@@ -754,10 +729,10 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             (invocation_id, request_id, kind, json.dumps(list(cmd)),
              workspace, owner_token, str(stdout_path), str(stderr_path),
              started_at, job.get("task_json"), int(timeout), meta_json, key,
-             (meta or {}).get("stage") or STAGE_FOR_KIND.get(kind),
-             (meta or {}).get("route") or (job.get("route") if kind.startswith("opencode") else None),
+             (meta or {}).get("stage") or harness.stage_for(kind),
+             (meta or {}).get("route") or harness.default_route(kind, job),
              policy.POLICY_VERSION, (meta or {}).get("reason") or "initial",
-             harness_version_for(kind), store.SCHEMA_VERSION),
+             harness.version(), store.SCHEMA_VERSION),
         )
         _event(con, request_id, "invocation_attempting",
                {"invocation_id": invocation_id[:16], "kind": kind})
@@ -793,6 +768,7 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             con.execute("COMMIT")
         finally:
             con.close()
+        _measure_invocation(state_dir, request_id, invocation_id)
         return 127, "", f"supervisor spawn failed: {e}"
 
     # The supervisor records its own PID and start identity when it claims
@@ -998,13 +974,21 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         inv_cmd = json.loads(inv.get("cmd_json") or "[]")
     except ValueError:
         inv_cmd = []
-    envelope = None
+    harness = harnesses.harness_for(kind)
+    try:
+        inv_meta = json.loads(inv.get("meta_json") or "{}") or {}
+    except ValueError:
+        inv_meta = {}
+    # Only the harness's own final record can carry the dispatcher's action.
+    envelope = harness.parse_report(kind, stdout_text, inv_cmd) if inv.get("stage") == "dispatch" \
+        or harness.is_dispatch(kind) else None
+    if envelope is not None and not (isinstance(envelope, dict) and envelope.get("action") in policy.VALID_ACTIONS):
+        # An OpenCode summary carries the Luna envelope in its assistant
+        # text; the harness seam extracts it so callers never parse
+        # harness output directly.
+        envelope = harness.luna_action(kind, stdout_text, inv_cmd) \
+            if isinstance(envelope, dict) else None
     planner_answer = None
-    if kind in ("codex_dispatch", "codex_resume"):
-        # Only Luna's own final agent message can carry an action.
-        envelope = adapters.parse_codex_agent_envelope(
-            stdout_text, adapters.read_last_message_file(
-                adapters.last_message_path_from_cmd(inv_cmd)))
     result_obj = None
     if inv.get("result_json"):
         try:
@@ -1013,23 +997,11 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             result_obj = None
     rc = inv.get("rc")
     if rc is None:
-        # Child and supervisor are dead. A Codex turn counts only with
-        # its completion event and a parsed action.
-        if kind in ("codex_dispatch", "codex_resume") and "turn.completed" in stdout_text \
-                and isinstance(envelope, dict):
-            rc = 0
-        elif kind == "claude_callback" and adapters.parse_claude_result(stdout_text).get("ok"):
-            rc = 0
-        else:
-            rc = 1
-    if kind == "claude_callback" and rc == 0:
-        parsed = adapters.parse_claude_result(stdout_text)
-        try:
-            qid = (json.loads(inv.get("meta_json") or "{}") or {}).get("qid")
-        except ValueError:
-            qid = None
-        if parsed.get("ok") and qid and parsed.get("session_id") == job.get("planner_session_id"):
-            planner_answer = (qid, parsed["answer"])
+        # Child and supervisor are dead: the harness's own record decides
+        # whether the turn counts, including the last-message file fallback.
+        rc = harness.infer_rc(kind, stdout_text, inv_cmd)
+    if rc == 0:
+        planner_answer = harness.planner_answer(kind, stdout_text, inv_meta, job)
     state = "completed" if rc == 0 else "failed"
     now = _utcnow()
     con = store.connect(state_dir)
@@ -1058,20 +1030,8 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             (rc, state, now, now, json.dumps(payload, sort_keys=True),
              sid, skind, inv["invocation_id"]),
         )
-        if sid and skind == "codex_task_id" and kind == "codex_dispatch":
-            con.execute(
-                "UPDATE jobs SET codex_task_id=COALESCE(codex_task_id, ?), adapter='codex',"
-                " model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, now, request_id),
-            )
-        elif sid and skind == "opencode_session_id":
-            route = job.get("route") or "muse-spark-xhigh-free"
-            r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
-            con.execute(
-                "UPDATE jobs SET opencode_session_id=COALESCE(opencode_session_id, ?),"
-                " adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, r_model, r_variant or "default", now, request_id),
-            )
+        if sid:
+            harness.record_session(con, request_id, sid, skind, kind, job, inv_meta, now)
         job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         job_status = job_row["status"] if job_row else None
         applied = "consumed"
@@ -1095,40 +1055,32 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                     job_status = "running"
                 applied = "answer-persisted"
         cancelled = bool(job_row is not None and job_row["cancel_requested"])
-        turn_ok = rc == 0 and (kind not in ("codex_dispatch", "codex_resume")
-                               or "turn.completed" in stdout_text)
-        # A Luna turn counts only from the saved thread: a resume that
+        is_dispatch = inv.get("stage") == "dispatch" or harness.is_dispatch(kind)
+        turn_ok = harness.turn_ok(kind, rc, stdout_text, inv_cmd)
+        # A dispatcher turn counts only from the saved task: a resume that
         # reports another thread, or none, is never applied.
         thread_ok = True
-        if kind in ("codex_dispatch", "codex_resume"):
+        if is_dispatch:
             saved_thread = job_row["codex_task_id"] if job_row is not None else None
-            thread_ok = bool(sid) and (saved_thread is None or sid == saved_thread)
+            thread_ok = harness.identity_ok(kind, sid, saved_thread)
         live_job = job_row is not None and job_status not in store.TERMINAL and not cancelled
         planner_reason = None
-        if live_job and kind == "claude_callback":
+        if live_job and inv_meta.get("qid") is not None:
             # A planner turn matters only while its question is still open;
             # a question answered meanwhile (public `answer`) wins.
-            try:
-                cb_qid = (json.loads(inv.get("meta_json") or "{}") or {}).get("qid")
-            except ValueError:
-                cb_qid = None
-            still_open = cb_qid is not None and con.execute(
+            cb_qid = inv_meta.get("qid")
+            still_open = con.execute(
                 "SELECT 1 FROM questions WHERE request_id=? AND qid=? AND status='pending'",
                 (request_id, cb_qid)).fetchone() is not None
             if still_open and not planner_answer:
-                parsed_cb = adapters.parse_claude_result(stdout_text)
-                if rc != 0 or not parsed_cb.get("ok"):
-                    planner_reason = f"planner_callback_failed rc={rc} (consumed by recovery)"
-                elif parsed_cb.get("session_id") != job_row["planner_session_id"]:
-                    planner_reason = "planner_session_mismatch (consumed by recovery)"
+                planner_reason = harness.callback_failure_reason(kind, rc, stdout_text, dict(job_row))
         if planner_reason:
             con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
                         " AND status NOT IN ('succeeded','failed','cancelled')",
                         (planner_reason, now, request_id))
             _event(con, request_id, "blocked", {"reason": planner_reason[:120]})
             applied = "blocked"
-        elif live_job and kind in ("codex_dispatch", "codex_resume") \
-                and (not turn_ok or not thread_ok):
+        elif live_job and is_dispatch and (not turn_ok or not thread_ok):
             # The controller would have blocked on this result; recovery
             # records the same durable, sticky reason instead of leaving
             # the job running without an owner. Muse turns are left to the
@@ -1176,22 +1128,35 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                 prompt = str(envelope.get("prompt") or envelope.get("question") or
                              envelope.get("text") or "Planner input requested.")
                 existing_q = con.execute(
-                    "SELECT qid FROM questions WHERE request_id=? AND qid=?",
+                    "SELECT qid, prompt FROM questions WHERE request_id=? AND qid=?",
                     (request_id, qid),
                 ).fetchone()
-                if existing_q is None:
-                    con.execute(
-                        "INSERT INTO questions(request_id,qid,prompt,status,created_at)"
-                        " VALUES(?,?,?,'pending',?)",
-                        (request_id, qid, prompt, now),
-                    )
-                if job_status != "question_pending":
-                    con.execute(
-                        "UPDATE jobs SET status='question_pending', updated_at=? WHERE request_id=?",
-                        (now, request_id),
-                    )
-                _event(con, request_id, "question_posted", {"qid": qid, "via": "consumed-invocation"})
-                applied = "question-persisted"
+                if existing_q is not None and (existing_q["prompt"] or "") != prompt:
+                    # A reused qid with a different prompt is a conflict, on
+                    # the live path and in recovery alike: block with the
+                    # documented reason instead of accepting the new prompt.
+                    # Clear it with `questions --clear QID` or use a new qid.
+                    reason = (f"planner_question_conflict: {qid} was stored for a different prompt; "
+                              f"clear it with `questions --clear {qid}` or use a new qid")
+                    con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
+                                " AND status NOT IN ('succeeded','failed','cancelled')",
+                                (reason, now, request_id))
+                    _event(con, request_id, "blocked", {"reason": reason[:120]})
+                    applied = "blocked"
+                else:
+                    if existing_q is None:
+                        con.execute(
+                            "INSERT INTO questions(request_id,qid,prompt,status,created_at)"
+                            " VALUES(?,?,?,'pending',?)",
+                            (request_id, qid, prompt, now),
+                        )
+                    if job_status != "question_pending":
+                        con.execute(
+                            "UPDATE jobs SET status='question_pending', updated_at=? WHERE request_id=?",
+                            (now, request_id),
+                        )
+                    _event(con, request_id, "question_posted", {"qid": qid, "via": "consumed-invocation"})
+                    applied = "question-persisted"
         _event(con, request_id, "invocation_consumed",
                {"invocation_id": inv["invocation_id"][:16], "applied": applied, "rc": rc})
         con.execute("COMMIT")
@@ -1254,19 +1219,12 @@ def _capture_invocation_sessions(state_dir, request_id: str,
                     "UPDATE invocations SET session_id=?, session_kind=? WHERE invocation_id=?",
                     (sid, skind, inv["invocation_id"]),
                 )
-                if skind == "codex_task_id" and inv["kind"] == "codex_dispatch":
-                    con.execute(
-                        "UPDATE jobs SET codex_task_id=COALESCE(codex_task_id, ?), adapter='codex',"
-                        " model=?, effort=?, updated_at=? WHERE request_id=?",
-                        (sid, adapters.CODEX_MODEL, adapters.CODEX_EFFORT, _utcnow(), request_id),
-                    )
-                elif skind == "opencode_session_id":
-                    route = job.get("route") or "muse-spark-xhigh-free"
-                    r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
-                    con.execute(
-                        "UPDATE jobs SET opencode_session_id=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                        (sid, r_model, r_variant or "default", _utcnow(), request_id),
-                    )
+                try:
+                    cap_meta = json.loads(inv.get("meta_json") or "{}") or {}
+                except ValueError:
+                    cap_meta = {}
+                harnesses.harness_for(inv["kind"]).record_session(
+                    con, request_id, sid, skind, inv["kind"], job, cap_meta, _utcnow())
                 _event(con, request_id, "invocation_session_reconciled",
                        {"invocation_id": inv["invocation_id"][:16],
                         "session_kind": skind, "session": sid[:24]})
@@ -1432,12 +1390,10 @@ def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -
 # Measurement (Agent Observer compatible)
 # ---------------------------------------------------------------------------
 
-STAGE_FOR_KIND = {"codex_dispatch": "dispatch", "codex_resume": "dispatch",
-                  "claude_callback": "planning", "opencode_control": "implementation",
-                  "opencode_run": "implementation", "opencode_serve": "implementation"}
 JOB_KINDS = ("ordinary", "experiment", "replay")
-PLANNER_HARNESSES = ("claude", "codex")
-_HARNESS_VERSIONS: dict = {}
+# The planner callback runs Claude --resume on the exact saved session; no
+# other planner harness is implemented, so only claude is accepted.
+PLANNER_HARNESSES = ("claude",)
 
 
 def _workspace_head(workspace: str | None) -> str | None:
@@ -1455,24 +1411,7 @@ def _workspace_head(workspace: str | None) -> str | None:
 
 def harness_version_for(kind: str) -> str | None:
     """``<binary> --version`` once per process for the harness behind a kind."""
-    if kind in ("codex_dispatch", "codex_resume"):
-        binary = adapters.CODEX_BIN
-    elif kind == "claude_callback":
-        binary = adapters.CLAUDE_BIN
-    elif kind.startswith("opencode"):
-        binary = adapters.OPENCODE_BIN
-    else:
-        return None
-    if binary not in _HARNESS_VERSIONS:
-        try:
-            out = subprocess.run([binary, "--version"], capture_output=True, text=True,
-                                 timeout=5, stdin=subprocess.DEVNULL).stdout
-            first = (out or "").strip().splitlines()
-            _HARNESS_VERSIONS[binary] = first[0][:80] if first else None
-        except Exception:
-            _HARNESS_VERSIONS[binary] = None
-    return _HARNESS_VERSIONS[binary]
-
+    return harnesses.harness_for(kind).version()
 
 def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
     if crashed:
@@ -1509,73 +1448,20 @@ def _runner_result_line(stdout: str) -> dict:
 
 
 def measure_output(kind: str, stdout: str, stderr: str, meta: dict | None = None) -> tuple:
-    """(usage, observed_model, native_ids) from a harness's own records.
+    """(usage, observed_model, observed_variant, native_ids) from the harness.
 
     Counters are copied verbatim under a ``source`` label and never folded;
-    a harness that reports nothing leaves usage None."""
-    usage = None
-    observed = None
-    ids: dict = {}
-    meta = meta or {}
-    if kind in ("codex_dispatch", "codex_resume"):
-        ids = {"thread_id": None, "turn_ids": [], "agent_message_ids": []}
-        for line in (stdout or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            typ = obj.get("type")
-            if typ == "thread.started":
-                ids["thread_id"] = obj.get("thread_id") or obj.get("id")
-            elif typ == "turn.completed":
-                usage = {"source": "codex", **(obj.get("usage") or {})}
-                if obj.get("turn_id"):
-                    ids["turn_ids"].append(obj["turn_id"])
-            elif typ == "item.completed":
-                item = obj.get("item") or {}
-                if item.get("type") == "agent_message" and item.get("id"):
-                    ids["agent_message_ids"].append(item["id"])
-    elif kind == "claude_callback":
-        obj = None
-        text = (stdout or "").strip()
-        try:
-            obj = json.loads(text) if text else None
-        except ValueError:
-            for line in reversed(text.splitlines()):
-                try:
-                    cand = json.loads(line.strip())
-                except ValueError:
-                    continue
-                if isinstance(cand, dict) and cand.get("type") == "result":
-                    obj = cand
-                    break
-        if isinstance(obj, dict):
-            usage = {"source": "claude", **(obj.get("usage") or {})}
-            for key in ("total_cost_usd", "duration_ms", "num_turns"):
-                if obj.get(key) is not None:
-                    usage[key] = obj.get(key)
-            ids = {"session_id": obj.get("session_id"), "uuid": obj.get("uuid")}
-            observed = obj.get("model") if isinstance(obj.get("model"), str) else None
-        if meta.get("prompt_sha256"):
-            ids["prompt_sha256"] = meta["prompt_sha256"]
-    elif kind == "opencode_control":
-        summary = _runner_result_line(stdout)
-        usage = summary.get("usage") if isinstance(summary.get("usage"), dict) else None
-        ids = summary.get("native_ids") if isinstance(summary.get("native_ids"), dict) else {}
-        am = summary.get("actual_model") if isinstance(summary.get("actual_model"), dict) else None
-        if am and am.get("providerID") and am.get("modelID"):
-            observed = f"{am['providerID']}/{am['modelID']}" + (f" {am['variant']}" if am.get("variant") else "")
-    return usage, observed, ids
-
+    a harness that reports nothing leaves usage None. Model and variant stay
+    separate; the harness seam is the single place that knows them."""
+    measured = harnesses.harness_for(kind).measure(kind, stdout, stderr, meta or {})
+    if len(measured) == 3:
+        usage, observed, ids = measured
+        return usage, observed, None, ids
+    return measured
 
 def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed: bool = False) -> None:
-    """Fill elapsed time, terminal class, usage, observed model, and native
-    identities on a finished invocation from its own files and result."""
+    """Fill elapsed time, terminal class, usage, observed model and variant,
+    and native identities on a finished invocation from its own files."""
     rows = [i for i in _list_invocations(state_dir, request_id) if i["invocation_id"] == invocation_id]
     if not rows:
         return
@@ -1589,7 +1475,7 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
         meta = json.loads(inv.get("meta_json") or "{}") or {}
     except ValueError:
         meta = {}
-    usage, observed, ids = measure_output(inv.get("kind") or "", stdout, stderr, meta)
+    usage, observed, variant, ids = measure_output(inv.get("kind") or "", stdout, stderr, meta)
     started = _parse_ts(inv.get("started_at"))
     ended = _parse_ts(inv.get("ended_at")) or time.time()
     elapsed = round(max(0.0, ended - started), 3) if started is not None else None
@@ -1599,9 +1485,12 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
         con.execute("BEGIN IMMEDIATE")
         con.execute(
             "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
-            " observed_model=COALESCE(?, observed_model), native_ids_json=? WHERE invocation_id=?",
+            " observed_model=COALESCE(?, observed_model),"
+            " observed_variant=COALESCE(?, observed_variant),"
+            " native_ids_json=?, schema_version=? WHERE invocation_id=?",
             (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
-             observed, json.dumps(ids, sort_keys=True) if ids else None, invocation_id))
+             observed, variant, json.dumps(ids, sort_keys=True) if ids else None,
+             store.SCHEMA_VERSION, invocation_id))
         con.execute("COMMIT")
     except Exception:
         try:
@@ -1620,12 +1509,19 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
             usage = json.loads(inv.get("usage_json") or "null")
         except ValueError:
             usage = None
+        try:
+            native_ids = json.loads(inv.get("native_ids_json") or "null")
+        except ValueError:
+            native_ids = None
         out.append({"invocation": inv["invocation_id"][:8], "kind": inv.get("kind"),
                     "stage": inv.get("stage"), "requested_route": inv.get("requested_route"),
                     "policy_version": inv.get("policy_version"), "reason": inv.get("reason"),
                     "observed_model": inv.get("observed_model"),
+                    "observed_variant": inv.get("observed_variant"),
                     "terminal_class": inv.get("terminal_class"), "elapsed_secs": inv.get("elapsed_secs"),
-                    "usage": usage, "harness_version": inv.get("harness_version"),
+                    "usage": usage, "native_ids": native_ids,
+                    "harness_version": inv.get("harness_version"),
+                    "schema_version": inv.get("schema_version"),
                     "report_path": inv.get("report_path"), "started_at": inv.get("started_at"),
                     "ended_at": inv.get("ended_at")})
     return out
@@ -1633,7 +1529,7 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
 
 def submit(state_dir, request_id: str, task, workspace: str,
            planner_session_id: str, route: str | None = None,
-           policy_id: str | None = None, max_attempts: int = 3,
+           policy_id: str | None = None, max_attempts: int = 5,
            timeout_secs: int | None = None,
            planner_model: str | None = None,
            planner_effort: str | None = None,
@@ -1792,8 +1688,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
-             adapters.opencode_route_params(route)[0],
-             adapters.opencode_route_params(route)[1] or "default", pcwd, lane_stage,
+             policy.opencode_route_params(route)[0],
+             policy.opencode_route_params(route)[1] or "default", pcwd, lane_stage,
              job_kind, replay_of, planner_harness, base_commit),
         )
         _event(con, request_id, "submitted", {
@@ -1823,7 +1719,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
 
 def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_session_id: str, route: str | None = None,
-                     policy_id: str | None = None, max_attempts: int = 3,
+                     policy_id: str | None = None, max_attempts: int = 5,
                      timeout_secs: int | None = None,
                      planner_model: str | None = None,
                      planner_effort: str | None = None,
@@ -2462,144 +2358,6 @@ def fail(state_dir, request_id: str, token: str, error, output: str | None = Non
     return _complete_with_token(state_dir, request_id, token, False, output, error)
 
 
-def launch_worker(state_dir, request_id: str, mode: str = "sleep",
-                  duration: float = 30.0, text: str = "") -> dict:
-    """Start a detached worker. Persists attempt before AND after ack.
-
-    Crash between the two rows leaves an 'attempting' launch that recover()
-    reconciles against the advertised worker identity file.
-    """
-    root = store.ensure_state_dir(state_dir)
-    _abandon_never_started(state_dir, request_id)
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-        if job is None:
-            con.execute("ROLLBACK")
-            raise NotFoundError(f"unknown request: {request_id}")
-        if job["status"] in store.TERMINAL:
-            con.execute("ROLLBACK")
-            raise TerminalError(f"job {request_id} is terminal ({job['status']}); refusing to resurrect")
-        if job["cancel_requested"]:
-            con.execute("ROLLBACK")
-            raise TerminalError(f"job {request_id} cancellation requested")
-        if job["status"] == "blocked":
-            con.execute("ROLLBACK")
-            raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
-        # Durable child ownership: never launch while ownership of a prior
-        # child is unknown. A live supervised child is adopted, not copied.
-        try:
-            _raise_if_unowned_invocation(state_dir, request_id)
-        except OwnershipError:
-            con.execute("ROLLBACK")
-            raise
-        # Launch-race guard: never spawn a second writer while the lease
-        # holder PID is still alive. A live recorded PID without a
-        # matching fresh handshake remains claimed/unknown and blocks
-        # duplicates; recover() reconciles it. Missing/stale heartbeats
-        # never count as worker_gone while the PID lives.
-        if job["owner_token"]:
-            ident = store.read_worker_identity(root, request_id)
-            if ident and ident.get("token") == job["owner_token"] \
-                    and ident.get("pid") == job["owner_pid"] \
-                    and _owner_alive(job) \
-                    and _heartbeat_fresh(ident.get("updated")):
-                con.execute("ROLLBACK")
-                raise OwnershipError(
-                    f"job {request_id} already has a live owned worker; refusing duplicate launch")
-            if job["owner_pid"] is not None and _owner_alive(job):
-                con.execute("ROLLBACK")
-                raise OwnershipError(
-                    f"job {request_id} still claimed by live pid {job['owner_pid']}; run recover")
-            # An attempting row with no ack yet is a launch in progress:
-            # let recover() reconcile it instead of forking a second writer.
-            if job["owner_pid"] is None and job["status"] in ("pending", "running", "question_pending"):
-                pending_attempt = con.execute(
-                    "SELECT * FROM launches WHERE request_id=? AND start_token=? AND state='attempting'",
-                    (request_id, job["owner_token"]),
-                ).fetchone()
-                if pending_attempt is not None:
-                    con.execute("ROLLBACK")
-                    raise OwnershipError(
-                        f"job {request_id} launch already in progress; run recover")
-        if job["attempts"] >= job["max_attempts"]:
-            # Bounded: do not loop retries.
-            now = _utcnow()
-            con.execute(
-                "UPDATE jobs SET status='failed', error_class='budget_exhausted',"
-                " result_json=?, updated_at=? WHERE request_id=?",
-                (json.dumps({"ok": False, "error": {"code": "BUDGET_EXHAUSTED"}}), now, request_id),
-            )
-            _event(con, request_id, "budget_exhausted", {})
-            con.execute("COMMIT")
-            raise TerminalError(f"job {request_id} retry budget exhausted")
-        token = secrets.token_hex(16)
-        attempt_no = int(job["attempts"]) + 1
-        now = _utcnow()
-        con.execute(
-            "INSERT INTO launches(request_id,attempt_no,start_token,state,created_at) VALUES(?,?,?,'attempting',?)",
-            (request_id, attempt_no, token, now),
-        )
-        con.execute(
-            "UPDATE jobs SET attempts=?, owner_token=?, owner_pid=NULL, owner_start=NULL, status=?,"
-            " updated_at=?, block_reason=NULL WHERE request_id=?",
-            (attempt_no, token,
-             "running" if job["status"] == "pending" else job["status"], now, request_id),
-        )
-        _event(con, request_id, "launch_attempting", {"attempt": attempt_no})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-    # Detached spawn: survives controller exit (new session, no stdio).
-    cmd = [sys.executable, "-m", "runner.worker", "--state-dir", str(root),
-           "--request-id", request_id, "--token", token,
-           "--mode", mode, "--duration", str(duration), "--text", text]
-    try:
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True, cwd=_PKG_ROOT,
-        )
-        pid = proc.pid
-    except OSError as e:
-        # Launch failed after the attempting row: leave for recover().
-        raise RunnerError(f"worker spawn failed: {e}")
-
-    # After-ack persistence.
-    con2 = store.connect(state_dir)
-    try:
-        con2.execute("BEGIN IMMEDIATE")
-        con2.execute(
-            "UPDATE launches SET pid=?, state='acknowledged', ack_at=? WHERE request_id=? AND start_token=?",
-            (pid, _utcnow(), request_id, token),
-        )
-        con2.execute(
-            "UPDATE jobs SET owner_pid=?, owner_start=?, updated_at=? WHERE request_id=? AND owner_token=?",
-            (pid, _process_start_identity(pid), _utcnow(), request_id, token),
-        )
-        cur = con2.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-        # A concurrent recover may have superseded this attempt; keep lease only
-        # if this token still holds it.
-        if cur is not None and cur["owner_token"] == token:
-            _event(con2, request_id, "launch_acknowledged", {"attempt": attempt_no, "pid": pid})
-        con2.execute("COMMIT")
-    except Exception:
-        try:
-            con2.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con2.close()
-    return {"request_id": request_id, "attempt": attempt_no, "token": token, "pid": pid}
 
 
 def _known_tokens(con: sqlite3.Connection, request_id: str) -> set[str]:
@@ -2690,7 +2448,7 @@ def recover_one(state_dir, request_id: str) -> dict:
         # the job would sit running without an owner. Block it here.
         if status in ("pending", "running") and not job["codex_task_id"]:
             failed_dispatch = [inv for inv in _list_invocations(state_dir, request_id)
-                               if inv.get("kind") == "codex_dispatch" and inv.get("state") == "failed"]
+                               if _is_dispatch_row(inv) and inv.get("state") == "failed"]
             live_or_open = [inv for inv in _list_invocations(state_dir, request_id)
                             if inv.get("state") in LIVE_INVOCATION_STATES]
             if failed_dispatch and not live_or_open:
@@ -2791,7 +2549,7 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.execute("COMMIT")
             out = {"request_id": request_id, "action": "adopted-live-invocation"}
             if not lease_pid_alive and (job["codex_task_id"] or any(
-                    i.get("kind") == "codex_dispatch" for i in live_invocations)):
+                    _is_dispatch_row(i) for i in live_invocations)):
                 # A new controller waits for the live child's durable
                 # result through the same action identity.
                 try:
@@ -2928,7 +2686,7 @@ def recover_one(state_dir, request_id: str) -> dict:
             # A finished dispatch whose action was not saved yet is resumed
             # too: the new controller reuses that result by action key.
             should_resume = bool(job["codex_task_id"]) or any(
-                i.get("kind") == "codex_dispatch" and i.get("state") == "completed"
+                _is_dispatch_row(i) and i.get("state") == "completed"
                 for i in _list_invocations(state_dir, request_id))
             # Same-session recovery within budget: clear lease, keep planner
             # and executor session IDs, keep partial log. When a public
@@ -3000,13 +2758,36 @@ def _trusted_reset_at(evidence) -> str | None:
 CAPACITY_STATES = ("unknown", "exhausted", "degraded", "available")
 
 
+def _capacity_windows_for(route: str, state: str, evidence, window: str | None) -> list[str]:
+    """Windows this capacity mark covers. The table keys on pool, model,
+    and window, so Go 5-hour, weekly, and monthly windows coexist. An
+    explicit window (or one named by evidence) wins; degraded uses the
+    documented cooldown; Go exhaustion without a named window covers all
+    three Go windows; anything else stays unknown rather than guessed."""
+    if isinstance(window, str) and window:
+        return [window]
+    if isinstance(evidence, dict):
+        named = evidence.get("window")
+        if isinstance(named, str) and named:
+            return [named]
+        nested = evidence.get("error") if isinstance(evidence.get("error"), dict) else None
+        if isinstance(nested, dict) and isinstance(nested.get("window"), str) and nested.get("window"):
+            return [str(nested.get("window"))]
+    if state == "degraded":
+        return ["cooldown"]
+    spec = policy.ROUTES.get(route) or {}
+    if state == "exhausted" and spec.get("pool") == "go":
+        return [w for w in ("5h", "weekly", "monthly") if w in policy.WINDOWS]
+    return ["unknown"]
+
+
 def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
                             evidence=None, reset_at: str | None = None,
                             window: str | None = None) -> None:
-    """Record capacity per route, which names one pool and model. The window
-    is the one the evidence names; otherwise it stays unknown rather than
-    guessed. ``reset_at`` comes only from provider evidence, the documented
-    degraded cooldown, or an operator."""
+    """Record capacity keyed by pool, model, and window. ``route`` names one
+    pool and model and is kept for display; the primary key is
+    (pool, model, window). ``reset_at`` comes only from provider evidence,
+    the documented degraded cooldown, or an operator."""
     now = _utcnow()
     ev = None
     if evidence is not None:
@@ -3015,17 +2796,16 @@ def _record_capacity_locked(con: sqlite3.Connection, route: str, state: str,
         except Exception:
             ev = json.dumps({"recorded": True})
     spec = policy.ROUTES.get(route) or {}
-    if window is None and isinstance(evidence, dict):
-        window = evidence.get("window") if isinstance(evidence.get("window"), str) else None
-    con.execute(
-        "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at, pool, model, window)"
-        " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET"
-        " state=excluded.state, evidence_json=excluded.evidence_json,"
-        " reset_at=excluded.reset_at, updated_at=excluded.updated_at,"
-        " pool=excluded.pool, model=excluded.model, window=excluded.window",
-        (route, state, ev, reset_at, now, spec.get("pool"), spec.get("model"),
-         window or ("cooldown" if state == "degraded" else "unknown")),
-    )
+    pool = spec.get("pool") or "unknown"
+    model = spec.get("model") or route
+    for win in _capacity_windows_for(route, state, evidence, window):
+        con.execute(
+            "INSERT INTO capacity(route, state, evidence_json, reset_at, updated_at, pool, model, window)"
+            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(pool, model, window) DO UPDATE SET"
+            " route=excluded.route, state=excluded.state, evidence_json=excluded.evidence_json,"
+            " reset_at=excluded.reset_at, updated_at=excluded.updated_at",
+            (route, state, ev, reset_at, now, pool, model, win),
+        )
 
 
 def degraded_until(now_ts: float | None = None) -> str:
@@ -3037,14 +2817,14 @@ def degraded_until(now_ts: float | None = None) -> str:
 
 
 def record_capacity(state_dir, route: str, state: str, evidence=None,
-                    reset_at: str | None = None) -> None:
+                    reset_at: str | None = None, window: str | None = None) -> None:
     policy.validate_route(route)
     if state not in CAPACITY_STATES:
         raise ValueError(f"invalid capacity state: {state!r}")
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        _record_capacity_locked(con, route, state, evidence, reset_at)
+        _record_capacity_locked(con, route, state, evidence, reset_at, window)
         con.execute("COMMIT")
     except Exception:
         try:
@@ -3059,7 +2839,8 @@ def record_capacity(state_dir, route: str, state: str, evidence=None,
 def list_capacity(state_dir) -> list[dict]:
     con = store.connect(state_dir)
     try:
-        return [dict(r) for r in con.execute("SELECT * FROM capacity ORDER BY route").fetchall()]
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM capacity ORDER BY route, window").fetchall()]
     finally:
         con.close()
 
@@ -3068,10 +2849,17 @@ def clear_capacity(state_dir, route: str) -> dict:
     """Operator action: forget an exhausted route after checking the
     provider. The runner never invents a reset time on its own."""
     policy.validate_route(route)
+    spec = policy.ROUTES.get(route) or {}
+    pool = spec.get("pool") or "unknown"
+    model = spec.get("model") or route
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        con.execute("DELETE FROM capacity WHERE route=?", (route,))
+        # The primary key is (pool, model, window); the route label is
+        # display. Clear by both so all windows go and an orphan row
+        # whose label was overwritten by a pool/model sharer is not left.
+        con.execute("DELETE FROM capacity WHERE route=? OR (pool=? AND model=?)",
+                    (route, pool, model))
         con.execute("COMMIT")
     except Exception:
         try:
@@ -3203,7 +2991,9 @@ def status_view(state_dir, request_id: str) -> dict:
         le = json.loads(job_public.get("last_error_json") or "null")
     except ValueError:
         le = None
-    job_public["last_error_json"] = ({k: le.get(k) for k in ("source", "rc", "quota", "idle_confirmed")}
+    job_public["last_error_json"] = ({k: le.get(k) for k in ("source", "rc", "error", "quota", "signal",
+                                                             "evidence", "idle_confirmed", "retry_next",
+                                                             "retry_next_capped", "overload_retries")}
                                      if isinstance(le, dict) else None)
     try:
         res = json.loads(job_public.get("result_json") or "null")

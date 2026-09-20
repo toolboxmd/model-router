@@ -8,9 +8,7 @@ Public operations (built-in defaults, no executor/callback commands):
   answer     persist an answer before ack
   cancel     persist cancellation before ack
   recover    reconcile durable records with live ownership (resume saved IDs)
-
-Worker-internal helpers (used by tests, not new authority):
-  launch, post-question, complete, fail
+  capacity   show or clear remembered route capacity
 
 State:
   --state-dir <dir> (or DURABLE_RUNNER_STATE_DIR). Created 0700; files 0600.
@@ -72,7 +70,8 @@ def main(argv=None) -> int:
                                help="implementation lane: default, small, hard; critical is "
                                     "planner-executed and rejected")
     p.add_argument("--policy", default=policy.POLICY_ID)
-    p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--max-attempts", type=int, default=5,
+                   help="controller launches per job (default 5: five 12-step launches cover the 48-step job budget)")
     p.add_argument("--timeout-secs", type=int, default=None)
     p.add_argument("--planner-model", default=None,
                    help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
@@ -83,8 +82,8 @@ def main(argv=None) -> int:
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
-    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex"),
-                   help="harness that hosts the planner session")
+    p.add_argument("--planner-harness", default="claude", choices=("claude",),
+                   help="harness that hosts the planner session (only claude is implemented)")
     p.add_argument("--start", action="store_true",
                    help="launch detached controller with built-in adapters after persist")
     p.add_argument("--no-start", action="store_true",
@@ -101,14 +100,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("questions", help="list pending questions")
     p.add_argument("--request-id", required=True)
-    p.add_argument("--all", action="store_true", help="include answered")
-    p.add_argument("--clear", default=None, metavar="QID",
-                   help="operator action: forget a stored question (clears planner_question_conflict)")
-
-    p = sub.add_parser("post-question", help="worker-internal: persist a question")
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--qid", required=True)
-    p.add_argument("--prompt", required=True)
+    qg = p.add_mutually_exclusive_group()
+    qg.add_argument("--all", action="store_true", help="include answered")
+    qg.add_argument("--clear", default=None, metavar="QID",
+                    help="operator action: forget a stored question (clears planner_question_conflict)")
 
     p = sub.add_parser("answer", help="persist an answer before ack")
     p.add_argument("--request-id", required=True)
@@ -126,23 +121,6 @@ def main(argv=None) -> int:
     p = sub.add_parser("capacity", help="show remembered route capacity; --clear forgets one")
     p.add_argument("--clear", default=None, metavar="ROUTE",
                    help="operator action after checking the provider allowance")
-
-    p = sub.add_parser("launch", help="worker-internal: start a detached worker")
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--mode", default="sleep")
-    p.add_argument("--duration", type=float, default=30.0)
-    p.add_argument("--text", default="")
-
-    p = sub.add_parser("complete", help="worker-internal: persist terminal success")
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--token", required=True)
-    p.add_argument("--output", default="")
-
-    p = sub.add_parser("fail", help="worker-internal: persist terminal failure")
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--token", required=True)
-    p.add_argument("--error", required=True, help="JSON error object or message")
-    p.add_argument("--output", default="")
 
     args = ap.parse_args(argv)
     sd = _state_dir(args)
@@ -203,9 +181,6 @@ def main(argv=None) -> int:
                 return _out(core.clear_question(sd, args.request_id, args.clear))
             qs = core.list_questions(sd, args.request_id, only_pending=not args.all)
             return _out({"request_id": args.request_id, "questions": qs})
-        if args.cmd == "post-question":
-            q = core.post_question(sd, args.request_id, args.qid, args.prompt)
-            return _out({"persisted": True, "question": {"qid": q["qid"], "status": q["status"]}})
         if args.cmd == "answer":
             q = core.answer(sd, args.request_id, args.qid, args.answer)
             return _out({"acknowledged": True, "qid": q["qid"], "status": q["status"]})
@@ -217,23 +192,6 @@ def main(argv=None) -> int:
             if args.all:
                 return _out({"recovered": core.recover_all(sd)})
             return _out(core.recover_one(sd, args.request_id))
-        if args.cmd == "launch":
-            info = core.launch_worker(sd, args.request_id, mode=args.mode,
-                                      duration=args.duration, text=args.text)
-            redacted = dict(info)
-            redacted["token"] = "<redacted>"
-            return _out({"launched": True, **redacted})
-        if args.cmd == "complete":
-            job = core.complete(sd, args.request_id, args.token, args.output)
-            return _out({"acknowledged": True, "status": job["status"]})
-        if args.cmd == "fail":
-            try:
-                err = json.loads(args.error)
-            except ValueError:
-                err = args.error
-            job = core.fail(sd, args.request_id, args.token, err, args.output)
-            return _out({"acknowledged": True, "status": job["status"],
-                         "route": job["route"]})
     except (core.NotFoundError, core.ConflictError, core.WorkspaceConflictError,
             core.TerminalError, core.BlockedError, core.OwnershipError,
             core.RunnerError, ValueError) as e:

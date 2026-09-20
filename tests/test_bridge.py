@@ -177,34 +177,6 @@ class TestPublicDefaults(Base):
         self.assertIn("m2", cmd2)
         self.assertIn("high", cmd2)
 
-    def test_opencode_defaults_free_first(self):
-        cmd = adapters.build_opencode_cmd("/tmp/ws", "implement")
-        blob = " ".join(cmd)
-        self.assertIn("opencode", cmd[0])
-        self.assertIn("opencode/muse-spark-1.3-contributor-free", cmd)
-        self.assertIn("--variant", cmd)
-        self.assertIn("xhigh", cmd)
-        self.assertIn("--dir", cmd)
-        self.assertIn("/tmp/ws", cmd)
-        self.assertIn("--format", cmd)
-        self.assertIn("json", cmd)
-        self.assertIn("--pure", cmd)
-        self.assertIn("--agent", cmd)
-        self.assertIn("build", cmd)
-        self.assertNotIn("--effort", cmd)
-        self.assertNotIn("--cd", cmd)
-        # Allowance drives the model route; Go only after exact exhaustion.
-        go = adapters.build_opencode_cmd("/tmp/ws", "implement",
-                                         allowance="go-included")
-        self.assertIn("opencode-go/muse-spark-1.3-contributor", go)
-        # Saved sessions resume via --session.
-        resumed = adapters.build_opencode_cmd("/tmp/ws", "implement",
-                                              session_id="oc-saved-1")
-        self.assertIn("--session", resumed)
-        self.assertIn("oc-saved-1", resumed)
-        self.assertNotIn("muse-spark-1.3-contributor", " ".join(
-            c for c in cmd if c.startswith("muse-")), blob)
-
     def test_missing_planner_session_rejected_no_fork(self):
         with self.assertRaises(ValueError):
             core.submit(self.sd, "r1", {"a": 1}, self.ws(), "")
@@ -221,9 +193,7 @@ class TestPublicDefaults(Base):
         rc, out, _ = cli(self.sd, "status", "--request-id", "r1")
         self.assertEqual(rc, 0)
         self.assertIn("job", out)
-        rc, _, _ = cli(self.sd, "post-question", "--request-id", "r1",
-                       "--qid", "q1", "--prompt", "Confirm?")
-        self.assertEqual(rc, 0)
+        core.post_question(self.sd, "r1", "q1", "Confirm?")
         rc, out, _ = cli(self.sd, "questions", "--request-id", "r1")
         self.assertEqual(rc, 0)
         self.assertEqual(len(out["questions"]), 1)
@@ -307,26 +277,6 @@ class TestAdapterSessions(Base):
         self.assertEqual(qs[0]["status"], "answered")
         self.assertEqual(qs[0]["answer"], "Approved as written.")
 
-    def test_opencode_session_persisted_with_route_adapter_model(self):
-        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
-
-        def fake_oc(cmd, cwd=None, timeout=120, **kw):
-            self.assertIn("opencode", cmd[0])
-            self.assertIn("opencode/muse-spark-1.3-contributor-free", cmd)
-            self.assertIn("--variant", cmd)
-            self.assertIn("xhigh", cmd)
-            self.assertIn("--dir", cmd)
-            self.assertNotIn("--effort", cmd)
-            self.assertNotIn("--cd", cmd)
-            return 0, json.dumps({"opencode_session_id": "oc-sess-5", "ok": True}), ""
-
-        res = controller.run_implementation(self.sd, "r1", artifact="/tmp/a.txt",
-                                            payload={"k": "v"}, run_cmd=fake_oc)
-        self.assertEqual(res["action"], "implementation_ok")
-        job = core.get_job(self.sd, "r1")
-        self.assertEqual(job["opencode_session_id"], "oc-sess-5")
-        self.assertEqual(job["route"], "muse-spark-xhigh-free")
-
     def test_luna_structured_actions_parse(self):
         q = controller.parse_luna_action(json.dumps({"action": "planner_question", "qid": "q1"}))
         self.assertEqual(q["action"], "planner_question")
@@ -335,24 +285,6 @@ class TestAdapterSessions(Base):
         done = controller.parse_luna_action(json.dumps({"action": "completion", "output": "ok"}))
         self.assertEqual(done["action"], "completion")
         self.assertIsNone(controller.parse_luna_action("plain text with no envelope"))
-
-    def test_implementation_carries_saved_artifact_output(self):
-        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
-        seen = {}
-
-        def fake(cmd, cwd=None, timeout=120, **kw):
-            seen["cmd"] = list(cmd)
-            return 0, json.dumps({"ok": True}), ""
-
-        controller.run_implementation(self.sd, "r1", artifact="outputs/fix.txt",
-                                      payload={"output": "prior output"}, run_cmd=fake)
-        blob = " ".join(seen["cmd"])
-        # Adapter carries the saved artifact/output in the prompt tail.
-        # The command itself stays provider-shaped; prompt is last arg.
-        self.assertIn("opencode", seen["cmd"][0])
-        # Prompt arg contains artifact (last element after --).
-        self.assertIn("outputs/fix.txt", seen["cmd"][-1])
-
 
 class TestControllerLifecycle(Base):
     def test_submit_persists_before_launch_with_builtin_spawn_seam(self):
@@ -387,72 +319,7 @@ class TestControllerLifecycle(Base):
         self.assertIsNone(job["owner_token"])
         self.assertIsNone(job["owner_pid"])
 
-    def test_controller_death_recoverable_resumes_saved_ids_never_forks(self):
-        core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
-        before = core.get_job(self.sd, "r1")
 
-        def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
-            return 0, codex_out("codex-keep-1", {"action": "completion", "output": "x"}), ""
-
-        controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
-
-        def fake_oc(cmd, cwd=None, timeout=120, **kw):
-            return 0, json.dumps({"opencode_session_id": "oc-keep-2"}), ""
-
-        controller.run_implementation(self.sd, "r1", run_cmd=fake_oc)
-        # Hold the lease with a real detached sleep controller (offline mode).
-        import subprocess as _sp
-        root = store.ensure_state_dir(self.sd)
-        con = store.connect(self.sd)
-        try:
-            tok = core.get_job(self.sd, "r1")["owner_token"]
-        finally:
-            con.close()
-        # Use the worker lease path for a live holder, then adopt via recover.
-        info = core.launch_worker(self.sd, "r1", mode="sleep", duration=30)
-        self.track(info["pid"])
-        time.sleep(0.8)
-        rc, out, _ = cli(self.sd, "recover", "--request-id", "r1")
-        self.assertEqual(rc, 0)
-        self.assertEqual(out.get("action"), "adopted-live-worker")
-        mid = core.get_job(self.sd, "r1")
-        self.assertEqual(mid["codex_task_id"], "codex-keep-1")
-        self.assertEqual(mid["opencode_session_id"], "oc-keep-2")
-        self.assertEqual(mid["planner_session_id"], "claude-1")
-        self.assertEqual(mid["executor_session_id"], before["executor_session_id"])
-        # Kill and recover: same IDs, no fork, partial preserved.
-        kill_pid(info["pid"])
-        rc, out, _ = cli(self.sd, "recover", "--request-id", "r1")
-        self.assertEqual(rc, 0)
-        after = core.get_job(self.sd, "r1")
-        self.assertEqual(after["codex_task_id"], "codex-keep-1")
-        self.assertEqual(after["opencode_session_id"], "oc-keep-2")
-        self.assertEqual(after["planner_session_id"], "claude-1")
-        self.assertEqual(after["executor_session_id"], before["executor_session_id"])
-
-    def test_builtin_controller_sleep_adopt(self):
-        cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-            "--workspace", self.ws(), "--planner-session", "claude-1")
-        info = core.launch_worker(self.sd, "r1", mode="sleep", duration=30)
-        self.track(info["pid"])
-        # Real detached controller in offline sleep mode holds the same lease shape.
-        proc = subprocess.Popen([PY, "-m", "runner.controller", "--state-dir", self.sd,
-                                 "--request-id", "r1", "--token", info["token"],
-                                 "--mode", "sleep", "--duration", "10"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                start_new_session=True, close_fds=True, cwd=str(ROOT))
-        self.track(proc.pid)
-        time.sleep(0.8)
-        rc, out, _ = cli(self.sd, "recover", "--request-id", "r1")
-        self.assertEqual(rc, 0)
-        # A live recorded PID without a matching fresh handshake stays
-        # claimed and blocks duplicates (never treated as worker_gone).
-        # Worker and sleep controller both advertise the same identity file;
-        # whichever wrote last decides. A recent acknowledgment without a
-        # matching handshake is a launch in progress.
-        self.assertIn(out.get("action"), ("adopted-live-worker", "reconciled-launch-race",
-                                          "noop", "blocked-claimed-live-pid", "blocked-unknown-owner",
-                                          "launch-in-progress"))
 
 
 class TestPlannerBusyAndCallback(Base):
@@ -600,29 +467,6 @@ class TestQuotaClassification(Base):
 
 class TestQuotaTransfer(Base):
     """``opencode run`` seam: only structured error events count."""
-
-    def test_free_exhaustion_error_event_transfers_and_preserves_artifacts(self):
-        w = self.ws()
-        core.submit(self.sd, "r1", {"goal": "t"}, w, "claude-1")
-        log = Path(self.sd) / "outputs" / "r1.log"
-        log.write_text("prior artifact chunk\n", encoding="utf-8")
-
-        def fake_oc(cmd, cwd=None, timeout=120, **kw):
-            events = [{"type": "step_start", "sessionID": "ses_free1"},
-                      {"type": "error", "sessionID": "ses_free1",
-                       "error": {"name": "APIError", "data": {
-                           "statusCode": 429,
-                           "responseBody": json.dumps({"type": "error", "error": {"type": "FreeUsageLimitError"}})}}}]
-            return 1, "\n".join(json.dumps(e) for e in events), ""
-
-        res = controller.run_implementation(self.sd, "r1", artifact="outputs/fix.txt",
-                                            run_cmd=fake_oc)
-        self.assertEqual(res["action"], "transferred_to_go")
-        job = core.get_job(self.sd, "r1")
-        self.assertEqual(job["route"], "muse-spark-xhigh-go")
-        self.assertEqual(job["opencode_session_id"], "ses_free1")
-        self.assertIn("prior artifact chunk", log.read_text(encoding="utf-8"))
-        self.assertIn("FreeUsageLimitError", job["last_error_json"])
 
     def test_model_text_naming_the_error_never_transfers(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")

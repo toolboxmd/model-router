@@ -335,7 +335,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
                 con.execute("UPDATE jobs SET route=?, status='running' WHERE request_id='oc1'", (route,))
             finally:
                 con.close()
-            res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+            res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
             self.assertEqual(res["action"], "implementation_ok", route)
             body = [r for r in self._requests() if r["path"].endswith("/prompt_async")][-1]["body"]
             self.assertEqual(body["model"], expect_model)
@@ -366,10 +366,29 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         finally:
             con.close()
 
+    def _insert_completed_turn(self, inv_id, seq=0):
+        root = store.ensure_state_dir(self.sd)
+        stdout = root / "outputs" / f"{inv_id}.stdout"
+        stderr = root / "outputs" / f"{inv_id}.stderr"
+        store.secure_write_text(stdout, "")
+        store.secure_write_text(stderr, "")
+        con = store.connect(self.sd)
+        try:
+            con.execute(
+                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
+                "pid,pgid,process_start,stdout_path,stderr_path,started_at,state,timeout_secs,"
+                "action_key,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (inv_id, "oc1", "opencode_control", json.dumps(["true"]), str(self.ws), "tok",
+                 None, None, None, str(stdout), str(stderr), core._utcnow(), "completed", 5,
+                 None, json.dumps({"seq": seq})),
+            )
+        finally:
+            con.close()
+
     def test_one_turn_route_is_refused_a_second_turn(self):
         run = self._setup("ok")
         self._set_route("kimi-k3-go")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "implementation_ok")
         con = store.connect(self.sd)
         try:
@@ -377,7 +396,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
                         (json.dumps({"seq": 1, "last_action": {"action": "implementation"}}),))
         finally:
             con.close()
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         # The one-turn mark now yields a lateral move before dispatch, not a block.
         self.assertEqual((res2["action"], res2["reason"], res2["route"]),
                          ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
@@ -390,7 +409,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
     def test_overload_moves_to_next_family_within_60s(self):
         run = self._setup("overloaded")
         started = time.monotonic()
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         elapsed = time.monotonic() - started
         self.assertEqual(res["action"], "route_switched")
         self.assertEqual(res["reason"], "lateral")
@@ -407,7 +426,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertTrue(cap["reset_at"])
         # The next turn runs on GLM in the same saved session.
         session = job["opencode_session_id"]
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
         self.assertEqual([m["providerID"] for m in prompts], ["opencode", "opencode-go"])
@@ -419,7 +438,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         run = self._setup("ok")
         self._go_mode("go_limit")
         self._set_route("grok-4.6-go")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "pool_move"))
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["route"], "grok-4.6-xai")
@@ -428,7 +447,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual((cap["state"], cap["pool"], cap["model"]), ("exhausted", "go", "opencode-go/grok-4.6"))
         self.assertIn("GoUsageLimitError", cap["evidence_json"])
         self.assertIsNone(cap["reset_at"])  # no invented reset
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
         self.assertEqual([m["providerID"] for m in prompts], ["opencode-go", "xai"])
@@ -438,7 +457,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         run = self._setup("ok")
         self._go_mode("go_limit")
         self._set_route("glm-5.3-go")  # last route of the default lane, no next pool
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("blocked", "capacity_exhausted"))
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["status"], "blocked")
@@ -453,10 +472,10 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
             con.execute("UPDATE jobs SET lane='implementation_hard', status='running' WHERE request_id='oc1'")
         finally:
             con.close()
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         # Overloaded free Muse in the hard lane moves to Kimi K3, not to GLM.
         self.assertEqual((res["action"], res["route"]), ("route_switched", "kimi-k3-go"))
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         # The dispatcher asks for another turn (new seq). A second turn on the
         # one-turn route is refused before dispatch: the job moves to the next
@@ -467,7 +486,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
                         (json.dumps({"seq": 1, "last_action": {"action": "implementation"}}),))
         finally:
             con.close()
-        res3 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res3 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res3["action"], res3["reason"], res3["route"]),
                          ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
         prompts = [r["body"]["model"]["modelID"] for r in self._requests() if r["path"].endswith("/prompt_async")]
@@ -478,7 +497,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         core.record_capacity(self.sd, "muse-spark-xhigh-free", "degraded",
                              {"source": "test", "class": "overloaded"}, reset_at=core.degraded_until())
         core.record_capacity(self.sd, "muse-spark-xhigh-go", "exhausted", {"source": "test"})
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "preflight_degraded"))
         self.assertEqual(core.get_job(self.sd, "oc1")["route"], "glm-5.3-go")
         self.assertEqual(self._requests(), [])  # nothing was dispatched to the resting routes
@@ -486,7 +505,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         core.record_capacity(self.sd, "glm-5.3-go", "degraded", {"source": "test"},
                              reset_at="2000-01-01T00:00:00+00:00")
         self.assertNotIn("glm-5.3-go", core.degraded_routes(self.sd))
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         self._no_secret_leak()
 
@@ -498,7 +517,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
                         (json.dumps({"goal": "owned serve", "proof": "python3 -c \"print('proof-ran')\""}),))
         finally:
             con.close()
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "implementation_ok")
         report = res["report"]
         turn_dir = Path(report["report_path"]).parent
@@ -511,37 +530,48 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
                          ("python3 -c \"print('proof-ran')\"", 0))
         self.assertIn("proof-ran", (turn_dir / "proof.log").read_text())
         self.assertEqual(on_disk["observed_model"], "opencode/muse-spark-1.3-contributor-free")
+        self.assertEqual(on_disk["observed_variant"], "xhigh")
         self.assertEqual(on_disk["tokens"]["source"], "opencode")
         self.assertEqual(on_disk["tokens"]["messages"][0]["tokens"]["cache"]["read"], 300)
         self.assertTrue(on_disk["native_ids"]["assistant_message_ids"])
         self.assertEqual(on_disk["workspace_note"], "workspace is not a git checkout")
         self.assertIn("IMPLEMENTED by fake worker", on_disk["worker_summary"])
-        # The dispatcher gets paths and fields, not the prose.
+        self.assertIn("IMPLEMENTED by fake worker", (turn_dir / "worker.txt").read_text())
+        # The dispatcher gets paths and structured fields, not the prose.
         evidence = controller._implementation_evidence(core.get_job(self.sd, "oc1"), res)
         self.assertIn(report["report_path"], evidence)
         self.assertIn('"proof_exit_code": 0', evidence)
-        self.assertIn("proof-ran", evidence)
+        self.assertIn('"policy_version":', evidence)
+        self.assertIn('"observed_variant": "xhigh"', evidence)
+        self.assertIn('"tokens":', evidence)
+        self.assertIn('"native_ids":', evidence)
+        self.assertNotIn("proof log tail:", evidence)
+        self.assertNotIn("worker summary:", evidence)
+        self.assertNotIn("IMPLEMENTED by fake worker", evidence)
         # The invocation row carries the measurements Agent Observer needs.
         inv = [i for i in core._list_invocations(self.sd, "oc1") if i["kind"] == "opencode_control"][-1]
         self.assertEqual((inv["stage"], inv["requested_route"], inv["policy_version"], inv["reason"]),
                          ("implementation", "muse-spark-xhigh-free", policy.POLICY_VERSION, "initial"))
         self.assertEqual(inv["terminal_class"], "completed")
         self.assertGreater(inv["elapsed_secs"], 0)
-        self.assertEqual(inv["observed_model"], "opencode/muse-spark-1.3-contributor-free xhigh")
+        self.assertEqual(inv["observed_model"], "opencode/muse-spark-1.3-contributor-free")
+        self.assertEqual(inv["observed_variant"], "xhigh")
         self.assertEqual(json.loads(inv["usage_json"])["source"], "opencode")
         self.assertEqual(json.loads(inv["native_ids_json"])["session_id"], inv["session_id"])
         self.assertEqual(inv["report_path"], report["report_path"])
         self.assertEqual(inv["schema_version"], store.SCHEMA_VERSION)
         view = core.status_view(self.sd, "oc1")
         m = view["job"]["measurements"][-1]
-        self.assertEqual((m["stage"], m["terminal_class"], m["observed_model"]),
-                         ("implementation", "completed", inv["observed_model"]))
+        self.assertEqual((m["stage"], m["terminal_class"], m["observed_model"], m["observed_variant"]),
+                         ("implementation", "completed", inv["observed_model"], "xhigh"))
+        self.assertTrue(m["native_ids"]["assistant_message_ids"])
+        self.assertEqual(m["schema_version"], store.SCHEMA_VERSION)
         self.assertEqual(core.result_view(self.sd, "oc1")["reports"], [report["report_path"]])
         self._no_secret_leak()
 
     def test_hard_error_ends_the_turn_failed_without_blocking(self):
         run = self._setup("hard_error")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "implementation_failed")
         job = core.get_job(self.sd, "oc1")
         self.assertNotEqual(job["status"], "blocked")
@@ -555,6 +585,34 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(controller._ladder(core.get_job(self.sd, "oc1"))["failures"], 1)
         self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
         self.assertNotIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
+
+    def test_dispatch_falls_back_to_luna_on_opencode_plan_mode(self):
+        run = self._setup("ok")
+        bindir = Path(os.environ["PATH"].split(os.pathsep)[0])
+        write_fake(bindir, "codex", "import sys\nprint('{\"type\":\"error\",\"message\":\"usage limit reached\"}')\nsys.exit(1)\n", PY)
+        res = controller.dispatch(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res["action"], "dispatched")
+        self.assertEqual(res["route"], "luna-go/max")
+        self.assertEqual(res["luna_action"]["action"], "completion")
+        job = core.get_job(self.sd, "oc1")
+        self.assertTrue(str(job["codex_task_id"]).startswith("ses"))
+        self.assertEqual(job["adapter"], "opencode")
+        self.assertEqual(controller._load_controller_state(job)["dispatch_route"], "luna-go/max")
+        prompts = [r["body"] for r in self._requests() if r["path"].endswith("/prompt_async")]
+        self.assertEqual(prompts[-1]["model"], {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
+        self.assertEqual(prompts[-1]["agent"], "plan")
+        invs = core._list_invocations(self.sd, "oc1")
+        self.assertEqual([i["stage"] for i in invs], ["dispatch", "dispatch"])
+        self.assertEqual(invs[-1]["requested_route"], "luna-go/max")
+        # A resume goes back to the same OpenCode dispatcher session.
+        res2 = controller.resume_luna(self.sd, "oc1", "context", run_cmd=run)
+        self.assertEqual((res2["action"], res2["codex_task_id"]), ("resumed", job["codex_task_id"]))
+        self.assertEqual(len([r for r in self._requests() if r["path"].endswith("/prompt_async")]), 2)
+        # The completion envelope ends the job through the normal step.
+        done = controller.step(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(done["action"], "completed")
+        self.assertEqual(core.get_job(self.sd, "oc1")["status"], "succeeded")
+        self._no_secret_leak()
 
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):
@@ -584,7 +642,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
     def test_success_saves_session_before_prompt_and_stops_server(self):
         run = self._setup("ok")
         res = controller.run_implementation(self.sd, "oc1", artifact="a.txt",
-                                            run_cmd=run, use_owned_server=True)
+                                            run_cmd=run)
         self.assertEqual(res["action"], "implementation_ok", core.get_job(self.sd, "oc1"))
         self.assertIn("IMPLEMENTED", res["output"])
         job = core.get_job(self.sd, "oc1")
@@ -600,9 +658,45 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertTrue(wait_for(lambda: not core._is_pgid_alive(inv["pgid"]), 10))
         self._no_secret_leak()
 
+    def test_implementation_carries_saved_artifact_output(self):
+        run = self._setup("ok")
+        res = controller.run_implementation(self.sd, "oc1", artifact="outputs/fix.txt",
+                                            payload={"output": "prior output"}, run_cmd=run)
+        self.assertEqual(res["action"], "implementation_ok")
+        prompt = [r for r in self._requests()
+                  if r["path"].endswith("/prompt_async")][-1]["body"]["parts"][0]["text"]
+        self.assertIn("outputs/fix.txt", prompt)
+        self.assertIn("prior output", prompt)
+
+    def test_provider_api_error_transfers_and_preserves_artifacts(self):
+        run = self._setup("api_free_error")
+        log = Path(self.sd) / "outputs" / "oc1.log"
+        log.write_text("prior artifact chunk\n", encoding="utf-8")
+        res = controller.run_implementation(self.sd, "oc1", artifact="outputs/fix.txt",
+                                            run_cmd=run)
+        self.assertEqual(res["action"], "transferred_to_go")
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "muse-spark-xhigh-go")
+        self.assertTrue(job["opencode_session_id"].startswith("ses_"))
+        self.assertIn("prior artifact chunk", log.read_text(encoding="utf-8"))
+        self.assertIn("FreeUsageLimitError", job["last_error_json"])
+
+    def test_capacity_memory_never_overrides_an_attempted_turn(self):
+        run = self._setup("ok")
+        core.record_capacity(self.sd, "muse-spark-xhigh-free", "exhausted",
+                             {"class": "FreeUsageLimitError"})
+        self._insert_completed_turn("i-free")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res["action"], "implementation_ok")
+        job = core.get_job(self.sd, "oc1")
+        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        self.assertTrue(job["opencode_session_id"].startswith("ses_"))
+        self.assertEqual(len([r for r in self._requests()
+                              if r["path"].endswith("/prompt_async")]), 1)
+
     def test_free_limit_status_aborts_confirms_idle_then_go(self):
         run = self._setup("free_limit")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "transferred_to_go")
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["route"], "muse-spark-xhigh-go")
@@ -612,7 +706,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
         # Same saved session continues on Go with the Go model.
         free_session = job["opencode_session_id"]
-        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r for r in self._requests() if r["path"].endswith("/prompt_async")]
         self.assertEqual([p["body"]["model"]["providerID"] for p in prompts],
@@ -622,7 +716,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
 
     def test_provider_api_error_body_is_trusted_free_evidence(self):
         run = self._setup("api_free_error")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "transferred_to_go")
 
     def test_generic_rate_limit_never_transfers(self):
@@ -630,7 +724,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         # marked exhausted and Go Muse is never selected; the job moves to the
         # next family after the provider's own retries.
         run = self._setup("rate_limit")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "lateral"))
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["route"], "glm-5.3-go")
@@ -640,7 +734,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
 
     def test_model_authored_text_is_not_provider_evidence(self):
         run = self._setup("model_text")
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "implementation_ok")
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
@@ -649,7 +743,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
 
     def test_hung_turn_times_out_with_abort(self):
         run = self._setup("hang", timeout_secs=3)
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run, use_owned_server=True)
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "blocked")
         self.assertTrue((self.fake_state / "aborted").exists())
         job = core.get_job(self.sd, "oc1")
@@ -802,6 +896,205 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         self.assertEqual(len(self._lines("opencode.log")), 1, "the interrupted turn is not replayed")
 
 
+class TestIssue13PublicCLIDrills(unittest.TestCase):
+    """Issue #13 drills through the public CLI (submit --start).
+
+    Overload leaves within 60s with the 20s `next` cap enforced and the
+    evidence recorded; exhaustion moves the same model to the Go pool;
+    transport HTTP 503/529 degrades laterally. Capacity keys on pool,
+    model, and window.
+    """
+
+    def _start_cli_job(self, oc_mode, extra_env=None, request_id="issue13-cli"):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        bindir = base / "bin"
+        bindir.mkdir()
+        fs = base / "fakestate"
+        fs.mkdir()
+        write_fake(bindir, "codex", FAKE_LUNA, PY)
+        write_fake(bindir, "claude", FAKE_CLAUDE, PY)
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        env = dict(os.environ)
+        env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
+                   FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+        env.update(extra_env or {})
+        rc, out, err = cli(sd, "submit", "--request-id", request_id,
+                           "--task", '{"goal":"issue13 cli drill"}',
+                           "--workspace", str(ws), "--planner-session", "p-issue13",
+                           "--start", env=env)
+        self.assertEqual(rc, 0, err)
+        return tmp, base, sd, ws, fs, env, request_id
+
+    def _cleanup_cli_job(self, sd, request_id):
+        try:
+            job = core.get_job(sd, request_id)
+        except Exception:
+            return
+        if job.get("owner_pid"):
+            kill_pid(job["owner_pid"])
+        for inv in core._list_invocations(sd, request_id):
+            for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
+                if pg:
+                    try:
+                        os.killpg(int(pg), signal.SIGKILL)
+                    except Exception:
+                        pass
+
+    def _requests(self, fs):
+        f = fs / "opencode-requests.jsonl"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def test_cli_overload_leaves_within_60s_with_capped_next(self):
+        tmp, base, sd, ws, fs, env, rid = self._start_cli_job(
+            "overloaded", {"FAKE_OC_MODE": "overloaded", "FAKE_OC_NEXT": "999"},
+            request_id="issue13-overload-cap")
+        self.addCleanup(lambda: self._cleanup_cli_job(sd, rid))
+        started = time.monotonic()
+        self.assertTrue(wait_for(
+            lambda: core.get_job(sd, rid)["status"] == "succeeded", 25),
+            core.get_job(sd, rid))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 60.0, "overloaded route left within 60s via public CLI")
+        job = core.get_job(sd, rid)
+        self.assertEqual(job["route"], "glm-5.3-go", job)
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
+        self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
+        # Retry counts and the 20s cap are recorded by the CLI-driven turn.
+        last = json.loads(job["last_error_json"] or "{}")
+        self.assertEqual(last.get("signal"), "overloaded")
+        self.assertLessEqual(float(last.get("retry_next_capped") or 0), 20.0)
+        self.assertEqual(float(last.get("retry_next_capped") or 0), 20.0)
+        self.assertLessEqual(int(last.get("overload_retries") or 0), 3)
+        self.assertTrue(last.get("idle_confirmed"))
+        # CLI-recorded evidence: capacity lists the degraded route with pool/model/window.
+        rc, cap_out, err = cli(sd, "capacity", env=env)
+        self.assertEqual(rc, 0, err)
+        rows = [r for r in cap_out.get("capacity", []) if r["route"] == "muse-spark-xhigh-free"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["state"], "degraded")
+        self.assertEqual((rows[0]["pool"], rows[0]["window"]), ("zen-free", "cooldown"))
+        self.assertTrue(rows[0]["reset_at"])
+        rc, st_out, err = cli(sd, "status", "--request-id", rid, env=env)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(st_out["job"]["route"], "glm-5.3-go")
+        # Same model is never retried on the same route: one free prompt, then Go.
+        prompts = [r for r in self._requests(fs) if r["path"].endswith("/prompt_async")]
+        free_prompts = [p for p in prompts if p["body"]["model"]["providerID"] == "opencode"]
+        self.assertEqual(len(free_prompts), 1, prompts)
+        self.assertTrue((ws / "fix.txt").exists())
+
+    def test_cli_transport_503_degrades_laterally(self):
+        tmp, base, sd, ws, fs, env, rid = self._start_cli_job(
+            "transport_503", {"FAKE_OC_MODE": "transport_503"},
+            request_id="issue13-transport-503")
+        self.addCleanup(lambda: self._cleanup_cli_job(sd, rid))
+        started = time.monotonic()
+        self.assertTrue(wait_for(
+            lambda: core.get_job(sd, rid)["status"] == "succeeded", 25),
+            core.get_job(sd, rid))
+        self.assertLess(time.monotonic() - started, 60.0)
+        job = core.get_job(sd, rid)
+        self.assertEqual(job["route"], "glm-5.3-go", job)
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
+        last = json.loads(job["last_error_json"] or "{}")
+        self.assertEqual(last.get("signal"), "overloaded")
+        self.assertEqual((last.get("evidence") or {}).get("source"), "transport")
+        self.assertEqual((last.get("evidence") or {}).get("status"), 503)
+        rc, cap_out, err = cli(sd, "capacity", env=env)
+        self.assertEqual(rc, 0, err)
+        rows = [r for r in cap_out.get("capacity", []) if r["route"] == "muse-spark-xhigh-free"]
+        self.assertTrue(rows and rows[0]["state"] == "degraded")
+
+    def test_cli_exhaustion_moves_to_go_with_evidence(self):
+        tmp, base, sd, ws, fs, env, rid = self._start_cli_job(
+            "free_limit", {"FAKE_OC_MODE": "free_limit"},
+            request_id="issue13-exhaust-go")
+        self.addCleanup(lambda: self._cleanup_cli_job(sd, rid))
+        started = time.monotonic()
+        self.assertTrue(wait_for(
+            lambda: core.get_job(sd, rid)["status"] == "succeeded", 25),
+            core.get_job(sd, rid))
+        self.assertLess(time.monotonic() - started, 60.0)
+        job = core.get_job(sd, rid)
+        self.assertEqual(job["route"], "muse-spark-xhigh-go", job)
+        self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
+        self.assertIn("free_tier_limit", job["last_error_json"])
+        self.assertIn('"idle_confirmed": true', job["last_error_json"])
+        rc, cap_out, err = cli(sd, "capacity", env=env)
+        self.assertEqual(rc, 0, err)
+        rows = [r for r in cap_out.get("capacity", []) if r["route"] == "muse-spark-xhigh-free"]
+        self.assertTrue(rows and rows[0]["state"] == "exhausted")
+        prompts = [r for r in self._requests(fs) if r["path"].endswith("/prompt_async")]
+        self.assertEqual([p["body"]["model"]["providerID"] for p in prompts],
+                         ["opencode", "opencode-go"])
+        self.assertTrue((ws / "fix.txt").exists())
+
+    def test_capacity_keys_on_pool_model_window(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        sd = str(Path(tmp.name) / "state")
+        ws = Path(tmp.name) / "ws"
+        ws.mkdir()
+        core.submit(sd, "capwin", {"g": 1}, str(ws), "p1")
+        core.record_capacity(sd, "grok-4.6-go", "exhausted", {"class": "GoUsageLimitError"})
+        rows = [r for r in core.list_capacity(sd) if r["route"] == "grok-4.6-go"]
+        self.assertEqual({r["window"] for r in rows}, {"5h", "weekly", "monthly"})
+        self.assertTrue(all(r["pool"] == "go" and r["model"] == "opencode-go/grok-4.6" for r in rows))
+        self.assertIn("grok-4.6-go", core.exhausted_routes(sd))
+        # A degraded mark on another window coexists; clearing forgets all windows.
+        core.record_capacity(sd, "muse-spark-xhigh-free", "degraded",
+                             {"source": "test"}, reset_at=core.degraded_until())
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
+        self.assertIn("grok-4.6-go", core.exhausted_routes(sd))
+        rc, cap_out, err = cli(sd, "capacity", env=dict(os.environ))
+        self.assertEqual(rc, 0, err)
+        self.assertGreaterEqual(len(cap_out.get("capacity", [])), 4)
+        core.clear_capacity(sd, "grok-4.6-go")
+        self.assertNotIn("grok-4.6-go", core.exhausted_routes(sd))
+        self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
+
+    def test_exhaustion_preflight_skips_degraded_next_pool(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        sd = str(Path(tmp.name) / "state")
+        ws = Path(tmp.name) / "ws"
+        ws.mkdir()
+        core.submit(sd, "pre1", {"g": 1}, str(ws), "p1")
+        core.record_capacity(sd, "muse-spark-xhigh-free", "exhausted", {"class": "FreeUsageLimitError"})
+        core.record_capacity(sd, "muse-spark-xhigh-go", "degraded",
+                             {"source": "test"}, reset_at=core.degraded_until())
+        move = controller._preflight_move(sd, "pre1", "muse-spark-xhigh-free")
+        self.assertIsNotNone(move)
+        self.assertEqual((move["reason"], move["route"]),
+                         ("preflight_exhausted", "glm-5.3-go"))
+        # The lateral signal path skips a degraded next-pool route as well.
+        ws2 = Path(tmp.name) / "ws2"
+        ws2.mkdir(exist_ok=True)
+        core.submit(sd, "pre2", {"g": 1}, str(ws2), "p1")
+        res = controller._move_after_signal(sd, "pre2", "muse-spark-xhigh-free",
+                                            "exhausted", {"class": "FreeUsageLimitError"})
+        self.assertEqual((res["reason"], res["route"]), ("lateral", "glm-5.3-go"))
+
+    def test_docs_and_skill_list_all_overload_signals(self):
+        root = Path(__file__).resolve().parents[1]
+        runner_doc = (root / "RUNNER.md").read_text()
+        skill = (root / "skills" / "model-routing" / "references" / "codex.md").read_text()
+        for name in ("overloaded_error", "rate_limit_exceeded", "RateLimitError",
+                     "overloaded", "rate_limit", "account_rate_limit", "503", "529"):
+            self.assertIn(name, runner_doc, name)
+            self.assertIn(name, skill, name)
+        self.assertIn("`next` capped at 20 seconds", runner_doc)
+        self.assertIn("`next` capped at", skill)
+        self.assertIn("implementation_failed", runner_doc)
+        self.assertIn("implementation_failed", skill)
+
+
 class TestCancelTimeoutOwnChildren(unittest.TestCase):
     def test_timeout_stops_child_group(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -839,6 +1132,266 @@ time.sleep(60)
         self.assertTrue(wait_for(lambda: not alive(child["pid"]), secs=8))
         job = core.get_job(sd, "to1")
         self.assertIn(job["status"], ("failed", "blocked", "cancelling"))
+
+
+class TestIssue14ReportContract(unittest.TestCase):
+    """Issue #14: every turn leaves redacted reports, diffs, and measurements."""
+
+    def _setup_owned(self, mode, task=None):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        bindir = base / "bin"
+        bindir.mkdir()
+        fake_state = base / "fakestate"
+        fake_state.mkdir()
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_STATE", "FAKE_OC_MODE")}
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        os.environ["PATH"] = str(bindir) + os.pathsep + (saved["PATH"] or "")
+        os.environ["FAKE_STATE"] = str(fake_state)
+        os.environ["FAKE_OC_MODE"] = mode
+        core.submit(sd, "oc1", task or {"goal": "owned serve"}, str(ws), "planner")
+        con = store.connect(sd)
+        try:
+            con.execute("UPDATE jobs SET owner_token='tok' WHERE request_id='oc1'")
+        finally:
+            con.close()
+        self.sd = sd
+        self.ws = ws
+        self.fake_state = fake_state
+        self.addCleanup(self._kill_owned)
+        run = core.make_durable_run_cmd(sd, "oc1", "tok")
+        def timed_run(cmd, cwd=None, timeout=None, **kw):
+            return run(cmd, cwd, timeout, **kw)
+        return timed_run
+
+    def _kill_owned(self):
+        try:
+            for inv in core._list_invocations(self.sd, "oc1"):
+                for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
+                    if pg:
+                        try:
+                            os.killpg(int(pg), signal.SIGKILL)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def _report_files(self, report):
+        turn_dir = Path(report["report_path"]).parent
+        for name in ("report.json", "proof.log", "diff.patch", "worker.txt"):
+            p = turn_dir / name
+            self.assertTrue(p.exists(), name)
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600, name)
+        return turn_dir
+
+    def test_failed_turn_writes_redacted_report(self):
+        run = self._setup_owned("hard_error")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res["action"], "implementation_failed")
+        turn_dir = self._report_files(res["report"])
+        on_disk = json.loads((turn_dir / "report.json").read_text())
+        self.assertEqual(on_disk["status"], "failed")
+        self.assertEqual(on_disk["observed_variant"], "xhigh")
+        inv = [i for i in core._list_invocations(self.sd, "oc1") if i["kind"] == "opencode_control"][-1]
+        self.assertEqual(inv["terminal_class"], "hard_error")
+        self.assertEqual(inv["observed_variant"], "xhigh")
+
+    def test_quota_and_overload_turns_write_reports_without_overwrite(self):
+        run = self._setup_owned("free_limit")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertIn(res["action"], ("transferred_to_go", "route_switched"))
+        self.assertIn("report", res)
+        first_dir = self._report_files(res["report"])
+        first_report = json.loads((first_dir / "report.json").read_text())
+        self.assertIn(first_report["status"], ("exhausted", "failed"))
+        res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res2["action"], "implementation_ok")
+        second_dir = self._report_files(res2["report"])
+        self.assertNotEqual(str(first_dir), str(second_dir))
+        reports = core.result_view(self.sd, "oc1")["reports"]
+        self.assertEqual(len(reports), 2)
+        self.assertIn(res["report"]["report_path"], reports)
+        self.assertIn(res2["report"]["report_path"], reports)
+
+    def test_crash_turn_writes_report(self):
+        self._setup_owned("ok")
+        def stub(cmd, cwd=None, timeout=None, **kw):
+            return 124, "", ""
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=stub)
+        self.assertEqual(res["action"], "blocked")
+        self.assertIn("report", res)
+        self._report_files(res["report"])
+        on_disk = json.loads(Path(res["report"]["report_path"]).read_text())
+        self.assertEqual(on_disk["status"], "failed")
+
+    def test_git_diff_includes_staged_and_untracked(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name) / "ws"
+        ws.mkdir()
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
+        subprocess.run(["git", "init", "-q", str(ws)], check=True, env=env)
+        (ws / "tracked.txt").write_text("base\n")
+        subprocess.run(["git", "-C", str(ws), "add", "tracked.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(ws), "commit", "-q", "-m", "base"], check=True, env=env)
+        (ws / "tracked.txt").write_text("unstaged\n")
+        (ws / "staged.txt").write_text("staged\n")
+        subprocess.run(["git", "-C", str(ws), "add", "staged.txt"], check=True, env=env)
+        (ws / "new.txt").write_text("untracked-body\n")
+        files, diff, note = controller._git_changes(str(ws))
+        self.assertIsNone(note)
+        self.assertIn("tracked.txt", files)
+        self.assertIn("staged.txt", files)
+        self.assertIn("new.txt", files)
+        self.assertIn("unstaged", diff)
+        self.assertIn("staged", diff)
+        self.assertIn("untracked-body", diff)
+
+    def test_worker_txt_is_full_and_redacted(self):
+        self._setup_owned("ok")
+        job = core.get_job(self.sd, "oc1")
+        long_text = "X" * 20000 + " api_key=SECRET123 Bearer abcdefgh12345678"
+        full = {"assistant_text": long_text, "usage": {"source": "opencode"},
+                "native_ids": {"session_id": "s"}, "actual_model": {"providerID": "opencode", "modelID": "m", "variant": "xhigh"}}
+        report = controller._write_turn_report(self.sd, "oc1", job, 9, "muse-spark-xhigh-free", full, "ses_1")
+        body = Path(report["worker_text"]).read_text()
+        self.assertEqual(len(body), len(controller.adapters.redact_text(long_text)))
+        self.assertNotIn("SECRET123", body)
+        self.assertNotIn("abcdefgh12345678", body)
+        self.assertIn("<redacted>", body)
+        self.assertGreater(len(body), 8000)
+        self.assertNotIn("SECRET123", report["worker_summary"])
+        proof = Path(report["proof_log"]).read_text()
+        self.assertNotIn("SECRET123", proof)
+
+    def test_proof_output_is_redacted(self):
+        run = self._setup_owned("ok")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET task_json=? WHERE request_id='oc1'",
+                        (json.dumps({"goal": "g", "proof": "python3 -c \"print('password=hunter2-secret')\""}),))
+        finally:
+            con.close()
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res["action"], "implementation_ok")
+        proof = Path(res["report"]["proof_log"]).read_text()
+        self.assertNotIn("hunter2-secret", proof)
+        self.assertIn("<redacted>", proof)
+
+    def test_evidence_has_fields_without_prose(self):
+        run = self._setup_owned("ok")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET task_json=? WHERE request_id='oc1'",
+                        (json.dumps({"goal": "g", "proof": "python3 -c \"print(40+2)\""}),))
+        finally:
+            con.close()
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        evidence = controller._implementation_evidence(core.get_job(self.sd, "oc1"), res)
+        for key in ("policy_version", "variant", "observed_variant", "tokens", "native_ids",
+                    "turn_status", "report", "proof_log", "diff", "worker_text"):
+            self.assertIn(f'"{key}"', evidence)
+        self.assertNotIn("proof log tail:", evidence)
+        self.assertNotIn("worker summary:", evidence)
+        self.assertNotIn("IMPLEMENTED", evidence)
+        # Proof output (42) stays in the file, not in the dispatcher message.
+        self.assertNotIn("\n42\n", evidence)
+
+    def test_measurements_expose_variant_native_ids_schema(self):
+        run = self._setup_owned("ok")
+        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        self.assertEqual(res["action"], "implementation_ok")
+        view = core.status_view(self.sd, "oc1")
+        m = view["job"]["measurements"][-1]
+        self.assertEqual(m["observed_model"], "opencode/muse-spark-1.3-contributor-free")
+        self.assertEqual(m["observed_variant"], "xhigh")
+        self.assertTrue(m["native_ids"]["assistant_message_ids"])
+        self.assertEqual(m["schema_version"], store.SCHEMA_VERSION)
+        self.assertGreater(m["elapsed_secs"], 0)
+        rview = core.result_view(self.sd, "oc1")
+        self.assertEqual(rview["measurements"][-1]["observed_variant"], "xhigh")
+
+    def test_planner_harness_codex_rejected_and_blocked(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        sd = str(Path(tmp.name) / "state")
+        ws = Path(tmp.name) / "ws"
+        ws.mkdir()
+        with self.assertRaises(ValueError):
+            core.submit(sd, "bad", {"g": 1}, str(ws), "p", planner_harness="codex")
+        rc, _, _ = cli(sd, "submit", "--request-id", "bad2", "--task", '{"g":1}',
+                       "--workspace", str(ws), "--planner-session", "p",
+                       "--planner-harness", "codex", "--no-start")
+        self.assertNotEqual(rc, 0)
+        # Legacy row naming codex must not execute Claude.
+        core.submit(sd, "legacy", {"g": 1}, str(ws), "p")
+        con = store.connect(sd)
+        try:
+            con.execute("UPDATE jobs SET planner_harness='codex' WHERE request_id='legacy'")
+        finally:
+            con.close()
+        out = controller.planner_callback(sd, "legacy", "q1", "prompt?")
+        self.assertEqual(out["reason"], "planner_harness_unsupported")
+        self.assertIn("planner_harness_unsupported", core.get_job(sd, "legacy")["block_reason"])
+
+    def test_supervisor_spawn_failure_is_measured(self):
+        self._setup_owned("ok")
+        import subprocess as _sp
+        real_popen = _sp.Popen
+        def boom(*a, **k):
+            raise OSError("no fork")
+        _sp.Popen = boom
+        try:
+            rc, _, _ = core._durable_run(self.sd, "oc1", "tok", "codex_dispatch", ["codex", "exec"], cwd=str(self.ws), meta={"stage": "dispatch", "route": "luna/max"})
+        finally:
+            _sp.Popen = real_popen
+        self.assertEqual(rc, 127)
+        inv = core._list_invocations(self.sd, "oc1")[-1]
+        self.assertEqual(inv["state"], "failed")
+        self.assertEqual(inv["rc"], 127)
+        self.assertIsNotNone(inv["elapsed_secs"])
+        self.assertEqual(inv["terminal_class"], "failed")
+        self.assertEqual(inv["schema_version"], store.SCHEMA_VERSION)
+
+    def test_public_cli_job_kinds_links_and_status(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        sd = str(Path(tmp.name) / "state")
+        ws = Path(tmp.name) / "ws"
+        ws.mkdir()
+        ws2 = Path(tmp.name) / "ws2"
+        ws2.mkdir()
+        task = json.dumps({"goal": "g", "links": [{"rel": "spec", "href": "https://example.com/s"}]})
+        rc, out, err = cli(sd, "submit", "--request-id", "jk1", "--task", task,
+                           "--workspace", str(ws), "--planner-session", "p",
+                           "--job-kind", "experiment", "--no-start")
+        self.assertEqual(rc, 0, err)
+        rc, st, err = cli(sd, "status", "--request-id", "jk1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(st["job"]["job_kind"], "experiment")
+        self.assertIn("links", core.get_job(sd, "jk1")["task_json"])
+        rc, out, err = cli(sd, "submit", "--request-id", "jk2", "--task", '{"goal":"g"}',
+                           "--workspace", str(ws2), "--planner-session", "p",
+                           "--job-kind", "replay", "--replay-of", "jk1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        rc, st, err = cli(sd, "status", "--request-id", "jk2", env=None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((st["job"]["job_kind"], st["job"]["replay_of"]), ("replay", "jk1"))
+        rc, res, err = cli(sd, "result", "--request-id", "jk1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(res["job_kind"], "experiment")
 
 
 if __name__ == "__main__":

@@ -35,8 +35,11 @@ class Provenance(unittest.TestCase):
         job = core.submit(self.sd, "o1", {"g": 1}, self.ws("a"), "p")
         self.assertEqual((job["job_kind"], job["replay_of"], job["planner_harness"]), ("ordinary", None, "claude"))
         job = core.submit(self.sd, "r1", {"g": 1}, self.ws("b"), "p", job_kind="replay", replay_of="o1",
-                          planner_harness="codex")
-        self.assertEqual((job["job_kind"], job["replay_of"], job["planner_harness"]), ("replay", "o1", "codex"))
+                          planner_harness="claude")
+        self.assertEqual((job["job_kind"], job["replay_of"], job["planner_harness"]), ("replay", "o1", "claude"))
+        # Only the Claude planner callback is implemented.
+        with self.assertRaises(ValueError):
+            core.submit(self.sd, "codex-plan", {"g": 1}, self.ws("b2"), "p", planner_harness="codex")
         with self.assertRaises(ValueError):
             core.submit(self.sd, "bad1", {"g": 1}, self.ws("c"), "p", job_kind="replay")
         with self.assertRaises(ValueError):
@@ -86,31 +89,40 @@ class Measures(unittest.TestCase):
             {"type": "item.completed", "item": {"id": "item_7", "type": "agent_message", "text": "{}"}},
             {"type": "turn.completed", "usage": {"input_tokens": 12, "cached_input_tokens": 3,
                                                   "output_tokens": 5, "reasoning_output_tokens": 2}}])
-        usage, observed, ids = core.measure_output("codex_dispatch", out, "")
+        usage, observed, variant, ids = core.measure_output("codex_dispatch", out, "")
         self.assertEqual(usage, {"source": "codex", "input_tokens": 12, "cached_input_tokens": 3,
                                  "output_tokens": 5, "reasoning_output_tokens": 2})
         self.assertEqual(ids["thread_id"], "thr_1")
         self.assertEqual(ids["agent_message_ids"], ["item_7"])
         self.assertIsNone(observed)
+        self.assertIsNone(variant)
 
     def test_measure_claude_output(self):
         out = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "yes",
                           "session_id": "s1", "uuid": "u1", "duration_ms": 40, "num_turns": 1,
                           "total_cost_usd": 0.01, "usage": {"input_tokens": 9, "output_tokens": 2}})
-        usage, observed, ids = core.measure_output("claude_callback", out, "", {"prompt_sha256": "abc"})
+        usage, observed, variant, ids = core.measure_output("claude_callback", out, "", {"prompt_sha256": "abc"})
         self.assertEqual(usage["source"], "claude")
         self.assertEqual((usage["input_tokens"], usage["duration_ms"], usage["total_cost_usd"]), (9, 40, 0.01))
         self.assertEqual(ids, {"session_id": "s1", "uuid": "u1", "prompt_sha256": "abc"})
+        self.assertIsNone(variant)
 
     def test_measure_opencode_control_output(self):
         summary = {"usage": {"source": "opencode", "messages": [{"id": "msg_1", "tokens": {"input": 1}}]},
                    "native_ids": {"session_id": "ses_1", "assistant_message_ids": ["msg_1"]},
                    "actual_model": {"providerID": "opencode-go", "modelID": "glm-5.3", "variant": None}}
         out = "junk\nRUNNER_RESULT " + json.dumps(summary) + "\n"
-        usage, observed, ids = core.measure_output("opencode_control", out, "")
+        usage, observed, variant, ids = core.measure_output("opencode_control", out, "")
         self.assertEqual(usage["messages"][0]["id"], "msg_1")
         self.assertEqual(observed, "opencode-go/glm-5.3")
+        self.assertIsNone(variant)
         self.assertEqual(ids["session_id"], "ses_1")
+        summary2 = dict(summary, actual_model={"providerID": "opencode", "modelID": "muse-spark-1.3-contributor-free",
+                                               "variant": "xhigh"})
+        out2 = "junk\nRUNNER_RESULT " + json.dumps(summary2) + "\n"
+        _, observed2, variant2, _ = core.measure_output("opencode_control", out2, "")
+        self.assertEqual(observed2, "opencode/muse-spark-1.3-contributor-free")
+        self.assertEqual(variant2, "xhigh")
 
     def test_terminal_classes(self):
         self.assertEqual(core.terminal_class_for(0, {}), "completed")

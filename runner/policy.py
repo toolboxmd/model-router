@@ -71,6 +71,10 @@ ROUTES = {
     "luna/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                  "variant": "max", "role": "dispatch", "family": "gpt",
                  "sandbox": "read-only"},
+    "luna-go/max": {"harness": "opencode", "pool": "go", "model": "opencode-go/gpt-5.6-luna",
+                    "variant": None, "agent": "plan", "role": "dispatch", "family": "gpt",
+                    "one_turn_per_job": True,
+                    "note": "dispatch fallback in OpenCode plan mode when Codex is unavailable"},
     "luna-max-review": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                         "variant": "max", "role": "review", "family": "gpt"},
     "opus-5/high-review": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
@@ -120,13 +124,14 @@ STAGES = {
     "planning": {"executor": "host", "routes": ["fable-5.1/max"], "overrides": ["sonnet/medium"],
                  "capabilities": ["session_resume"],
                  "note": "Fable 5.1 in Claude Code; Sonnet medium only as the explicit live-test override"},
-    "dispatch": {"executor": "runner", "routes": ["luna/max"],
+    "dispatch": {"executor": "runner", "routes": ["luna/max", "luna-go/max"],
                  "capabilities": ["read_only", "session_resume", "structured_output"],
-                 "note": "read-only Codex sandbox; Go Luna fallback arrives with the adapter seam (#16)"},
+                 "note": "read-only Codex sandbox first; the same model on Go in OpenCode plan mode "
+                         "when Codex cannot start the task"},
     "implementation_default": {"executor": "runner",
                                "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go"],
                                "capabilities": ["workspace_write", "session_resume"],
-                               "note": "policy declares Go exhaustion moves the same model to xAI; overload moves to the next model family within one minute"},
+                               "note": "policy declares exhaustion moves the same model to the next pool where declared (free Muse to Go Muse, Go Grok to xAI Grok), otherwise to the next family; overload moves to the next model family within one minute"},
     "implementation_small": {"executor": "runner",
                              "routes": ["glm-5.3-flash-go", "qwen3.8-flash-go", "minimax-m3-go"],
                              "capabilities": ["workspace_write", "session_resume"],
@@ -165,7 +170,7 @@ SIGNAL_CLASSES = {
                    "retry_reasons": ["overloaded", "rate_limit", "account_rate_limit"],
                    "error_names": ["overloaded_error", "rate_limit_exceeded", "RateLimitError"],
                    "status_codes": [503, 529]},
-    "hard": {"action": "block", "retries": 0,
+    "hard": {"action": "implementation_failed", "retries": 0,
              "retry_reasons": ["auth", "region", "consent"],
              "error_names": ["context_length_exceeded", "AuthError", "RegionError", "DataPolicyError"]},
 }
@@ -576,14 +581,17 @@ def render_skill_table() -> str:
         "no pay-per-token API keys and no paid balance overflow.",
         "- The policy declares that exhaustion (" + ", ".join(SIGNAL_CLASSES["exhausted"]["retry_reasons"]
                                       + SIGNAL_CLASSES["exhausted"]["error_names"])
-        + ") moves the same model to the next pool with no retries; for Go routes, that means the xAI pool. "
+        + ") moves the same model to the next pool with no retries where the route declares one (free Muse to Go Muse, Go Grok to xAI Grok); without a next pool it moves to the next model family in its lane. "
         "It declares that overload ("
-        + ", ".join(SIGNAL_CLASSES["overloaded"]["retry_reasons"]) + ", HTTP "
+        + ", ".join(SIGNAL_CLASSES["overloaded"]["retry_reasons"]
+                     + SIGNAL_CLASSES["overloaded"]["error_names"]) + ", HTTP "
         + ", ".join(str(c) for c in SIGNAL_CLASSES["overloaded"]["status_codes"])
         + f") allows {SIGNAL_CLASSES['overloaded']['retries']} retries inside "
-        f"{SIGNAL_CLASSES['overloaded']['window_secs']} seconds, then moves to the next "
+        f"{SIGNAL_CLASSES['overloaded']['window_secs']} seconds with `next` capped at "
+        f"{SIGNAL_CLASSES['overloaded']['next_cap_secs']} seconds (a `next` larger than the cap "
+        "aborts instead of waiting), then moves to the next "
         "model family within one minute. "
-        "Hard errors block with a reason.",
+        "Hard errors end the turn as `implementation_failed` for the ladder; they never move routes.",
         f"- Go models with a ${SCARCE_MONTHLY_LIMIT_USD} monthly limit get one turn per job. "
         f"Windows: 5-hour {int(WINDOWS['5h'] * 100)} percent, weekly {int(WINDOWS['weekly'] * 100)} "
         "percent, monthly 100 percent of the model's limit.",
