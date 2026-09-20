@@ -21,7 +21,7 @@ class PolicyData(unittest.TestCase):
 
     def test_every_route_has_adapter_and_subscription_pool(self):
         for name, spec in policy.ROUTES.items():
-            self.assertIn(spec["harness"], ("codex", "claude", "opencode"), name)
+            self.assertIn(spec["harness"], ("codex", "claude", "opencode", "grok"), name)
             self.assertIn(spec["pool"], policy.POOLS, name)
             self.assertTrue(policy.is_operational(name))
             self.assertIsNone(policy.route_blocker(name))
@@ -104,12 +104,14 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(s["implementation_small"]["routes"],
                          ["muse-spark-xhigh-free", "muse-spark-xhigh-go"] +
                          s["implementation_default"]["routes"][2:])
-        # hard: Muse free, Muse Go, GLM-5.3, DeepSeek V4 Pro, Grok 4.6 Go, xAI.
+        # hard: Muse free, Muse Go, GLM-5.3, DeepSeek V4 Pro, Grok 4.6 Go, Build, xAI.
         self.assertEqual(s["implementation_hard"]["routes"],
                          ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go",
-                          "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-xai"])
+                          "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-build",
+                          "grok-4.6-xai"])
+        self.assertEqual(s["implementation_hard"]["routes"][-2:], ["grok-4.6-build", "grok-4.6-xai"])
         self.assertEqual(s["correction"]["routes"], ["kimi-k2.7-code-go"])
-        self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-xai"])
+        self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"])
         self.assertEqual(s["dispatch"]["routes"], ["luna/max", "luna-go/max"])
         self.assertEqual(s["dispatch"]["manual"], ["terra/max"])
         self.assertTrue(policy.ROUTES["terra/max"]["manual"])
@@ -150,7 +152,9 @@ class PolicyData(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.opencode_route_params("luna/max")
         self.assertEqual(policy.next_pool_route("muse-spark-xhigh-free"), "muse-spark-xhigh-go")
-        self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-xai")
+        self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-build")
+        self.assertEqual(policy.next_pool_route("grok-4.6-build"), "grok-4.6-xai")
+        self.assertIsNone(policy.next_pool_route("grok-4.6-xai"))
         self.assertIsNone(policy.next_pool_route("muse-spark-xhigh-go"))
         self.assertEqual(policy.next_family_route("muse-spark-xhigh-free"), "glm-5.3-flash-go")
         self.assertEqual(policy.next_family_route("muse-spark-xhigh-free",
@@ -169,15 +173,25 @@ class PolicyData(unittest.TestCase):
 
     def test_correction_advances_to_recovery(self):
         self.assertEqual(policy.next_recovery_route("kimi-k2.7-code-go"), "grok-4.6-go")
-        self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-xai")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-build")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-build"), "grok-4.6-xai")
         self.assertIsNone(policy.next_recovery_route("grok-4.6-xai"))
-        # Rungs the job already used are skipped.
-        self.assertIsNone(policy.next_recovery_route("kimi-k2.7-code-go",
-                                                     {"grok-4.6-go": 1, "grok-4.6-xai": 1}))
+        # Rungs the job already used are skipped. The native Grok Build
+        # route sits between Go Grok and the OpenCode xAI fallback.
+        self.assertIsNone(policy.next_recovery_route(
+            "kimi-k2.7-code-go",
+            {"grok-4.6-go": 1, "grok-4.6-build": 1, "grok-4.6-xai": 1}))
+        self.assertEqual(policy.next_recovery_route(
+            "kimi-k2.7-code-go",
+            {"grok-4.6-go": 1, "grok-4.6-xai": 1}),
+            "grok-4.6-build")
         self.assertEqual(policy.next_recovery_route("kimi-k2.7-code-go", {"grok-4.6-go": 1}),
-                         "grok-4.6-xai")
-        self.assertIsNone(policy.next_recovery_route("grok-4.6-go", {"grok-4.6-xai": 1}))
-        self.assertEqual(policy.next_recovery_route("grok-4.6-go", {}), "grok-4.6-xai")
+                         "grok-4.6-build")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-go", {"grok-4.6-xai": 1}),
+                         "grok-4.6-build")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-go", {}), "grok-4.6-build")
+        self.assertEqual(policy.next_recovery_route("grok-4.6-build", {}), "grok-4.6-xai")
+        self.assertIsNone(policy.next_recovery_route("grok-4.6-build", {"grok-4.6-xai": 1}))
 
     def test_session_permission_flags(self):
         rules = {r["permission"]: r["action"]
@@ -243,7 +257,7 @@ class PolicyData(unittest.TestCase):
         # Pool moves need exact exhaustion evidence; free Muse keeps its strict rule.
         self.assertEqual(policy.next_implementation_route("muse-spark-xhigh-free", free), "muse-spark-xhigh-go")
         self.assertIsNone(policy.next_implementation_route("muse-spark-xhigh-free", go_limit))
-        self.assertEqual(policy.next_implementation_route("grok-4.6-go", go_limit), "grok-4.6-xai")
+        self.assertEqual(policy.next_implementation_route("grok-4.6-go", go_limit), "grok-4.6-build")
         self.assertIsNone(policy.next_implementation_route("muse-spark-xhigh-go", go_limit))
         self.assertFalse(policy.classify_quota_exhaustion(go_limit))
 
@@ -390,13 +404,15 @@ class Lanes(unittest.TestCase):
         # glm-5.3-go has max_concurrent 1 and one running job on it.
         self.assertTrue(core.route_concurrency_full(self.sd, "glm-5.3-go"))
         self.assertFalse(core.route_concurrency_full(self.sd, "glm-5.3-go", exclude="h1"))
+        self.assertFalse(core.route_concurrency_full(self.sd, "grok-4.6-build"))
         self.assertFalse(core.route_concurrency_full(self.sd, "grok-4.6-xai"))
         self.assertFalse(core.route_concurrency_full(self.sd, "muse-spark-xhigh-free"))
         # Sticky home skips the capped route; ties go to the earlier route.
         self.assertEqual(core.sticky_home_route(self.sd, "hard"), "muse-spark-xhigh-free")
         # A full lane returns None.
         for route in ("muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go",
-                      "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-xai"):
+                      "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-build",
+                      "grok-4.6-xai"):
             con = store.connect(self.sd)
             try:
                 core.submit(self.sd, "cap-" + route, {"g": 1}, self.ws("ws-" + route),
@@ -411,8 +427,11 @@ class Lanes(unittest.TestCase):
         # uncapped route; the earliest uncapped route wins.
         self.assertEqual(core.sticky_home_route(self.sd, "hard"), "muse-spark-xhigh-free")
         # next_capable_route follows lane order past the capped routes; the
-        # last route (no cap) still has free concurrency.
+        # native Grok Build route comes before the OpenCode xAI fallback.
         self.assertEqual(core.next_capable_route(self.sd, "muse-spark-xhigh-go",
+                                                 "implementation_hard", exclude="cap"),
+                         "grok-4.6-build")
+        self.assertEqual(core.next_capable_route(self.sd, "grok-4.6-build",
                                                  "implementation_hard", exclude="cap"),
                          "grok-4.6-xai")
 
@@ -724,11 +743,12 @@ class ControllerCapsAndRecovery(unittest.TestCase):
         finally:
             con.close()
         self._insert_turn("s1", "grok-4.6-go", seq=0)
-        # grok-go already used: escalation must skip to xai, not block.
-        self.assertEqual(policy.next_recovery_route(None, {"grok-4.6-go": 1}), "grok-4.6-xai")
+        # grok-go already used: escalation must skip to the native Build
+        # route first, never straight to the OpenCode fallback.
+        self.assertEqual(policy.next_recovery_route(None, {"grok-4.6-go": 1}), "grok-4.6-build")
         res = controller._apply_ladder(self.sd, "s1")
         self.assertIsNone(res)
-        self.assertEqual(core.get_job(self.sd, "s1")["route"], "grok-4.6-xai")
+        self.assertEqual(core.get_job(self.sd, "s1")["route"], "grok-4.6-build")
 
     def test_overload_move_during_recovery(self):
         core.submit(self.sd, "r1", {"g": 1}, self.ws("a"), "p", lane="small")
@@ -739,11 +759,17 @@ class ControllerCapsAndRecovery(unittest.TestCase):
         finally:
             con.close()
         # Overload on the recovery rung must move inside recovery, never raise.
+        # The native Build route is next; the OpenCode fallback follows it.
         res = controller._move_after_signal(self.sd, "r1", "grok-4.6-go", "overloaded",
+                                            {"name": "RateLimitError"})
+        self.assertEqual(res["route"], "grok-4.6-build")
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], "grok-4.6-build")
+        self.assertIn("grok-4.6-go", core.degraded_routes(self.sd))
+        # Overload on the native route falls back to OpenCode's xAI provider.
+        res = controller._move_after_signal(self.sd, "r1", "grok-4.6-build", "overloaded",
                                             {"name": "RateLimitError"})
         self.assertEqual(res["route"], "grok-4.6-xai")
         self.assertEqual(core.get_job(self.sd, "r1")["route"], "grok-4.6-xai")
-        self.assertIn("grok-4.6-go", core.degraded_routes(self.sd))
 
 
 if __name__ == "__main__":

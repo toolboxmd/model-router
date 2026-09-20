@@ -23,12 +23,16 @@ class TestHarnessRegistryRouting(unittest.TestCase):
         self.assertTrue(harnesses.route_uses_owned_server("luna-go/max"))
         self.assertTrue(harnesses.route_uses_owned_server("muse-spark-xhigh-free"))
         self.assertTrue(harnesses.route_uses_owned_server("grok-4.6-go"))
+        self.assertTrue(harnesses.route_uses_owned_server("grok-4.6-xai"))
+        self.assertFalse(harnesses.route_uses_owned_server("grok-4.6-build"))
         self.assertFalse(harnesses.route_uses_owned_server("fable-5.1/max"))
         self.assertFalse(harnesses.route_uses_owned_server("bogus-route"))
         # Registry is the source: owned_server flag decides.
         self.assertTrue(harnesses.harness_named("opencode").owned_server)
         self.assertFalse(harnesses.harness_named("codex").owned_server)
         self.assertFalse(harnesses.harness_named("claude").owned_server)
+        self.assertFalse(harnesses.harness_named("grok").owned_server)
+        self.assertTrue(harnesses.harness_named("grok").headless_worker)
 
     def test_controller_no_direct_harness_string_compare(self):
         src = (ROOT / "runner" / "controller.py").read_text()
@@ -92,10 +96,12 @@ class TestHarnessRegistryRouting(unittest.TestCase):
 
 class TestGoExhaustionDocs(unittest.TestCase):
     def test_only_grok_go_has_next_pool(self):
-        self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-xai")
+        self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-build")
+        self.assertEqual(policy.next_pool_route("grok-4.6-build"), "grok-4.6-xai")
         self.assertEqual(policy.next_pool_route("muse-spark-xhigh-free"), "muse-spark-xhigh-go")
         for route in ("glm-5.3-go", "qwen3.8-flash-go", "minimax-m3-go",
-                      "deepseek-v4.1-flash-go", "deepseek-v4-pro-go", "muse-spark-xhigh-go"):
+                      "deepseek-v4.1-flash-go", "deepseek-v4-pro-go", "muse-spark-xhigh-go",
+                      "grok-4.6-xai"):
             self.assertIsNone(policy.next_pool_route(route), route)
         # Without a next pool the lane moves to the next family (or ends).
         self.assertEqual(policy.next_family_route("muse-spark-xhigh-free"), "glm-5.3-flash-go")

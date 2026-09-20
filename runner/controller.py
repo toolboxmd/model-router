@@ -680,7 +680,8 @@ def _set_phase(state_dir, request_id: str, **fields) -> None:
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
         core._event(con, request_id, "implementation_output",
-                    {"session": str(fields.get("opencode_session_id") or "")[:24],
+                    {"session": str(fields.get("opencode_session_id")
+                                     or fields.get("grok_session_id") or "")[:24],
                      "phase": fields.get("phase")})
         con.execute("COMMIT")
     except Exception:
@@ -732,7 +733,7 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
                 return {"action": "blocked", "reason": "capacity_exhausted"}
             target = nxt
             reason = reason + "_concurrent" if "concurrent" not in reason else reason
-        model, variant, _agent = policy.opencode_route_params(target)
+        model, variant = policy.worker_model_variant(target)
         st_row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         try:
             st = json.loads(st_row["controller_state"] or "{}") if st_row is not None else {}
@@ -991,8 +992,9 @@ def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
 def _turns_by_route(state_dir, request_id: str) -> dict:
     """Implementation turns already run per route, for the one-turn rule."""
     counts: dict = {}
+    worker_kinds = harnesses.worker_control_kinds()
     for inv in core._list_invocations(state_dir, request_id):
-        if inv.get("kind") != "opencode_control" or inv.get("state") == "abandoned":
+        if inv.get("kind") not in worker_kinds or inv.get("state") == "abandoned":
             continue
         try:
             route = (json.loads(inv.get("meta_json") or "{}") or {}).get("route")
@@ -1007,17 +1009,16 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                        payload: dict | None = None, run_cmd=None) -> dict:
     """Run one implementation turn for the current dispatcher action.
 
-    The controller uses an owned ``opencode serve`` driven by the
-    supervisor through the harness seam. Capacity signals move routes;
-    other errors end the turn for the escalation ladder.
+    The turn runs on the job route's harness through the harness seam:
+    an owned ``opencode serve`` driven by the supervisor, or a headless
+    ``grok -p`` worker process. Capacity signals move routes; other
+    errors end the turn for the escalation ladder.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
     workspace = job["workspace"]
     route = job.get("route") or "muse-spark-xhigh-free"
-    allowance = _route_allowance(route)
-    model, variant, agent = policy.opencode_route_params(route)
-    saved_session = job.get("opencode_session_id")
+    harness = harnesses.harness_named(policy.route_spec(route)["harness"])
     state = _load_controller_state(job)
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
@@ -1028,7 +1029,7 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         except ValueError:
             return None
     prior_tries = [i for i in core._list_invocations(state_dir, request_id)
-                   if i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
+                   if i.get("kind") in harnesses.worker_control_kinds() and i.get("state") != "abandoned"
                    and _turn_seq(i) == seq]
     attempted = bool(prior_tries)
     if not attempted:
@@ -1055,6 +1056,20 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         env = res.get("envelope")
         return isinstance(env, dict) and env.get("signal") == "stalled"
     attempt = sum(1 for i in prior_tries if _turn_stalled(i))
+    if harness.owned_server:
+        return _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
+                                  seq, route_reason, run_cmd, artifact, attempt)
+    if harness.headless_worker:
+        return _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
+                              seq, route_reason, run_cmd, artifact, attempt)
+    raise core.RunnerError(f"route {route} runs on {harness.name}, which has no worker turn")
+
+
+def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
+                       seq, route_reason, run_cmd, artifact=None, attempt=0) -> dict:
+    allowance = _route_allowance(route)
+    model, variant, agent = policy.opencode_route_params(route)
+    saved_session = job.get("opencode_session_id")
     cmd = adapters.build_opencode_serve_cmd()
     rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
                            meta={"prompt": prompt, "allowance": allowance,
@@ -1148,6 +1163,95 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                                 status="failed", error=full.get("error"))
     _set_phase(state_dir, request_id, phase="implementation_failed",
                opencode_session_id=session_id, report_path=report.get("report_path"))
+    return {"action": "implementation_failed", "session": session_id, "rc": rc,
+            "error": full.get("error"), "report": report,
+            "output": str(full.get("assistant_text") or "")}
+
+
+def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
+                   seq, route_reason, run_cmd, artifact=None, attempt=0) -> dict:
+    """One headless Grok Build worker turn for the current dispatcher action.
+
+    The saved Grok session resumes when one exists; a turn that reports a
+    different session never replaces it. Provider signals move routes
+    through the same capacity memory as the owned-server path. The exited
+    process is the turn boundary, so no abort or idle confirmation applies.
+    """
+    grok_h = harnesses.harness_named("grok")
+    model, effort = policy.grok_route_params(route)
+    saved_session = job.get("grok_session_id")
+    cmd = adapters.build_grok_cmd(prompt, workspace, model, effort, saved_session)
+    rc, out, err = run_cmd(cmd, workspace, None, kind="grok_control",
+                           meta={"prompt": prompt, "model": model, "variant": effort,
+                                 "session_id": saved_session, "seq": seq,
+                                 "try": attempt,
+                                 "stage": "implementation", "route": route,
+                                 "reason": route_reason})
+    # The JSON result comes from this invocation's own output file, read
+    # through the harness seam.
+    full = grok_h.parse_report("grok_control", out, cmd) or {}
+    got_session = full.get("grok_session_id")
+    if saved_session and got_session \
+            and not grok_h.identity_ok("grok_control", got_session, saved_session):
+        # A turn on another session, completed or not, never replaces the saved one.
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "grok_control", "rc": rc,
+                                 "expected_session": saved_session,
+                                 "reported_session": got_session})
+        _mark_blocked(state_dir, request_id,
+                      f"luna_task_mismatch: grok turn reported {str(got_session)[:24]}")
+        return {"action": "blocked", "reason": "luna_task_mismatch"}
+    session_id = got_session or saved_session
+    _record_child(state_dir, request_id, "grok_control", cmd, rc,
+                  session_id=session_id,
+                  output_text=json.dumps({k: full.get(k) for k in (
+                      "ok", "finish", "signal", "error")}, sort_keys=True))
+    if rc == 0 and full.get("ok"):
+        report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
+        _set_phase(state_dir, request_id, phase="implemented",
+                   grok_session_id=session_id, artifact=artifact,
+                   report_path=report.get("report_path"),
+                   implementation_output=adapters.redact_text(str(full.get("assistant_text") or ""))[-8000:])
+        return {"action": "implementation_ok", "session": session_id,
+                "output": str(full.get("assistant_text") or ""),
+                "finish": full.get("finish"), "actual_model": full.get("actual_model"),
+                "report": report}
+    evidence = full.get("signal_evidence")
+    signal = full.get("signal")
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "grok_control", "rc": rc,
+                             "error": full.get("error"),
+                             "signal": signal, "evidence": evidence,
+                             "finish": full.get("finish"),
+                             "stderr": (err or "")[:1000]})
+    if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
+        # Every worker turn leaves a report, including capacity moves, so
+        # the dispatcher and the ledger keep the evidence.
+        move_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
+                                         status=signal, error=full.get("error"))
+        _set_phase(state_dir, request_id, phase=f"{signal}_moved",
+                   grok_session_id=session_id, report_path=move_report.get("report_path"))
+        moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
+        moved["report"] = move_report
+        return moved
+    if rc in (124, 143):
+        # The worker process never finished its turn (a timeout or a stop);
+        # that is an ownership matter, not a worker failure, and it blocks
+        # as before, but the turn still leaves a report.
+        crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
+                                          status="failed", error=full.get("error") or f"rc={rc}")
+        _set_phase(state_dir, request_id, phase="implementation_failed",
+                   grok_session_id=session_id, report_path=crash_report.get("report_path"))
+        _mark_blocked(state_dir, request_id,
+                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
+        return {"action": "blocked", "reason": "implementation_failed", "report": crash_report}
+    # A hard provider or worker error ends the turn as failed. The
+    # dispatcher hears about it and the escalation ladder decides the
+    # next route; nothing is retried here.
+    report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
+                                status="failed", error=full.get("error"))
+    _set_phase(state_dir, request_id, phase="implementation_failed",
+               grok_session_id=session_id, report_path=report.get("report_path"))
     return {"action": "implementation_failed", "session": session_id, "rc": rc,
             "error": full.get("error"), "report": report,
             "output": str(full.get("assistant_text") or "")}
@@ -1324,7 +1428,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     am = full.get("actual_model") if isinstance(full.get("actual_model"), dict) else {}
     observed = (f"{am.get('providerID')}/{am.get('modelID')}" if am.get("providerID") and am.get("modelID") else None)
     observed_variant = am.get("variant") if isinstance(am.get("variant"), str) else None
-    model, variant, _agent = policy.opencode_route_params(route)
+    model, variant = policy.worker_model_variant(route)
     blockers_raw = full.get("blockers") if isinstance(full.get("blockers"), list) else []
     report = {
         "schema_version": store.SCHEMA_VERSION, "request_id": request_id, "seq": seq,
@@ -1345,13 +1449,15 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     store.secure_write_text(report_path, json.dumps(report, sort_keys=True, indent=1))
     report["report_path"] = str(report_path)
     # Link the report to the invocation that produced it.
+    kinds = harnesses.worker_control_kinds()
+    placeholders = ",".join("?" for _ in kinds)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        con.execute("UPDATE invocations SET report_path=? WHERE request_id=? AND kind='opencode_control'"
-                    " AND invocation_id=(SELECT invocation_id FROM invocations WHERE request_id=?"
-                    " AND kind='opencode_control' ORDER BY id DESC LIMIT 1)",
-                    (str(report_path), request_id, request_id))
+        con.execute(f"UPDATE invocations SET report_path=? WHERE request_id=? AND kind IN ({placeholders})"
+                    f" AND invocation_id=(SELECT invocation_id FROM invocations WHERE request_id=?"
+                    f" AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1)",
+                    (str(report_path), request_id, *kinds, request_id, *kinds))
         con.execute("COMMIT")
     except Exception:
         try:
@@ -1512,11 +1618,17 @@ def _ladder(job: dict) -> dict:
 
 
 def _clear_session(state_dir, request_id: str) -> None:
+    """Forget the worker session on a rung change, on every worker harness.
+
+    A fresh correction or escalation starts a new worker session; the old
+    one is never resumed again.
+    """
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
         _lease_guard(con, request_id)
-        con.execute("UPDATE jobs SET opencode_session_id=NULL, updated_at=? WHERE request_id=?",
+        con.execute("UPDATE jobs SET opencode_session_id=NULL, grok_session_id=NULL, updated_at=?"
+                    " WHERE request_id=?",
                     (core._utcnow(), request_id))
         con.execute("COMMIT")
     except Exception:
@@ -1640,14 +1752,15 @@ def _record_turn_outcome(state_dir, request_id: str, impl: dict) -> None:
 
 
 def _latest_invocation_seq(state_dir, request_id: str) -> int | None:
-    """Newest ``opencode_control`` invocation seq, for a controller whose
-    own state lost its seq but whose turn already started."""
+    """Newest worker-turn invocation seq, for a controller whose own state
+    lost its seq but whose turn already started."""
+    worker_kinds = harnesses.worker_control_kinds()
     try:
         invs = core._list_invocations(state_dir, request_id)
     except Exception:
         return None
     for inv in reversed(invs):
-        if inv.get("kind") != "opencode_control":
+        if inv.get("kind") not in worker_kinds:
             continue
         try:
             meta = json.loads(inv.get("meta_json") or "{}")
@@ -1661,7 +1774,7 @@ def _latest_invocation_seq(state_dir, request_id: str) -> int | None:
 
 def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
                                   run_cmd, token: str | None = None) -> dict:
-    """One bounded implementation transition: OpenCode then Luna resume."""
+    """One bounded implementation transition: worker turn then Luna resume."""
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
     ended = _apply_ladder(state_dir, request_id, token)

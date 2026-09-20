@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   owner_pid INTEGER,
   codex_task_id TEXT,
   opencode_session_id TEXT,
+  grok_session_id TEXT,
   adapter TEXT,
   model TEXT,
   effort TEXT,
@@ -251,6 +252,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     for _col, _ddl in (
         ("codex_task_id", "TEXT"),
         ("opencode_session_id", "TEXT"),
+        ("grok_session_id", "TEXT"),
         ("adapter", "TEXT"),
         ("model", "TEXT"),
         ("effort", "TEXT"),

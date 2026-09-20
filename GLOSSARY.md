@@ -24,5 +24,6 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Concurrency cap | A route's `max_concurrent`: the most running jobs that may sit on it (exactly one on the 15 and 30 USD Go tiers, reserved atomically with the route record; Muse free carries no cap, so parallel jobs open parallel Muse free sessions). | slot limit |
 | Planner-chosen rung | A policy-listed route (Astra medium on Codex, Opus 5 high on Claude) the planner itself chooses and runs; never selected automatically by the runner. | automatic recovery |
 | Report contract | The fields every role's report must carry. | schema |
+| Worker kit | The checked-in setup that gives a worker host its AgentsMD link and hook; the Grok kit lives in `worker-kits/grok`. | host setup |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |
 | Policy | The versioned data in `runner/policy.py` that defines pools, routes, stages, windows, and signal classes. The skill table is rendered from it. | config |

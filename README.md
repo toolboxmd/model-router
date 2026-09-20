@@ -30,8 +30,9 @@ Active work belongs in GitHub Issues.
 persistent Codex Luna dispatcher, returns planner questions, and runs
 implementation turns through an owned local OpenCode server, following the
 policy's lanes across the full OpenCode Go implementer chain with sticky
-homes and per-tier concurrency caps. Saved jobs
-survive planner exit and controller death without starting a second writer.
+homes and per-tier concurrency caps, or the native Grok Build CLI. Saved
+jobs survive planner exit and controller death without starting a second
+writer.
 It is not installed or started automatically. See [RUNNER.md](RUNNER.md).
 
 ```
