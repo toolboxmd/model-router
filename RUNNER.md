@@ -171,6 +171,26 @@ Changing any of them is a policy edit with no state-machine change;
 plugin, or MCP server that is not installed, and the generated skill
 table lists each role's kit.
 
+Direction supply (`runner/direction.py`): every role session's input
+carries the current Project Direction of the job's workspace. The
+installed AgentsMD loader (`project-direction` on PATH, `project-direction
+hook --host HOST` with `{"cwd": workspace}` on stdin) owns the block; the
+runner attaches it verbatim and never fabricates it. On the owned OpenCode
+server the runner prepends the loader's verbatim block (status, the three
+files VISION.md, MISSION.md, OBJECTIVE.md with hashes, the core instruction
+link, and the workspace's own AGENTS.md when present) to every session the
+runner spawns there (worker, correction, recovery, and dispatch fallback).
+Review sessions run on hosts whose own hook supplies direction (Codex,
+Claude, Grok) or manually from the role's kit below; the runner records
+that hook supply and does not duplicate the block. When the loader is missing or fails, the
+invocation records supply `none` with the reason, the owned-server prompt
+names the three files to read, `status` shows the gap in the invocation
+measurements, and the job continues. Per invocation the ledger records kit
+identity and hash, supply (`hook`, `runner`, `none`), hash of the supplied
+block, direction status, skills loaded (the kit's skills), and tools called
+(distinct tool part names in the turn, empty on text-only turns); `status`
+and `result` expose them in the Agent Observer mapping.
+
 Manual dispatch recipe (stand-in runs carry the same kit as the runner).
 Resolve the route's kit with `kit_name_for_route`, generate an isolated
 directory, and point the harness at it:

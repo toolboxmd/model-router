@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.14.0] - 2026-09-20
+
+### Added
+
+- Direction supply and measurement through the harness seam
+
 ## [0.13.0] - 2026-09-20
 
 ### Added

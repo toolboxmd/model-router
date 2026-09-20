@@ -142,7 +142,15 @@ CREATE TABLE IF NOT EXISTS invocations (
   native_ids_json TEXT,
   report_path TEXT,
   schema_version INTEGER,
-  longest_silence_secs REAL
+  longest_silence_secs REAL,
+  kit TEXT,
+  kit_hash TEXT,
+  direction_supply TEXT,
+  direction_reason TEXT,
+  direction_hash TEXT,
+  direction_status TEXT,
+  skills_json TEXT,
+  tools_json TEXT
 );
 CREATE TABLE IF NOT EXISTS capacity (
   route TEXT NOT NULL,
@@ -388,6 +396,14 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("report_path", "TEXT"),
         ("schema_version", "INTEGER"),
         ("longest_silence_secs", "REAL"),
+        ("kit", "TEXT"),
+        ("kit_hash", "TEXT"),
+        ("direction_supply", "TEXT"),
+        ("direction_reason", "TEXT"),
+        ("direction_hash", "TEXT"),
+        ("direction_status", "TEXT"),
+        ("skills_json", "TEXT"),
+        ("tools_json", "TEXT"),
     ):
         if _col not in inv_cols:
             _add_column(con, "invocations", _col, _ddl)

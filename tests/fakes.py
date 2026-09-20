@@ -22,6 +22,8 @@ file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
 hard_error, hang, hold), ``FAKE_GROK_DELAY`` (seconds before success),
 ``FAKE_GROK_WRITE`` (relative file the fake worker writes),
 ``FAKE_GROK_RELEASE`` (hold mode waits for this file, then succeeds).
+``FAKE_OC_TOOLS`` (``1`` appends one ``read`` tool part to text assistant
+messages, proving tool-part recording; unset keeps text-only turns).
 """
 
 FAKE_OPENCODE = r'''
@@ -90,6 +92,11 @@ def assistant(sid, model, text="", error=None, finish="stop"):
     if error:
         info["error"] = error
     parts = [{"type": "text", "text": text}] if text else []
+    if text and os.environ.get("FAKE_OC_TOOLS") == "1":
+        # Opt-in tool part so tests can prove distinct tool-part recording;
+        # default off keeps every existing text-only drill unchanged.
+        parts.append({"type": "tool", "name": "read",
+                      "input": {"path": "VISION.md"}})
     return {"info": info, "parts": parts}
 
 def run_turn(sid, model, directory, aborted, prompt_text=""):
