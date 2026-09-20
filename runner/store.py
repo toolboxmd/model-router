@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS invocations (
   elapsed_secs REAL,
   native_ids_json TEXT,
   report_path TEXT,
-  schema_version INTEGER
+  schema_version INTEGER,
+  longest_silence_secs REAL
 );
 CREATE TABLE IF NOT EXISTS capacity (
   route TEXT NOT NULL,
@@ -151,7 +152,19 @@ CREATE TABLE IF NOT EXISTS capacity (
   pool TEXT NOT NULL,
   model TEXT NOT NULL,
   window TEXT NOT NULL,
+  reset_source TEXT,
+  next_probe_at TEXT,
+  probe_failures INTEGER,
   PRIMARY KEY (pool, model, window)
+);
+CREATE TABLE IF NOT EXISTS capacity_probes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool TEXT NOT NULL,
+  model TEXT NOT NULL,
+  window TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  detail_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_launches_req ON launches(request_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(request_id);
@@ -159,6 +172,7 @@ CREATE INDEX IF NOT EXISTS idx_questions_req ON questions(request_id);
 CREATE INDEX IF NOT EXISTS idx_child_req ON child_calls(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_request ON invocations(request_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_state ON invocations(state);
+CREATE INDEX IF NOT EXISTS idx_probes_route ON capacity_probes(pool, model, window);
 """
 
 # Ledger contract version for events and invocations; Agent Observer reads
@@ -262,6 +276,13 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
     for _col in ("pool", "model", "window"):
         if _col not in cap_cols:
             _add_column(con, "capacity", _col, "TEXT")
+    # Stall-33 marks: where the reset came from, and the assumed-mark probe
+    # schedule. Older rows predate them and read as NULL (unknown source,
+    # no scheduled probe).
+    for _col, _ddl in (("reset_source", "TEXT"), ("next_probe_at", "TEXT"),
+                       ("probe_failures", "INTEGER")):
+        if _col not in cap_cols:
+            _add_column(con, "capacity", _col, _ddl)
     # Migrate pre-v2 capacity keyed by route to the (pool, model, window)
     # key. Go 5-hour, weekly, and monthly windows coexist; a route PK
     # would overwrite them.
@@ -350,6 +371,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("native_ids_json", "TEXT"),
         ("report_path", "TEXT"),
         ("schema_version", "INTEGER"),
+        ("longest_silence_secs", "REAL"),
     ):
         if _col not in inv_cols:
             _add_column(con, "invocations", _col, _ddl)

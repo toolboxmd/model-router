@@ -21,6 +21,38 @@ KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
 
 
+class StreamActivity:
+    """Last-activity tracking for one turn, behind the harness seam.
+
+    ``note(now)`` records stream activity (a new part, a part update, a
+    new JSON line); ``silence(now)`` is seconds since that activity;
+    ``longest`` is the longest observed silence, recorded on the
+    invocation so the window is tuned on data. Times use a monotonic
+    clock supplied by the caller, so deterministic tests can drive it.
+    """
+
+    def __init__(self, now: float):
+        self.started = now
+        self.last = now
+        self.longest = 0.0
+        self.events = 0
+        self.last_part_type = None
+        self.part_sig = None
+        self.cli_mark = None
+
+    def note(self, now: float) -> None:
+        if now < self.last:
+            return
+        gap = now - self.last
+        if gap > self.longest:
+            self.longest = gap
+        self.last = now
+        self.events += 1
+
+    def silence(self, now: float) -> float:
+        return max(0.0, now - self.last)
+
+
 class Harness:
     """The seam. Subclasses override what their harness reports."""
 
@@ -100,6 +132,50 @@ class Harness:
 
     def default_route(self, kind: str, job: dict | None) -> str | None:
         return None
+
+    # -- stream activity (stall detection) ---------------------------
+    def stall_window_secs(self, meta=None) -> float:
+        """Silence window for this turn in seconds: a per-invocation
+        ``stall_secs`` override wins, then the ``RUNNER_STALL_SECS``
+        environment override (deterministic drills only; unset in
+        production), else the policy default (whose session-database
+        evidence lives beside it in the policy)."""
+        try:
+            override = (meta or {}).get("stall_secs")
+            if override is not None and float(override) > 0:
+                return float(override)
+        except (TypeError, ValueError):
+            pass
+        try:
+            import os as _os
+            env_override = _os.environ.get("RUNNER_STALL_SECS")
+            if env_override is not None and float(env_override) > 0:
+                return float(env_override)
+        except (TypeError, ValueError):
+            pass
+        return float(policy.STALL_SILENCE_SECS)
+
+    def new_activity_tracker(self, now=None) -> StreamActivity:
+        import time as _time
+        return StreamActivity(now if now is not None else _time.monotonic())
+
+    def note_cli_output(self, tracker: StreamActivity, stdout: str, stderr: str,
+                        now: float) -> tuple[bool, dict]:
+        """(changed, detail) from JSON-line stream growth. Any new output
+        line counts as activity; the supervisor ends a turn whose stream
+        stays silent past the window while the child lives."""
+        blob = (stdout or "") + "\n" + (stderr or "")
+        lines = blob.count("\n")
+        mark = (lines, len(blob))
+        prev = tracker.cli_mark
+        tracker.cli_mark = mark
+        if prev is None:
+            changed = lines > 1 or len(blob) > 1
+        else:
+            changed = mark != prev
+        if changed:
+            tracker.note(now)
+        return changed, {"lines": lines, "bytes": len(blob)}
 
     _version_cache: dict = {}
 
@@ -387,6 +463,72 @@ class OpenCodeServer(Harness):
         except Exception:
             pass
         return policy.classify_signal(evidence)
+
+    @staticmethod
+    def _tool_running(part: dict) -> bool:
+        """True when a tool part reports a running process. The part counts
+        as activity while its process is alive; the per-turn timeout stays
+        the outer budget for a tool that never finishes."""
+        for key in ("state", "status"):
+            val = part.get(key)
+            if isinstance(val, str) and val.lower() == "running":
+                return True
+            if isinstance(val, dict):
+                nested = val.get("status") or val.get("state")
+                if isinstance(nested, str) and nested.lower() == "running":
+                    return True
+        return False
+
+    def part_activity(self, messages, baseline_ids) -> tuple[list, str | None, bool]:
+        """(signature, last_part_type, running_tool) for assistant messages
+        after the baseline. Every part creation or update (text, reasoning,
+        or tool) changes the signature; a tool part in running state also
+        reports liveness. Text changes count as activity through the part
+        signature, but text is never classified: only the signal tables
+        decide capacity signals."""
+        sig: list = []
+        last_type: str | None = None
+        running = False
+        base = baseline_ids or set()
+        for m in messages or []:
+            info = m.get("info") if isinstance(m, dict) else None
+            if not isinstance(info, dict) or info.get("id") in base \
+                    or info.get("role") != "assistant":
+                continue
+            for p in m.get("parts") or []:
+                if not isinstance(p, dict):
+                    continue
+                ptype = p.get("type") if isinstance(p.get("type"), str) else None
+                last_type = ptype or last_type
+                try:
+                    sig.append((info.get("id"), ptype,
+                                json.dumps(p, sort_keys=True, default=str)))
+                except (TypeError, ValueError):
+                    sig.append((info.get("id"), ptype, str(ptype)))
+                if ptype == "tool" and self._tool_running(p):
+                    running = True
+        return sig, last_type, running
+
+    def note_part_activity(self, tracker: StreamActivity, messages, baseline_ids,
+                           now: float) -> tuple[bool, dict]:
+        """(changed, detail) from message-part polling at a short interval.
+        A changed part signature, or a tool part in running state, counts as
+        activity and refreshes the last-activity timestamp."""
+        sig, last_type, running = self.part_activity(messages, baseline_ids)
+        prev = tracker.part_sig
+        tracker.part_sig = sig
+        if last_type is not None:
+            tracker.last_part_type = last_type
+        if running:
+            changed = True
+        elif prev is None:
+            changed = bool(sig)
+        else:
+            changed = sig != prev
+        if changed:
+            tracker.note(now)
+        return changed, {"last_part_type": tracker.last_part_type,
+                         "parts": len(sig), "running_tool": running}
 
     @staticmethod
     def capped_retry_next(status) -> tuple[float, float]:

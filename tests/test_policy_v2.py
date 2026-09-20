@@ -237,7 +237,7 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(policy.classify_signal(go_limit), "exhausted")
         self.assertEqual(policy.classify_signal(rate), "overloaded")
         self.assertEqual(policy.classify_signal(over), "overloaded")
-        self.assertEqual(policy.classify_signal(ctx), "hard")
+        self.assertEqual(policy.classify_signal(ctx), "context")
         self.assertIsNone(policy.classify_signal(text_only))
         self.assertIsNone(policy.classify_signal("HTTP 429"))
         # Pool moves need exact exhaustion evidence; free Muse keeps its strict rule.

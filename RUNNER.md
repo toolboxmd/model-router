@@ -159,8 +159,28 @@ route's model, variant, and agent from the policy (free Muse is
 GLM, Qwen, MiniMax, Kimi, and DeepSeek on Go use the provider default variant;
 Grok on Go or xAI uses `medium`). An unknown route is an error, never a
 substitution.
-The supervisor polls `GET /session/status` for that session only and reads
-the new assistant messages when it is idle. The server group stops after
+The supervisor polls `GET /session/status` for that session only, polls the
+session's message parts at a one-second interval, and reads the new
+assistant messages when it is idle. Every part creation or update (text,
+reasoning, or tool parts) refreshes the turn's last-activity timestamp; a
+tool part in running state counts as activity while its process is alive.
+A turn whose status is busy with no activity past the policy silence window
+(180 seconds; evidence: healthy 2026-09-20 sessions showed 110 to 161 second
+gaps, the stalled session 321 seconds then nothing) is aborted, confirmed
+idle, and recorded with signal `stalled` carrying the last-activity age and
+the last part type. Before aborting, the detector probes the same route with
+a fresh minimal request, so a stall that is exhaustion in disguise moves
+pools instead of retrying the same route; the probe's answer (exhausted,
+overloaded, or unknown) is recorded as the signal evidence. An unknown probe
+retries the same route bounded by the overload window, then moves laterally
+with the route degraded. The Codex and Claude CLI harnesses apply the same
+rule to their JSON-line streams through the harness seam (last line time).
+The per-turn timeout (OpenCode 1800 s) stays as the outer budget for runaway
+but active turns; the silence window ends silent turns within minutes.
+`RUNNER_STALL_SECS` shrinks the window for deterministic drills only; it
+stays unset in production, where the policy value governs. Every invocation
+records its longest observed stream silence (`longest_silence_secs`) so the
+window is tuned on data through Agent Observer. The server group stops after
 every turn.
 
 Provider signals are classified from structured evidence only, never from
@@ -184,7 +204,15 @@ model-authored text:
   confirmed idle, the route rests for 15 minutes (`degraded` with a cooldown
   end), and the job moves to the next model family in its lane. The same
   family on another pool is not a lateral move.
-- hard: `context_length_exceeded`, auth, region, and consent errors end the
+- stalled: no stream activity past the silence window while busy. The probe
+  answer decides the move: exhausted moves pools, overloaded moves family,
+  unknown retries the same route bounded by the overload window, then moves
+  laterally with the route degraded 15 minutes like overload.
+- context: `context_length_exceeded` is a capacity signal, not a hard
+  failure. The turn moves to the next route in its lane with a larger
+  `context_window` (a per-route policy hint in tokens); only when no
+  larger-context route is left does the turn end as `implementation_failed`.
+- hard: auth, region, and consent errors end the
   turn as `implementation_failed` for the ladder; they never move routes.
 
 Before a turn starts, a route the capacity memory knows as exhausted or
@@ -197,10 +225,22 @@ read inside the same write transaction that records the new route, and a full
 target moves to the next free route in the same transaction. The Go dispatch
 fallback (`luna-go/max`) reserves the same way before any child starts. No eligible route left in the lane blocks the job with
 `capacity_exhausted`. The `capacity` command lists remembered routes with
-pool, model, window, state, evidence, and reset time; `--clear ROUTE` is an
-operator action after checking the provider. Reset times come only from
-provider evidence or the documented cooldown; an unknown reset stays
-unknown. Zen balance overflow and direct paid APIs are disabled.
+pool, model, window, state, evidence, reset time, and reset source
+(`provider`, `assumed`, or `cooldown`); `--clear ROUTE` is an
+operator action after checking the provider. A provider-named reset is used
+verbatim (Codex `resets_at`, Go `Retry-After` seconds as the exact reset,
+Claude's reset time in text); a limit event with none assumes the named or
+default window (5-hour: now plus five hours; weekly plus seven days; monthly
+the next month boundary), flagged as assumed, honored by preflight, and
+retried once after it passes, with the retry's outcome on the ledger for the
+observer. Assumed weekly and monthly marks are re-probed on a lengthening
+schedule (one hour first, doubling, six-hour cap) and cleared on the first
+success; every probe outcome is recorded. Re-probing is operator-driven via
+`core.probe_due_routes`/`core.record_probe_outcome` (no sentinel process:
+an always-on observer is a non-goal); the mark itself still skips the route
+until its reset passes. The three Go windows stay separate,
+so a weekly mark does not clear when the 5-hour mark expires. Zen balance
+overflow and direct paid APIs are disabled.
 
 ## Process ownership
 
@@ -324,7 +364,8 @@ native identities) instead of the worker's prose.
 
 Every invocation records its stage, requested route, policy version, route
 reason, harness version, elapsed time, terminal class (completed, failed,
-crashed, cancelled, timeout, quota, overloaded, hard_error), usage counters
+crashed, cancelled, timeout, quota, overloaded, stalled, context, hard_error),
+longest observed stream silence (`longest_silence_secs`), usage counters
 verbatim under a source label, the observed model and the observed variant as
 separate fields, and native identities (Codex thread and turn ids, Claude
 session and result ids with the callback's prompt digest, OpenCode session
@@ -363,7 +404,9 @@ that execute turns. A `Harness` base class declares the interface; `CodexCLI`,
 one instance per harness with lookup helpers: `HARNESSES` by name, `harness_for`
 by invocation kind, `harness_named` by name, and `kind_for_cmd` from a command
 line. A harness provides spawn specs, session and report parsing, provider
-signal classification, and usage measurement; the core and supervisor call
+signal classification, stream-activity tracking (last-activity timestamps
+per turn for stall detection on every harness), and usage measurement; the
+core and supervisor call
 these methods instead of branching on invocation kind. Each harness declares
 its capabilities, and each policy stage declares the capabilities it needs.
 `route_capability_blocker(route, stage)` names any capability the route's
@@ -429,9 +472,13 @@ Signal classes are defined in the policy and applied by later work: exhaustion
 declares one (free Muse to Go Muse, Go Grok to xAI Grok), otherwise to the
 next family; overload
 (`overloaded`, `rate_limit`, `account_rate_limit`, HTTP 503 and 529) moves to
-the next family after a bounded retry window; hard errors end the turn as
-`implementation_failed` for the ladder and never move routes. The controller
-applies them on the owned-server path, driven through the harness seam.
+the next family after a bounded retry window; stalled (stream silence past
+the window, with a same-route probe first) retries bounded like overload,
+then moves laterally; context (`context_length_exceeded`) moves to a
+larger-context route in the lane; hard errors (auth, region, consent) end the
+turn as `implementation_failed` for the ladder and never move routes. The
+controller applies them on the owned-server path, driven through the harness
+seam.
 
 ## Verification
 

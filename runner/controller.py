@@ -697,7 +697,7 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
                   evidence: dict | None = None, mark: tuple | None = None) -> dict:
     """Move the job to ``target`` and, when ``mark`` is given, record the
     old route's capacity state in the same transaction. ``mark`` is
-    (state, route, evidence, reset_at). The target's concurrency cap is
+    (state, route, evidence, reset_at, reset_source). The target's concurrency cap is
     reserved in the same write transaction that records the route: running
     jobs on the target are counted inside the transaction, so two
     controllers cannot both take a capped route."""
@@ -722,9 +722,10 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
             if nxt is None:
                 # No free route: record the capacity mark, then block.
                 if mark is not None:
-                    state, marked_route, mark_evidence, reset_at = mark
+                    state, marked_route, mark_evidence, reset_at, reset_source = mark
                     core._record_capacity_locked(con, marked_route, state,
-                                                 mark_evidence, reset_at)
+                                                 mark_evidence, reset_at,
+                                                 reset_source=reset_source)
                 con.execute("COMMIT")
                 _mark_blocked(state_dir, request_id,
                               f"capacity_exhausted: no eligible route for {target}")
@@ -747,8 +748,10 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
                      "evidence": str(evidence.get("source") or evidence.get("class")
                                      or evidence.get("name") or "provider")[:64]})
         if mark is not None:
-            state, marked_route, mark_evidence, reset_at = mark
-            core._record_capacity_locked(con, marked_route, state, mark_evidence, reset_at)
+            state, marked_route, mark_evidence, reset_at, reset_source = mark
+            core._record_capacity_locked(con, marked_route, state,
+                                         mark_evidence, reset_at,
+                                         reset_source=reset_source)
         con.execute("COMMIT")
     except Exception:
         try:
@@ -781,8 +784,8 @@ def _pool_target_in_lane(pool_target: str | None, route: str, lane: str | None) 
 def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
                        evidence: dict) -> dict:
     """Exhaustion: zero retries, the same model on the next pool, else the
-    next family. Overload: the next family; the route rests for the
-    documented cooldown. Moves stay inside the job's stored lane and skip
+    next family. Overload and stalled: the next family; the route rests for
+    the documented cooldown. Moves stay inside the job's stored lane and skip
     one-turn routes already used. No eligible route blocks with a reason."""
     job = core.get_job(state_dir, request_id)
     lane = job.get("lane")
@@ -798,18 +801,21 @@ def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
             pool_target = None
         target = pool_target or policy.next_family_route(route, exhausted, degraded, lane, turns)
         reason = "pool_move" if target and target == pool_target else "lateral"
-        mark = ("exhausted", route, evidence, core._trusted_reset_at(evidence))
+        reset_at, source = core.reset_at_for_evidence(route, evidence, "exhausted")
+        mark = ("exhausted", route, evidence, reset_at, source)
     else:
         degraded.add(route)
         target = policy.next_family_route(route, exhausted, degraded, lane, turns)
         reason = "lateral"
-        mark = ("degraded", route, evidence, core.degraded_until())
+        reset_at, source = core.reset_at_for_evidence(route, evidence, "degraded")
+        mark = ("degraded", route, evidence, reset_at, source)
     if target is None:
         con = store.connect(state_dir)
         try:
             con.execute("BEGIN IMMEDIATE")
             _lease_guard(con, request_id)
-            core._record_capacity_locked(con, mark[1], mark[0], mark[2], mark[3])
+            core._record_capacity_locked(con, mark[1], mark[0], mark[2], mark[3],
+                                         reset_source=mark[4])
             con.execute("COMMIT")
         finally:
             con.close()
@@ -817,6 +823,128 @@ def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
                       f"capacity_exhausted: no eligible route after {signal} on {route}")
         return {"action": "blocked", "reason": "capacity_exhausted"}
     return _switch_route(state_dir, request_id, target, reason, evidence, mark=mark)
+
+
+def _move_after_context(state_dir, request_id: str, route: str, evidence: dict) -> dict | None:
+    """A context_length_exceeded turn moves to the next route in the job's
+    lane with a strictly larger context window, skipping exhausted,
+    degraded, already-used one-turn, and concurrency-full routes. No
+    capacity mark: context pressure is not availability. None when no
+    larger-context route is left: the caller then ends the turn as
+    implementation_failed."""
+    job = core.get_job(state_dir, request_id)
+    lane = job.get("lane")
+    turns = _turns_by_route(state_dir, request_id)
+    exhausted = core.exhausted_routes(state_dir)
+    degraded = core.degraded_routes(state_dir)
+    try:
+        stage = policy.lane_of_route(route, lane)
+    except ValueError:
+        return None
+    target = None
+    if stage is not None:
+        size = policy.route_context_window(route)
+        order = policy.stage_routes(stage)
+        for cand in order[order.index(route) + 1:]:
+            if cand in exhausted or cand in degraded:
+                continue
+            if policy.one_turn_routes_used(cand, turns):
+                continue
+            if policy.route_context_window(cand) <= size:
+                continue
+            if core.route_concurrency_full(state_dir, cand, exclude=request_id):
+                continue
+            target = cand
+            break
+    if target is None:
+        return None
+    return _switch_route(state_dir, request_id, target, "larger_context", evidence)
+
+
+def _stalled_retry_state(state_dir, request_id: str, route: str) -> dict:
+    st = _load_controller_state(core.get_job(state_dir, request_id)).get("stalled")
+    if isinstance(st, dict) and st.get("route") == route:
+        try:
+            return {"route": route, "count": int(st.get("count") or 0),
+                    "first": float(st.get("first") or 0)}
+        except (TypeError, ValueError):
+            pass
+    return {"route": route, "count": 0, "first": 0.0}
+
+
+def _stall_reset_evidence(evidence: dict) -> dict:
+    """Stall evidence with the probe's structured answer hoisted.
+
+    A stall can be exhaustion in disguise: the probe's provider detail
+    (``resets_at``/``Retry-After``/reset text, status, message error) is
+    copied alongside the stall fields so :func:`core.reset_at_for_evidence`
+    reads the provider reset first and the assumed window only when none
+    is present. The nested ``probe`` is kept for the ledger.
+    """
+    if not isinstance(evidence, dict):
+        return evidence
+    probe = evidence.get("probe")
+    detail = None
+    if isinstance(probe, dict):
+        detail = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else None
+    if not isinstance(detail, dict):
+        return evidence
+    merged = dict(evidence)
+    for key, val in detail.items():
+        if key not in merged:
+            merged[key] = val
+    for key in ("status", "message_error_detail", "transport_evidence"):
+        val = detail.get(key)
+        if isinstance(val, dict) and "error" not in merged:
+            merged["error"] = val
+            break
+    return merged
+
+
+def _handle_stalled(state_dir, request_id: str, job: dict, seq: int, route: str,
+                    full: dict, session_id: str | None, evidence: dict) -> dict:
+    """Route a silent turn from its probe answer. A probe that found
+    exhaustion moves pools and one that found overload moves family; an
+    unknown probe retries the same route bounded by the overload window,
+    then moves laterally with the route degraded. No hot loop (the retry
+    count and window bound it, the step budgets bound the walk) and no
+    duplicate writer (one turn at a time, same session reused)."""
+    probe = evidence.get("probe") if isinstance(evidence.get("probe"), dict) else {}
+    probe_signal = full.get("probe_signal") or probe.get("signal")
+    stall_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
+                                      status="stalled", error=full.get("error"))
+    _set_phase(state_dir, request_id, phase="stalled_moved",
+               opencode_session_id=session_id, report_path=stall_report.get("report_path"))
+    if not full.get("idle_confirmed"):
+        _mark_blocked(state_dir, request_id,
+                      "route_transfer_abort_failed: session not confirmed idle after stalled")
+        return {"action": "blocked", "reason": "route_transfer_abort_failed",
+                "report": stall_report}
+    if probe_signal == "exhausted":
+        moved = _move_after_signal(state_dir, request_id, route, "exhausted",
+                                   _stall_reset_evidence(evidence))
+        moved["report"] = stall_report
+        return moved
+    if probe_signal == "overloaded":
+        moved = _move_after_signal(state_dir, request_id, route, "overloaded",
+                                   _stall_reset_evidence(evidence))
+        moved["report"] = stall_report
+        return moved
+    spec = policy.SIGNAL_CLASSES["stalled"]
+    now = time.time()
+    seen = _stalled_retry_state(state_dir, request_id, route)
+    first = seen["first"]
+    count = seen["count"]
+    if not first or now - first > float(spec["window_secs"]):
+        first, count = now, 0
+    if count < int(spec["retries"]):
+        _set_phase(state_dir, request_id,
+                   stalled={"route": route, "count": count + 1, "first": first})
+        return {"action": "stalled_retry", "route": route, "reason": "stalled_retry",
+                "report": stall_report}
+    moved = _move_after_signal(state_dir, request_id, route, "stalled", evidence)
+    moved["report"] = stall_report
+    return moved
 
 
 def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
@@ -894,18 +1022,45 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
     prompt = _implementation_prompt(job["task_json"], artifact, payload)
-    attempted = any(i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
-                    and json.loads(i.get("meta_json") or "{}").get("seq") == seq
-                    for i in core._list_invocations(state_dir, request_id))
+    def _turn_seq(inv):
+        try:
+            return (json.loads(inv.get("meta_json") or "{}") or {}).get("seq")
+        except ValueError:
+            return None
+    prior_tries = [i for i in core._list_invocations(state_dir, request_id)
+                   if i.get("kind") == "opencode_control" and i.get("state") != "abandoned"
+                   and _turn_seq(i) == seq]
+    attempted = bool(prior_tries)
     if not attempted:
         move = _preflight_move(state_dir, request_id, route)
         if move is not None:
             return move
+    # ``try`` numbers repeated worker turns for one dispatcher turn, so a
+    # bounded same-route retry after a stall spawns a new attempt with its
+    # own action identity instead of reusing the stalled turn's record.
+    # Only stalled failures count: a live turn is adopted, a completed turn
+    # is reused, and any other failure is returned as-is (never replayed),
+    # all under the original identity.
+    def _turn_stalled(inv):
+        if inv.get("state") != "failed":
+            return False
+        try:
+            res = json.loads(inv.get("result_json") or "null")
+        except ValueError:
+            return False
+        if not isinstance(res, dict):
+            return False
+        if res.get("signal") == "stalled":
+            return True
+        env = res.get("envelope")
+        return isinstance(env, dict) and env.get("signal") == "stalled"
+    attempt = sum(1 for i in prior_tries if _turn_stalled(i))
     cmd = adapters.build_opencode_serve_cmd()
     rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
                            meta={"prompt": prompt, "allowance": allowance,
                                  "model": model, "variant": variant, "agent": agent,
                                  "session_id": saved_session, "seq": seq,
+                                 "try": attempt,
                                  "stage": "implementation", "route": route,
                                  "reason": route_reason})
     # The result line comes from this invocation's own output file, read
@@ -936,7 +1091,25 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
                              "idle_confirmed": full.get("idle_confirmed"),
                              "retry_next": full.get("last_retry_next"),
                              "retry_next_capped": full.get("last_retry_next_capped"),
-                             "overload_retries": full.get("overload_retries")})
+                             "overload_retries": full.get("overload_retries"),
+                             "probe_signal": full.get("probe_signal"),
+                             "longest_silence_secs": full.get("longest_silence_secs")})
+    if signal == "context" and isinstance(evidence, dict):
+        # A capacity signal, not a hard failure: move to a larger-context
+        # route, and only end the turn failed when none is left.
+        moved = _move_after_context(state_dir, request_id, route, evidence)
+        if moved is not None:
+            ctx_report = _write_turn_report(state_dir, request_id, job, seq, route, full,
+                                            session_id, status="context",
+                                            error=full.get("error"))
+            _set_phase(state_dir, request_id, phase="context_moved",
+                       opencode_session_id=session_id,
+                       report_path=ctx_report.get("report_path"))
+            moved["report"] = ctx_report
+            return moved
+    if signal == "stalled" and isinstance(evidence, dict):
+        return _handle_stalled(state_dir, request_id, job, seq, route, full,
+                               session_id, evidence)
     if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
         # Every worker turn leaves a report, including capacity moves, so
         # the dispatcher and the ledger keep the evidence.
@@ -1166,6 +1339,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         "worker_text": str(turn_dir / "worker.txt"), "worker_summary": worker_text[:1500],
         "blockers": adapters.redact_nested(blockers_raw),
         "tokens": full.get("usage"), "native_ids": full.get("native_ids"),
+        "longest_silence_secs": full.get("longest_silence_secs"),
     }
     report_path = turn_dir / "report.json"
     store.secure_write_text(report_path, json.dumps(report, sort_keys=True, indent=1))
@@ -1494,10 +1668,11 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
     if ended is not None:
         return ended
     impl = run_implementation(state_dir, request_id, artifact=artifact,
-                              payload=payload, run_cmd=run_cmd)
+                               payload=payload, run_cmd=run_cmd)
     if impl.get("action") not in ("implementation_ok", "implementation_failed"):
-        # transferred_to_go, route_switched, or blocked: the next step
-        # retries on the new route or stops; never fork a second writer here.
+        # transferred_to_go, route_switched, stalled_retry, or blocked: the
+        # next step retries on the same or the new route, or stops; never
+        # fork a second writer here.
         return impl
     _record_turn_outcome(state_dir, request_id, impl)
     # The recovery turn just failed: the job is exhausted. End it here
@@ -1633,7 +1808,8 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     # the spawn; a finished action is reused, never rerun.
     durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
     continuing = ("dispatched", "question-answered-resumed",
-                  "implementation-resumed", "transferred_to_go", "route_switched")
+                  "implementation-resumed", "transferred_to_go", "route_switched",
+                  "stalled_retry")
     for _ in range(MAX_LOOP_STEPS):
         try:
             total = _count_step(state_dir, request_id)

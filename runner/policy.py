@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.1.0"
+POLICY_VERSION = "2.2.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, and #26 (Go plan, 2026-09-20)")
@@ -26,6 +26,38 @@ ALLOW_DIRECT_PAID_API = False
 
 # Go usage windows as a share of each model's monthly dollar limit.
 WINDOWS = {"5h": 0.20, "weekly": 0.50, "monthly": 1.00}
+
+# Stall detection (toolboxmd/model-router#33). Evidence from the 2026-09-20
+# OpenCode session database: healthy worker sessions (330 to 463 parts each)
+# showed a longest gap between consecutive parts of 110 to 161 seconds, all
+# explained by tool calls such as the 100-second test suite; the stalled
+# session showed gaps of 321 seconds and then nothing. A 180-second silence
+# window catches today's stalls within three minutes with zero false
+# positives on today's healthy sessions. The per-turn timeout stays as the
+# outer budget for runaway but active turns.
+STALL_SILENCE_SECS = 180
+STALL_EVIDENCE = ("2026-09-20 OpenCode session database: healthy worker sessions "
+                  "(330-463 parts) longest inter-part gap 110-161s; stalled session "
+                  "gaps of 321s then nothing (toolboxmd/model-router#33)")
+# The supervisor polls stream activity this often; a stall ends within the
+# silence window plus one poll interval.
+STALL_POLL_SECS = 1.0
+# A fresh minimal request on the same route when a turn goes silent, so a
+# stall that is exhaustion in disguise moves pools instead of retrying.
+STALL_PROBE_TIMEOUT_SECS = 30
+STALL_PROBE_PROMPT = "stall probe: reply with the single word ok"
+# Assumed limit windows when a limit event carries no provider reset time.
+# The named window wins; otherwise the 5-hour default applies. Weekly and
+# monthly assumed marks are re-probed on a lengthening schedule (first probe
+# after one hour, doubling, capped at six) and cleared on the first success.
+WINDOW_SECS = {"5h": 5 * 3600, "weekly": 7 * 24 * 3600}
+ASSUMED_WINDOW_DEFAULT = "5h"
+PROBE_FIRST_DELAY_SECS = 3600
+PROBE_BACKOFF_FACTOR = 2
+PROBE_MAX_DELAY_SECS = 6 * 3600
+# Where a capacity reset time came from: verbatim provider evidence, a
+# derived window assumption, or the documented overload cooldown.
+RESET_SOURCES = ("provider", "assumed", "cooldown")
 
 # Worker pools in preference order, then the two host pools.
 POOLS = {
@@ -74,109 +106,122 @@ GO_IMPLEMENTER_GROK_ROUTES = ("grok-4.6-go", "grok-4.6-xai")
 # role, family, next_pool (same model on the next pool), one_turn_per_job,
 # max_concurrent (running jobs allowed on the route), override_only,
 # planner_requested, planner_chosen (the planner runs it itself, never a
-# dispatch route), manual (never selected automatically).
+# dispatch route), manual (never selected automatically), context_window
+# (input context in tokens, a routing hint for context-overflow moves).
+# Context windows are rounded vendor-documented sizes as of 2026-09-20, kept
+# here so a context_length_exceeded turn can move to a larger-context route
+# in its lane; exact vendor limits vary and the observer tunes from evidence.
 ROUTES = {
     "fable-5.1/max": {"harness": "claude", "pool": "claude", "model": "claude-fable-5-1",
-                      "variant": "max", "role": "planning", "family": "claude"},
+                      "variant": "max", "role": "planning", "family": "claude",
+                      "context_window": 200_000},
     "astra/max": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
                   "variant": "max", "role": "planning", "family": "gpt",
+                  "context_window": 400_000,
                   "note": "planning fallback on the Codex subscription"},
     "sonnet/medium": {"harness": "claude", "pool": "claude", "model": "claude-sonnet-5",
                       "variant": "medium", "role": "planning", "family": "claude",
-                      "override_only": True,
+                      "override_only": True, "context_window": 200_000,
                       "note": "explicit live-test override only, never a default"},
     "terra/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-terra",
                   "variant": "max", "role": "dispatch", "family": "gpt",
-                  "manual": True,
+                  "manual": True, "context_window": 400_000,
                   "note": "manual-only option; never selected automatically"},
     "luna/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                  "variant": "max", "role": "dispatch", "family": "gpt",
-                 "sandbox": "read-only"},
+                 "sandbox": "read-only", "context_window": 400_000},
     "luna-go/max": {"harness": "opencode", "pool": "go", "model": "opencode-go/gpt-5.6-luna",
                     "variant": None, "agent": "plan", "role": "dispatch", "family": "gpt",
                     "one_turn_per_job": True, "max_concurrent": 1,
+                    "context_window": 400_000,
                     "note": "dispatch fallback in OpenCode plan mode when Codex is unavailable"},
     "luna-max-review": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
-                        "variant": "max", "role": "review", "family": "gpt"},
+                        "variant": "max", "role": "review", "family": "gpt",
+                        "context_window": 400_000},
     "luna-go-review": {"harness": "opencode", "pool": "go", "model": "opencode-go/gpt-5.6-luna",
                        "variant": None, "agent": "plan", "role": "review", "family": "gpt",
                        "one_turn_per_job": True, "max_concurrent": 1,
+                       "context_window": 400_000,
                        "note": "ticket review fallback in OpenCode plan mode"},
     "astra/high-review": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
-                          "variant": "high", "role": "review", "family": "gpt"},
+                          "variant": "high", "role": "review", "family": "gpt",
+                          "context_window": 400_000},
     "opus-5/high-review": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
                            "variant": "high", "role": "review", "family": "claude",
-                           "planner_requested": True},
+                           "planner_requested": True, "context_window": 200_000},
     "muse-spark-xhigh-free": {"harness": "opencode", "pool": "zen-free",
                               "model": "opencode/muse-spark-1.3-contributor-free",
                               "variant": "xhigh", "agent": "build", "role": "implementation",
-                              "family": "muse", "next_pool": "muse-spark-xhigh-go"},
+                              "family": "muse", "next_pool": "muse-spark-xhigh-go",
+                              "context_window": 200_000},
     "muse-spark-xhigh-go": {"harness": "opencode", "pool": "go",
                             "model": "opencode-go/muse-spark-1.3-contributor",
                             "variant": "xhigh", "agent": "build", "role": "implementation",
-                            "family": "muse"},
+                            "family": "muse", "context_window": 200_000},
     "glm-5.3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.3",
                    "variant": None, "agent": "build", "role": "implementation",
-                   "family": "glm", "one_turn_per_job": True, "max_concurrent": 1},
+                   "family": "glm", "one_turn_per_job": True, "max_concurrent": 1,
+                   "context_window": 128_000},
     "deepseek-v4-pro-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/deepseek-v4-pro",
                            "variant": None, "agent": "build", "role": "implementation",
                            "family": "deepseek", "one_turn_per_job": True,
-                           "max_concurrent": 1},
+                           "max_concurrent": 1, "context_window": 128_000},
     "kimi-k2.7-code-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k2.7-code",
                           "variant": None, "agent": "build", "role": "correction",
-                          "family": "kimi"},
+                          "family": "kimi", "context_window": 256_000},
     "glm-5.3-flash-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.3-flash",
                          "variant": None, "agent": "build", "role": "implementation",
-                         "family": "glm"},
+                         "family": "glm", "context_window": 256_000},
     "qwen3.8-flash-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/qwen3.8-flash",
                          "variant": None, "agent": "build", "role": "implementation",
-                       "family": "qwen", "max_concurrent": 1},
+                       "family": "qwen", "max_concurrent": 1, "context_window": 256_000},
     "deepseek-v4.1-flash-go": {"harness": "opencode", "pool": "go",
                                "model": "opencode-go/deepseek-v4.1-flash",
                                "variant": None, "agent": "build", "role": "implementation",
                                "family": "deepseek",
                                "one_turn_per_job": True, "max_concurrent": 1,
+                               "context_window": 128_000,
                                "note": f"${GO_MONTHLY_LIMIT_USD['deepseek-v4.1-flash']} USD tier from "
                                        f"{DEEPSEEK_V4_1_FLASH_TIER_FROM}"},
     "hy3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/hy3",
                "variant": None, "agent": "build", "role": "implementation",
-               "family": "hy"},
+               "family": "hy", "context_window": 200_000},
     "minimax-m3-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/minimax-m3",
                       "variant": None, "agent": "build", "role": "implementation",
-                      "family": "minimax"},
+                      "family": "minimax", "context_window": 200_000},
     "mimo-v2.5-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/mimo-v2.5",
                      "variant": None, "agent": "build", "role": "implementation",
-                     "family": "mimo"},
+                     "family": "mimo", "context_window": 200_000},
     "minimax-m2.7-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/minimax-m2.7",
                         "variant": None, "agent": "build", "role": "implementation",
-                        "family": "minimax"},
+                        "family": "minimax", "context_window": 256_000},
     "longcat-2.0-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/longcat-2.0",
                        "variant": None, "agent": "build", "role": "implementation",
-                       "family": "longcat"},
+                       "family": "longcat", "context_window": 256_000},
     "glm-5.2-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.2",
                    "variant": None, "agent": "build", "role": "implementation",
-                   "family": "glm"},
+                   "family": "glm", "context_window": 200_000},
     "kimi-k2.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/kimi-k2.6",
                      "variant": None, "agent": "build", "role": "implementation",
-                     "family": "kimi"},
+                     "family": "kimi", "context_window": 256_000},
     "glm-5.1-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/glm-5.1",
                    "variant": None, "agent": "build", "role": "implementation",
-                   "family": "glm"},
+                   "family": "glm", "context_window": 200_000},
     "astra/medium": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
                      "variant": "medium", "role": "implementation", "family": "gpt",
-                     "planner_chosen": True,
+                     "planner_chosen": True, "context_window": 400_000,
                      "note": "planner-chosen rung; runs in the planner's own session"},
     "opus-5/high": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
                     "variant": "high", "role": "implementation", "family": "claude",
-                    "planner_chosen": True,
+                    "planner_chosen": True, "context_window": 200_000,
                     "note": "planner-chosen rung; runs in the planner's Claude session"},
     "grok-4.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/grok-4.6",
                     "variant": "medium", "agent": "build", "role": "recovery",
                     "family": "grok", "next_pool": "grok-4.6-xai", "one_turn_per_job": True,
-                    "max_concurrent": 1},
+                    "max_concurrent": 1, "context_window": 2_000_000},
     "grok-4.6-xai": {"harness": "opencode", "pool": "xai", "model": "xai/grok-4.6",
                      "variant": "medium", "agent": "build", "role": "recovery",
-                     "family": "grok"},
+                     "family": "grok", "context_window": 2_000_000},
 }
 
 # Stages in flow order. executor: host (the human-facing session or its
@@ -258,6 +303,11 @@ LANE_ALIASES = {"default": "implementation_default", "small": "implementation_sm
 DEFAULT_LANE = "implementation_default"
 
 # Provider signal classes. Definitions only; the controller applies them.
+# ``stalled`` is detected from stream silence, never from provider text, so
+# it carries no matchers; the controller still treats it like overload
+# (bounded same-route retry inside the overload window, then a lateral move
+# with the route degraded). ``context`` is a capacity signal, not a hard
+# failure: the turn moves to a larger-context route in its lane.
 SIGNAL_CLASSES = {
     "exhausted": {"action": "next_pool", "retries": 0,
                   "retry_reasons": ["free_tier_limit"],
@@ -267,9 +317,15 @@ SIGNAL_CLASSES = {
                    "retry_reasons": ["overloaded", "rate_limit", "account_rate_limit"],
                    "error_names": ["overloaded_error", "rate_limit_exceeded", "RateLimitError"],
                    "status_codes": [503, 529]},
+    "stalled": {"action": "next_family", "retries": 2, "window_secs": 45,
+                "degraded_secs": 900,
+                "retry_reasons": [], "error_names": []},
+    "context": {"action": "next_larger_context", "retries": 0,
+                "retry_reasons": [],
+                "error_names": ["context_length_exceeded"]},
     "hard": {"action": "implementation_failed", "retries": 0,
              "retry_reasons": ["auth", "region", "consent"],
-             "error_names": ["context_length_exceeded", "AuthError", "RegionError", "DataPolicyError"]},
+             "error_names": ["AuthError", "RegionError", "DataPolicyError"]},
 }
 
 # Vendor-shaped free-exhaustion evidence (OpenCode 1.18.31). Free exhaustion
@@ -515,6 +571,44 @@ def next_family_route(route: str, exhausted=None, degraded=None, lane: str | Non
     return None
 
 
+def route_context_window(route: str) -> int:
+    """Input context in tokens for a route (a routing hint, not a vendor
+    guarantee). Unknown routes raise: the runner never substitutes."""
+    size = route_spec(route).get("context_window")
+    if type(size) is not int or size <= 0:
+        raise ValueError(f"route {route!r} has no positive context_window")
+    return size
+
+
+def next_larger_context_route(route: str, exhausted=None, degraded=None, lane: str | None = None,
+                              turns_by_route: dict | None = None) -> str | None:
+    """Next route in the job's lane with a strictly larger context window
+    that is neither exhausted, degraded, nor a one-turn route already used.
+    None when no larger-context route is left: the turn then ends as
+    implementation_failed."""
+    stage = lane_of_route(route, lane)
+    if stage is None:
+        return None
+    skip = set(exhausted or ()) | set(degraded or ())
+    order = STAGES[stage]["routes"]
+    try:
+        size = route_context_window(route)
+    except ValueError:
+        return None
+    for cand in order[order.index(route) + 1:]:
+        if cand in skip:
+            continue
+        if one_turn_routes_used(cand, turns_by_route):
+            continue
+        try:
+            cand_size = route_context_window(cand)
+        except ValueError:
+            continue
+        if cand_size > size:
+            return cand
+    return None
+
+
 def next_capacity_route(current: str | None, exhausted: set[str] | None = None,
                         lane: str | None = None) -> tuple[str | None, str | None]:
     """Next eligible route in the job's lane, skipping exhausted ones.
@@ -624,9 +718,11 @@ def _signal_facts(evidence) -> tuple[str | None, list[str], int | None]:
 
 
 def classify_signal(evidence) -> str | None:
-    """``exhausted``, ``overloaded``, ``hard``, or None for provider evidence."""
+    """``exhausted``, ``overloaded``, ``context``, ``hard``, or None for
+    provider evidence. ``stalled`` never matches provider text: it is
+    detected from stream silence, not classified."""
     reason, names, code = _signal_facts(evidence)
-    for cls in ("exhausted", "overloaded", "hard"):
+    for cls in ("exhausted", "overloaded", "context", "hard"):
         spec = SIGNAL_CLASSES[cls]
         if reason in spec.get("retry_reasons", ()):
             return cls
@@ -635,6 +731,169 @@ def classify_signal(evidence) -> str | None:
         if code is not None and code in spec.get("status_codes", ()):
             return cls
     return None
+
+
+def _coerce_reset_moment(value, now_ts: float) -> str | None:
+    """An ISO reset timestamp from a provider reset value: an ISO string
+    verbatim, or epoch seconds (int/float or digit string) as UTC."""
+    import datetime
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            moment = datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        if moment.timestamp() < now_ts - 86400:
+            return None
+        return moment.isoformat()
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.isdigit() and len(text) >= 9:
+            return _coerce_reset_moment(float(text), now_ts)
+        try:
+            moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.isoformat()
+    return None
+
+
+def _reset_in_text(text, now_ts: float) -> str | None:
+    """A reset timestamp carried in free text (Claude names the reset time
+    in its message). Only an ISO-8601 moment counts; anything else is None
+    so model-authored prose can never invent a reset."""
+    import re
+    if not isinstance(text, str) or not text:
+        return None
+    for match in re.finditer(r"20\d\d-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?"
+                             r"(?:Z|[+-]\d\d:?\d\d)?", text):
+        moment = _coerce_reset_moment(match.group(0), now_ts)
+        if moment is not None:
+            return moment
+    return None
+
+
+def _walk_dicts(evidence) -> list[dict]:
+    """Every nested dict in provider evidence (stall probes nest the probe
+    answer under ``probe``/``transport_evidence``/``status``/
+    ``message_error_detail``). ``responseBody`` strings are never descended
+    into as dicts; stray dates there must never invent a reset."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    stack: list = [evidence]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            out.append(cur)
+            for key, val in cur.items():
+                if key == "responseBody":
+                    continue
+                if isinstance(val, (dict, list)):
+                    stack.append(val)
+        elif isinstance(cur, list):
+            for val in cur:
+                if isinstance(val, (dict, list)):
+                    stack.append(val)
+    return out
+
+
+def _evidence_strings(evidence) -> list[str]:
+    """Candidate strings that may carry a provider reset in prose (Claude
+    names the reset time in its message). Only message, reason, and text
+    fields are scanned: response bodies are structured payloads where a
+    stray date must never invent a reset. Structured reset keys are read
+    separately; this only feeds the free-text scan. Stall-probe nesting
+    (``probe``/``transport_evidence``/``status``/``message_error_detail``)
+    is scanned too, so a probe-discovered reset counts."""
+    out: list[str] = []
+    for blob in _walk_dicts(evidence):
+        for key in ("message", "reason", "text"):
+            val = blob.get(key)
+            if isinstance(val, str) and val and val not in out:
+                out.append(val)
+    return out
+
+
+def parse_provider_reset(evidence, now_ts: float | None = None) -> str | None:
+    """A provider-named reset timestamp (ISO string), or None.
+
+    Reads explicit reset fields first (Codex ``resets_at`` in epoch or ISO;
+    OpenCode Go ``Retry-After`` in seconds as now plus the delay, which is
+    the exact reset), then a reset moment named in message text (Claude).
+    Zen free and Grok name no reset and yield None: the assumed-window rule
+    applies only then. Model-authored text without an ISO moment never
+    counts. Stall-probe nesting is scanned, so a probe-discovered reset on
+    the same route counts without re-shaping the evidence.
+    """
+    import time as _time
+    now = now_ts if now_ts is not None else _time.time()
+    if not isinstance(evidence, dict):
+        return None
+    dicts: list[dict] = _walk_dicts(evidence)
+    for blob in dicts:
+        for key in ("resets_at", "reset_at", "resetAt", "provider_reset_at",
+                    "quota_reset_at", "resetsAt"):
+            if blob.get(key) is not None:
+                moment = _coerce_reset_moment(blob.get(key), now)
+                if moment is not None:
+                    return moment
+        for key in ("retry_after", "retryAfter", "Retry-After",
+                    "retry_after_secs", "retryAfterSeconds"):
+            raw = blob.get(key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                delay = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if delay > 0:
+                import datetime
+                return (datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+                        + datetime.timedelta(seconds=delay)).isoformat()
+    for text in _evidence_strings(evidence):
+        moment = _reset_in_text(text, now)
+        if moment is not None:
+            return moment
+    return None
+
+
+def assumed_reset_at(window: str | None = None, now_ts: float | None = None) -> str:
+    """An assumed reset timestamp for a limit event with no provider reset:
+    the named window from the event, else the 5-hour default (now plus five
+    hours; weekly plus seven days; monthly the next calendar month boundary
+    at 00:00 UTC). Stored flagged as assumed, never as provider-reported."""
+    import datetime
+    import time as _time
+    now = now_ts if now_ts is not None else _time.time()
+    base = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    win = window if window in WINDOW_SECS or window == "monthly" else ASSUMED_WINDOW_DEFAULT
+    if win == "weekly":
+        return (base + datetime.timedelta(seconds=WINDOW_SECS["weekly"])).isoformat()
+    if win == "monthly":
+        first = base.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if base.month == 12:
+            nxt = first.replace(year=base.year + 1, month=1)
+        else:
+            nxt = first.replace(month=base.month + 1)
+        return nxt.isoformat()
+    return (base + datetime.timedelta(seconds=WINDOW_SECS["5h"])).isoformat()
+
+
+def probe_delay_secs(failures: int) -> float:
+    """Delay before the next probe of an assumed weekly or monthly mark:
+    starts at one hour, lengthens with each failure, caps at six hours."""
+    try:
+        n = max(0, int(failures))
+    except (TypeError, ValueError):
+        n = 0
+    return float(min(PROBE_FIRST_DELAY_SECS * (PROBE_BACKOFF_FACTOR ** n),
+                     PROBE_MAX_DELAY_SECS))
 
 
 def next_implementation_route(current: str, error) -> str | None:
@@ -697,6 +956,19 @@ RECOVERY_ORDER = list(STAGES["recovery"]["routes"])
 def validate_policy() -> list[str]:
     """Problems in the policy data, empty when consistent."""
     problems: list[str] = []
+    for cls in ("exhausted", "overloaded", "stalled", "context", "hard"):
+        spec = SIGNAL_CLASSES.get(cls)
+        if not isinstance(spec, dict) or spec.get("action") not in (
+                "next_pool", "next_family", "next_larger_context", "implementation_failed"):
+            problems.append(f"signal class {cls}: unknown action")
+    if not isinstance(STALL_SILENCE_SECS, (int, float)) or STALL_SILENCE_SECS <= 0:
+        problems.append("STALL_SILENCE_SECS must be a positive number of seconds")
+    if not STALL_EVIDENCE:
+        problems.append("STALL_SILENCE_SECS needs its session-database evidence beside it")
+    if ASSUMED_WINDOW_DEFAULT not in WINDOW_SECS:
+        problems.append("ASSUMED_WINDOW_DEFAULT must name a window in WINDOW_SECS")
+    if not (0 < PROBE_FIRST_DELAY_SECS <= PROBE_MAX_DELAY_SECS):
+        problems.append("probe schedule must start positive and cap at or above the start")
     if ROUTES.get("muse-spark-xhigh-free", {}).get("max_concurrent") is not None:
         problems.append("muse-spark-xhigh-free: must carry no concurrency cap "
                         "(parallel Muse free sessions by design)")
@@ -710,6 +982,9 @@ def validate_policy() -> list[str]:
             problems.append(f"{name}: unknown harness {spec['harness']}")
         if spec["pool"] not in POOLS:
             problems.append(f"{name}: unknown pool {spec['pool']}")
+        size = spec.get("context_window")
+        if type(size) is not int or size <= 0:
+            problems.append(f"{name}: context_window must be a positive int of tokens")
         if spec["harness"] == "opencode":
             provider, sep, model_id = spec["model"].partition("/")
             if not sep or provider != POOLS[spec["pool"]]["provider"]:
@@ -836,6 +1111,25 @@ def render_skill_table() -> str:
         "aborts instead of waiting), then moves to the next "
         "model family within one minute. "
         "Hard errors end the turn as `implementation_failed` for the ladder; they never move routes.",
+        f"- A worker turn that stops streaming is stalled: no new part for {STALL_SILENCE_SECS} "
+        "seconds while busy ends the turn within the window plus one poll "
+        f"(evidence: {STALL_EVIDENCE}). The detector probes the same route with a minimal request "
+        "first, so a stall that is exhaustion in disguise moves pools instead of retrying the same "
+        "route. Stalled is treated like overload: a bounded same-route retry inside "
+        f"{SIGNAL_CLASSES['stalled']['window_secs']} seconds, then a lateral move with the route "
+        f"degraded {SIGNAL_CLASSES['stalled']['degraded_secs'] // 60} minutes. "
+        "The per-turn timeout stays as the outer budget for active turns.",
+        "- A `context_length_exceeded` turn is a capacity signal: it moves to the next route in "
+        "its lane with a larger `context_window`, and only ends as `implementation_failed` when no "
+        "larger-context route is left.",
+        "- A limit event with no provider reset time assumes one from the named or default window "
+        "(5-hour: now plus five hours; weekly plus seven days; monthly the next month boundary), "
+        "flagged as assumed rather than provider-reported, honored by preflight, and retried once "
+        "after it passes. Assumed weekly and monthly marks are re-probed on a lengthening schedule "
+        "(one hour first, doubling, six-hour cap) and cleared on the first success; every probe "
+        "outcome is recorded for the observer.",
+        "- Each invocation records its longest observed stream silence "
+        "(`longest_silence_secs`), so the silence window is tuned on data through Agent Observer.",
         f"- Go models with a ${SCARCE_MONTHLY_LIMIT_USD} monthly limit get one turn per job. "
         "Go routes on the "
         f"${' and $'.join(str(t) for t in CONCURRENT_CAP_TIERS_USD)} tiers allow at most one "
