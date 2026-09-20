@@ -1548,20 +1548,35 @@ def submit(state_dir, request_id: str, task, workspace: str,
     if not planner_session_id:
         raise ValueError("missing planner session ID")
     # An existing request is compared first, so an identical resubmission
-    # returns it even if its directory was removed since.
+    # returns it even if its directory was removed since. Sticky-home
+    # selection runs only for a new request, inside the same write
+    # transaction that records the route, so the count and the insert are
+    # atomic.
     ws = _canonical_workspace(workspace, must_exist=False)
-    # The lane picks the first route of an implementation lane unless an
-    # explicit route is given; the critical lane is planner-executed and
-    # raises here so the planner keeps that step.
+    # The lane picks an implementation route unless an explicit route is
+    # given; the critical lane is planner-executed and raises here so the
+    # planner keeps that step.
+    explicit_route = route
     if lane:
         lane_route = policy.lane_default_route(lane)
-        route = route or lane_route
-    route = route or policy.lane_default_route(policy.DEFAULT_LANE)
-    policy.validate_implementation_route(route)
-    # The job remembers its lane: Muse sits in two lanes, so later moves
-    # must not guess from the route alone. An explicit route must belong
-    # to the explicit lane.
-    lane_stage = policy.lane_of_route(route, lane)  # raises on a lane mismatch
+    else:
+        lane_route = None
+    if explicit_route is not None:
+        policy.validate_implementation_route(explicit_route)
+        # The job remembers its lane: Muse sits in two lanes, so later moves
+        # must not guess from the route alone. An explicit route must belong
+        # to the explicit lane (initial submit never starts in recovery, even
+        # for dual-listed Grok rungs).
+        if lane is not None:
+            req_stage = policy.resolve_lane(lane)
+            if req_stage in policy.IMPLEMENTATION_LANES \
+                    and explicit_route not in policy.STAGES[req_stage]["routes"]:
+                raise ValueError(f"route {explicit_route!r} is not in lane {lane!r}")
+            explicit_lane_stage = req_stage
+        else:
+            explicit_lane_stage = policy.lane_of_route(explicit_route, None)
+    else:
+        explicit_lane_stage = None
     pid = policy_id or policy.POLICY_ID
     if not pid:
         raise ValueError("missing policy identity")
@@ -1597,12 +1612,26 @@ def submit(state_dir, request_id: str, task, workspace: str,
         con.execute("BEGIN IMMEDIATE")
         existing = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         if existing is not None:
+            if explicit_route is not None:
+                same_route = (existing["route"] == explicit_route)
+                same_lane = (existing["lane"] is None
+                             or existing["lane"] == explicit_lane_stage)
+            else:
+                # Sticky resubmission: the stored route wins; running counts
+                # must not turn an identical request into a conflict.
+                same_route = True
+                if lane is not None:
+                    req_stage = policy.resolve_lane(lane)
+                else:
+                    req_stage = policy.resolve_lane(policy.DEFAULT_LANE)
+                same_lane = (existing["lane"] is None
+                             or existing["lane"] == req_stage)
             same = (
                 existing["task_hash"] == thash
                 and existing["workspace"] == ws
                 and existing["planner_session_id"] == planner_session_id
                 and existing["policy_id"] == pid
-                and existing["route"] == route
+                and same_route
                 and int(existing["max_attempts"]) == int(max_attempts)
                 and existing["timeout_secs"] == timeout_secs
             )
@@ -1619,16 +1648,41 @@ def submit(state_dir, request_id: str, task, workspace: str,
                 same = False
             if existing["planner_cwd"] is not None and existing["planner_cwd"] != pcwd:
                 same = False
-            if existing["lane"] is not None and existing["lane"] != lane_stage:
+            if not same_lane:
                 same = False
             if existing["job_kind"] is not None and (
                     existing["job_kind"] != job_kind or existing["replay_of"] != replay_of
                     or existing["planner_harness"] != planner_harness):
                 same = False
+            # An explicit route that differs is a different payload; a sticky
+            # resubmission with the same payload returns the stored job.
+            if explicit_route is not None and existing["route"] != explicit_route:
+                same = False
             con.execute("ROLLBACK")
             if same:
                 return _row_to_job(existing)
             raise ConflictError(f"request ID {request_id!r} already used with a different payload")
+        # New request: sticky-home selection inside the same write
+        # transaction that records the route, counting running jobs on each
+        # route inside the transaction (atomic reservation).
+        if explicit_route is not None:
+            route = explicit_route
+            lane_stage = explicit_lane_stage
+        else:
+            # Muse on Zen free takes every new job (no concurrency cap; skipped
+            # only when exhausted or degraded); the `fewest running jobs`
+            # spread applies only among capped routes. A job walks the lane
+            # only on evidence. A new job never starts
+            # in recovery, even for dual-listed Grok rungs.
+            if lane:
+                route = _sticky_home_locked(con, lane) or lane_route
+                lane_stage = policy.resolve_lane(lane)
+            else:
+                route = _sticky_home_locked(con, policy.DEFAULT_LANE) \
+                    or policy.lane_default_route(policy.DEFAULT_LANE)
+                lane_stage = policy.resolve_lane(policy.DEFAULT_LANE)
+            route = route or policy.lane_default_route(policy.DEFAULT_LANE)
+            policy.validate_implementation_route(route)
         try:
             _canonical_workspace(ws)  # a new job needs existing directories
             _canonical_workspace(pcwd)
@@ -2900,6 +2954,205 @@ def exhausted_routes(state_dir) -> set[str]:
 def degraded_routes(state_dir) -> set[str]:
     """Routes marked overloaded until their documented cooldown passes."""
     return _routes_in_state(state_dir, "degraded")
+
+
+def _running_counts_locked(con, exclude: str | None = None) -> dict[str, int]:
+    """Running jobs per route counted inside the caller's write transaction."""
+    if exclude:
+        rows = con.execute("SELECT route, COUNT(*) AS n FROM jobs"
+                           " WHERE status='running' AND request_id != ?"
+                           " GROUP BY route", (exclude,)).fetchall()
+    else:
+        rows = con.execute("SELECT route, COUNT(*) AS n FROM jobs"
+                           " WHERE status='running' GROUP BY route").fetchall()
+    counts = {r["route"]: int(r["n"]) for r in rows}
+    return {r: n for r, n in counts.items() if r in policy.ROUTES}
+
+
+def running_job_counts(state_dir, exclude: str | None = None) -> dict[str, int]:
+    """Running jobs per requested route (capacity windows for sticky homes).
+
+    ``exclude`` drops one job's own count so a running job does not read
+    as filling its own route's window.
+    """
+    con = store.connect(state_dir)
+    try:
+        return _running_counts_locked(con, exclude=exclude)
+    finally:
+        con.close()
+
+
+def _route_full_locked(con, route: str, exclude: str | None = None) -> bool:
+    """True when the route's max_concurrent is used, counted in-transaction."""
+    cap = policy.route_max_concurrent(route)
+    if cap is None:
+        return False
+    return _running_counts_locked(con, exclude=exclude).get(route, 0) >= cap
+
+
+def route_concurrency_full(state_dir, route: str, exclude: str | None = None) -> bool:
+    """True when the route's max_concurrent is already used by running jobs."""
+    con = store.connect(state_dir)
+    try:
+        return _route_full_locked(con, route, exclude=exclude)
+    finally:
+        con.close()
+
+
+def _capacity_sets_locked(con) -> tuple[set[str], set[str]]:
+    """(exhausted, degraded) routes from the capacity memory, read inside the
+    caller's write transaction so sticky selection and the route record are
+    atomic. Entries whose reset time has passed count as eligible again."""
+    now = time.time()
+    exhausted: set[str] = set()
+    degraded: set[str] = set()
+    for r in con.execute("SELECT route, state, reset_at FROM capacity").fetchall():
+        if r["state"] not in ("exhausted", "degraded"):
+            continue
+        reset_at = r["reset_at"]
+        if reset_at:
+            ts = _parse_ts(reset_at)
+            if ts is not None and now >= ts:
+                continue
+        if r["state"] == "exhausted":
+            exhausted.add(r["route"])
+        else:
+            degraded.add(r["route"])
+    return exhausted, degraded
+
+
+def _sticky_home_locked(con, lane: str) -> str | None:
+    """Muse-free-first sticky home, counted inside the caller's write
+    transaction, so the count and the later route record are atomic.
+
+    The lane's first route (Muse on Zen free, no concurrency cap) takes every
+    new job and is skipped only when capacity memory marks it exhausted or
+    degraded. Uncapped routes never spread by load: the first eligible
+    uncapped route in lane order wins, so parallel jobs open parallel Muse
+    free sessions by design. Only when no uncapped route is eligible does the
+    choice spread among capped routes by fewest running jobs (ties go to the
+    earlier route; full, exhausted, or degraded capped routes are excluded).
+    None when no route in the lane is eligible."""
+    stage = policy.resolve_lane(lane)
+    routes = policy.stage_routes(stage)
+    counts = _running_counts_locked(con)
+    exhausted, degraded = _capacity_sets_locked(con)
+    skip = exhausted | degraded
+    for route in routes:
+        if policy.route_max_concurrent(route) is None:
+            if route in skip:
+                continue
+            return route
+    best = None
+    for route in routes:
+        cap = policy.route_max_concurrent(route)
+        if cap is None:
+            continue
+        if route in skip:
+            continue
+        if counts.get(route, 0) >= cap:
+            continue
+        if best is None or counts.get(route, 0) < counts.get(best, 0):
+            best = route
+    return best
+
+
+def sticky_home_route(state_dir, lane: str) -> str | None:
+    """Muse on Zen free takes every new job (no concurrency cap; skipped only
+    when exhausted or degraded); the `fewest running jobs` spread applies only
+    among capped routes. None when no route in the lane is eligible."""
+    con = store.connect(state_dir)
+    try:
+        return _sticky_home_locked(con, lane)
+    finally:
+        con.close()
+
+
+def _next_capable_locked(con, current: str, lane: str | None = None,
+                         exclude: str | None = None,
+                         turns_by_route: dict | None = None) -> str | None:
+    """Next eligible route with free concurrency, counted inside the write
+    transaction that will record the move. Recovery routes reason in the
+    recovery stage. Lane membership comes from the stage order itself;
+    every candidate also passes capacity state, one-turn use, and cap.
+    Callers pass the job's turns (controller._turns_by_route); the core
+    never branches on harness kind, per the harness seam."""
+    try:
+        stage = policy.lane_of_route(current, lane)
+    except ValueError:
+        return None
+    if stage is None:
+        return None
+    order = policy.stage_routes(stage)
+    if current not in order:
+        return None
+    counts = _running_counts_locked(con, exclude=exclude)
+    exhausted, degraded = _capacity_sets_locked(con)
+    skip = exhausted | degraded
+    turns_by_route = turns_by_route or {}
+    for route in order[order.index(current) + 1:]:
+        if route in skip:
+            continue
+        if policy.one_turn_routes_used(route, turns_by_route):
+            continue
+        cap = policy.route_max_concurrent(route)
+        if cap is not None and counts.get(route, 0) >= cap:
+            continue
+        return route
+    return None
+
+
+def next_capable_route(state_dir, current: str, lane: str | None = None,
+                       exclude: str | None = None,
+                       turns_by_route: dict | None = None) -> str | None:
+    """Next eligible route in the lane, skipping exhausted, degraded,
+    already-used one-turn, lane-outside, and concurrency-full routes."""
+    con = store.connect(state_dir)
+    try:
+        return _next_capable_locked(con, current, lane, exclude=exclude,
+                                    turns_by_route=turns_by_route)
+    finally:
+        con.close()
+
+
+def _dispatch_route_counts_locked(con, exclude: str | None = None) -> dict[str, int]:
+    """Running jobs per dispatch route, counted in-transaction from the saved
+    ``dispatch_route`` in controller state (jobs.route stays the implementation
+    route, so the generic route counts never see dispatch occupancy)."""
+    import json as _json
+    if exclude:
+        rows = con.execute("SELECT request_id, controller_state FROM jobs"
+                           " WHERE status='running' AND request_id != ?",
+                           (exclude,)).fetchall()
+    else:
+        rows = con.execute("SELECT request_id, controller_state FROM jobs"
+                           " WHERE status='running'").fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        try:
+            st = _json.loads(r["controller_state"] or "{}") or {}
+        except ValueError:
+            continue
+        d = st.get("dispatch_route")
+        if isinstance(d, str) and d in policy.ROUTES:
+            counts[d] = counts.get(d, 0) + 1
+    return counts
+
+
+def _dispatch_route_full_locked(con, route: str, exclude: str | None = None) -> bool:
+    cap = policy.route_max_concurrent(route)
+    if cap is None:
+        return False
+    return _dispatch_route_counts_locked(con, exclude=exclude).get(route, 0) >= cap
+
+
+def dispatch_route_full(state_dir, route: str, exclude: str | None = None) -> bool:
+    """True when a dispatch route's max_concurrent is used by running jobs."""
+    con = store.connect(state_dir)
+    try:
+        return _dispatch_route_full_locked(con, route, exclude=exclude)
+    finally:
+        con.close()
 
 
 def select_implementation_route(state_dir, current: str, error,

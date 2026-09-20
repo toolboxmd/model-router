@@ -396,13 +396,56 @@ def _dispatcher_route(job: dict) -> str:
     return _load_controller_state(job).get("dispatch_route") or policy.stage_routes("dispatch")[0]
 
 
+def _reserve_dispatch_route(state_dir, request_id: str, route: str) -> bool:
+    """Reserve a capped dispatch route in the same write transaction that
+    records the reservation, counting running dispatch jobs inside the
+    transaction. True when reserved, False when the cap is already used."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        if core._dispatch_route_full_locked(con, route, exclude=request_id):
+            con.execute("ROLLBACK")
+            return False
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads(row["controller_state"] or "{}") if row is not None else {}
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        if st.get("dispatch_route") != route:
+            st["dispatch_route"] = route
+            con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                        (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+            core._event(con, request_id, "dispatch_route_reserved", {"route": route})
+        con.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
 def _dispatch_on_opencode(state_dir, request_id: str, route: str, prompt: str, run_cmd,
                           reason: str, session_id: str | None = None,
                           phase: str = "dispatched") -> dict:
     """Run one dispatcher turn on an OpenCode-hosted Luna in plan mode.
 
     The saved OpenCode session is the dispatcher task; a turn that reports
-    another session, or no envelope, blocks like its Codex counterpart."""
+    another session, or no envelope, blocks like its Codex counterpart.
+    A capped dispatch route (luna-go/max) is reserved atomically before any
+    child starts; a full cap blocks without starting a dispatcher."""
+    if session_id is None and policy.route_max_concurrent(route) is not None:
+        if not _reserve_dispatch_route(state_dir, request_id, route):
+            _mark_blocked(state_dir, request_id,
+                          f"capacity_exhausted: dispatch route {route} at max_concurrent")
+            return {"action": "blocked", "reason": "capacity_exhausted"}
     job = core.get_job(state_dir, request_id)
     oc_h = harnesses.harness_named("opencode")
     model, variant, agent = policy.opencode_route_params(route)
@@ -654,14 +697,40 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
                   evidence: dict | None = None, mark: tuple | None = None) -> dict:
     """Move the job to ``target`` and, when ``mark`` is given, record the
     old route's capacity state in the same transaction. ``mark`` is
-    (state, route, evidence, reset_at)."""
+    (state, route, evidence, reset_at). The target's concurrency cap is
+    reserved in the same write transaction that records the route: running
+    jobs on the target are counted inside the transaction, so two
+    controllers cannot both take a capped route."""
     evidence = evidence or {}
+    turns = _turns_by_route(state_dir, request_id)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
         _lease_guard(con, request_id)
-        row = con.execute("SELECT route FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+        row = con.execute("SELECT route, lane FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
         prev = row["route"] if row is not None else None
+        lane = row["lane"] if row is not None else None
+        # Atomic reservation: a capped target already used by other running
+        # jobs moves to the next eligible route in the same transaction.
+        # Eligibility matches normal selection (lane membership, capacity
+        # state, one-turn use, and cap); recovery reasons in the recovery
+        # stage, never raises.
+        if core._route_full_locked(con, target, exclude=request_id):
+            nxt = core._next_capable_locked(con, target, lane, exclude=request_id,
+                                            turns_by_route=turns)
+            if nxt is None:
+                # No free route: record the capacity mark, then block.
+                if mark is not None:
+                    state, marked_route, mark_evidence, reset_at = mark
+                    core._record_capacity_locked(con, marked_route, state,
+                                                 mark_evidence, reset_at)
+                con.execute("COMMIT")
+                _mark_blocked(state_dir, request_id,
+                              f"capacity_exhausted: no eligible route for {target}")
+                return {"action": "blocked", "reason": "capacity_exhausted"}
+            target = nxt
+            reason = reason + "_concurrent" if "concurrent" not in reason else reason
         model, variant, _agent = policy.opencode_route_params(target)
         st_row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         try:
@@ -693,6 +762,22 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
     return {"action": action, "route": target, "reason": reason}
 
 
+def _pool_target_in_lane(pool_target: str | None, route: str, lane: str | None) -> bool:
+    """True when the same-model next-pool target stays in the job's lane."""
+    if not pool_target:
+        return False
+    try:
+        from_stage = policy.lane_of_route(route, lane)
+        to_stage = policy.lane_of_route(pool_target, lane)
+    except ValueError:
+        return False
+    if to_stage is None or from_stage is None:
+        return False
+    # Recovery pool moves stay in recovery; implementation pool moves stay
+    # in the stored lane.
+    return to_stage == from_stage
+
+
 def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
                        evidence: dict) -> dict:
     """Exhaustion: zero retries, the same model on the next pool, else the
@@ -708,7 +793,8 @@ def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
         exhausted.add(route)
         pool_target = policy.next_pool_route(route)
         if pool_target and (pool_target in exhausted or pool_target in degraded
-                            or policy.one_turn_routes_used(pool_target, turns)):
+                            or policy.one_turn_routes_used(pool_target, turns)
+                            or not _pool_target_in_lane(pool_target, route, lane)):
             pool_target = None
         target = pool_target or policy.next_family_route(route, exhausted, degraded, lane, turns)
         reason = "pool_move" if target and target == pool_target else "lateral"
@@ -743,8 +829,9 @@ def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
     degraded = core.degraded_routes(state_dir)
     if route in exhausted:
         target = policy.next_pool_route(route)
-        if not target or target in exhausted or target in degraded \
-                or policy.one_turn_routes_used(target, turns):
+        if (not target or target in exhausted or target in degraded
+                or policy.one_turn_routes_used(target, turns)
+                or not _pool_target_in_lane(target, route, lane)):
             target = policy.next_family_route(route, exhausted, degraded, lane, turns)
         reason = "preflight_exhausted"
     elif route in degraded:
@@ -754,6 +841,13 @@ def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
         # A $15 model already had its one turn in this job: move on before dispatch.
         target = policy.next_family_route(route, exhausted, degraded, lane, turns)
         reason = "preflight_one_turn"
+    elif core.route_concurrency_full(state_dir, route, exclude=request_id):
+        # The route's max_concurrent is already used by running jobs: move
+        # to the next eligible route in the lane (capacity state, one-turn
+        # use, lane membership, and cap).
+        target = core.next_capable_route(state_dir, route, lane, exclude=request_id,
+                                         turns_by_route=turns)
+        reason = "preflight_concurrent"
     else:
         return None
     if target is None:
@@ -1282,7 +1376,13 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
         target = policy.stage_routes("correction")[0]
     elif failures == 3:
         rung = "recovery"
-        target = policy.next_recovery_route(None)
+        target = policy.next_recovery_route(None, _turns_by_route(state_dir, request_id))
+        if target is None:
+            # Every recovery rung was already used by this job: the planner
+            # gets the evidence instead of a second automatic rung.
+            _mark_blocked(state_dir, request_id,
+                          "recovery_exhausted: every recovery rung was already used")
+            return {"action": "blocked", "reason": "recovery_exhausted"}
     else:
         reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
                                           .glob("turn-*/report.json")))

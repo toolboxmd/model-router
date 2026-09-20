@@ -459,8 +459,8 @@ class TestQuotaClassification(Base):
         self.assertFalse(policy.ALLOW_DIRECT_PAID_API)
 
     def test_non_implementation_routes_rejected_at_submit(self):
-        for route in ("luna-max-review", "grok-4.6-go", "kimi-k2.7-code-go", "luna/max",
-                      "fable-5.1/max", "opus-5/high-review"):
+        for route in ("luna-max-review", "luna-go/max", "luna/max",
+                      "fable-5.1/max", "opus-5/high-review", "astra/medium"):
             with self.assertRaises(ValueError):
                 core.submit(self.sd, "r-" + route.replace("/", "-"), {"g": 1}, self.ws(), "p", route=route)
 

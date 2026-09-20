@@ -244,7 +244,7 @@ class TestCapacityPolicy(unittest.TestCase):
         # The stored lane decides where a shared route continues.
         self.assertEqual(core.select_implementation_route(sd, "muse-spark-xhigh-go", free_status,
                                                           lane="implementation_hard"),
-                         ("kimi-k3-go", None))
+                         ("glm-5.3-go", None))
         # Duplicate recover must not reset capacity memory.
         core.recover_one(sd, "c1")
         self.assertIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
@@ -258,12 +258,12 @@ class TestCapacityPolicy(unittest.TestCase):
         # policy route has an adapter, so there is no blocker, and the lane
         # ends with (None, None) instead of an inoperable placeholder.
         nxt3, blocker3 = policy.next_capacity_route("muse-spark-xhigh-go", set())
-        self.assertEqual(nxt3, "glm-5.3-go")
+        self.assertEqual(nxt3, "glm-5.3-flash-go")
         self.assertIsNone(blocker3)
-        self.assertEqual(policy.next_capacity_route("glm-5.3-go", set()), (None, None))
-        self.assertTrue(policy.is_operational("glm-5.3-go"))
-        for gone in ("go-deepseek-v4.1-flash", "terra/max", "kimi-k2.7-code", "grok-4.6/medium",
-                     "astra/medium", "opus-5/high"):
+        self.assertEqual(policy.next_capacity_route("glm-5.1-go", set()), (None, None))
+        self.assertTrue(policy.is_operational("glm-5.1-go"))
+        for gone in ("go-deepseek-v4.1-flash", "kimi-k2.7-code", "grok-4.6/medium",
+                     "kimi-k3-go"):
             self.assertFalse(policy.is_operational(gone))
             self.assertIn("unsupported route", policy.route_blocker(gone))
         self.assertIsNone(policy.route_blocker("muse-spark-xhigh-free"))
@@ -387,7 +387,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
 
     def test_one_turn_route_is_refused_a_second_turn(self):
         run = self._setup("ok")
-        self._set_route("kimi-k3-go")
+        self._set_route("glm-5.3-go")
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res["action"], "implementation_ok")
         con = store.connect(self.sd)
@@ -401,7 +401,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual((res2["action"], res2["reason"], res2["route"]),
                          ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
         prompts = [r for r in self._requests() if r["path"].endswith("/prompt_async")]
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual([p["body"]["model"]["modelID"] for p in prompts], ["glm-5.3"])
     def _capacity(self, route):
         rows = [r for r in core.list_capacity(self.sd) if r["route"] == route]
         return rows[0] if rows else None
@@ -415,8 +415,8 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(res["reason"], "lateral")
         self.assertLess(elapsed, 60.0)
         job = core.get_job(self.sd, "oc1")
-        # Same family (Go Muse) is skipped; the next family in the default lane is GLM.
-        self.assertEqual(job["route"], "glm-5.3-go")
+        # Same family (Go Muse) is skipped; the next family in the default lane is GLM 5.3 Flash.
+        self.assertEqual(job["route"], "glm-5.3-flash-go")
         self.assertTrue((self.fake_state / "aborted").exists())
         self.assertIn('"signal": "overloaded"', job["last_error_json"])
         self.assertIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
@@ -424,13 +424,13 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         cap = self._capacity("muse-spark-xhigh-free")
         self.assertEqual((cap["state"], cap["pool"], cap["window"]), ("degraded", "zen-free", "cooldown"))
         self.assertTrue(cap["reset_at"])
-        # The next turn runs on GLM in the same saved session.
+        # The next turn runs on GLM 5.3 Flash in the same saved session.
         session = job["opencode_session_id"]
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         prompts = [r["body"]["model"] for r in self._requests() if r["path"].endswith("/prompt_async")]
         self.assertEqual([m["providerID"] for m in prompts], ["opencode", "opencode-go"])
-        self.assertEqual(prompts[-1]["modelID"], "glm-5.3")
+        self.assertEqual(prompts[-1]["modelID"], "glm-5.3-flash")
         self.assertEqual(core.get_job(self.sd, "oc1")["opencode_session_id"], session)
         self._no_secret_leak()
 
@@ -456,14 +456,14 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
     def test_exhaustion_without_next_route_blocks_with_reason(self):
         run = self._setup("ok")
         self._go_mode("go_limit")
-        self._set_route("glm-5.3-go")  # last route of the default lane, no next pool
+        self._set_route("glm-5.1-go")  # last route of the default lane, no next pool
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("blocked", "capacity_exhausted"))
         job = core.get_job(self.sd, "oc1")
         self.assertEqual(job["status"], "blocked")
         self.assertIn("capacity_exhausted", job["block_reason"])
-        self.assertEqual(job["route"], "glm-5.3-go")
-        self.assertIn("glm-5.3-go", core.exhausted_routes(self.sd))
+        self.assertEqual(job["route"], "glm-5.1-go")
+        self.assertIn("glm-5.1-go", core.exhausted_routes(self.sd))
 
     def test_hard_lane_moves_stay_in_the_hard_lane_and_respect_one_turn(self):
         run = self._setup("overloaded")
@@ -473,8 +473,9 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         finally:
             con.close()
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
-        # Overloaded free Muse in the hard lane moves to Kimi K3, not to GLM.
-        self.assertEqual((res["action"], res["route"]), ("route_switched", "kimi-k3-go"))
+        # Overloaded free Muse in the hard lane skips the Muse family and
+        # moves to GLM 5.3, not GLM 5.3 Flash (which is a different lane).
+        self.assertEqual((res["action"], res["route"]), ("route_switched", "glm-5.3-go"))
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual(res2["action"], "implementation_ok")
         # The dispatcher asks for another turn (new seq). A second turn on the
@@ -490,7 +491,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual((res3["action"], res3["reason"], res3["route"]),
                          ("route_switched", "preflight_one_turn", "deepseek-v4-pro-go"))
         prompts = [r["body"]["model"]["modelID"] for r in self._requests() if r["path"].endswith("/prompt_async")]
-        self.assertEqual(prompts.count("kimi-k3"), 1)
+        self.assertEqual(prompts.count("glm-5.3"), 1)
 
     def test_preflight_skips_degraded_and_exhausted_routes(self):
         run = self._setup("ok")
@@ -499,10 +500,10 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         core.record_capacity(self.sd, "muse-spark-xhigh-go", "exhausted", {"source": "test"})
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "preflight_degraded"))
-        self.assertEqual(core.get_job(self.sd, "oc1")["route"], "glm-5.3-go")
+        self.assertEqual(core.get_job(self.sd, "oc1")["route"], "glm-5.3-flash-go")
         self.assertEqual(self._requests(), [])  # nothing was dispatched to the resting routes
         # Cooldown in the past means the route is eligible again.
-        core.record_capacity(self.sd, "glm-5.3-go", "degraded", {"source": "test"},
+        core.record_capacity(self.sd, "glm-5.3-flash-go", "degraded", {"source": "test"},
                              reset_at="2000-01-01T00:00:00+00:00")
         self.assertNotIn("glm-5.3-go", core.degraded_routes(self.sd))
         res2 = controller.run_implementation(self.sd, "oc1", run_cmd=run)
@@ -727,7 +728,7 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
         self.assertEqual((res["action"], res["reason"]), ("route_switched", "lateral"))
         job = core.get_job(self.sd, "oc1")
-        self.assertEqual(job["route"], "glm-5.3-go")
+        self.assertEqual(job["route"], "glm-5.3-flash-go")
         self.assertNotEqual(job["route"], "muse-spark-xhigh-go")
         self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(self.sd))
         self.assertIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
@@ -962,7 +963,7 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 60.0, "overloaded route left within 60s via public CLI")
         job = core.get_job(sd, rid)
-        self.assertEqual(job["route"], "glm-5.3-go", job)
+        self.assertEqual(job["route"], "glm-5.3-flash-go", job)
         self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
         self.assertNotIn("muse-spark-xhigh-free", core.exhausted_routes(sd))
         # Retry counts and the 20s cap are recorded by the CLI-driven turn.
@@ -982,7 +983,7 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
         self.assertTrue(rows[0]["reset_at"])
         rc, st_out, err = cli(sd, "status", "--request-id", rid, env=env)
         self.assertEqual(rc, 0, err)
-        self.assertEqual(st_out["job"]["route"], "glm-5.3-go")
+        self.assertEqual(st_out["job"]["route"], "glm-5.3-flash-go")
         # Same model is never retried on the same route: one free prompt, then Go.
         prompts = [r for r in self._requests(fs) if r["path"].endswith("/prompt_async")]
         free_prompts = [p for p in prompts if p["body"]["model"]["providerID"] == "opencode"]
@@ -1000,7 +1001,7 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
             core.get_job(sd, rid))
         self.assertLess(time.monotonic() - started, 60.0)
         job = core.get_job(sd, rid)
-        self.assertEqual(job["route"], "glm-5.3-go", job)
+        self.assertEqual(job["route"], "glm-5.3-flash-go", job)
         self.assertIn("muse-spark-xhigh-free", core.degraded_routes(sd))
         last = json.loads(job["last_error_json"] or "{}")
         self.assertEqual(last.get("signal"), "overloaded")
@@ -1072,14 +1073,14 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
         move = controller._preflight_move(sd, "pre1", "muse-spark-xhigh-free")
         self.assertIsNotNone(move)
         self.assertEqual((move["reason"], move["route"]),
-                         ("preflight_exhausted", "glm-5.3-go"))
+                         ("preflight_exhausted", "glm-5.3-flash-go"))
         # The lateral signal path skips a degraded next-pool route as well.
         ws2 = Path(tmp.name) / "ws2"
         ws2.mkdir(exist_ok=True)
         core.submit(sd, "pre2", {"g": 1}, str(ws2), "p1")
         res = controller._move_after_signal(sd, "pre2", "muse-spark-xhigh-free",
                                             "exhausted", {"class": "FreeUsageLimitError"})
-        self.assertEqual((res["reason"], res["route"]), ("lateral", "glm-5.3-go"))
+        self.assertEqual((res["reason"], res["route"]), ("lateral", "glm-5.3-flash-go"))
 
     def test_docs_and_skill_list_all_overload_signals(self):
         root = Path(__file__).resolve().parents[1]

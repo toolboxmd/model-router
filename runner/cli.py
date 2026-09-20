@@ -65,10 +65,11 @@ def main(argv=None) -> int:
     lane_or_route = p.add_mutually_exclusive_group()
     lane_or_route.add_argument("--route", default=None,
                                help=f"implementation route: {', '.join(policy.implementation_routes())}"
-                                    " (default: the default lane's first route)")
+                                    " (default: the lane's sticky home)"
+                                    )
     lane_or_route.add_argument("--lane", default=None, choices=sorted(policy.LANE_ALIASES),
-                               help="implementation lane: default, small, hard; critical is "
-                                    "planner-executed and rejected")
+                               help="implementation lane: default, small, hard; the job starts on "
+                                    "its sticky home; critical is planner-executed and rejected")
     p.add_argument("--policy", default=policy.POLICY_ID)
     p.add_argument("--max-attempts", type=int, default=5,
                    help="controller launches per job (default 5: five 12-step launches cover the 48-step job budget)")

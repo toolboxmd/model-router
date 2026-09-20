@@ -215,8 +215,13 @@ class TestPublicLoopProof(unittest.TestCase):
         creates = [r for r in reqs if r["method"] == "POST" and r["path"] == "/session"]
         self.assertEqual(len(creates), 1)
         rules = {(x["permission"], x["action"]) for x in creates[0]["body"]["permission"]}
-        self.assertIn(("external_directory", "deny"), rules)
+        # Full access by default; question and task stay denied.
+        self.assertIn(("external_directory", "allow"), rules)
+        self.assertIn(("webfetch", "allow"), rules)
+        self.assertIn(("websearch", "allow"), rules)
+        self.assertIn(("doom_loop", "allow"), rules)
         self.assertIn(("task", "deny"), rules)
+        self.assertIn(("question", "deny"), rules)
         prompts = [r for r in reqs if r["path"].endswith("/prompt_async")]
         self.assertEqual(len(prompts), 1)
         self.assertEqual(prompts[0]["body"]["model"],

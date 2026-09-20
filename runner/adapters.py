@@ -588,20 +588,16 @@ def split_model(model: str) -> dict:
     return {"providerID": provider, "modelID": model_id}
 
 
-# Harness write boundary for the owned implementation session. Session
-# rules are appended to the build agent's rules. Anything outside the
-# served directory is denied; subagents, interactive questions, doom-loop
-# prompts, and web access are denied so a headless session cannot block
-# on an approval or recurse into other workers. Bash is not OS-confined
-# by OpenCode; the live proof checks the fixture diff separately.
-SESSION_PERMISSION_RULES = (
-    {"permission": "external_directory", "pattern": "*", "action": "deny"},
-    {"permission": "task", "pattern": "*", "action": "deny"},
-    {"permission": "question", "pattern": "*", "action": "deny"},
-    {"permission": "doom_loop", "pattern": "*", "action": "deny"},
-    {"permission": "webfetch", "pattern": "*", "action": "deny"},
-    {"permission": "websearch", "pattern": "*", "action": "deny"},
-)
+# Session-bound permission rules are policy data now (see
+# policy.session_permissions). The policy default gives a headless worker
+# session full access: outside-workspace writes, web fetch, web search, and
+# doom-loop prompts are allowed by default as a per-route policy flag.
+# ``question`` and ``task`` stay denied: an interactive question stalls a
+# headless session, and spawning subagents would bypass the policy.
+# Bash is not OS-confined by OpenCode; the live proof checks the fixture
+# diff separately.
+SESSION_PERMISSION_RULES = tuple(_policy.DEFAULT_SESSION_PERMISSIONS)
+SESSION_PERMISSIONS = _policy.session_permissions
 
 
 class OpenCodeHTTPError(RuntimeError):
@@ -676,7 +672,14 @@ class OpenCodeClient:
         return self._http("GET", "/global/health")
 
     def create_session(self, title: str = "model-router runner",
-                       permission=SESSION_PERMISSION_RULES) -> dict:
+                       permission=None) -> dict:
+        """Create a session with the route's resolved permission set.
+
+        Callers pass ``policy.session_permissions(route)``; a missing set
+        resolves to the read-only set (least privilege), never full access.
+        """
+        if permission is None:
+            permission = _policy.READ_ONLY_SESSION_PERMISSIONS
         body = {"title": title}
         if permission:
             body["permission"] = [dict(r) for r in permission]

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.0] - 2026-09-20
+
+### Added
+
+- Policy v2.1: full Go implementer chain, concurrency caps, sticky homes, planner and review fallbacks, per-route worker permissions
+
 ## [0.8.0] - 2026-09-20
 
 ### Added
