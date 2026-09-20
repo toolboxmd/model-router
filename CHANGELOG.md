@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0] - 2026-09-20
+
+### Added
+
+- Role kits as policy data and per-role session configuration
+
 ## [0.9.0] - 2026-09-20
 
 ### Added

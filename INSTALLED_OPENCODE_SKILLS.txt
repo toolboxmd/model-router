@@ -1,0 +1,16 @@
+algorithm
+delivery-profile
+domain-modeling
+elon-method
+grill-with-docs
+grilling
+operations
+project-direction
+prototype
+research
+to-spec
+to-tickets
+use-grok
+version-control
+wayfinder
+writing-for-agents
