@@ -11,14 +11,18 @@ and a test keeps the two equal.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import sys
+from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
 POLICY_VERSION = "2.2.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
-                 "#12, and #26 (Go plan, 2026-09-20)")
-POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/26"
+                 "#12, #26 (Go plan, 2026-09-20), and #28/#29 (role kits, 2026-09-20)")
+POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
 ALLOW_ZEN_OVERFLOW = False
@@ -546,15 +550,22 @@ READ_ONLY_SESSION_PERMISSIONS = (
 
 
 def session_permissions(route: str | None = None) -> tuple[dict, ...]:
-    """The resolved permission rules for a route by role: implementation,
-    correction, and recovery routes get the full-access set; dispatch and
-    review routes get the read-only set. Unknown or missing routes get the
-    read-only set (least privilege). A route's own ``permissions``
-    overrides apply on top of its role base, in base order."""
+    """The resolved permission rules for a route from its role kit.
+
+    The kit's ``permission_set`` is the policy edit point: ``full`` resolves
+    to the full-access set (implementation, correction, recovery), anything
+    else to the read-only set (planning, dispatch, review). Unknown or
+    missing routes get the read-only set (least privilege). A route's own
+    ``permissions`` overrides apply on top of its kit base, in base order."""
+    base = READ_ONLY_SESSION_PERMISSIONS
+    if route in ROUTES:
+        try:
+            kit = kit_for_route(route)
+        except ValueError:
+            kit = None
+        if isinstance(kit, dict) and kit.get("permission_set") == "full":
+            base = DEFAULT_SESSION_PERMISSIONS
     spec: dict = route_spec(route) if route in ROUTES else {}
-    role = spec.get("role")
-    base = DEFAULT_SESSION_PERMISSIONS if role in ("implementation", "correction", "recovery") \
-        else READ_ONLY_SESSION_PERMISSIONS
     overrides = {o["permission"]: o["action"]
                  for o in spec.get("permissions", ()) if isinstance(o, dict)}
     out = tuple(dict(r, action=overrides.get(r["permission"], r["action"]))
@@ -564,6 +575,266 @@ def session_permissions(route: str | None = None) -> tuple[dict, ...]:
     extra = tuple({"permission": k, "pattern": "*", "action": v}
                   for k, v in overrides.items() if k not in base_names)
     return out + extra
+
+
+# ---------------------------------------------------------------------------
+# Role kits: one row per role. A role's tools change by editing this table;
+# no state-machine change is needed. The harness seam materializes the kit
+# at spawn time: the owned OpenCode server runs on a runner-generated
+# configuration directory built from the kit (AgentsMD link, plugins,
+# skills, MCP servers named by the kit, permission set from the route);
+# Codex uses CODEX_HOME, Claude uses CLAUDE_CONFIG_DIR, Grok uses its
+# config directory; the planner keeps the user's own session.
+# First cut (tuning follows measurement): the worker and correction kits
+# hold the paid ``treg`` MCP gateway; every other kit names no MCP server.
+# ---------------------------------------------------------------------------
+
+KIT_ROLES = ("planner", "dispatcher", "reviewer", "worker", "correction", "recovery")
+
+# Policy role (on routes) -> kit role.
+KIT_FOR_POLICY_ROLE = {
+    "planning": "planner",
+    "dispatch": "dispatcher",
+    "review": "reviewer",
+    "implementation": "worker",
+    "correction": "correction",
+    "recovery": "recovery",
+}
+
+KITS = {
+    "planner": {
+        "instructions": ("You are the planner. Decide scope and acceptance criteria. "
+                         "You keep your own session and tools; the runner never isolates it."),
+        "skills": [],
+        "plugins": [],
+        "mcp": [],
+        "permission_set": "read-only",
+        "agentsmd": True,
+    },
+    "dispatcher": {
+        "instructions": ("You are the read-only dispatcher. Coordinate and verify; never edit. "
+                         "Ask the planner for decisions and request implementation with "
+                         "complete worker instructions."),
+        "skills": ["operations"],
+        "plugins": ["agentsmd-project-direction"],
+        "mcp": [],
+        "permission_set": "read-only",
+        "agentsmd": True,
+    },
+    "reviewer": {
+        "instructions": ("You are the reviewer. Verify the work against acceptance; "
+                         "read-only, never edit."),
+        "skills": ["operations"],
+        "plugins": ["agentsmd-project-direction"],
+        "mcp": [],
+        "permission_set": "read-only",
+        "agentsmd": True,
+    },
+    "worker": {
+        "instructions": ("You are the implementation worker. Edit only what the task allows "
+                         "inside the workspace. Run the task's proof command when it has one. "
+                         "Finish with changed files and proof results."),
+        "skills": ["operations", "project-direction"],
+        "plugins": ["agentsmd-project-direction"],
+        "mcp": ["treg"],
+        "permission_set": "full",
+        "agentsmd": True,
+    },
+    "correction": {
+        "instructions": ("You are the correction worker. Fix the failed turn with the smallest "
+                         "change that satisfies the task and its proof."),
+        "skills": ["operations", "project-direction"],
+        "plugins": ["agentsmd-project-direction"],
+        "mcp": ["treg"],
+        "permission_set": "full",
+        "agentsmd": True,
+    },
+    "recovery": {
+        "instructions": ("You are the recovery worker. Make one bounded attempt to rescue the "
+                         "job, then report evidence for the planner."),
+        "skills": ["operations"],
+        "plugins": ["agentsmd-project-direction"],
+        "mcp": [],
+        "permission_set": "full",
+        "agentsmd": True,
+    },
+}
+
+
+def kit_for_role(role: str) -> dict:
+    """The kit row for a kit role. Unknown roles raise: never substitute."""
+    if role not in KITS:
+        raise ValueError(f"unsupported kit role: {role!r}")
+    return KITS[role]
+
+
+def kit_name_for_route(route: str) -> str:
+    """The kit role for a route, via the route's policy role."""
+    spec = route_spec(route)
+    kit = KIT_FOR_POLICY_ROLE.get(spec.get("role") or "")
+    if kit is None:
+        raise ValueError(f"route {route!r} has no kit role")
+    return kit
+
+
+def kit_for_route(route: str) -> dict:
+    """The kit row for a route. Unknown routes raise: never substitute."""
+    return kit_for_role(kit_name_for_route(route))
+
+
+def kit_hash(kit: dict) -> str:
+    """Short stable identity of a kit's content (for the ledger and probes)."""
+    blob = json.dumps(kit, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# -- installed-kit checks (local directories; fakes in tests) -------------
+
+def _opencode_home() -> Path:
+    override = os.environ.get("MODEL_ROUTER_OPENCODE_HOME")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "opencode"
+    return Path.home() / ".config" / "opencode"
+
+
+def _codex_home() -> Path:
+    override = os.environ.get("MODEL_ROUTER_CODEX_HOME") or os.environ.get("CODEX_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".codex"
+
+
+def _claude_home() -> Path:
+    override = os.environ.get("MODEL_ROUTER_CLAUDE_HOME") or os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".claude"
+
+
+def _grok_home() -> Path:
+    override = os.environ.get("MODEL_ROUTER_GROK_HOME") or os.environ.get("GROK_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".grok"
+
+
+def _agents_home() -> Path:
+    override = os.environ.get("MODEL_ROUTER_AGENTS_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".agents"
+
+
+def _skill_search_roots() -> list[Path]:
+    return [_opencode_home() / "skills", _codex_home() / "skills",
+            _claude_home() / "skills", _grok_home() / "skills",
+            _agents_home() / "skills"]
+
+
+def is_skill_installed(name: str) -> bool:
+    """True when a skill directory or file with this name exists locally."""
+    if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+        return False
+    for root in _skill_search_roots():
+        try:
+            if (root / name).is_dir() or (root / name).is_file():
+                return True
+            if (root / f"{name}.md").is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_plugin_installed(name: str) -> bool:
+    """True when a plugin module with this name exists locally."""
+    if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+        return False
+    candidates = [_opencode_home() / "plugins", _codex_home() / "plugins",
+                  _claude_home() / "plugins", _grok_home() / "plugins"]
+    for root in candidates:
+        try:
+            if (root / name).exists() or (root / f"{name}.js").is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _opencode_mcp_names() -> set[str]:
+    names: set[str] = set()
+    for candidate in (_opencode_home() / "opencode.json",
+                      _opencode_home() / "opencode.jsonc"):
+        try:
+            raw = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        mcp = obj.get("mcp") if isinstance(obj, dict) else None
+        if isinstance(mcp, dict):
+            names.update(str(k) for k in mcp.keys())
+    return names
+
+
+def _codex_mcp_names() -> set[str]:
+    """MCP servers configured in the Codex ``config.toml`` only.
+
+    Skills are not MCP servers: a skill directory with the same name
+    never counts, so ``validate`` still rejects a kit that names an
+    MCP server that is not configured.
+    """
+    names: set[str] = set()
+    try:
+        raw = (_codex_home() / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return names
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("[mcp_servers."):
+            rest = line[len("[mcp_servers."):]
+            name = rest.split("]")[0].strip().strip('"').strip("'")
+            if name:
+                names.add(name)
+    return names
+
+
+def is_mcp_installed(name: str) -> bool:
+    """True when an MCP server with this name is configured locally."""
+    if not isinstance(name, str) or not name:
+        return False
+    return name in _opencode_mcp_names() or name in _codex_mcp_names()
+
+
+def kit_problems(role: str | None = None) -> list[str]:
+    """Problems in kit rows (empty when consistent and installed)."""
+    problems: list[str] = []
+    roles = [role] if role else list(KITS)
+    for name in roles:
+        kit = KITS.get(name)
+        if not isinstance(kit, dict):
+            problems.append(f"kit {name}: missing row")
+            continue
+        if not isinstance(kit.get("instructions"), str) or not kit["instructions"].strip():
+            problems.append(f"kit {name}: missing instructions")
+        if kit.get("permission_set") not in ("full", "read-only"):
+            problems.append(f"kit {name}: permission_set must be full or read-only")
+        for field, check in (("skills", is_skill_installed),
+                             ("plugins", is_plugin_installed),
+                             ("mcp", is_mcp_installed)):
+            items = kit.get(field)
+            if not isinstance(items, list) or any(not isinstance(i, str) for i in items):
+                problems.append(f"kit {name}: {field} must be a list of names")
+                continue
+            for item in items:
+                if not check(item):
+                    problems.append(f"kit {name}: {field} {item!r} is not installed")
+    return problems
 
 
 def next_pool_route(route: str) -> str | None:
@@ -1098,6 +1369,18 @@ def validate_policy() -> list[str]:
             problems.append(f"stage {stage}: planner-executed stage lists routes")
         if stage in IMPLEMENTATION_LANES and not spec["routes"]:
             problems.append(f"stage {stage}: empty implementation lane")
+    # Role kits: one row per role; installed entries only.
+    if set(KITS) != set(KIT_ROLES):
+        problems.append(f"kits: must carry one row per role {', '.join(KIT_ROLES)}")
+    for _role, _kit in KITS.items():
+        if not isinstance(_kit, dict):
+            problems.append(f"kit {_role}: missing row")
+            continue
+        if not isinstance(_kit.get("instructions"), str) or not _kit["instructions"].strip():
+            problems.append(f"kit {_role}: missing instructions")
+        if _kit.get("permission_set") not in ("full", "read-only"):
+            problems.append(f"kit {_role}: permission_set must be full or read-only")
+    problems.extend(kit_problems())
     return problems
 
 
@@ -1205,13 +1488,40 @@ def render_skill_table() -> str:
         "override or escalation in the existing handoff. Instructions describe "
         "the policy and its required evidence.",
         "",
+        "## Role kits",
+        "",
+        "One kit row per role; a role's tools change by editing policy. "
+        "The owned OpenCode server runs on a runner-generated configuration "
+        "directory built from the route's kit (AgentsMD link, plugins, skills, "
+        "MCP servers named by the kit, permission set from the route); "
+        "Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, Grok uses "
+        "its config directory; the planner keeps the user's own session.",
+        "",
+        "| Role | Skills | Plugins | MCP servers | Permissions | Instructions |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for _role in KIT_ROLES:
+        _kit = KITS[_role]
+        _skills = ", ".join(f"`{s}`" for s in _kit.get("skills", [])) or "none"
+        _plugins = ", ".join(f"`{p}`" for p in _kit.get("plugins", [])) or "none"
+        _mcp = ", ".join(f"`{m}`" for m in _kit.get("mcp", [])) or "none"
+        _perm = str(_kit.get("permission_set"))
+        _instr = str(_kit.get("instructions", "")).split(".")[0].strip()
+        lines.append(f"| {_role} | {_skills} | {_plugins} | {_mcp} | {_perm} | {_instr} |")
+    lines += [
+        "",
+        "Kit hashes (`kit_hash`): "
+        + "; ".join(f"`{r}` = {kit_hash(k)}" for r, k in KITS.items())
+        + ".",
+        "",
     ]
     return "\n".join(lines)
 
 
 def main(argv=None) -> int:
     """``render-skill`` prints the skill reference; ``validate`` exits 1 on
-    problems. Run as ``python -c "from runner import policy; policy.main([...])"``."""
+    problems. Run as ``python -m runner.policy validate`` or
+    ``python -c "from runner import policy; policy.main([...])"``."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv == ["render-skill"]:
         sys.stdout.write(render_skill_table())
@@ -1223,3 +1533,7 @@ def main(argv=None) -> int:
         return 1 if problems else 0
     print("usage: policy.main(['render-skill'] | ['validate'])", file=sys.stderr)
     return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

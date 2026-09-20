@@ -1,7 +1,7 @@
 # Codex routing policy
 
 Generated from `runner/policy.py` (`durable-runner-policy-v2` 2.2.0); do not edit by hand.
-Source: human decision, toolboxmd/model-router#10 (amended 2026-09-19), #12, and #26 (Go plan, 2026-09-20). Evidence: https://github.com/toolboxmd/model-router/issues/26.
+Source: human decision, toolboxmd/model-router#10 (amended 2026-09-19), #12, #26 (Go plan, 2026-09-20), and #28/#29 (role kits, 2026-09-20). Evidence: https://github.com/toolboxmd/model-router/issues/29.
 
 | Stage | Routes in order | Notes |
 | --- | --- | --- |
@@ -37,3 +37,18 @@ Rules:
 - Implementation, correction, and recovery worker sessions run with full access: outside-workspace writes, web fetch, web search, and doom-loop prompts are allowed as a per-route policy flag; `question` and `task` stay denied (headless stall; policy bypass). Dispatch and review routes on OpenCode run read-only in plan mode: `edit`, outside-workspace writes, web fetch/search, doom-loop, `question` and `task` stay denied (the coordinator role never needs them).
 - One escalation per job; afterwards evidence returns to the planner. No duplicate attempts, no retry loops. Never substitute a route silently; if the selected route is unavailable, stop that dispatch with the reason.
 - Record the policy version, the requested and observed route, and any override or escalation in the existing handoff. Instructions describe the policy and its required evidence.
+
+## Role kits
+
+One kit row per role; a role's tools change by editing policy. The owned OpenCode server runs on a runner-generated configuration directory built from the route's kit (AgentsMD link, plugins, skills, MCP servers named by the kit, permission set from the route); Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, Grok uses its config directory; the planner keeps the user's own session.
+
+| Role | Skills | Plugins | MCP servers | Permissions | Instructions |
+| --- | --- | --- | --- | --- | --- |
+| planner | none | none | none | read-only | You are the planner |
+| dispatcher | `operations` | `agentsmd-project-direction` | none | read-only | You are the read-only dispatcher |
+| reviewer | `operations` | `agentsmd-project-direction` | none | read-only | You are the reviewer |
+| worker | `operations`, `project-direction` | `agentsmd-project-direction` | `treg` | full | You are the implementation worker |
+| correction | `operations`, `project-direction` | `agentsmd-project-direction` | `treg` | full | You are the correction worker |
+| recovery | `operations` | `agentsmd-project-direction` | none | full | You are the recovery worker |
+
+Kit hashes (`kit_hash`): `planner` = 4312c57addddb355; `dispatcher` = d5a1fc8fba219cfb; `reviewer` = 0ef330e21531d0a0; `worker` = 3721c722b09edfb4; `correction` = 2bbac32e2ee3dd04; `recovery` = ea95ccff325a43c8.

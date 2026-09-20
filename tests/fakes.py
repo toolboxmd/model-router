@@ -37,10 +37,24 @@ with open(st / "opencode.log", "a") as f:
 if not argv or argv[0] != "serve":
     print(json.dumps({"type": "error", "error": {"name": "UnknownError", "data": {"message": "run not faked"}}}))
     sys.exit(1)
-assert "--pure" in argv and "127.0.0.1" in argv and "--port" in argv, argv
+assert "--pure" not in argv and "127.0.0.1" in argv and "--port" in argv, argv
 PWD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
 assert PWD, "password must arrive in the environment"
 (st / "pwd-in-argv").write_text("yes" if PWD in " ".join(argv) else "no")
+kit_env = {k: os.environ.get(k, "") for k in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG")}
+with open(st / "opencode-env.jsonl", "a") as f:
+    f.write(json.dumps(kit_env) + "\n")
+try:
+    _kd = kit_env.get("OPENCODE_CONFIG_DIR") or ""
+    if _kd:
+        _kj = Path(_kd) / "kit.json"
+        if _kj.is_file():
+            (st / "kit-actual.json").write_text(_kj.read_text())
+        _oj = Path(_kd) / "opencode.json"
+        if _oj.is_file():
+            (st / "opencode-kit-config.json").write_text(_oj.read_text())
+except Exception:
+    pass
 MODE = os.environ.get("FAKE_OC_MODE", "ok")
 AGENT = None  # set per prompt from the request body
 MODE_GO = os.environ.get("FAKE_OC_MODE_GO", "ok")

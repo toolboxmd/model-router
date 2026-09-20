@@ -56,6 +56,10 @@ GROK_BIN = "grok"
 _GROK_BUILD = _policy.ROUTES["grok-4.6-build"]
 GROK_MODEL = _GROK_BUILD["model"]
 GROK_EFFORT = _GROK_BUILD["variant"]
+# Grok Build resolves its configuration from its config directory
+# (``$GROK_HOME`` or ``~/.grok``). The runner points it at a generated
+# kit directory (see ``runner/kits.py``) so a Grok session carries its
+# kit equivalent and nothing inherited.
 
 # Explicit structured-action protocol embedded in every Luna prompt.
 # Luna must reply with exactly one JSON envelope as its final message.
@@ -483,8 +487,12 @@ def grok_route_params(route: str | None) -> tuple[str, str | None]:
 
 def build_grok_cmd(prompt: str, workspace: str, model: str = GROK_MODEL,
                    effort: str | None = GROK_EFFORT,
-                   session_id: str | None = None) -> list[str]:
-    """Headless single-turn Grok Build worker command.
+                   session_id: str | None = None,
+                   config_dir: str | None = None) -> tuple[list[str], dict]:
+    """Headless single-turn Grok Build worker command carrying its kit equivalent.
+
+    Returns ``(cmd, env)``. ``cmd`` is the plain headless prompt so the
+    spec stays testable without a live CLI:
 
     ``grok -p PROMPT --verbatim --cwd WS -m MODEL --effort EFFORT
     --always-approve --disable-web-search --no-subagents --output-format
@@ -493,6 +501,12 @@ def build_grok_cmd(prompt: str, workspace: str, model: str = GROK_MODEL,
     on approval or fork a second writer. Resume names the saved session
     and never forks: a resume reporting another session is rejected by
     the harness identity check.
+
+    ``env`` carries the kit (``GROK_HOME`` points at the runner-generated
+    kit directory the launcher must export, via ``runner/kits.py``
+    ``grok_kit_env``); empty when no kit directory is given. The live
+    turn's kit arrives via the harness ``spawn_spec``; this ``env`` is the
+    manual-run equivalent.
     """
     if not workspace:
         raise ValueError("missing workspace for grok worker turn")
@@ -508,7 +522,8 @@ def build_grok_cmd(prompt: str, workspace: str, model: str = GROK_MODEL,
         cmd += ["--effort", effort]
     if session_id:
         cmd += ["--resume", session_id]
-    return cmd
+    env = {"GROK_HOME": str(config_dir)} if config_dir else {}
+    return cmd, env
 
 
 def parse_grok_result(stdout: str) -> dict:
@@ -662,10 +677,17 @@ def generate_control_password(nbytes: int = 24) -> str:
 
 
 def build_opencode_serve_cmd(hostname: str = "127.0.0.1", port: str | int = 0) -> list[str]:
-    """Owned ephemeral serve argv. Password is environment-only, never argv."""
+    """Owned ephemeral serve argv. Password is environment-only, never argv.
+
+    The server runs on a runner-generated configuration directory built
+    from the route's kit (see ``runner/kits.py``): ``OPENCODE_CONFIG_DIR``,
+    ``XDG_CONFIG_HOME`` (shadow), and ``OPENCODE_CONFIG`` point at it in
+    the child's environment. ``--pure`` is gone: plugins the kit names
+    are allowed, and nothing is inherited from the user's configuration.
+    """
     if hostname not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("ephemeral serve allows localhost only")
-    return [OPENCODE_BIN, "serve", "--pure", "--hostname", hostname, "--port", str(port)]
+    return [OPENCODE_BIN, "serve", "--hostname", hostname, "--port", str(port)]
 
 
 def parse_serve_url(output_text: str) -> str | None:

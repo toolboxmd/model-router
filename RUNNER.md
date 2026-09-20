@@ -88,9 +88,10 @@ allowance; the runner never invents a reset time.
    resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
    sandbox_mode="read-only"`. A resume that reports another thread, or none,
    blocks.
-5. `implementation`: one Muse turn runs on an owned `opencode serve --pure
-   --hostname 127.0.0.1 --port 0`. See below. The worker report returns to
-   the same Luna task.
+5. `implementation`: one Muse turn runs on an owned `opencode serve
+   --hostname 127.0.0.1 --port 0` on a runner-generated configuration
+   directory built from the route's kit (see below). The worker report
+   returns to the same Luna task.
 6. `completion`: the terminal result is saved before acknowledgment.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
@@ -137,13 +138,21 @@ its transcript counts as busy.
 ## Implementation worker
 
 Each turn starts a fresh `opencode serve` with a random password in its
-environment only. The supervisor authenticates with Basic auth
-(`opencode:<password>`) and scopes every call with `directory=<workspace>`.
-It creates or reuses the saved session and saves the session ID before the
-model request. The session's permission rules are policy data, resolved per
-route by role. Implementation, correction, and recovery routes run with full
-access: outside-workspace writes, web fetch, web search, and doom-loop prompts
-are allowed as a per-route policy flag. Dispatch and review routes on OpenCode
+environment only. The server runs on a runner-generated configuration
+directory built from the route's kit (`runner/kits.py`): `OPENCODE_CONFIG_DIR`,
+`XDG_CONFIG_HOME` (shadow), and `OPENCODE_CONFIG` point at
+`state/kits/<request>.<invocation>.<kit>/`, which holds `kit.json`
+(kit identity and hash), `AGENTS.md` (AgentsMD link), `opencode.json`
+(the kit's MCP subset only), and `skills/` plus `plugins/` equal to the
+kit. Plugins the kit names are allowed; nothing is inherited from the
+user's own configuration (`--pure` is gone). The supervisor authenticates
+with Basic auth (`opencode:<password>`) and scopes every call with
+`directory=<workspace>`. It creates or reuses the saved session and saves
+the session ID before the model request. The session's permission rules
+are policy data, resolved per route from its role kit: the kit's
+`permission_set` (`full` for worker, correction, recovery; `read-only`
+for planner, dispatcher, reviewer) selects the base set, with a route's
+own `permissions` overrides on top. Dispatch and review routes on OpenCode
 run read-only in plan mode (`luna-go/max`, `luna-go-review`): `edit`,
 outside-workspace writes, web fetch/search, and doom-loop prompts are denied
 because the coordinator role never needs them; the plan agent is kept. Two
@@ -152,6 +161,41 @@ stalls a headless session forever, and `task`, because spawning subagents would
 bypass the policy and the runner's ownership and proof guarantees. OpenCode does not
 confine Bash at the OS level; that remains a known
 limit.
+
+Role kits are policy rows (`runner/policy.py` `KITS`): one row per role
+(planner, dispatcher, reviewer, worker, correction, recovery) with
+instructions, skills, plugins, MCP servers, and the permission set.
+Changing any of them is a policy edit with no state-machine change;
+`python -m runner.policy validate` rejects a kit that names a skill,
+plugin, or MCP server that is not installed, and the generated skill
+table lists each role's kit.
+
+Manual dispatch recipe (stand-in runs carry the same kit as the runner).
+Resolve the route's kit with `kit_name_for_route`, generate an isolated
+directory, and point the harness at it:
+
+```
+# Owned OpenCode worker on the worker kit (paid treg kept, other dropped).
+python3 -c "from runner import kits, policy; kits.materialize_opencode_kit(
+  policy.kit_name_for_route('muse-spark-xhigh-free'),
+  '/tmp/manual-kit', route='muse-spark-xhigh-free')"
+OPENCODE_CONFIG_DIR=/tmp/manual-kit XDG_CONFIG_HOME=/tmp/manual-kit/xdg-shadow \
+  OPENCODE_CONFIG=/tmp/manual-kit/opencode.json \
+  opencode serve --hostname 127.0.0.1 --port 0
+# Codex dispatcher on the dispatcher kit (nothing inherited).
+python3 -c "from runner import kits; kits.materialize_codex_kit('dispatcher', '/tmp/codex-kit')"
+CODEX_HOME=/tmp/codex-kit codex exec --json --model gpt-5.6-luna --sandbox read-only --cd WS PROMPT
+# Claude review equivalent (isolated); the planner keeps the user's session.
+python3 -c "from runner import kits; kits.materialize_claude_kit('reviewer', '/tmp/claude-kit')"
+CLAUDE_CONFIG_DIR=/tmp/claude-kit claude --resume SID -p PROMPT
+# Grok recovery equivalent.
+python3 -c "from runner import kits; kits.materialize_grok_kit('recovery', '/tmp/grok-kit')"
+GROK_HOME=/tmp/grok-kit grok -p PROMPT --model grok-4.6
+```
+
+The planner (`claude --resume`) keeps the user's own session and is never
+isolated; Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, and
+Grok Build uses `GROK_HOME` (or `~/.grok`) for their kit equivalents.
 
 The prompt goes through `POST /session/{id}/prompt_async` with the job
 route's model, variant, and agent from the policy (free Muse is
