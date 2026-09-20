@@ -361,6 +361,105 @@ def build_claude_cmd(planner_session_id: str, prompt: str,
             "-p", prompt]
 
 
+def build_claude_compact_cmd(planner_session_id: str, focus: str) -> list[str]:
+    """Headless post-submit compaction of the exact saved planner session.
+
+    ``claude -p --resume SID "/compact <focus>"`` compacts the session
+    around the submitted job (request id, Issue, decisions, proof command)
+    so a later callback resumes a small context. Never forks a new
+    session; a missing session is a caller error so the failure is
+    recorded, never silent. The focus names the job; see
+    ``policy.compact_focus``.
+    """
+    if not planner_session_id:
+        raise ValueError("missing planner session ID: refusing to fork a new session")
+    stripped = (focus or "").strip()
+    # The builder owns the single "/compact " prefix: the policy template
+    # holds only the focus text, so drop any caller-carried copy here to
+    # guarantee exactly one prefix reaches argv.
+    while stripped == "/compact" or stripped.startswith("/compact "):
+        stripped = stripped[len("/compact"):].strip()
+    if not stripped:
+        raise ValueError("missing compaction focus")
+    return [CLAUDE_BIN, "-p", "--resume", planner_session_id,
+            "/compact " + stripped]
+
+
+def parse_claude_compact_result(stdout: str) -> dict:
+    """Parse the headless ``claude -p --resume SID "/compact ..."`` result.
+
+    Returns ``{ok, session_id, error}``. Only a ``result`` object with
+    ``is_error`` false from a session counts: the verified live shape
+    carries ``local_command: compact`` (a ``result`` with a compact
+    subtype or command marker), persisted in the transcript. Anything
+    else (empty output, plain text, an error object) is a recorded
+    compact failure that never blocks the job.
+    """
+    obj = None
+    text = (stdout or "").strip()
+    if text:
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    cand = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(cand, dict) and cand.get("type") == "result":
+                    obj = cand
+                    break
+    if not isinstance(obj, dict) or obj.get("type") != "result":
+        # The live CLI names the compact command in text: accept a
+        # transcript marker as success only with its session id.
+        marker = "local_command" in text and "compact" in text
+        if marker:
+            sid = None
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        cand = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(cand, dict) and isinstance(cand.get("session_id"), str):
+                        sid = cand["session_id"]
+                        break
+            if sid is None:
+                return {"ok": False, "session_id": None,
+                        "error": "compact marker without session id"}
+            return {"ok": True, "session_id": sid, "error": None}
+        return {"ok": False, "session_id": None,
+                "error": "compact output is not a Claude JSON result"}
+    sid = obj.get("session_id") if isinstance(obj.get("session_id"), str) else None
+    if obj.get("is_error"):
+        return {"ok": False, "session_id": sid,
+                "error": f"compact result error: {str(obj.get('subtype') or 'is_error')[:80]}",
+                "detail": str(obj.get("result") or "")[:500]}
+    # Verified live shape carries the compact marker: only a compact
+    # turn counts, so a normal planner answer routed here is a failure.
+    subtype = obj.get("subtype")
+    result_val = obj.get("result")
+    has_marker = False
+    if isinstance(subtype, str) and "compact" in subtype.lower():
+        has_marker = True
+    if isinstance(result_val, str):
+        _rl = result_val.lower()
+        if "local_command" in _rl and "compact" in _rl:
+            has_marker = True
+    local_cmd = obj.get("local_command")
+    if isinstance(local_cmd, str) and "compact" in local_cmd.lower():
+        has_marker = True
+    if not has_marker:
+        return {"ok": False, "session_id": sid,
+                "error": "compact result is not a compact turn",
+                "detail": str(result_val or "")[:500]}
+    return {"ok": True, "session_id": sid, "error": None}
+
+
 def parse_claude_result(stdout: str) -> dict:
     """Parse ``claude -p --output-format json``.
 

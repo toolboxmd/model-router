@@ -85,6 +85,10 @@ def main(argv=None) -> int:
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
     p.add_argument("--planner-harness", default="claude", choices=("claude",),
                    help="harness that hosts the planner session (only claude is implemented)")
+    p.add_argument("--handoff-summary", default=None,
+                   help="durable handoff summary stored on the job (default: derived from the task packet)")
+    p.add_argument("--handoff-summary-file", default=None,
+                   help="file holding the handoff summary")
     p.add_argument("--start", action="store_true",
                    help="launch detached controller with built-in adapters after persist")
     p.add_argument("--no-start", action="store_true",
@@ -135,6 +139,10 @@ def main(argv=None) -> int:
                 task = json.loads(task_raw)
             except ValueError:
                 task = task_raw
+            handoff_summary = args.handoff_summary
+            if args.handoff_summary_file:
+                with open(args.handoff_summary_file, encoding="utf-8") as f:
+                    handoff_summary = f.read()
             # Persist first; launch only when explicitly requested with
             # built-in adapters. --no-start wins so deterministic tests
             # stay offline. Default (neither flag) only persists, which
@@ -149,7 +157,8 @@ def main(argv=None) -> int:
                                             planner_cwd=args.planner_cwd,
                                             lane=args.lane, job_kind=args.job_kind,
                                             replay_of=args.replay_of,
-                                            planner_harness=args.planner_harness)
+                                            planner_harness=args.planner_harness,
+                                            handoff_summary=handoff_summary)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
@@ -160,7 +169,8 @@ def main(argv=None) -> int:
                                   planner_cwd=args.planner_cwd,
                                   lane=args.lane, job_kind=args.job_kind,
                                   replay_of=args.replay_of,
-                                  planner_harness=args.planner_harness)
+                                  planner_harness=args.planner_harness,
+                                  handoff_summary=handoff_summary)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
                          "policy": job["policy_id"]})

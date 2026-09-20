@@ -17,7 +17,8 @@ python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-fi
   --workspace PATH --planner-session SID [--planner-cwd PATH] \
   [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
   [--timeout-secs S] [--job-kind ordinary|experiment|replay] [--replay-of ID] \
-  [--planner-harness claude] [--start | --no-start]
+  [--planner-harness claude] [--handoff-summary TEXT | --handoff-summary-file F] \
+  [--start | --no-start]
 python -m runner --state-dir DIR start --request-id ID
 python -m runner --state-dir DIR status --request-id ID
 python -m runner --state-dir DIR questions --request-id ID [--all | --clear QID]
@@ -59,7 +60,18 @@ planner session was started, because Claude stores sessions per project
 directory; it defaults to the workspace.
 `--job-kind` is `ordinary`, `experiment`, or `replay`; a replay names the
 request it repeats with `--replay-of`. `--planner-harness` names the harness
-hosting the planner session; only `claude` is implemented. The task JSON may
+hosting the planner session; only `claude` is implemented.
+`--handoff-summary` (or `--handoff-summary-file`) stores the durable handoff
+summary on the job; without it the summary is derived from the task packet
+(`handoff_summary`, else Issue, decisions, proof command, and goal). The same
+ID and payload return the existing job, including the stored summary; a
+changed summary conflicts like any other payload field. After a successful
+submit with `--start`, the Claude planner harness compacts the planner
+session headlessly (`claude -p --resume SID "/compact <focus>"`) with the
+policy focus template naming the job (request id, Issue, decisions, proof
+command), recorded as a `claude_compact` invocation with elapsed time and
+usage; a compact failure is recorded and never blocks the job, and no
+compaction runs when the policy flag for the harness is off. The task JSON may
 carry an optional `links` array of `{"rel": "...", "href": "..."}` objects
 (references for the worker, kept verbatim in the stored task); it changes no
 routing and needs no runner flag.
@@ -80,11 +92,19 @@ allowance; the runner never invents a reset time.
    `completion`. The envelope is saved before its effect.
 3. `planner_question`: the question is saved, then the original planner is
    resumed with `claude --resume SID --model M --effort E --output-format
-   json --tools "" -p PROMPT` in the planner directory. The answer counts
-   only when the JSON result is a success from the same session ID. A running
-   `claude` process that names the session in its arguments is a busy
-   planner. Busy, failed, or mismatched callbacks block the job with a
-   reason; the question stays pending for `answer` plus `recover`.
+   json --tools "" -p PROMPT` in the planner directory. PROMPT carries the
+   stored handoff summary before the dispatcher's question, so a callback
+   hours later answers from the ledger even on the compacted session. The
+   answer counts only when the JSON result is a success from the same
+   session ID. The `claude_callback` invocation records the resumed
+   context (input, cache-read, and cache-creation tokens) with elapsed
+   time, so the saving is visible per job in the Observer mapping
+   (`status` and `result` measurements). A running `claude` process that
+   names the session in its arguments is a busy planner. Busy, failed, or
+   mismatched callbacks block the job with a reason; the question stays
+   pending for `answer` plus `recover`. The Astra fallback never resumes:
+   it answers from the handoff summary in a fresh session with no resume
+   (`controller.astra_fallback_prompt`), persisted the same way.
 4. The answer is saved, then the same Luna task resumes with `codex exec
    resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
    sandbox_mode="read-only"`. A resume that reports another thread, or none,
@@ -541,7 +561,8 @@ that OpenCode session while the saved dispatch route stays OpenCode.
 
 `runner/policy.py` (`durable-runner-policy-v2`) is the single policy source:
 pools, routes, stages (lanes), each Go model's monthly dollar limit and its
-usage windows, signal classes, and provenance. The Codex skill reference
+usage windows, signal classes, the planner-handoff compaction focus template
+and per-harness compact flag, and provenance. The Codex skill reference
 `skills/model-routing/references/codex.md` is rendered from it with
 `python -c "from runner import policy; policy.main(['render-skill'])"` and a
 test keeps the two equal; `policy.main(['validate'])` checks the data.

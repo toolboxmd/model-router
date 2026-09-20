@@ -22,6 +22,7 @@ from pathlib import Path as _KitPath
 KIND_CODEX_DISPATCH = "codex_dispatch"
 KIND_CODEX_RESUME = "codex_resume"
 KIND_CLAUDE_CALLBACK = "claude_callback"
+KIND_CLAUDE_COMPACT = "claude_compact"
 KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
 KIND_GROK_CONTROL = "grok_control"
@@ -419,12 +420,15 @@ class CodexCLI(Harness):
 
 class ClaudeCLI(Harness):
     name = "claude"
-    kinds = (KIND_CLAUDE_CALLBACK,)
+    kinds = (KIND_CLAUDE_CALLBACK, KIND_CLAUDE_COMPACT)
     # The callback runs with no tools, so it cannot write: read-only holds.
+    # Compaction rewrites the planner's own transcript summary, which is
+    # the harness's session maintenance, not workspace work: read-only
+    # still holds for the runner's stage capabilities.
     capabilities = frozenset({"read_only", "session_resume", "structured_output"})
     binary = adapters.CLAUDE_BIN
-    timeouts = {KIND_CLAUDE_CALLBACK: 900}
-    stages = {KIND_CLAUDE_CALLBACK: "planning"}
+    timeouts = {KIND_CLAUDE_CALLBACK: 900, KIND_CLAUDE_COMPACT: 900}
+    stages = {KIND_CLAUDE_CALLBACK: "planning", KIND_CLAUDE_COMPACT: "planning"}
     session_kind = "planner_session_id"
 
     def parse_session(self, kind, stdout, stderr, job):
@@ -465,12 +469,20 @@ class ClaudeCLI(Harness):
         return usage, observed, None, ids
 
     def infer_rc(self, kind, stdout, cmd=None):
+        if kind == KIND_CLAUDE_COMPACT:
+            return 0 if adapters.parse_claude_compact_result(stdout).get("ok") else 1
         return 0 if adapters.parse_claude_result(stdout).get("ok") else 1
 
     def parsed_result(self, kind, stdout):
         """Structured Claude result via the seam, so callers never parse
         the harness output directly."""
+        if kind == KIND_CLAUDE_COMPACT:
+            return adapters.parse_claude_compact_result(stdout)
         return adapters.parse_claude_result(stdout)
+
+    def parsed_compact_result(self, kind, stdout):
+        """Structured Claude compact result via the seam."""
+        return adapters.parse_claude_compact_result(stdout)
 
     def planner_answer(self, kind, stdout, meta, job):
         parsed = adapters.parse_claude_result(stdout)
@@ -485,6 +497,15 @@ class ClaudeCLI(Harness):
             return f"planner_callback_failed rc={rc} (consumed by recovery)"
         if parsed.get("session_id") != (job or {}).get("planner_session_id"):
             return "planner_session_mismatch (consumed by recovery)"
+        return None
+
+    def compact_failure_reason(self, kind, rc, stdout, job):
+        """Recorded compact failure; never blocks the job."""
+        parsed = adapters.parse_claude_compact_result(stdout)
+        if rc != 0 or not parsed.get("ok"):
+            return f"planner_compact_failed rc={rc}"
+        if parsed.get("session_id") not in (None, (job or {}).get("planner_session_id")):
+            return "planner_compact_session_mismatch"
         return None
 
     def spawn_spec(self, inv, env):
@@ -1642,6 +1663,8 @@ def kind_for_cmd(cmd: list) -> str:
     if name == "codex":
         return KIND_CODEX_RESUME if "resume" in args else KIND_CODEX_DISPATCH
     if name == "claude":
+        if any(str(a).strip().startswith("/compact") for a in args):
+            return KIND_CLAUDE_COMPACT
         return KIND_CLAUDE_CALLBACK
     if name == "opencode":
         return KIND_OPENCODE_SERVE if "serve" in args else KIND_OPENCODE_CONTROL

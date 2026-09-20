@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.0] - 2026-09-21
+
+### Added
+
+- Compact the planner session at handoff and store a durable handoff summary on the job
+
 ## [0.14.0] - 2026-09-20
 
 ### Added

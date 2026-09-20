@@ -199,11 +199,20 @@ class TestPublicLoopProof(unittest.TestCase):
             self.assertIn(THREAD_ID, r)
         self.assertEqual(len(codex_calls), len(dispatches) + len(resumes))
 
-        # One Claude --resume of the exact original planner ID, JSON output,
-        # run in the planner's directory (default: the workspace).
-        self.assertEqual(len(claude_calls), 1, claude_calls)
-        self.assertIn("--resume", claude_calls[0])
-        self.assertIn(PLANNER_SID, claude_calls[0])
+        # One headless compact plus one Claude --resume of the exact
+        # original planner ID, both run in the planner's directory
+        # (default: the workspace).
+        self.assertEqual(len(claude_calls), 2, claude_calls)
+        compacts = [c for c in claude_calls
+                    if any("/compact" in str(a) for a in c)]
+        callbacks = [c for c in claude_calls
+                     if not any("/compact" in str(a) for a in c)]
+        self.assertEqual(len(compacts), 1, claude_calls)
+        self.assertEqual(len(callbacks), 1, claude_calls)
+        for c in claude_calls:
+            self.assertIn("--resume", c)
+            self.assertIn(PLANNER_SID, c)
+        self.assertIn(req, " ".join(str(a) for a in compacts[0]))
         self.assertEqual(read_log("claude.log")[0]["cwd"], os.path.realpath(ws))
 
         # Owned ephemeral OpenCode server with the real API contract.
@@ -254,10 +263,12 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("claude_callback", kinds)
         self.assertIn("opencode_control", kinds)
         # Every model child ran under a supervisor and was collected once.
+        # The post-submit compact is a synchronous invocation (no
+        # supervisor), still recorded with elapsed time and usage.
         invs = core._list_invocations(sd, req)
         self.assertEqual(sorted(i["kind"] for i in invs),
-                         ["claude_callback", "codex_dispatch", "codex_resume",
-                          "codex_resume", "opencode_control"])
+                         ["claude_callback", "claude_compact", "codex_dispatch",
+                          "codex_resume", "codex_resume", "opencode_control"])
         self.assertTrue(all(i["state"] == "completed" and i["consumed_at"] for i in invs))
 
         # Recover/restart must not fork a second planner session or writer.
