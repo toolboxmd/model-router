@@ -64,15 +64,20 @@ def main(argv=None) -> int:
     g.add_argument("--task-file", default=None, help="file holding JSON task")
     p.add_argument("--workspace", required=True)
     p.add_argument("--planner-session", required=True)
-    p.add_argument("--route", default="muse-spark-xhigh-free",
-                   help=f"implementation route: {', '.join(policy.IMPLEMENTATION_ORDER)}")
+    lane_or_route = p.add_mutually_exclusive_group()
+    lane_or_route.add_argument("--route", default=None,
+                               help=f"implementation route: {', '.join(policy.implementation_routes())}"
+                                    " (default: the default lane's first route)")
+    lane_or_route.add_argument("--lane", default=None, choices=sorted(policy.LANE_ALIASES),
+                               help="implementation lane: default, small, hard; critical is "
+                                    "planner-executed and rejected")
     p.add_argument("--policy", default=policy.POLICY_ID)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--timeout-secs", type=int, default=None)
-    p.add_argument("--planner-model", default="claude-fable-5-1",
-                   help="planner model (default claude-fable-5-1; live-test override claude-sonnet-5)")
-    p.add_argument("--planner-effort", default="max",
-                   help="planner effort (default max; live-test override medium)")
+    p.add_argument("--planner-model", default=None,
+                   help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
+    p.add_argument("--planner-effort", default=None,
+                   help="planner effort (default: policy planning route; live-test override medium)")
     p.add_argument("--planner-cwd", default=None,
                    help="directory where the planner session was started (default: workspace)")
     p.add_argument("--start", action="store_true",
@@ -155,7 +160,8 @@ def main(argv=None) -> int:
                                             timeout_secs=args.timeout_secs,
                                             planner_model=args.planner_model,
                                             planner_effort=args.planner_effort,
-                                            planner_cwd=args.planner_cwd)
+                                            planner_cwd=args.planner_cwd,
+                                            lane=args.lane)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
@@ -163,7 +169,8 @@ def main(argv=None) -> int:
                                   timeout_secs=args.timeout_secs,
                                   planner_model=args.planner_model,
                                   planner_effort=args.planner_effort,
-                                  planner_cwd=args.planner_cwd)
+                                  planner_cwd=args.planner_cwd,
+                                  lane=args.lane)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
                          "policy": job["policy_id"]})

@@ -436,6 +436,11 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                      "opencode_session_id", job)
     allowance = meta.get("allowance") or "free"
     model = meta.get("model") or adapters.opencode_model_for_allowance(allowance)
+    # Variant and agent come from the route through the controller's meta;
+    # a missing key keeps the legacy Muse defaults, an explicit None omits the
+    # variant so the provider default applies.
+    variant = meta["variant"] if "variant" in meta else adapters.OPENCODE_VARIANT
+    agent = meta.get("agent") or adapters.OPENCODE_AGENT
     baseline = set()
     for m in client.messages(saved):
         info = m.get("info") if isinstance(m, dict) else None
@@ -444,9 +449,9 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
                 "opencode_session_id": saved}, saved, "opencode_session_id"
-    client.prompt_async(saved, meta.get("prompt") or "", model=model)
+    client.prompt_async(saved, meta.get("prompt") or "", model=model, variant=variant, agent=agent)
     result = {"opencode_session_id": saved, "model": model,
-              "variant": adapters.OPENCODE_VARIANT, "agent": adapters.OPENCODE_AGENT,
+              "variant": variant, "agent": agent,
               "ok": False}
     prompted_at = time.monotonic()
     seen_active = False
@@ -552,10 +557,10 @@ def _persist_session(state_dir, request_id, invocation_id, sid, skind, job) -> N
             row = con.execute("SELECT route FROM jobs WHERE request_id=?",
                               (request_id,)).fetchone()
             route = (row["route"] if row is not None else None) or "muse-spark-xhigh-free"
+            r_model, r_variant, _r_agent = adapters.opencode_route_params(route)
             con.execute(
                 "UPDATE jobs SET opencode_session_id=?, adapter='opencode', model=?, effort=?, updated_at=? WHERE request_id=?",
-                (sid, adapters.opencode_model_for_route(route), adapters.OPENCODE_VARIANT,
-                 core._utcnow(), request_id),
+                (sid, r_model, r_variant or "default", core._utcnow(), request_id),
             )
         core._event(con, request_id, "invocation_session_captured",
                     {"invocation_id": invocation_id[:16],
