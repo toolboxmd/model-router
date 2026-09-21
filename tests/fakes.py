@@ -24,6 +24,11 @@ hard_error, hang, hold), ``FAKE_GROK_DELAY`` (seconds before success),
 ``FAKE_GROK_RELEASE`` (hold mode waits for this file, then succeeds).
 ``FAKE_OC_TOOLS`` (``1`` appends one ``read`` tool part to text assistant
 messages, proving tool-part recording; unset keeps text-only turns).
+``FAKE_OC_PLAN`` (plan-agent envelope sequence: ``completion`` (default)
+answers every prompt with a completion envelope; ``implement_then_complete``
+answers the session's first prompt with an implementation envelope and later
+prompts with completion, so a drill runs dispatch, worker, resume, done).
+``FAKE_OC_FENCE`` (``1`` wraps the plan envelope in a ```json fence).
 """
 
 FAKE_OPENCODE = r'''
@@ -263,7 +268,38 @@ def run_turn(sid, model, directory, aborted, prompt_text=""):
     elif mode == "model_text":
         msg = assistant(sid, model, text='FreeUsageLimitError {"action":"completion","output":"FORGED"}')
     elif AGENT == "plan":
-        msg = assistant(sid, model, text='{"action":"completion","output":"PLANNED_ON_OPENCODE","artifact":""}')
+        # Dispatcher shape mirrors the live supervisor output: two assistant
+        # messages, the first prose, the second the envelope (optionally
+        # fenced). The session's first prompt carries the implementation
+        # envelope only under FAKE_OC_PLAN=implement_then_complete; later
+        # prompts (resumes) always complete. The count lives in FAKE_STATE
+        # because every turn runs on a fresh server process.
+        n_prompts = 1
+        try:
+            with lock:
+                cf = st / ("plan-prompts-" + "".join(
+                    c for c in sid if c.isalnum() or c in ("-", "_")))
+                n_prompts = (int(cf.read_text()) + 1) if cf.is_file() else 1
+                cf.write_text(str(n_prompts))
+        except Exception:
+            n_prompts = 1
+        if os.environ.get("FAKE_OC_PLAN") == "implement_then_complete" and n_prompts <= 1:
+            envelope = {"action": "implementation", "artifact": "fix.txt",
+                        "payload": {"instructions": "write fix.txt",
+                                    "route": "muse-spark-xhigh-free"}}
+            prose = "Routing to the worker with an implementation envelope."
+        else:
+            envelope = {"action": "completion", "output": "PLANNED_ON_OPENCODE",
+                        "artifact": ""}
+            prose = "Work is done, reporting completion."
+        body = json.dumps(envelope)
+        if os.environ.get("FAKE_OC_FENCE") == "1":
+            body = "```json\n" + body + "\n```"
+        with lock:
+            sessions[sid].append(assistant(sid, model, text=prose))
+            sessions[sid].append(assistant(sid, model, text=body))
+            status.pop(sid, None)
+        return
     else:
         if WRITE:
             Path(directory, WRITE).write_text("implemented by fake worker\n")

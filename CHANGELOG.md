@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.18.0] - 2026-09-21
+
+### Added
+
+- Parse the dispatcher envelope from the OpenCode-hosted Luna turn: last JSON object of the last assistant message, fake mirrors the real RUNNER_RESULT shape
+
 ## [0.17.0] - 2026-09-21
 
 ### Added

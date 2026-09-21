@@ -107,7 +107,14 @@ allowance; the runner never invents a reset time.
    reason, never a bare "turn not completed".
    The first `thread.started` ID is saved as the Luna task. Luna's action is
    read only from its own final `item.completed` `agent_message` text, or
-   the last-message file. Command output is never parsed for actions.
+   the last-message file. Command output is never parsed for actions. On
+   the OpenCode-hosted dispatcher the action is the last complete JSON
+   object of the turn's last assistant message (two messages arrive as
+   prose, then the envelope, optionally fenced; surrounding prose is
+   tolerated, and a tail missing at most three closers is completed),
+   validated as an action envelope; the raw text stays in the ledger.
+   A turn with no extractable envelope blocks quoting the first 200
+   characters of the assistant text, never a bare "no structured envelope".
 2. Luna replies with one envelope: `planner_question`, `implementation`, or
    `completion`. The envelope is saved before its effect.
 3. `planner_question`: the question is saved, then the original planner is
@@ -599,7 +606,11 @@ before any child starts. Dispatch has one fallback route: when the Codex CLI
 dispatch route cannot start a task, the controller dispatches Luna on OpenCode
 Go (`luna-go/max`, agent `plan`, one turn per job) through the owned OpenCode
 server (`_dispatch_on_opencode` in `runner/controller.py`). Later turns resume
-that OpenCode session while the saved dispatch route stays OpenCode.
+that OpenCode session while the saved dispatch route stays OpenCode. The
+fallback extracts the envelope the same way on dispatch and on resume
+(last complete JSON object of the last assistant message, fenced or bare),
+keeps the raw text in the `luna_action` ledger event, and quotes the first
+200 characters of the assistant text when no envelope extracts.
 
 ## Policy
 
@@ -681,6 +692,10 @@ python -m compileall -q runner tests
 
 The suite uses fake `codex`, `claude`, `opencode`, and `grok` executables shaped like
 the real contracts (`tests/fakes.py`) and real detached processes. The fake
+OpenCode server answers plan-agent dispatcher turns the live way: two
+assistant messages, the first prose, the second the envelope, optionally
+fenced (`FAKE_OC_FENCE`), with the first prompt carrying implementation
+under `FAKE_OC_PLAN=implement_then_complete`. The fake
 `grok` covers ok, xAI exhaustion, overload, hard errors, hangs, and a held
 turn for controller-death drills. It covers
 duplicate and concurrent submission, workspace conflicts, launch races,

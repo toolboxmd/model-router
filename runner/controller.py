@@ -165,8 +165,14 @@ def _load_controller_state(job: dict) -> dict:
 
 
 def _persist_envelope(state_dir, request_id: str, envelope: dict | None,
-                      phase: str) -> None:
-    """Persist the Luna action envelope BEFORE its side effect."""
+                      phase: str, raw_text: str | None = None) -> None:
+    """Persist the Luna action envelope BEFORE its side effect.
+
+    ``raw_text`` is the dispatcher text the envelope was extracted from
+    (the OpenCode summary's last assistant message): its redacted tail
+    travels in the ledger event so Agent Observer reads what Luna said
+    without querying the private output files.
+    """
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -185,11 +191,24 @@ def _persist_envelope(state_dir, request_id: str, envelope: dict | None,
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(cur, sort_keys=True), now, request_id))
         if envelope is not None:
-            core._event(con, request_id, "luna_action",
-                        {"action": str(envelope.get("action") or "unknown")[:64],
-                         "phase": phase})
+            detail = {"action": str(envelope.get("action") or "unknown")[:64],
+                      "phase": phase}
+            if isinstance(raw_text, str) and raw_text.strip():
+                try:
+                    kept = adapters.redact_text(raw_text)
+                except Exception:
+                    kept = raw_text
+                detail["assistant_text"] = " ".join(kept.split())[:2000]
+            core._event(con, request_id, "luna_action", detail)
         else:
-            core._event(con, request_id, "luna_action_missing", {"phase": phase})
+            missing = {"phase": phase}
+            if isinstance(raw_text, str) and raw_text.strip():
+                try:
+                    kept = adapters.redact_text(raw_text)
+                except Exception:
+                    kept = raw_text
+                missing["assistant_text"] = " ".join(kept.split())[:2000]
+            core._event(con, request_id, "luna_action_missing", missing)
         con.execute("COMMIT")
     except Exception:
         try:
@@ -565,6 +584,24 @@ def _codex_failure_message(out, err, cmd) -> str:
     return msg[:200] or "empty provider output"
 
 
+def _assistant_text_quote(full) -> str:
+    """First 200 characters of an OpenCode summary's assistant text.
+
+    A missing envelope still blocks, but with what Luna actually said
+    instead of a bare "no structured envelope". Redacted first (the
+    text is model-authored and can echo secrets), then collapsed to one
+    line; blank text reports as empty dispatcher output, never empty.
+    """
+    text = full.get("assistant_text") if isinstance(full, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return "empty dispatcher output"
+    try:
+        text = adapters.redact_text(text)
+    except Exception:
+        pass
+    return " ".join(text.split())[:200] or "empty dispatcher output"
+
+
 def _dispatch_fallback_routes(dispatch_route: str) -> list:
     """Owned-server dispatch routes after ``dispatch_route``, in policy order."""
     return [r for r in policy.stage_routes("dispatch") if r != dispatch_route
@@ -822,9 +859,11 @@ def _dispatch_on_opencode(state_dir, request_id: str, route: str, prompt: str, r
         _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: dispatcher turn on {route} failed")
         return {"action": "blocked", "reason": "codex_dispatch_failed"}
     luna_action = oc_h.luna_action("opencode_control", out, cmd)
-    _persist_envelope(state_dir, request_id, luna_action, phase)
+    _persist_envelope(state_dir, request_id, luna_action, phase,
+                      raw_text=full.get("assistant_text") if isinstance(full, dict) else None)
     if luna_action is None:
-        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        quote = _assistant_text_quote(full)
+        _mark_blocked(state_dir, request_id, f"luna_missing_action: {quote}")
         return {"action": "blocked", "reason": "luna_missing_action", "codex_task_id": got_session}
     return {"action": "dispatched" if phase == "dispatched" else "resumed",
             "codex_task_id": got_session, "luna_action": luna_action, "route": route}

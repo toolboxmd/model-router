@@ -595,32 +595,79 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertNotIn("muse-spark-xhigh-free", core.degraded_routes(self.sd))
 
     def test_dispatch_falls_back_to_luna_on_opencode_plan_mode(self):
-        run = self._setup("ok")
-        bindir = Path(os.environ["PATH"].split(os.pathsep)[0])
-        write_fake(bindir, "codex", "import sys\nprint('{\"type\":\"error\",\"message\":\"usage limit reached\"}')\nsys.exit(1)\n", PY)
-        res = controller.dispatch(self.sd, "oc1", run_cmd=run)
-        self.assertEqual(res["action"], "dispatched")
-        self.assertEqual(res["route"], "luna-go/max")
-        self.assertEqual(res["luna_action"]["action"], "completion")
-        job = core.get_job(self.sd, "oc1")
-        self.assertTrue(str(job["codex_task_id"]).startswith("ses"))
-        self.assertEqual(job["adapter"], "opencode")
-        self.assertEqual(controller._load_controller_state(job)["dispatch_route"], "luna-go/max")
-        prompts = [r["body"] for r in self._requests() if r["path"].endswith("/prompt_async")]
-        self.assertEqual(prompts[-1]["model"], {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
-        self.assertEqual(prompts[-1]["agent"], "plan")
-        invs = core._list_invocations(self.sd, "oc1")
-        self.assertEqual([i["stage"] for i in invs], ["dispatch", "dispatch"])
-        self.assertEqual(invs[-1]["requested_route"], "luna-go/max")
-        # A resume goes back to the same OpenCode dispatcher session.
-        res2 = controller.resume_luna(self.sd, "oc1", "context", run_cmd=run)
-        self.assertEqual((res2["action"], res2["codex_task_id"]), ("resumed", job["codex_task_id"]))
-        self.assertEqual(len([r for r in self._requests() if r["path"].endswith("/prompt_async")]), 2)
-        # The completion envelope ends the job through the normal step.
-        done = controller.step(self.sd, "oc1", run_cmd=run)
-        self.assertEqual(done["action"], "completed")
-        self.assertEqual(core.get_job(self.sd, "oc1")["status"], "succeeded")
-        self._no_secret_leak()
+        # The exhausted Codex reading preflights straight to Luna on
+        # OpenCode Go, as in the live rehearsal. The OpenCode-hosted
+        # dispatcher mirrors the live shape: two assistant messages
+        # (prose, then the envelope, fenced), the first prompt carrying
+        # implementation, the resume completing. The job runs dispatch,
+        # one worker turn, resume, and completion.
+        saved = {k: os.environ.get(k) for k in ("FAKE_OC_PLAN", "FAKE_OC_FENCE", "FAKE_OC_WRITE")}
+        os.environ["FAKE_OC_PLAN"] = "implement_then_complete"
+        os.environ["FAKE_OC_FENCE"] = "1"
+        os.environ["FAKE_OC_WRITE"] = "fix.txt"
+        try:
+            run = self._setup("ok")
+            bindir = Path(os.environ["PATH"].split(os.pathsep)[0])
+            write_fake(bindir, "codex",
+                       "import os, sys\nfrom pathlib import Path\n"
+                       "Path(os.environ['FAKE_STATE'], 'codex-invoked').write_text(' '.join(sys.argv[1:]))\n"
+                       "sys.exit(1)\n", PY)
+            import datetime
+            reset_at = (datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(hours=2)).isoformat()
+            core.record_capacity(self.sd, "luna/max", "exhausted",
+                                 {"source": "codex", "message": "usage limit reached"},
+                                 reset_at=reset_at, reset_source="provider")
+            res = controller.dispatch(self.sd, "oc1", run_cmd=run,
+                                      probe=lambda *a: None)
+            self.assertEqual(res["action"], "dispatched")
+            self.assertEqual(res["route"], "luna-go/max")
+            self.assertEqual(res["luna_action"]["action"], "implementation")
+            self.assertEqual(res["luna_action"]["artifact"], "fix.txt")
+            self.assertFalse((self.fake_state / "codex-invoked").exists(),
+                             "exhausted Codex is skipped in preflight")
+            job = core.get_job(self.sd, "oc1")
+            self.assertTrue(str(job["codex_task_id"]).startswith("ses"))
+            self.assertEqual(job["adapter"], "opencode")
+            st = controller._load_controller_state(job)
+            self.assertEqual(st["dispatch_route"], "luna-go/max")
+            self.assertEqual(st.get("route_reason"), "preflight_exhausted")
+            prompts = [r["body"] for r in self._requests() if r["path"].endswith("/prompt_async")]
+            self.assertEqual(prompts[-1]["model"], {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
+            self.assertEqual(prompts[-1]["agent"], "plan")
+            invs = core._list_invocations(self.sd, "oc1")
+            self.assertEqual([i["stage"] for i in invs], ["dispatch"])
+            self.assertEqual(invs[-1]["requested_route"], "luna-go/max")
+            # The dispatch summary mirrors the live supervisor output.
+            out = Path(invs[-1]["stdout_path"]).read_text()
+            summaries = [json.loads(l[len("RUNNER_RESULT "):]) for l in out.splitlines()
+                         if l.startswith("RUNNER_RESULT ")]
+            self.assertTrue(summaries)
+            self.assertEqual(summaries[-1]["assistant_messages"], 2)
+            self.assertIn("```json", summaries[-1]["assistant_text"])
+            # One worker turn on the dispatched implementation.
+            impl = controller.run_implementation(self.sd, "oc1", artifact="fix.txt",
+                                                payload={"instructions": "write fix.txt"},
+                                                run_cmd=run)
+            self.assertEqual(impl["action"], "implementation_ok")
+            self.assertTrue((self.ws / "fix.txt").exists())
+            # A resume goes back to the same OpenCode dispatcher session and
+            # recovers the fenced completion envelope with the same parser.
+            res2 = controller.resume_luna(self.sd, "oc1", "context", run_cmd=run)
+            self.assertEqual((res2["action"], res2["codex_task_id"]), ("resumed", job["codex_task_id"]))
+            self.assertEqual(res2["luna_action"]["action"], "completion")
+            self.assertEqual(len([r for r in self._requests() if r["path"].endswith("/prompt_async")]), 3)
+            # The completion envelope ends the job through the normal step.
+            done = controller.step(self.sd, "oc1", run_cmd=run)
+            self.assertEqual(done["action"], "completed")
+            self.assertEqual(core.get_job(self.sd, "oc1")["status"], "succeeded")
+            self._no_secret_leak()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def _kill_groups(self):
         for inv in core._list_invocations(self.sd, "oc1"):
