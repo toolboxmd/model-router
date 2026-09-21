@@ -48,7 +48,7 @@ assert "--pure" not in argv and "127.0.0.1" in argv and "--port" in argv, argv
 PWD = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
 assert PWD, "password must arrive in the environment"
 (st / "pwd-in-argv").write_text("yes" if PWD in " ".join(argv) else "no")
-kit_env = {k: os.environ.get(k, "") for k in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG")}
+kit_env = {k: os.environ.get(k, "") for k in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG", "OPENCODE_DISABLE_EXTERNAL_SKILLS")}
 with open(st / "opencode-env.jsonl", "a") as f:
     f.write(json.dumps(kit_env) + "\n")
 try:

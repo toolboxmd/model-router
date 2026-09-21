@@ -198,16 +198,29 @@ environment only. The server runs on a runner-generated configuration
 directory built from the route's kit (`runner/kits.py`): `OPENCODE_CONFIG_DIR`
 and `OPENCODE_CONFIG` point at
 `state/kits/<request>.<invocation>.<kit>/`, which holds `kit.json`
-(kit identity and hash), `AGENTS.md` (AgentsMD link), `opencode.json`
-(the kit's MCP subset only), and `skills/` plus `plugins/` equal to the
-kit. Plugins the kit names are allowed; nothing is inherited from the
+(kit identity and hash, plus the observed `skills_loaded`), `AGENTS.md`
+(AgentsMD link), `opencode.json`
+(the kit's MCP subset only), `skills/` plus `plugins/` equal to the
+kit, and `xdg-mirror/` (one symlink per entry of the user's `~/.config`,
+or `$XDG_CONFIG_HOME` when the runner itself runs under one, except
+`opencode`, rebuilt per invocation). Plugins the kit names are allowed;
+nothing is inherited from the
 user's own OpenCode configuration (`--pure` is gone). `XDG_CONFIG_HOME`
-is never set, so the shell inside a worker or dispatcher session sees the
-same user environment as the user's own shell (`gh auth status`, the
-global git config, and other XDG-aware tools behave the same); the
-OpenCode binary already resolves its global config directory as
+points at the kit's `xdg-mirror/`, so the shell inside a worker or
+dispatcher session keeps the user's environment as in the user's own shell
+(`gh auth status`, the global git config, and other XDG-aware tools behave
+the same) while OpenCode scans no user skills;
+`OPENCODE_DISABLE_EXTERNAL_SKILLS=1` disables the `~/.claude` and
+`~/.agents` skill roots, so a session can invoke exactly the skills its
+kit names plus OpenCode's built-in `customize-opencode`. The OpenCode
+binary already resolves its global config directory as
 `OPENCODE_CONFIG_DIR ?? XDG_CONFIG_HOME/opencode`, so `OPENCODE_CONFIG_DIR`
-alone keeps the user's `~/.config/opencode` out. The supervisor authenticates
+alone keeps the user's `~/.config/opencode` out, and
+`policy._opencode_home` falls back to `~/.config/opencode` when
+`XDG_CONFIG_HOME/opencode` does not exist (the mirror carries no
+`opencode` entry), so this project's own proof passes inside a worker
+without extra variables (`MODEL_ROUTER_OPENCODE_HOME` keeps precedence).
+The supervisor authenticates
 with Basic auth (`opencode:<password>`) and scopes every call with
 `directory=<workspace>`. It creates or reuses the saved session and saves
 the session ID before the model request. The session's permission rules
@@ -269,9 +282,11 @@ The owned-server drive path persists its actual supply back to the invocation ro
 block never records `none` and a kit-hook turn never records `runner`.
 Per invocation the ledger records kit
 identity and hash, supply (`hook`, `runner`, `none`), hash of the supplied
-block, direction status, skills loaded (the kit's skills), and tools called
-(distinct tool part names in the turn, empty on text-only turns); `status`
-and `result` expose them in the Agent Observer mapping.
+block, direction status, skills loaded (observed at materialization: the
+kit directory's `skills/*/SKILL.md` names plus OpenCode's built-in
+`customize-opencode` on the owned server, not the policy list), and tools
+called (distinct tool part names in the turn, empty on text-only turns);
+`status` and `result` expose them in the Agent Observer mapping.
 
 Manual dispatch recipe (stand-in runs carry the same kit as the runner).
 Resolve the route's kit with `kit_name_for_route`, generate an isolated
@@ -284,6 +299,8 @@ python3 -c "from runner import kits, policy; kits.materialize_opencode_kit(
   '/tmp/manual-kit', route='muse-spark-xhigh-free')"
 OPENCODE_CONFIG_DIR=/tmp/manual-kit \
   OPENCODE_CONFIG=/tmp/manual-kit/opencode.json \
+  XDG_CONFIG_HOME=/tmp/manual-kit/xdg-mirror \
+  OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
   opencode serve --hostname 127.0.0.1 --port 0
 # Codex dispatcher on the dispatcher kit (nothing inherited except the
 # auth.json login link, so the dispatch authenticates).

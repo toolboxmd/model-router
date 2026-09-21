@@ -758,7 +758,17 @@ def _opencode_home() -> Path:
         return Path(override).expanduser()
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg:
-        return Path(xdg).expanduser() / "opencode"
+        cand = Path(xdg).expanduser() / "opencode"
+        try:
+            if cand.exists():
+                return cand
+        except OSError:
+            pass
+        # Inside an owned-server worker XDG points at the per-kit mirror,
+        # which carries every user config entry except opencode: fall back
+        # to the user's real opencode home so this project's own proof
+        # resolves its installed skills without extra variables.
+        return Path.home() / ".config" / "opencode"
     return Path.home() / ".config" / "opencode"
 
 

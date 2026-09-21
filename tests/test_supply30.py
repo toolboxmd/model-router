@@ -369,7 +369,10 @@ class TestSupplyPublicCLI(unittest.TestCase):
         self.assertEqual(disp["kit_hash"], policy.kit_hash(policy.kit_for_role("dispatcher")))
         self.assertEqual(disp["direction_status"], "ready")
         self.assertIsNotNone(disp["direction_hash"])
-        self.assertEqual(disp["skills_loaded"], policy.kit_for_role("dispatcher")["skills"])
+        # #57: observed at materialization (kit skills plus the built-in).
+        self.assertEqual(sorted(disp["skills_loaded"]),
+                         sorted(policy.kit_for_role("dispatcher")["skills"]
+                                + ["customize-opencode"]))
         # Text-only turn: no tool parts observed.
         self.assertEqual(disp["tools_called"], [])
         # Worker job (Codex ok): worker kit names the direction plugin, so
@@ -397,7 +400,9 @@ class TestSupplyPublicCLI(unittest.TestCase):
                          hashlib.sha256(wmeta["direction_block"].encode("utf-8")).hexdigest())
         self.assertEqual(worker["direction_hash"], winv.get("direction_hash"))
         self.assertEqual(worker["direction_status"], "ready")
-        self.assertEqual(worker["skills_loaded"], policy.kit_for_role("worker")["skills"])
+        self.assertEqual(sorted(worker["skills_loaded"]),
+                         sorted(policy.kit_for_role("worker")["skills"]
+                                + ["customize-opencode"]))
         self.assertEqual(worker["tools_called"], ["read"])
         # status and result expose the Agent Observer mapping.
         for sd, rid in ((sd1, rid1), (sd2, rid2)):
@@ -506,7 +511,9 @@ class TestSupplyPublicCLI(unittest.TestCase):
         self.assertEqual(rev["kit_hash"], policy.kit_hash(policy.kit_for_role("reviewer")))
         self.assertEqual(rev["direction_status"], "ready")
         self.assertIsNotNone(rev["direction_hash"])
-        self.assertEqual(rev["skills_loaded"], policy.kit_for_role("reviewer")["skills"])
+        self.assertEqual(sorted(rev["skills_loaded"]),
+                         sorted(policy.kit_for_role("reviewer")["skills"]
+                                + ["customize-opencode"]))
         self.assertEqual(rev["tools_called"], [])
         invs = core._list_invocations(sd, rid)
         rinv = next(i for i in invs if i.get("kind") == "opencode_control")

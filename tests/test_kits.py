@@ -213,10 +213,12 @@ class TestKitPolicy(unittest.TestCase):
         self.assertIn("keeps the user's own session", doc)
         self.assertIn("never", doc)
         self.assertNotIn("opencode serve --pure", doc)
-        # #53: the kit no longer needs an XDG shadow; the manual recipe
-        # drops it while the doc still explains why XDG is left alone.
+        # #57: the manual recipe carries the per-kit XDG mirror and the
+        # external-skills disable flag.
         self.assertNotIn("xdg-shadow", doc)
-        self.assertNotIn("XDG_CONFIG_HOME=/tmp", doc)
+        self.assertIn("xdg-mirror", doc)
+        self.assertIn("OPENCODE_DISABLE_EXTERNAL_SKILLS=1", doc)
+        self.assertIn("XDG_CONFIG_HOME=/tmp/manual-kit/xdg-mirror", doc)
 
 
 class TestKitMaterialization(unittest.TestCase):
@@ -225,8 +227,14 @@ class TestKitMaterialization(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
         self.homes = make_fake_homes(self.base)
-        self._saved = {k: os.environ.get(k) for k in self.homes}
+        self._saved = {k: os.environ.get(k) for k in list(self.homes) + ["XDG_CONFIG_HOME"]}
         os.environ.update(self.homes)
+        self.user_config = self.base / "fake-user-config"
+        (self.user_config / "gh").mkdir(parents=True, exist_ok=True)
+        (self.user_config / "gh" / "hosts.yml").write_text("user: u\n")
+        (self.user_config / "sometool").mkdir(parents=True, exist_ok=True)
+        (self.user_config / "opencode").mkdir(parents=True, exist_ok=True)
+        os.environ["XDG_CONFIG_HOME"] = str(self.user_config)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -254,14 +262,24 @@ class TestKitMaterialization(unittest.TestCase):
         self.assertTrue((dest / "skills" / "project-direction").exists())
         self.assertTrue((dest / "plugins" / "agentsmd-project-direction.js").exists())
         self.assertTrue((dest / "AGENTS.md").is_file())
-        # #53: no XDG shadow dir; the kit env leaves XDG alone so the
-        # owned server inherits the user's shell environment.
+        # #57: per-kit XDG mirror keeps the user's environment without user
+        # skills; the kit env carries the mirror and the disable flag.
         self.assertFalse((dest / "xdg-shadow").exists())
         env = kitmod.opencode_kit_env(dest)
         self.assertEqual(env["OPENCODE_CONFIG_DIR"], str(dest))
         self.assertEqual(env["OPENCODE_CONFIG"], str(dest / "opencode.json"))
-        self.assertNotIn("XDG_CONFIG_HOME", env)
-        self.assertEqual(set(env), {"OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"})
+        self.assertEqual(env["XDG_CONFIG_HOME"], str(dest / "xdg-mirror"))
+        self.assertEqual(env["OPENCODE_DISABLE_EXTERNAL_SKILLS"], "1")
+        self.assertEqual(set(env), {"OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG",
+                                    "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS"})
+        mirror = dest / "xdg-mirror"
+        self.assertTrue(mirror.is_dir())
+        self.assertFalse((mirror / "opencode").exists())
+        self.assertTrue((mirror / "gh").is_symlink())
+        # Observed skills are recorded at materialization.
+        self.assertEqual(sorted(stored.get("skills_loaded") or []),
+                         sorted(kitmod.observed_opencode_skills(dest)))
+        self.assertIn("customize-opencode", stored.get("skills_loaded") or [])
 
     def test_opencode_dispatcher_kit_without_mcp(self):
         dest = self.base / "kit-dispatcher"
@@ -591,11 +609,17 @@ class TestKitPublicCLI(unittest.TestCase):
         fs = base / "fakestate"
         fs.mkdir()
         homes = make_fake_homes(base)
+        user_config = base / "fake-user-config"
+        (user_config / "gh").mkdir(parents=True, exist_ok=True)
+        (user_config / "gh" / "hosts.yml").write_text("user: u\n")
+        (user_config / "sometool").mkdir(parents=True, exist_ok=True)
+        (user_config / "opencode").mkdir(parents=True, exist_ok=True)
         write_fake(bindir, "codex", codex_body, PY)
         write_fake(bindir, "claude", FAKE_CLAUDE, PY)
         write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
         env = dict(os.environ)
         env.update(homes)
+        env["XDG_CONFIG_HOME"] = str(user_config)
         env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
                    FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
                    FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
@@ -656,10 +680,12 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertTrue(kit_env["OPENCODE_CONFIG_DIR"].startswith(str(Path(sd).resolve()))
                         or kit_env["OPENCODE_CONFIG_DIR"].startswith(sd),
                         kit_env)
-        # #53: no XDG override on the owned server; it keeps the parent's
-        # value (or absence) while the kit vars still point at the kit.
-        self.assertEqual(kit_env.get("XDG_CONFIG_HOME", ""), env.get("XDG_CONFIG_HOME", ""),
+        # #57: the owned server carries the per-kit XDG mirror and the
+        # external-skills disable flag.
+        self.assertEqual(kit_env.get("XDG_CONFIG_HOME"),
+                         kit_env["OPENCODE_CONFIG_DIR"] + "/xdg-mirror",
                          kit_env)
+        self.assertEqual(kit_env.get("OPENCODE_DISABLE_EXTERNAL_SKILLS"), "1")
         self.assertNotIn("xdg-shadow", kit_env.get("XDG_CONFIG_HOME", ""))
         self.assertEqual(kit_env["OPENCODE_CONFIG"],
                          kit_env["OPENCODE_CONFIG_DIR"] + "/opencode.json")
@@ -678,6 +704,9 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertEqual(set(cfg["mcp"]), {"treg"})
         self.assertTrue((kit_dir / "skills" / "operations").exists())
         self.assertFalse((kit_dir / "xdg-shadow").exists())
+        self.assertTrue((kit_dir / "xdg-mirror").is_dir())
+        self.assertFalse((kit_dir / "xdg-mirror" / "opencode").exists())
+        self.assertTrue((kit_dir / "xdg-mirror" / "gh").is_symlink())
         # Session settings equal the kit: full permissions, policy model/variant/agent.
         reqs = [json.loads(l) for l in (fs / "opencode-requests.jsonl").read_text().splitlines()]
         creates = [r for r in reqs if r["method"] == "POST" and r["path"] == "/session"]
@@ -731,13 +760,15 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertEqual(prompts[0]["body"].get("agent"), "plan")
         self.assertEqual(prompts[0]["body"]["model"],
                          {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
-        # #53: the dispatcher turn also carries no XDG override; it keeps
-        # the parent's value while the kit vars still point at the kit.
+        # #57: the dispatcher turn also carries the per-kit XDG mirror and
+        # the disable flag.
         env_lines = (fs / "opencode-env.jsonl").read_text().splitlines() if (fs / "opencode-env.jsonl").exists() else []
         self.assertTrue(env_lines)
         disp_env = json.loads(env_lines[-1])
-        self.assertEqual(disp_env.get("XDG_CONFIG_HOME", ""), env.get("XDG_CONFIG_HOME", ""),
+        self.assertEqual(disp_env.get("XDG_CONFIG_HOME"),
+                         disp_env["OPENCODE_CONFIG_DIR"] + "/xdg-mirror",
                          disp_env)
+        self.assertEqual(disp_env.get("OPENCODE_DISABLE_EXTERNAL_SKILLS"), "1")
         self.assertNotIn("xdg-shadow", disp_env.get("XDG_CONFIG_HOME", ""))
         self.assertTrue(disp_env["OPENCODE_CONFIG_DIR"].startswith(str(Path(sd).resolve()))
                         or disp_env["OPENCODE_CONFIG_DIR"].startswith(sd),
@@ -745,6 +776,8 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertEqual(disp_env["OPENCODE_CONFIG"],
                          disp_env["OPENCODE_CONFIG_DIR"] + "/opencode.json")
         self.assertFalse((kit_dir / "xdg-shadow").exists())
+        self.assertTrue((kit_dir / "xdg-mirror").is_dir())
+        self.assertFalse((kit_dir / "xdg-mirror" / "opencode").exists())
 
 
 if __name__ == "__main__":
