@@ -399,7 +399,10 @@ SIGNAL_CLASSES = {
                 "error_names": ["context_length_exceeded"]},
     "hard": {"action": "implementation_failed", "retries": 0,
              "retry_reasons": ["auth", "region", "consent"],
-             "error_names": ["AuthError", "RegionError", "DataPolicyError"]},
+             "error_names": ["AuthError", "RegionError", "DataPolicyError",
+                             "Unauthorized", "AuthenticationError",
+                             "MissingAuthentication"],
+             "status_codes": [401, 403]},
 }
 
 # Vendor-shaped free-exhaustion evidence (OpenCode 1.18.31). Free exhaustion

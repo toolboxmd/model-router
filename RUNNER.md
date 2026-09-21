@@ -85,6 +85,13 @@ allowance; the runner never invents a reset time.
 
 1. Dispatch: `codex exec --json --output-last-message PATH --model
    gpt-5.6-luna -c model_reasoning_effort="max" --sandbox read-only --cd WS`.
+   Before the dispatch the runner runs the Codex rate-limit probe when due
+   (the newest rollout record first; unknown with its reason when nothing
+   reads, never blocking the dispatch). The kit carries the user's
+   `auth.json` login by symlink, so the dispatch authenticates. A 401 or
+   "missing authentication" text classifies `hard` with reason `auth` and
+   blocks with `codex_auth_failed: <short reason>` (no fallback: no other
+   route holds the same login).
    The first `thread.started` ID is saved as the Luna task. Luna's action is
    read only from its own final `item.completed` `agent_message` text, or
    the last-message file. Command output is never parsed for actions.
@@ -189,7 +196,14 @@ instructions, skills, plugins, MCP servers, and the permission set.
 Changing any of them is a policy edit with no state-machine change;
 `python -m runner.policy validate` rejects a kit that names a skill,
 plugin, or MCP server that is not installed, and the generated skill
-table lists each role's kit.
+table lists each role's kit. The Codex kit links the user's `auth.json`
+by symlink from the Codex home (honoring `MODEL_ROUTER_CODEX_HOME` and
+`CODEX_HOME` overrides) and the Grok kit links `auth.json` the same way
+when the Grok home keeps its login under that filename (recorded as
+missing otherwise); `kit.json` records the linked
+filenames without secrets, and `status`/`result` list the kit contents
+(skills, plugins, MCP, auth link state) from the materialized kit without
+secret values.
 
 Direction supply (`runner/direction.py`): every role session's input
 carries the current Project Direction of the job's workspace. The
@@ -223,13 +237,15 @@ python3 -c "from runner import kits, policy; kits.materialize_opencode_kit(
 OPENCODE_CONFIG_DIR=/tmp/manual-kit XDG_CONFIG_HOME=/tmp/manual-kit/xdg-shadow \
   OPENCODE_CONFIG=/tmp/manual-kit/opencode.json \
   opencode serve --hostname 127.0.0.1 --port 0
-# Codex dispatcher on the dispatcher kit (nothing inherited).
+# Codex dispatcher on the dispatcher kit (nothing inherited except the
+# auth.json login link, so the dispatch authenticates).
 python3 -c "from runner import kits; kits.materialize_codex_kit('dispatcher', '/tmp/codex-kit')"
 CODEX_HOME=/tmp/codex-kit codex exec --json --model gpt-5.6-luna --sandbox read-only --cd WS PROMPT
 # Claude review equivalent (isolated); the planner keeps the user's session.
 python3 -c "from runner import kits; kits.materialize_claude_kit('reviewer', '/tmp/claude-kit')"
 CLAUDE_CONFIG_DIR=/tmp/claude-kit claude --resume SID -p PROMPT
-# Grok recovery equivalent.
+# Grok recovery equivalent (kit links `auth.json` when the Grok home keeps
+# its login under that filename, recorded as missing otherwise).
 python3 -c "from runner import kits; kits.materialize_grok_kit('recovery', '/tmp/grok-kit')"
 GROK_HOME=/tmp/grok-kit grok -p PROMPT --model grok-4.6
 ```
@@ -314,6 +330,10 @@ model-authored text:
   larger-context route is left does the turn end as `implementation_failed`.
 - hard: auth, region, and consent errors end the
   turn as `implementation_failed` for the ladder; they never move routes.
+  A Codex 401 or "missing authentication" text (live: stderr 401
+  Unauthorized with stdout missing bearer authentication) is `hard` with
+  reason `auth`: the dispatch blocks as `codex_auth_failed: <short reason>`
+  with the evidence in `status`, and never falls back to another route.
 
 Before a turn starts, a route the capacity memory knows as exhausted or
 resting is skipped the same way (`preflight_exhausted`, `preflight_degraded`),
@@ -349,7 +369,9 @@ monthly marks are re-probed on a lengthening schedule (one hour first,
 doubling, six-hour cap) and cleared on the first success; every probe
 outcome is recorded. Re-probing is operator-driven via
 `core.probe_due_routes`/`core.record_probe_outcome`/`core.record_reading`/`core.record_route_success`
-(no sentinel process: an always-on observer is a non-goal).
+(no sentinel process: an always-on observer is a non-goal), plus the
+harness default before a Codex dispatch: when due it reads the newest
+rollout record first and otherwise records unknown with its reason.
 Probes never block routing: a failing or slow probe records `unknown`
 (`used` None with its source semantics kept) and the route stays eligible
 on error evidence alone, so the router still works with every probe
@@ -529,7 +551,9 @@ these methods instead of branching on invocation kind. Each harness declares
 its capabilities, and each policy stage declares the capabilities it needs.
 Each harness also probes its subscription windows through the seam:
 Codex `account/rateLimits/read` (every 300 seconds, or on demand before a
-dispatch, via an optional probe hook that never blocks it), Claude `/usage`
+dispatch through the controller default, which reads the newest rollout
+first and records unknown when nothing reads; an injected probe hook
+never blocks the dispatch), Claude `/usage`
 (every 180 seconds at most, plus the free statusline feed while a session
 runs), OpenCode Go rolling cost sums from the local session database against
 the policy tier windows, Zen free request counts against an assumed cap, and

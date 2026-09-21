@@ -335,6 +335,134 @@ def _prompt_digest(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
+def _codex_probe_due(state_dir) -> bool:
+    """True when a Codex usage probe is due before dispatch."""
+    try:
+        readings = core.list_readings(state_dir, pool="codex")
+    except Exception:
+        return True
+    latest = None
+    for r in readings or []:
+        obs = r.get("observed_at")
+        if isinstance(obs, str) and obs:
+            if latest is None or obs > latest:
+                latest = obs
+    try:
+        return core.probe_due_for("codex", latest)
+    except Exception:
+        return True
+
+
+def _record_codex_probe_unknown(state_dir, route: str, reason: str) -> None:
+    """Record unknown Codex readings for the probe windows, never raising."""
+    try:
+        observed = core._utcnow()
+    except Exception:
+        import datetime as _dt
+        observed = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    for window in ("5h", "weekly"):
+        try:
+            core.note_probe_failure(state_dir, route, window,
+                                    source="provider_reported",
+                                    detail={"error": str(reason)[:300],
+                                            "probe": "codex-rate-limits"},
+                                    observed_at=observed)
+        except Exception:
+            continue
+
+
+def _default_codex_probe(state_dir, request_id: str, route: str) -> dict:
+    """Best-effort Codex rate-limit probe before dispatch, never blocking.
+
+    When due, tries the zero-cost session rollout first; an account-level
+    payload with no live source records unknown with its reason. Never
+    raises: dispatch stays eligible on error evidence alone.
+    """
+    if not _codex_probe_due(state_dir):
+        return {"action": "probe-skipped", "route": route}
+    harness = harnesses.harness_named("codex")
+    # Zero-cost attempt: the newest rollout file under the Codex home, when
+    # one exists. Before the first dispatch there is usually none, which
+    # records unknown like any other unreadable probe.
+    try:
+        try:
+            home = policy._codex_home()
+        except Exception:
+            home = None
+        candidates: list = []
+        if home is not None:
+            try:
+                from pathlib import Path as _P
+                root = _P(os.path.expanduser(str(home)))
+                for pat in ("rollouts/**/*.jsonl", "rollouts/*.jsonl",
+                            "sessions/**/*.jsonl", "*.jsonl"):
+                    try:
+                        candidates.extend([p for p in root.glob(pat) if p.is_file()])
+                    except Exception:
+                        continue
+            except Exception:
+                candidates = []
+        candidates = sorted(
+            (p for p in candidates if p.is_file()),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True)[:3]
+        for cand in candidates:
+            try:
+                readings = harness.read_rollout(str(cand))
+            except Exception:
+                continue
+            if not readings:
+                continue
+            for r in readings:
+                try:
+                    core.record_reading(state_dir, r["pool"], r["model"],
+                                        r["window"], r["used"], r["limit"],
+                                        r["reset_at"],
+                                        observed_at=r["observed_at"],
+                                        source=r["source"],
+                                        detail=r.get("detail"))
+                except Exception:
+                    continue
+            return {"action": "probe-ok", "route": route,
+                    "windows": sorted({r.get("window") for r in readings})}
+    except Exception as e:  # noqa: BLE001 - unknown below, never blocks
+        _record_codex_probe_unknown(state_dir, route, f"probe failed: {type(e).__name__}")
+        return {"action": "probe-unknown", "route": route}
+    _record_codex_probe_unknown(state_dir, route, "probe unavailable: no rate record")
+    return {"action": "probe-unknown", "route": route}
+
+
+def _codex_auth_block(state_dir, request_id: str, rc, out, err) -> dict | None:
+    """Blocked auth result when Codex text shows a missing/rejected login.
+
+    Returns the blocked payload after persisting hard/auth evidence, or
+    None when the output carries no auth marker. Auth never falls back to
+    another route: no other route holds the same login.
+    """
+    try:
+        reason = harnesses.harness_named("codex").auth_failure_reason(out, err)
+    except Exception:
+        reason = None
+    if not reason:
+        return None
+    try:
+        home = policy._codex_home()
+        from pathlib import Path as _P
+        missing = not (_P(os.path.expanduser(str(home))) / "auth.json").is_file()
+    except Exception:
+        missing = False
+    if missing and "auth.json" not in reason.lower():
+        reason = f"{reason} (auth.json missing in CODEX_HOME)"[:160]
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "codex_dispatch", "rc": rc,
+                             "signal": "hard", "reason": "auth",
+                             "error": reason,
+                             "stderr": (err or "")[:1000],
+                             "stdout": (out or "")[:1000]})
+    _mark_blocked(state_dir, request_id, f"codex_auth_failed: {reason}")
+    return {"action": "blocked", "reason": "codex_auth_failed"}
+
+
 def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     """Ensure Codex dispatch; persist the task ID before accepting.
 
@@ -342,7 +470,8 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     ``probe(state_dir, request_id, route)`` (for example Codex
     ``account/rateLimits/read`` before a dispatch). It runs best-effort:
     a failing or slow probe records unknown and never blocks the
-    dispatch, which stays eligible on error evidence alone.
+    dispatch, which stays eligible on error evidence alone. When ``probe``
+    is None the harness default runs when due.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -360,6 +489,16 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     if probe is not None:
         try:
             probe(state_dir, request_id, dispatch_route)
+        except Exception as e:  # noqa: BLE001 - record unknown, never block
+            try:
+                _record_codex_probe_unknown(
+                    state_dir, dispatch_route,
+                    f"probe failed: {type(e).__name__}: {str(e)[:200]}")
+            except Exception:
+                pass
+    else:
+        try:
+            _default_codex_probe(state_dir, request_id, dispatch_route)
         except Exception:
             pass  # probes never block routing
     dispatch = policy.ROUTES[dispatch_route]
@@ -375,6 +514,9 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
                   session_id=task_id, output_text=(out or "") + (err or ""))
     if not task_id:
+        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
+        if auth_blocked is not None:
+            return auth_blocked
         _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
         # The Codex dispatcher could not start a task at all: try the next
         # dispatch route once, the same model on OpenCode in plan mode.
@@ -390,6 +532,12 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
                      effort=dispatch["variant"])
     if not codex_h.turn_ok("codex_dispatch", rc, out, cmd):
+        # A missing or rejected login blocks with its reason: no other
+        # route holds the same login, so there is no fallback.
+        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
+        if auth_blocked is not None:
+            auth_blocked["codex_task_id"] = task_id
+            return auth_blocked
         # A turn counts only with its completion event, as in recovery.
         _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000]})
         _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: turn not completed")
@@ -647,6 +795,11 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
                   session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
     if not codex_h.turn_ok("codex_resume", rc, out, cmd):
+        # A missing or rejected login blocks with its reason like dispatch:
+        # no other route holds the same login.
+        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
+        if auth_blocked is not None:
+            return auth_blocked
         # A resume that failed by exit code is a failed turn with its error
         # kept, whatever thread it named or did not reach. Exit code alone
         # is not a completed turn: the harness's own turn.completed record

@@ -37,12 +37,151 @@ CODEX_KIT_ENV_VAR = "CODEX_HOME"
 CLAUDE_KIT_ENV_VAR = "CLAUDE_CONFIG_DIR"
 GROK_KIT_ENV_VAR = "GROK_HOME"
 
+# Config-directory logins shared by link, never copied. Codex keeps the
+# user's login as ``auth.json`` directly under ``CODEX_HOME``; the Grok kit
+# tries the same ``auth.json`` filename convention when the Grok home keeps
+# its login in its config directory, and records missing otherwise.
+# Only filenames travel in kit.json and the ledger; secret values never do.
+CODEX_AUTH_FILES = ("auth.json",)
+GROK_AUTH_FILES = ("auth.json",)
+
 
 def kit_dir_for(state_dir, request_id: str, invocation_id: str, kit_name: str) -> Path:
     """Generated config directory for one invocation (under the state dir)."""
     safe_req = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(request_id))[:64] or "job"
     safe_inv = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(invocation_id))[:32] or "inv"
     return Path(state_dir) / "kits" / f"{safe_req}.{safe_inv}.{kit_name}"
+
+
+def _link_login_files(home, filenames, dest: Path) -> dict:
+    """Share a config-directory login by symlink, never by copy.
+
+    Each ``filename`` present as a regular file under ``home`` is linked
+    into ``dest`` (an existing link to the same file is kept; a stale link
+    or copy is replaced). Missing files are recorded as missing so the
+    ledger shows the gap without secrets. Returns
+    ``{"linked": [...], "missing": [...]}`` with filenames only; no secret
+    values ever leave the user's home.
+    """
+    linked: list[str] = []
+    missing: list[str] = []
+    try:
+        home_p = Path(os.path.expanduser(str(home)))
+    except Exception:
+        return {"linked": linked, "missing": list(filenames)}
+    for name in filenames:
+        if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+            continue
+        try:
+            src = home_p / name
+        except Exception:
+            missing.append(name)
+            continue
+        try:
+            is_file = src.is_file() and not src.is_dir()
+        except OSError:
+            is_file = False
+        if not is_file:
+            missing.append(name)
+            try:
+                stale = dest / name
+                if stale.is_symlink():
+                    stale.unlink()
+            except OSError:
+                pass
+            continue
+        target = dest / name
+        try:
+            if target.is_symlink():
+                try:
+                    if os.path.realpath(target) == os.path.realpath(src):
+                        linked.append(name)
+                        continue
+                except OSError:
+                    pass
+                target.unlink()
+            elif target.exists():
+                try:
+                    if target.is_dir():
+                        import shutil
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                except OSError:
+                    pass
+            os.symlink(str(src), str(target))
+            linked.append(name)
+        except OSError:
+            missing.append(name)
+    return {"linked": linked, "missing": missing}
+
+
+def _codex_auth_link(dest: Path) -> dict:
+    """Link the user's Codex login into a kit dir, honoring overrides."""
+    try:
+        home = policy._codex_home()
+    except Exception:
+        return {"linked": [], "missing": list(CODEX_AUTH_FILES)}
+    return _link_login_files(home, CODEX_AUTH_FILES, dest)
+
+
+def _grok_auth_link(dest: Path) -> dict:
+    """Link the user's Grok login into a kit dir when it uses one."""
+    try:
+        home = policy._grok_home()
+    except Exception:
+        return {"linked": [], "missing": list(GROK_AUTH_FILES)}
+    return _link_login_files(home, GROK_AUTH_FILES, dest)
+
+
+def kit_dirs_for_invocation(state_dir, request_id: str, invocation_id: str) -> list[Path]:
+    """Kit directories materialized for one invocation, if any."""
+    def _safe(value: str, limit: int) -> str:
+        return "".join(c if c.isalnum() or c in ("-", "_") else "_"
+                       for c in str(value))[:limit] or "job"
+    try:
+        root = Path(state_dir) / "kits"
+        prefix = f"{_safe(request_id, 64)}.{_safe(invocation_id, 32)}."
+        if not root.is_dir():
+            return []
+        return sorted(p for p in root.iterdir()
+                      if p.is_dir() and p.name.startswith(prefix))
+    except OSError:
+        return []
+
+
+def kit_contents_for_ledger(kit_dir) -> dict | None:
+    """Kit contents from a materialized kit.json without secrets.
+
+    Returns ``{"kit", "hash", "skills", "plugins", "mcp", "auth"}`` with
+    filenames and status only; secret file contents are never read.
+    None when the kit.json is missing or unparsable.
+    """
+    try:
+        raw = (Path(kit_dir) / "kit.json").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    auth = obj.get("auth")
+    if not isinstance(auth, dict):
+        auth = {"linked": [], "missing": []}
+    def _names(value) -> list:
+        return [v for v in (value or []) if isinstance(v, str)][:32]
+    out = {
+        "kit": obj.get("kit") if isinstance(obj.get("kit"), str) else None,
+        "hash": obj.get("hash") if isinstance(obj.get("hash"), str) else None,
+        "skills": _names(obj.get("skills")),
+        "plugins": _names(obj.get("plugins")),
+        "mcp": _names(obj.get("mcp")),
+        "auth": {"linked": _names(auth.get("linked")),
+                 "missing": _names(auth.get("missing"))},
+    }
+    return out
 
 
 def _find_skill_source(name: str) -> Path | None:
@@ -266,7 +405,11 @@ def materialize_codex_kit(kit_name: str, dest) -> Path:
     kit's skill/plugin/MCP lists plus the installed ``[mcp_servers.NAME]``
     sections named by the kit (none when the kit names none); ``mcp.json``
     holds the installed opencode MCP subset named by the kit so a kit that
-    names a paid MCP server keeps it as data on every harness.
+    names a paid MCP server keeps it as data on every harness. The user's
+    ``auth.json`` login is shared by symlink from the user's Codex home
+    (honoring ``MODEL_ROUTER_CODEX_HOME``/``CODEX_HOME`` overrides) so the
+    dispatcher authenticates; ``kit.json`` records the linked filenames
+    without secrets.
     """
     kit = policy.kit_for_role(kit_name)
     dest = Path(dest)
@@ -275,6 +418,7 @@ def materialize_codex_kit(kit_name: str, dest) -> Path:
         os.chmod(dest, 0o700)
     except OSError:
         pass
+    auth = _codex_auth_link(dest)
     _secure_write_json(dest / "kit.json", {
         "kit": kit_name, "hash": policy.kit_hash(kit),
         "skills": list(kit.get("skills", [])),
@@ -282,6 +426,8 @@ def materialize_codex_kit(kit_name: str, dest) -> Path:
         "mcp": list(kit.get("mcp", [])),
         "permission_set": kit.get("permission_set"),
         "agentsmd": bool(kit.get("agentsmd")),
+        "auth": {"linked": list(auth.get("linked", [])),
+                 "missing": list(auth.get("missing", []))},
     })
     _materialize_skills_and_plugins(kit_name, kit, dest)
     _secure_write_json(dest / "mcp.json", {"mcp": _opencode_mcp_subset(kit.get("mcp", []))})
@@ -347,7 +493,11 @@ def materialize_grok_kit(kit_name: str, dest) -> Path:
 
     ``skills/`` and ``plugins/`` equal the kit; ``config.toml`` lists the
     kit's skills, plugins, and MCP servers; ``mcp.json`` holds the installed
-    opencode MCP subset named by the kit (empty when none).
+    opencode MCP subset named by the kit (empty when none). When the Grok
+    home keeps its login as ``auth.json`` in its config directory, that
+    file is shared by symlink (honoring ``MODEL_ROUTER_GROK_HOME``/``GROK_HOME``
+    overrides, recorded as missing otherwise);
+    ``kit.json`` records the linked filenames without secrets.
     """
     kit = policy.kit_for_role(kit_name)
     dest = Path(dest)
@@ -356,6 +506,7 @@ def materialize_grok_kit(kit_name: str, dest) -> Path:
         os.chmod(dest, 0o700)
     except OSError:
         pass
+    auth = _grok_auth_link(dest)
     _secure_write_json(dest / "kit.json", {
         "kit": kit_name, "hash": policy.kit_hash(kit),
         "skills": list(kit.get("skills", [])),
@@ -363,6 +514,8 @@ def materialize_grok_kit(kit_name: str, dest) -> Path:
         "mcp": list(kit.get("mcp", [])),
         "permission_set": kit.get("permission_set"),
         "agentsmd": bool(kit.get("agentsmd")),
+        "auth": {"linked": list(auth.get("linked", [])),
+                 "missing": list(auth.get("missing", []))},
     })
     _materialize_skills_and_plugins(kit_name, kit, dest)
     _secure_write_json(dest / "mcp.json", {"mcp": _opencode_mcp_subset(kit.get("mcp", []))})
