@@ -275,6 +275,127 @@ def read_last_message_file(path: str | None) -> str | None:
         return None
 
 
+def _strip_fence_lines(text: str) -> str:
+    """Drop code-fence marker lines (``` or ```json) from dispatcher text.
+
+    The envelope JSON inside the fence is kept; only the marker lines go,
+    so a fenced envelope scans like a bare one. Stray inline ticks outside
+    JSON spans are ignored by the balanced scan below.
+    """
+    kept = [l for l in (text or "").splitlines()
+            if not l.strip().startswith("```")]
+    return "\n".join(kept)
+
+
+def _balanced_object_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) spans of top-level balanced {...} objects in ``text``.
+
+    String-aware: braces inside double-quoted strings (with backslash
+    escapes) never count, and nested arrays are tracked so an envelope
+    carrying lists still scans as one span. Unbalanced opens (a model
+    emitting a truncated envelope) yield no span here; the bounded
+    repair in :func:`parse_opencode_dispatcher_envelope` covers those.
+    """
+    spans: list[tuple[int, int]] = []
+    stack: list[str] = []
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if not stack:
+                start = i
+            stack.append("{")
+        elif ch == "[":
+            if stack:
+                stack.append("[")
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+                if not stack and start is not None:
+                    spans.append((start, i + 1))
+                    start = None
+            elif not stack:
+                start = None
+            # A mismatched close inside an array span is model prose, not
+            # structure: leave the stack alone.
+        elif ch == "]":
+            if len(stack) > 1 and stack[-1] == "[":
+                stack.pop()
+    return spans
+
+
+def _valid_dispatcher_envelope(obj) -> dict | None:
+    """``obj`` when it is a dict carrying a valid dispatcher action."""
+    if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
+        return obj
+    return None
+
+
+# At most this many missing closers are repaired on an unbalanced
+# dispatcher envelope (live 2026-09-21 dropped exactly one).
+DISPATCH_ENVELOPE_MAX_REPAIR_CLOSERS = 3
+
+
+def parse_opencode_dispatcher_envelope(text: str | None) -> dict | None:
+    """Dispatcher envelope from one OpenCode-hosted Luna turn's text.
+
+    Takes the last assistant message's text (the supervisor's
+    ``assistant_text``), extracts the last complete JSON object in it
+    (tolerating code fences and surrounding prose), and validates it as
+    an action envelope. When no complete object validates, a bounded
+    repair appends up to ``DISPATCH_ENVELOPE_MAX_REPAIR_CLOSERS``
+    missing closers to an unbalanced tail (the live rehearsal shape
+    dropped one); a truncation inside a string still fails closed and
+    returns None. Only dicts with a valid ``action`` count, never
+    model-authored prose.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    cleaned = _strip_fence_lines(text)
+    spans = _balanced_object_spans(cleaned)
+    for start, end in reversed(spans):
+        try:
+            found = _valid_dispatcher_envelope(json.loads(cleaned[start:end]))
+        except ValueError:
+            continue
+        if found is not None:
+            return found
+    # Bounded repair for an unbalanced tail: try each late open,
+    # last-first, with 1..N appended closers. The whole-text open
+    # recovers the live shape (payload never closed); the payload open
+    # alone parses but carries no action and is skipped by validation.
+    opens = [i for i, ch in enumerate(cleaned) if ch == "{"]
+    for pos in reversed(opens[-20:]):
+        tail = cleaned[pos:].strip()
+        if not tail:
+            continue
+        variants = [tail]
+        last_brace = tail.rfind("}")
+        if last_brace != -1 and last_brace < len(tail) - 1:
+            variants.append(tail[:last_brace + 1])
+        for variant in variants:
+            for extra in range(1, DISPATCH_ENVELOPE_MAX_REPAIR_CLOSERS + 1):
+                try:
+                    found = _valid_dispatcher_envelope(
+                        json.loads(variant + "}" * extra))
+                except ValueError:
+                    continue
+                if found is not None:
+                    return found
+    return None
+
+
 def parse_luna_envelope_from_texts(*blobs: str | None) -> dict | None:
     """Parse the structured action envelope from stdout + last-message.
 

@@ -944,11 +944,20 @@ class OpenCodeServer(Harness):
         return bool(sid) and (saved is None or sid == saved)
 
     def luna_action(self, kind, stdout, cmd=None):
+        """Dispatcher envelope from the owned-server summary's text.
+
+        The summary's ``assistant_text`` is the turn's last assistant
+        message verbatim (the live shape is two messages: prose, then
+        the envelope): the last complete JSON object in it is the
+        envelope, tolerating code fences and surrounding prose. The raw
+        text stays in the summary on disk and in the ledger event; only
+        a validated action envelope returns.
+        """
         summary = self.parse_report(kind, stdout, cmd) or {}
         text = summary.get("assistant_text") if isinstance(summary, dict) else None
         if not isinstance(text, str) or not text.strip():
             return None
-        return adapters.parse_luna_envelope_from_texts(text)
+        return adapters.parse_opencode_dispatcher_envelope(text)
 
     def parse_report(self, kind, stdout, cmd):
         summary = {}
