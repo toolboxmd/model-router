@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0] - 2026-09-21
+
+### Added
+
+- Direction supply follows the kit with a unique loader session id (#52)
+- XDG shadow dropped and the stray live report removed from the owned-server environment (#53)
+
 ## [0.19.0] - 2026-09-21
 
 ### Added
