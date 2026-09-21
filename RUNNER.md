@@ -86,12 +86,25 @@ allowance; the runner never invents a reset time.
 1. Dispatch: `codex exec --json --output-last-message PATH --model
    gpt-5.6-luna -c model_reasoning_effort="max" --sandbox read-only --cd WS`.
    Before the dispatch the runner runs the Codex rate-limit probe when due
-   (the newest rollout record first; unknown with its reason when nothing
-   reads, never blocking the dispatch). The kit carries the user's
+   (`account/rateLimits/read` through the app-server first, the newest
+   rollout record as fallback; unknown with its reason when nothing
+   reads, never blocking the dispatch). A dispatch route the capacity
+   memory knows as exhausted or resting is skipped in preflight before any
+   child starts: later jobs go straight to Luna on OpenCode Go until the
+   reset revalidates. The kit carries the user's
    `auth.json` login by symlink, so the dispatch authenticates. A 401 or
    "missing authentication" text classifies `hard` with reason `auth` and
    blocks with `codex_auth_failed: <short reason>` (no fallback: no other
-   route holds the same login).
+   route holds the same login). A usage-limit refusal (the "You've hit
+   your usage limit ... try again at ..." message, or a
+   `UsageLimitExceeded` / `RateLimitExceeded` error item with `resets_at`)
+   classifies `exhausted` with the carried reset time (the message's human
+   date reads as UTC): the Codex pool is marked exhausted until that reset
+   in the capacity ledger with the verbatim message as evidence, and the
+   job dispatches on `luna-go/max` in the same step without retrying Codex,
+   with `route_reason` recorded. A dispatch that fails with no recognized
+   signal still blocks, but with the last provider message in the block
+   reason, never a bare "turn not completed".
    The first `thread.started` ID is saved as the Luna task. Luna's action is
    read only from its own final `item.completed` `agent_message` text, or
    the last-message file. Command output is never parsed for actions.
@@ -304,7 +317,12 @@ model-authored text:
 
 - exhausted: a `retry` status with reason `free_tier_limit`, or an
   `APIError` whose provider `responseBody` names `FreeUsageLimitError`,
-  `GoUsageLimitError`, or `insufficient_quota`. Zero retries: the session is
+  `GoUsageLimitError`, `insufficient_quota`, or `UsageLimitExceeded`.
+  On the Codex dispatch route a usage-limit refusal also counts: the
+  provider's usage-limit message or a `UsageLimitExceeded` /
+  `RateLimitExceeded` error item with `resets_at` (failed turns only; the
+  message's human reset date reads as UTC and the verbatim message is the
+  evidence). Zero retries: the session is
   aborted and confirmed idle, the route is remembered exhausted with its
   evidence and any trusted reset time, and the job moves the same model to
   the next pool where the route declares one (free Muse to Go Muse, Go Grok
@@ -551,9 +569,11 @@ these methods instead of branching on invocation kind. Each harness declares
 its capabilities, and each policy stage declares the capabilities it needs.
 Each harness also probes its subscription windows through the seam:
 Codex `account/rateLimits/read` (every 300 seconds, or on demand before a
-dispatch through the controller default, which reads the newest rollout
-first and records unknown when nothing reads; an injected probe hook
-never blocks the dispatch), Claude `/usage`
+dispatch through the controller default, which reads the app-server first
+and the newest rollout as fallback, and records unknown when nothing
+reads; a response with no rate record stores unknown with the raw shape,
+keys only, in the reading detail so the parser can be fixed from the
+ledger; an injected probe hook never blocks the dispatch), Claude `/usage`
 (every 180 seconds at most, plus the free statusline feed while a session
 runs), OpenCode Go rolling cost sums from the local session database against
 the policy tier windows, Zen free request counts against an assumed cap, and

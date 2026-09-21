@@ -420,6 +420,230 @@ class CodexCLI(Harness):
     # (e.g. "HTTP error: 401 Unauthorized") counts, via word boundaries.
     CODEX_AUTH_CODE_RE = re.compile(r"\b401\b")
 
+    # A usage-limit refusal arrives as the turn's terminal provider message
+    # (live 2026-09-21: an agent_message "You've hit your usage limit. ...
+    # try again at Sep 22nd, 2026 9:51 AM." with rc=1 and no
+    # turn.completed), or as an error item naming UsageLimitExceeded /
+    # RateLimitExceeded with resets_at. Both classify exhausted with the
+    # carried reset time. The phrasing rule needs "usage limit" plus a
+    # provider corroborator (retry wording, reset wording, the Codex usage
+    # URL, or credit wording), so a bare mention never counts. Consulted
+    # only for failed dispatch turns, never for completed ones.
+    CODEX_USAGE_LIMIT_CODES = ("UsageLimitExceeded", "RateLimitExceeded")
+    CODEX_USAGE_LIMIT_PHRASE_RE = re.compile(r"(?i)usage[\s_-]?limit")
+    CODEX_USAGE_LIMIT_CORROBORATORS = (
+        "try again",
+        "resets at",
+        "reset at",
+        "resets in",
+        "reset in",
+        "chatgpt.com/codex",
+        "purchase more credits",
+        "purchase credits",
+        "rate limit",
+        "ratelimit",
+        "quota exceeded",
+        "quota_exceeded",
+        "credits exhausted",
+        "out of credit",
+    )
+
+    def _usage_limit_text_hit(self, text: str | None) -> str | None:
+        """The verbatim usage-limit message in ``text``, or None.
+
+        Matches an exact limit code, or "usage limit" with a provider
+        corroborator in the same text. Returns the stripped text.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if any(code in text for code in self.CODEX_USAGE_LIMIT_CODES):
+            return text.strip()
+        if self.CODEX_USAGE_LIMIT_PHRASE_RE.search(text) is not None:
+            low = text.lower()
+            if any(c in low for c in self.CODEX_USAGE_LIMIT_CORROBORATORS):
+                return text.strip()
+        return None
+
+    @staticmethod
+    def _error_dicts_from_jsonl(stdout: str | None):
+        """Candidate error dicts from a Codex JSON event stream.
+
+        Yields each top-level object plus its nested ``item``, ``error``,
+        and ``data`` dicts one level down, so UsageLimitExceeded /
+        RateLimitExceeded items are found whatever wrapper carries them.
+        """
+        for obj in _jsonl(stdout or ""):
+            yield obj
+            for key in ("item", "error", "data"):
+                nested = obj.get(key)
+                if isinstance(nested, dict):
+                    yield nested
+
+    @staticmethod
+    def _resets_from_dict(blob: dict):
+        """(raw resets value, window) from explicit reset fields, or (None, None)."""
+        if not isinstance(blob, dict):
+            return None, None
+        raw = None
+        for key in ("resets_at", "reset_at", "resetsAt", "resetAt",
+                    "provider_reset_at", "quota_reset_at"):
+            if blob.get(key) is not None:
+                raw = blob.get(key)
+                break
+        window = blob.get("window")
+        if not isinstance(window, str) or not window:
+            window = None
+        return raw, window
+
+    def _agent_message_texts(self, stdout: str | None) -> list[str]:
+        """Agent message texts from the JSON stream, oldest first."""
+        texts: list[str] = []
+        for obj in _jsonl(stdout or ""):
+            if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+                continue
+            item = obj.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message" \
+                    and isinstance(item.get("text"), str) and item["text"].strip():
+                texts.append(item["text"])
+        return texts
+
+    def usage_limit_evidence(self, stdout: str | None, stderr: str | None,
+                             cmd=None) -> dict | None:
+        """Exhaustion evidence from a Codex usage-limit refusal, or None.
+
+        Scans error items (UsageLimitExceeded / RateLimitExceeded with
+        resets_at) first, then the turn's agent messages, the
+        output-last-message file, and finally raw stdout/stderr text for
+        the provider's usage-limit message. The evidence records the
+        verbatim message with its code, raw resets value, and window;
+        reset parsing stays with the policy. None when no limit shape is
+        present: the caller keeps its generic dispatch failure.
+        """
+        for blob in self._error_dicts_from_jsonl(stdout):
+            code = None
+            for key in ("code", "name", "type", "class"):
+                val = blob.get(key)
+                if isinstance(val, str) and val in self.CODEX_USAGE_LIMIT_CODES:
+                    code = val
+                    break
+            message = None
+            for key in ("message", "text", "error"):
+                val = blob.get(key)
+                if isinstance(val, str) and val.strip():
+                    message = val.strip()
+                    break
+            if code is None:
+                # Structured error objects only: an agent message merely
+                # mentioning limits is model-authored text and never counts
+                # here (it is re-checked with corroborators below).
+                if not isinstance(blob, dict) or blob.get("type") != "error":
+                    continue
+                if message is None \
+                        or self.CODEX_USAGE_LIMIT_PHRASE_RE.search(message) is None:
+                    continue
+            raw_reset, window = self._resets_from_dict(blob)
+            if raw_reset is None:
+                for key in ("item", "error", "data"):
+                    nested = blob.get(key)
+                    if isinstance(nested, dict):
+                        raw_reset, window = self._resets_from_dict(nested)
+                        if raw_reset is not None:
+                            break
+            try:
+                verbatim = adapters.redact_text(str(message or code))
+            except Exception:
+                verbatim = str(message or code)
+            evidence: dict = {"source": "codex",
+                              "message": verbatim[:1000]}
+            if code is not None:
+                evidence["code"] = code
+            if raw_reset is not None:
+                evidence["resets_at"] = raw_reset
+            if window is not None:
+                evidence["window"] = window
+            return evidence
+        candidates: list[str] = []
+        candidates.extend(self._agent_message_texts(stdout))
+        if cmd is not None:
+            try:
+                file_text = adapters.read_last_message_file(
+                    adapters.last_message_path_from_cmd(cmd))
+            except Exception:
+                file_text = None
+            if isinstance(file_text, str) and file_text.strip():
+                candidates.append(file_text)
+        for blob in (stdout or "", stderr or ""):
+            for line in blob.splitlines():
+                if line.strip():
+                    candidates.append(line)
+        for text in candidates:
+            hit = self._usage_limit_text_hit(text)
+            if hit is not None:
+                try:
+                    verbatim = adapters.redact_text(hit)
+                except Exception:
+                    verbatim = hit
+                return {"source": "codex", "message": verbatim[:1000]}
+        return None
+
+    def dispatch_limit_signal(self, stdout: str | None, stderr: str | None,
+                              cmd=None, rc=None) -> tuple:
+        """(signal, evidence) for a failed Codex dispatch turn.
+
+        A usage-limit refusal (message or error item with resets_at) is
+        ``exhausted`` with the verbatim message as evidence; anything else
+        is (None, None) and the caller keeps its generic failure. Only
+        structured limit shapes count: auth text stays ``hard`` via
+        ``classify_signal`` and is checked before this.
+        """
+        try:
+            evidence = self.usage_limit_evidence(stdout, stderr, cmd)
+        except Exception:
+            evidence = None
+        if not isinstance(evidence, dict):
+            return None, None
+        try:
+            if policy.classify_signal({"name": evidence.get("code")}) == "exhausted":
+                return "exhausted", evidence
+        except Exception:
+            pass
+        if evidence.get("code") in self.CODEX_USAGE_LIMIT_CODES:
+            return "exhausted", evidence
+        return "exhausted", evidence
+
+    def last_provider_message(self, stdout: str | None, stderr: str | None,
+                              cmd=None, limit: int = 200) -> str:
+        """Short redacted last provider message for a dispatch block reason.
+
+        Prefers the turn's last agent message, then the output-last-message
+        file, then the last non-empty stdout/stderr line. Never empty:
+        falls back to "empty provider output".
+        """
+        texts = self._agent_message_texts(stdout)
+        if texts:
+            cand = texts[-1]
+        else:
+            cand = ""
+            if cmd is not None:
+                try:
+                    cand = adapters.read_last_message_file(
+                        adapters.last_message_path_from_cmd(cmd)) or ""
+                except Exception:
+                    cand = ""
+            if not (isinstance(cand, str) and cand.strip()):
+                lines = ((stdout or "") + "\n" + (stderr or "")).splitlines()
+                cand = ""
+                for line in reversed(lines):
+                    if line.strip():
+                        cand = line
+                        break
+        try:
+            cand = adapters.redact_text(cand or "")
+        except Exception:
+            cand = cand or ""
+        cand = " ".join(cand.split())
+        return cand[:limit] if cand else "empty provider output"
+
     def auth_failure_reason(self, stdout: str | None, stderr: str | None) -> str | None:
         """Short redacted auth reason from Codex CLI text, or None.
 
@@ -479,6 +703,18 @@ class CodexCLI(Harness):
         if not readings:
             raise ValueError("codex rate-limits payload carried no window")
         return readings
+
+    def query_app_server_rate_limits(self, timeout_secs: float = 15.0) -> dict:
+        """Raw ``account/rateLimits/read`` payload through the app-server.
+
+        Spawns ``codex app-server`` on stdio (default transport), runs the
+        initialize handshake, and reads the rate-limits snapshot. The kit
+        login is resolved through the policy home (``CODEX_HOME`` is set
+        for the child, so isolated test homes stay isolated). Raises with
+        the exact failure (missing binary, timeout, auth error, RPC error)
+        so the caller records why the probe could not read. Stdlib only.
+        """
+        return query_codex_app_server_rate_limits(timeout_secs=timeout_secs)
 
     def read_rollout(self, path, observed_at: str | None = None) -> list[dict]:
         """Zero-cost readings from the session's own rollout file."""
@@ -1166,22 +1402,210 @@ def _minutes_to_window(mins) -> str | None:
     return None
 
 
+def query_codex_app_server_rate_limits(timeout_secs: float = 15.0) -> dict:
+    """Raw ``account/rateLimits/read`` result through ``codex app-server``.
+
+    JSON-RPC over stdio (newline-delimited JSON, no ``jsonrpc`` header on
+    the wire): ``initialize`` with client metadata, the ``initialized``
+    notification, then ``account/rateLimits/read``. Returns the ``result``
+    object. Raises on a missing binary, a timeout, an auth refusal, or an
+    RPC error, naming the cause, so the caller records exactly why the
+    probe could not read. The child inherits the caller's environment with
+    ``CODEX_HOME`` pointed at the policy home, so the user's login is used
+    in production and isolated homes stay isolated in tests.
+    """
+    import select as _select
+
+    binary = adapters.CODEX_BIN
+    try:
+        home = policy._codex_home()
+    except Exception:
+        home = None
+    env = dict(os.environ)
+    if home is not None:
+        try:
+            env["CODEX_HOME"] = os.path.expanduser(str(home))
+        except Exception:
+            pass
+    try:
+        timeout = max(1.0, float(timeout_secs))
+    except (TypeError, ValueError):
+        timeout = 15.0
+    # Capability sniff: the deterministic fake CLIs in this suite answer
+    # `--version` as fake-harness and speak only the exec contract, never
+    # app-server. Spawning app-server against one would run a fake dispatch
+    # (polluting call counts and hanging), so a non-zero version exit or a
+    # fake version string skips the live read and the caller falls back to
+    # the rollout or unknown. The sniff itself is safe: every fake answers
+    # `--version` without running its body.
+    try:
+        ver = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True,
+            timeout=5, stdin=subprocess.DEVNULL, env=env)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"codex app-server unavailable: {e}") from e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"codex app-server unavailable: {e}") from e
+    ver_out = ((ver.stdout or "") + "\n" + (ver.stderr or "")).strip()
+    if ver.returncode != 0 or "fake" in ver_out.lower():
+        raise RuntimeError(
+            f"codex app-server not served by this binary "
+            f"(version: {ver_out[:80] or 'unknown'})")
+    deadline = time.time() + timeout
+    try:
+        proc = subprocess.Popen(
+            [binary, "app-server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"codex app-server unavailable: {e}") from e
+    except OSError as e:
+        raise RuntimeError(f"codex app-server spawn failed: {e}") from e
+
+    def _remaining() -> float:
+        return max(0.1, deadline - time.time())
+
+    def _send(obj: dict) -> None:
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            raise RuntimeError(f"codex app-server write failed: {e}") from e
+
+    def _read_id(want_id) -> dict:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"codex app-server exited rc={proc.returncode} before answering")
+            try:
+                ready, _, _ = _select.select([proc.stdout], [], [], _remaining())
+            except (OSError, ValueError) as e:
+                raise RuntimeError(f"codex app-server read failed: {e}") from e
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("id") != want_id:
+                continue
+            return obj
+        raise RuntimeError("codex app-server read timed out")
+
+    try:
+        _send({"id": 0, "method": "initialize",
+               "params": {"clientInfo": {"name": "model-router",
+                                         "title": "Model Router",
+                                         "version": "1.0.0"}}})
+        init = _read_id(0)
+        if isinstance(init.get("error"), dict):
+            raise RuntimeError(
+                f"codex app-server initialize refused: "
+                f"{str(init['error'].get('message') or init['error'])[:200]}")
+        if "result" not in init:
+            raise RuntimeError("codex app-server initialize returned no result")
+        _send({"method": "initialized", "params": {}})
+        _send({"id": 1, "method": "account/rateLimits/read"})
+        resp = _read_id(1)
+        if isinstance(resp.get("error"), dict):
+            raise RuntimeError(
+                f"codex account/rateLimits/read refused: "
+                f"{str(resp['error'].get('message') or resp['error'])[:200]}")
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("codex account/rateLimits/read returned no result")
+        return result
+    finally:
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def codex_payload_shape(payload) -> list[str]:
+    """Keys-only outline of a rate-limits payload for the ledger.
+
+    Top-level keys plus one level of nested keys under ``rateLimits``,
+    ``rate_limits``, and ``result`` (``parent.child``). Values never
+    travel: the shape lets the parser be fixed from the ledger when a
+    response carries no rate record.
+    """
+    shape: set[str] = set()
+    if isinstance(payload, dict):
+        for key in payload:
+            shape.add(str(key))
+        for parent in ("rateLimits", "rate_limits", "result"):
+            nested = payload.get(parent)
+            if isinstance(nested, dict):
+                for key in nested:
+                    shape.add(f"{parent}.{str(key)}")
+    elif isinstance(payload, list):
+        shape.add(f"list[{len(payload)}]")
+    else:
+        shape.add(type(payload).__name__)
+    return sorted(shape)
+
+
 def parse_codex_rate_limits(payload, observed_at: str, plan: str | None = None) -> list[dict]:
     """Readings from Codex ``account/rateLimits/read``.
 
     Each limit window carries ``usedPercent``, ``windowDurationMins``,
-    ``resetsAt`` (epoch or ISO), plus the plan type. Limits are
-    account-level, so every window fans out to one provider_reported Reading
-    per codex-pool route model; exact-match joins in ``core`` then see it on
-    every Codex route. An entry naming a route model already in the policy
-    stays on that single model. Unrecognized window durations are skipped.
-    Empty or misshapen payloads yield no readings: the caller records
-    unknown.
+    ``resetsAt`` (epoch or ISO), plus the plan type. The app-server answers
+    with ``rateLimits`` holding ``primary``/``secondary`` limit records (a
+    JSON-RPC ``result`` wrapper is unwrapped); older shapes carry a
+    ``windows``/``rate_limits`` list. Limits are account-level, so every
+    window fans out to one provider_reported Reading per codex-pool route
+    model; exact-match joins in ``core`` then see it on every Codex route.
+    An entry naming a route model already in the policy stays on that
+    single model. Unrecognized window durations are skipped. Empty or
+    misshapen payloads yield no readings: the caller records unknown with
+    the payload shape.
     """
     if isinstance(payload, dict):
-        windows = (payload.get("windows") or payload.get("rate_limits")
-                   or payload.get("rateLimits") or [])
-        plan = plan or payload.get("plan") or payload.get("plan_type")
+        if isinstance(payload.get("result"), dict):
+            payload = payload["result"]
+        plan = (plan or payload.get("plan") or payload.get("plan_type")
+                or payload.get("planType"))
+        raw = payload.get("windows")
+        if raw is None:
+            for key in ("rate_limits", "rateLimits"):
+                cand = payload.get(key)
+                if isinstance(cand, list):
+                    raw = cand
+                    break
+                if isinstance(cand, dict):
+                    recs = [v for v in cand.values() if isinstance(v, dict)]
+                    if recs:
+                        raw = recs
+                        break
+                    if "usedPercent" in cand or "used_percent" in cand:
+                        raw = [cand]
+                        break
+            if raw is None:
+                if "usedPercent" in payload or "used_percent" in payload:
+                    raw = [payload]
+                else:
+                    raw = []
+        windows = raw
     elif isinstance(payload, list):
         windows = payload
     else:

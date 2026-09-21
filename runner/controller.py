@@ -353,35 +353,93 @@ def _codex_probe_due(state_dir) -> bool:
         return True
 
 
-def _record_codex_probe_unknown(state_dir, route: str, reason: str) -> None:
-    """Record unknown Codex readings for the probe windows, never raising."""
+def _record_codex_probe_unknown(state_dir, route: str, reason: str,
+                                shape=None) -> None:
+    """Record unknown Codex readings for the probe windows, never raising.
+
+    ``shape`` is the keys-only outline of a response that carried no rate
+    record, so the parser can be fixed from the ledger.
+    """
     try:
         observed = core._utcnow()
     except Exception:
         import datetime as _dt
         observed = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    try:
+        shape_list = [str(k) for k in (shape or [])][:20]
+    except Exception:
+        shape_list = []
     for window in ("5h", "weekly"):
         try:
+            detail = {"error": str(reason)[:300],
+                      "probe": "codex-rate-limits"}
+            if shape_list:
+                detail["shape"] = shape_list
             core.note_probe_failure(state_dir, route, window,
                                     source="provider_reported",
-                                    detail={"error": str(reason)[:300],
-                                            "probe": "codex-rate-limits"},
+                                    detail=detail,
                                     observed_at=observed)
         except Exception:
             continue
 
 
-def _default_codex_probe(state_dir, request_id: str, route: str) -> dict:
+def _record_codex_probe_readings(state_dir, readings) -> None:
+    """Store parsed Codex probe readings, never raising."""
+    for r in readings or []:
+        try:
+            core.record_reading(state_dir, r["pool"], r["model"],
+                                r["window"], r["used"], r["limit"],
+                                r["reset_at"],
+                                observed_at=r["observed_at"],
+                                source=r["source"],
+                                detail=r.get("detail"))
+        except Exception:
+            continue
+
+
+def _default_codex_probe(state_dir, request_id: str, route: str,
+                         query_fn=None) -> dict:
     """Best-effort Codex rate-limit probe before dispatch, never blocking.
 
-    When due, tries the zero-cost session rollout first; an account-level
-    payload with no live source records unknown with its reason. Never
-    raises: dispatch stays eligible on error evidence alone.
+    When due, reads ``account/rateLimits/read`` through the app-server
+    first and stores the windows; a response with no rate record stores
+    unknown with the raw shape (keys only) in the reading detail. The
+    zero-cost session rollout is the fallback when the app-server cannot
+    be read; with neither source the probe records unknown with its
+    reason. Never raises: dispatch stays eligible on error evidence alone.
+    ``query_fn`` overrides the app-server read (deterministic tests).
     """
     if not _codex_probe_due(state_dir):
         return {"action": "probe-skipped", "route": route}
     harness = harnesses.harness_named("codex")
-    # Zero-cost attempt: the newest rollout file under the Codex home, when
+    try:
+        observed = core._utcnow()
+    except Exception:
+        import datetime as _dt
+        observed = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    query_error = None
+    try:
+        query = query_fn or harness.query_app_server_rate_limits
+        payload = query()
+    except Exception as e:  # noqa: BLE001 - rollout fallback below
+        payload = None
+        query_error = f"{type(e).__name__}: {str(e)[:150]}"
+    if payload is not None:
+        try:
+            readings = harness.probe_rate_limits(payload, observed)
+        except Exception:
+            readings = []
+        if readings:
+            _record_codex_probe_readings(state_dir, readings)
+            return {"action": "probe-ok", "route": route,
+                    "windows": sorted({r.get("window") for r in readings})}
+        try:
+            shape = harnesses.codex_payload_shape(payload)
+        except Exception:
+            shape = []
+        _record_codex_probe_unknown(state_dir, route, "no rate record", shape)
+        return {"action": "probe-unknown", "route": route}
+    # Zero-cost fallback: the newest rollout file under the Codex home, when
     # one exists. Before the first dispatch there is usually none, which
     # records unknown like any other unreadable probe.
     try:
@@ -413,22 +471,17 @@ def _default_codex_probe(state_dir, request_id: str, route: str) -> dict:
                 continue
             if not readings:
                 continue
-            for r in readings:
-                try:
-                    core.record_reading(state_dir, r["pool"], r["model"],
-                                        r["window"], r["used"], r["limit"],
-                                        r["reset_at"],
-                                        observed_at=r["observed_at"],
-                                        source=r["source"],
-                                        detail=r.get("detail"))
-                except Exception:
-                    continue
+            _record_codex_probe_readings(state_dir, readings)
             return {"action": "probe-ok", "route": route,
                     "windows": sorted({r.get("window") for r in readings})}
     except Exception as e:  # noqa: BLE001 - unknown below, never blocks
         _record_codex_probe_unknown(state_dir, route, f"probe failed: {type(e).__name__}")
         return {"action": "probe-unknown", "route": route}
-    _record_codex_probe_unknown(state_dir, route, "probe unavailable: no rate record")
+    if query_error:
+        _record_codex_probe_unknown(state_dir, route,
+                                    f"probe unavailable: {query_error}")
+    else:
+        _record_codex_probe_unknown(state_dir, route, "probe unavailable: no rate record")
     return {"action": "probe-unknown", "route": route}
 
 
@@ -461,6 +514,102 @@ def _codex_auth_block(state_dir, request_id: str, rc, out, err) -> dict | None:
                              "stdout": (out or "")[:1000]})
     _mark_blocked(state_dir, request_id, f"codex_auth_failed: {reason}")
     return {"action": "blocked", "reason": "codex_auth_failed"}
+
+
+def _record_dispatch_reason(state_dir, request_id: str, prev: str,
+                            target: str, reason: str) -> None:
+    """Record why the dispatch moved routes, with the route reason.
+
+    Merges ``route_reason`` into the controller state and emits a
+    ``route_switched`` event (from the Codex dispatch route to the
+    OpenCode fallback), so the move is visible the same way an
+    implementation capacity move is. Never raises past the caller: a lost
+    lease still yields to the owner.
+    """
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads(row["controller_state"] or "{}") if row is not None else {}
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        st["route_reason"] = reason
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "route_switched",
+                    {"from": prev, "to": target, "reason": reason,
+                     "evidence": "codex_dispatch"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _codex_failure_message(out, err, cmd) -> str:
+    """Short redacted last provider message for a dispatch block reason."""
+    try:
+        msg = harnesses.harness_named("codex").last_provider_message(out, err, cmd)
+    except Exception:
+        msg = ""
+    msg = " ".join((msg or "").split())
+    return msg[:200] or "empty provider output"
+
+
+def _dispatch_fallback_routes(dispatch_route: str) -> list:
+    """Owned-server dispatch routes after ``dispatch_route``, in policy order."""
+    return [r for r in policy.stage_routes("dispatch") if r != dispatch_route
+            and harnesses.route_uses_owned_server(r)]
+
+
+def _dispatch_exhausted(state_dir, request_id: str, dispatch_route: str,
+                        prompt: str, run_cmd, out, err, cmd, rc) -> dict | None:
+    """Fallback when the Codex dispatch answers its usage-limit message.
+
+    Classifies the refusal as ``exhausted`` with the carried reset time,
+    marks the Codex pool exhausted until that reset in the capacity ledger
+    (like the implementation stage), records the route reason, and
+    dispatches on the next dispatch route, Luna on OpenCode Go, in the same
+    step without retrying Codex. Returns None when the output carries no
+    usage-limit shape: the caller keeps its generic failure.
+    """
+    codex_h = harnesses.harness_named("codex")
+    try:
+        signal, evidence = codex_h.dispatch_limit_signal(out, err, cmd, rc)
+    except Exception:
+        signal, evidence = None, None
+    if signal != "exhausted" or not isinstance(evidence, dict):
+        return None
+    reset_at, source = core.reset_at_for_evidence(dispatch_route, evidence, "exhausted")
+    try:
+        core.record_capacity(state_dir, dispatch_route, "exhausted", evidence,
+                             reset_at, reset_source=source)
+    except Exception:
+        pass
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "codex_dispatch", "rc": rc,
+                             "signal": "exhausted", "evidence": evidence,
+                             "reset_at": reset_at,
+                             "stderr": (err or "")[:1000],
+                             "stdout": (out or "")[:1000]})
+    fallback = _dispatch_fallback_routes(dispatch_route)
+    if not fallback:
+        _mark_blocked(state_dir, request_id,
+                      f"capacity_exhausted: no eligible route after exhausted on {dispatch_route}")
+        return {"action": "blocked", "reason": "capacity_exhausted"}
+    _record_dispatch_reason(state_dir, request_id, dispatch_route,
+                            fallback[0], "dispatch_exhausted")
+    return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
+                                 reason="dispatch_exhausted")
 
 
 def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
@@ -501,6 +650,29 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
             _default_codex_probe(state_dir, request_id, dispatch_route)
         except Exception:
             pass  # probes never block routing
+    # Preflight: a Codex pool the capacity memory knows as exhausted or
+    # resting is skipped before any child starts; later jobs go straight to
+    # Luna on OpenCode Go until the reset revalidates.
+    try:
+        _skip = core.exhausted_routes(state_dir) | core.degraded_routes(state_dir)
+    except Exception:
+        _skip = set()
+    if dispatch_route in _skip:
+        _exhausted_now = False
+        try:
+            _exhausted_now = dispatch_route in core.exhausted_routes(state_dir)
+        except Exception:
+            _exhausted_now = dispatch_route in _skip
+        _pre_reason = "preflight_exhausted" if _exhausted_now else "preflight_degraded"
+        _fallback = _dispatch_fallback_routes(dispatch_route)
+        if not _fallback:
+            _mark_blocked(state_dir, request_id,
+                          f"capacity_exhausted: no eligible route before dispatch on {dispatch_route}")
+            return {"action": "blocked", "reason": "capacity_exhausted"}
+        _record_dispatch_reason(state_dir, request_id, dispatch_route,
+                                _fallback[0], _pre_reason)
+        return _dispatch_on_opencode(state_dir, request_id, _fallback[0], prompt, run_cmd,
+                                     reason=_pre_reason)
     dispatch = policy.ROUTES[dispatch_route]
     if harnesses.route_uses_owned_server(dispatch_route):
         return _dispatch_on_opencode(state_dir, request_id, dispatch_route, prompt, run_cmd, "initial")
@@ -517,15 +689,19 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
         auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
         if auth_blocked is not None:
             return auth_blocked
-        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
+        exhausted = _dispatch_exhausted(state_dir, request_id, dispatch_route,
+                                        prompt, run_cmd, out, err, cmd, rc)
+        if exhausted is not None:
+            return exhausted
+        message = _codex_failure_message(out, err, cmd)
+        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "message": message, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
         # The Codex dispatcher could not start a task at all: try the next
         # dispatch route once, the same model on OpenCode in plan mode.
-        fallback = [r for r in policy.stage_routes("dispatch") if r != dispatch_route
-                    and harnesses.route_uses_owned_server(r)]
+        fallback = _dispatch_fallback_routes(dispatch_route)
         if fallback:
             return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
                                          reason=f"dispatch_fallback rc={rc}")
-        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted")
+        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted: {message}")
         return {"action": "blocked", "reason": "codex_dispatch_failed"}
     # The thread exists even when the turn failed: save it so recovery
     # resumes it instead of creating a replacement task.
@@ -538,9 +714,18 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
         if auth_blocked is not None:
             auth_blocked["codex_task_id"] = task_id
             return auth_blocked
-        # A turn counts only with its completion event, as in recovery.
-        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "stderr": (err or "")[:1000]})
-        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: turn not completed")
+        # A usage-limit refusal moves to Luna on OpenCode Go with the Codex
+        # pool marked exhausted; it never retries Codex.
+        exhausted = _dispatch_exhausted(state_dir, request_id, dispatch_route,
+                                        prompt, run_cmd, out, err, cmd, rc)
+        if exhausted is not None:
+            return exhausted
+        # A turn counts only with its completion event, as in recovery. A
+        # failure with no recognized signal still blocks, but with the last
+        # provider message in the reason, never a bare "turn not completed".
+        message = _codex_failure_message(out, err, cmd)
+        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "message": message, "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: {message}")
         return {"action": "blocked", "reason": "codex_dispatch_failed", "codex_task_id": task_id}
     luna_action = codex_h.luna_action("codex_dispatch", out, cmd)
     # Persist the envelope before any side effect it commands.

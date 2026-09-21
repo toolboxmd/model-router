@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.17.0] - 2026-09-21
+
+### Added
+
+- Codex usage-limit message is exhaustion: classify it with its reset time and fall back to Luna on OpenCode Go for dispatch
+
 ## [0.16.0] - 2026-09-21
 
 ### Added
