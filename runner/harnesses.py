@@ -400,6 +400,76 @@ class CodexCLI(Harness):
     def default_route(self, kind, job):
         return policy.stage_routes("dispatch")[0]
 
+    # A missing or rejected Codex login surfaces as transport text, not as
+    # structured provider evidence: live 2026-09-21 showed stderr
+    # "failed to connect to websocket: HTTP error: 401 Unauthorized" with
+    # stdout "Missing bearer or basic authentication in header". Both
+    # classify hard with reason auth (policy hard covers 401/403 and auth
+    # names for structured shapes; this covers the CLI text shapes).
+    CODEX_AUTH_TEXT_MARKERS = (
+        "missing bearer",
+        "missing authentication",
+        "bearer or basic authentication",
+        "authentication in header",
+        "auth failed",
+        "invalid api key",
+        "unauthorized",
+    )
+    # Bare "401" never matches by substring: counts, ports, and ids like
+    # "4010" or "14012" are not auth failures. Only a standalone 401 token
+    # (e.g. "HTTP error: 401 Unauthorized") counts, via word boundaries.
+    CODEX_AUTH_CODE_RE = re.compile(r"\b401\b")
+
+    def auth_failure_reason(self, stdout: str | None, stderr: str | None) -> str | None:
+        """Short redacted auth reason from Codex CLI text, or None.
+
+        Scans stderr then stdout line by line for a missing-auth marker
+        or a standalone 401 token (word-boundary match, so "4010" or
+        "14012" never count). Returns the first matching line truncated
+        to 120 chars (redacted), never a secret value. None when no auth
+        marker is present: the caller keeps its generic dispatch failure.
+        """
+        blobs = [stderr or "", stdout or ""]
+        for blob in blobs:
+            for line in blob.splitlines():
+                low = line.strip().lower()
+                if not low:
+                    continue
+                if (any(m in low for m in self.CODEX_AUTH_TEXT_MARKERS)
+                        or self.CODEX_AUTH_CODE_RE.search(low) is not None):
+                    try:
+                        reason = adapters.redact_text(line.strip())
+                    except Exception:
+                        reason = line.strip()
+                    reason = " ".join(reason.split())
+                    return reason[:120] or "codex authentication failed"
+        return None
+
+    def classify_signal(self, evidence):
+        """Codex signals: structured shapes via policy, 401 text as hard."""
+        try:
+            cls = policy.classify_signal(evidence)
+        except Exception:
+            cls = None
+        if cls is not None:
+            return cls
+        if isinstance(evidence, dict):
+            blobs = []
+            for key in ("message", "error", "stderr", "stdout", "text"):
+                val = evidence.get(key)
+                if isinstance(val, str) and val.strip():
+                    blobs.append(val)
+            nested = evidence.get("detail") if isinstance(evidence.get("detail"), dict) else None
+            if isinstance(nested, dict):
+                for key in ("message", "text"):
+                    val = nested.get(key)
+                    if isinstance(val, str) and val.strip():
+                        blobs.append(val)
+            for blob in blobs:
+                if self.auth_failure_reason("", blob) is not None:
+                    return "hard"
+        return None
+
     def probe_rate_limits(self, payload, observed_at: str,
                           plan: str | None = None) -> list[dict]:
         """Readings from ``account/rateLimits/read`` (every 300 seconds,

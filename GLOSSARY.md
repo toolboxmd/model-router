@@ -31,7 +31,9 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Worker kit | The checked-in setup that gives a worker host its AgentsMD link and hook; the Grok kit lives in `worker-kits/grok`. | host setup |
 | Direction block | The installed AgentsMD loader's verbatim output for a workspace: status, VISION.md, MISSION.md, OBJECTIVE.md with hashes, the core instruction link, plus the workspace's own AGENTS.md when present. Never fabricated. | context block |
 | Supply mechanism | How a session received direction: `runner` (owned OpenCode server, attached verbatim), `hook` (host hook supplied, recorded without duplication), `none` (loader missing/failed, reason recorded, job continues). | direction source |
-| Kit identity | The role kit name and its content hash (`kit_hash`) recorded per invocation. | role tag |
+| Kit identity | The role kit name and its content hash (`kit_hash`) recorded per invocation, with the kit contents (skills, plugins, MCP, auth link state) listed without secrets. | role tag |
+| Auth failure | A missing or rejected login (Codex 401 or missing-authentication text): `hard` with reason `auth`; the dispatch blocks as `codex_auth_failed` with no fallback. | login error |
+| Dispatch probe | The best-effort Codex rate-limit read before dispatch when due (newest rollout first, else `unknown` with its reason); never blocks dispatch. | pre-dispatch probe |
 | Skills loaded | The kit's skills recorded per invocation as what the session may invoke. | loaded plugins |
 | Tools called | Distinct tool part names observed in the turn's assistant messages (empty on text-only turns). | tool usage |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |

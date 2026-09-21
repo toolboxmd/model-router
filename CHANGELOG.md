@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.16.0] - 2026-09-21
+
+### Added
+
+- Codex kit must carry the login: auth.json into the kit CODEX_HOME, 401 classified as an auth failure, usage probe before dispatch
+
 ## [0.15.0] - 2026-09-21
 
 ### Added

@@ -1646,6 +1646,32 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
             tools = None
         if not isinstance(tools, list):
             tools = []
+        try:
+            from . import kits as _kits
+            _kit_contents = None
+            _kit_auth = {"linked": [], "missing": []}
+            try:
+                _dirs = _kits.kit_dirs_for_invocation(
+                    state_dir, request_id, inv.get("invocation_id") or "")
+            except Exception:
+                _dirs = []
+            for _d in _dirs or []:
+                try:
+                    _c = _kits.kit_contents_for_ledger(_d)
+                except Exception:
+                    _c = None
+                if isinstance(_c, dict):
+                    _kit_contents = _c
+                    _auth = _c.get("auth")
+                    if isinstance(_auth, dict):
+                        _kit_auth = {"linked": [v for v in (_auth.get("linked") or [])
+                                                if isinstance(v, str)],
+                                     "missing": [v for v in (_auth.get("missing") or [])
+                                                 if isinstance(v, str)]}
+                    break
+        except Exception:
+            _kit_contents = None
+            _kit_auth = {"linked": [], "missing": []}
         out.append({"invocation": inv["invocation_id"][:8], "kind": inv.get("kind"),
                     "stage": inv.get("stage"), "requested_route": inv.get("requested_route"),
                     "policy_version": inv.get("policy_version"), "reason": inv.get("reason"),
@@ -1663,7 +1689,8 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
                     "supply_reason": inv.get("direction_reason"),
                     "direction_hash": inv.get("direction_hash"),
                     "direction_status": inv.get("direction_status"),
-                    "skills_loaded": skills, "tools_called": tools})
+                    "skills_loaded": skills, "tools_called": tools,
+                    "kit_contents": _kit_contents, "kit_auth": _kit_auth})
     return out
 
 
