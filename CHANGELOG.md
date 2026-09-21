@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.19.0] - 2026-09-21
+
+### Added
+
+- Proof runs through the shell, completion is refused while the last turn's proof failed, and worker supply is labeled truthfully
+
 ## [0.18.0] - 2026-09-21
 
 ### Added

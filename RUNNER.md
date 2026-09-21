@@ -140,7 +140,15 @@ allowance; the runner never invents a reset time.
    --hostname 127.0.0.1 --port 0` on a runner-generated configuration
    directory built from the route's kit (see below). The worker report
    returns to the same Luna task.
-6. `completion`: the terminal result is saved before acknowledgment.
+6. `completion`: the terminal result is saved before acknowledgment, but
+   never while the latest implementation turn's proof failed. A completion
+   envelope arriving with a non-zero `proof_exit_code` or a `failed` report
+   status is refused: the controller records `completion_refused: proof
+   failed rc=<n>`, hands the failed report's evidence back to the dispatcher
+   once (a resume carrying the report, proof log, and diff paths), and blocks
+   with that reason if the dispatcher insists on completion for the same
+   failed turn; `status` shows the refusal and the block reason. Recovery
+   refuses the same way when it consumes a completion.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
 but cannot edit. The controller runs at most 12 transitions per launch and
@@ -239,7 +247,12 @@ Claude, Grok) or manually from the role's kit below; the runner records
 that hook supply and does not duplicate the block. When the loader is missing or fails, the
 invocation records supply `none` with the reason, the owned-server prompt
 names the three files to read, `status` shows the gap in the invocation
-measurements, and the job continues. Per invocation the ledger records kit
+measurements, and the job continues. The ledger records what was actually
+sent: `runner` when the runner injected the block on the owned server,
+`hook` when the host hook supplied it, and `none` only when neither happened,
+with the direction hash in every injected case. The owned-server drive path
+persists its actual supply back to the invocation row, so a runner-injected
+block never records `none`. Per invocation the ledger records kit
 identity and hash, supply (`hook`, `runner`, `none`), hash of the supplied
 block, direction status, skills loaded (the kit's skills), and tools called
 (distinct tool part names in the turn, empty on text-only turns); `status`
@@ -516,8 +529,10 @@ same seq use `turn-<seq>-1`, ... so no turn overwrites another):
 fields, session, changed files, proof command and exit code, tokens verbatim
 with a source label including reasoning and cache read and write, native
 message identities, blockers, a redacted worker summary), `proof.log` (the
-redacted output of the task's own `proof` command, run by the runner in the
-workspace), `diff.patch` (`git diff HEAD` plus untracked files, or a note
+task's own `proof` command run through `/bin/sh -c` in the workspace with the
+runner's environment, so `&&`, pipes, and quoting behave as in the project's
+own docs; the log records the exact command and its exit code plus the
+redacted output), `diff.patch` (`git diff HEAD` plus untracked files, or a note
 when the workspace is not a checkout), and `worker.txt` (the worker's full
 text, redacted). Harness-reported worker questions travel in the report's
 blockers (redacted), never as live questions; the implementation harness

@@ -1827,13 +1827,22 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     proof_log = turn_dir / "proof.log"
     if proof_cmd:
         try:
-            run = subprocess.run(shlex.split(proof_cmd), cwd=workspace, capture_output=True, text=True,
-                                 timeout=600, stdin=subprocess.DEVNULL)
+            # The task's proof runs exactly as written: through the shell in
+            # the workspace with the runner's environment, so `&&`, pipes,
+            # and quoting behave as in the project's own docs.
+            run = subprocess.run(["/bin/sh", "-c", proof_cmd], cwd=workspace,
+                                 capture_output=True, text=True,
+                                 timeout=600, stdin=subprocess.DEVNULL,
+                                 env=dict(os.environ))
             proof_rc = run.returncode
-            store.secure_write_text(proof_log, adapters.redact_text((run.stdout or "") + (run.stderr or "")))
+            header = f"$ {proof_cmd}\nexit {proof_rc}\n"
+            store.secure_write_text(proof_log, adapters.redact_text(
+                header + (run.stdout or "") + (run.stderr or "")))
         except Exception as e:  # noqa: BLE001
             proof_rc = 127
-            store.secure_write_text(proof_log, f"proof command failed to run: {type(e).__name__}: {e}\n")
+            header = f"$ {proof_cmd}\nexit {proof_rc}\n"
+            store.secure_write_text(proof_log, adapters.redact_text(
+                header + f"proof command failed to run: {type(e).__name__}: {e}\n"))
     else:
         store.secure_write_text(proof_log, "# no proof command in the task\n")
     if proof_rc is not None and proof_rc != 0 and status == "ok":
@@ -1987,8 +1996,101 @@ def _complete_job(state_dir, request_id: str, token: str | None,
     return {"action": "completed", "status": "succeeded"}
 
 
+def _record_completion_refusal(state_dir, request_id: str, report: dict,
+                               reason: str) -> None:
+    """Persist one completion refusal and its evidence for the dispatcher.
+
+    Stores ``completion_refused_seq`` in the controller state so a second
+    completion on the same failed turn blocks, and emits a
+    ``completion_refused`` ledger event (visible in ``status``) before the
+    evidence goes back to Luna. Raises on persistence or lease loss so the
+    caller fails loudly instead of resuming on an unrecorded refusal.
+    """
+    try:
+        rep_seq = report.get("seq")
+        rep_seq_i = int(rep_seq) if rep_seq is not None else None
+    except (TypeError, ValueError):
+        rep_seq_i = None
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads(row["controller_state"] or "{}") if row is not None else {}
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        st["completion_refused_seq"] = rep_seq_i
+        st["completion_refused_reason"] = reason
+        st["completion_refused_report"] = str(
+            report.get("report_path") or report.get("_path") or "")[:500]
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "completion_refused",
+                    {"reason": str(reason)[:200],
+                     "proof_exit_code": report.get("proof_exit_code"),
+                     "report": str(report.get("report_path") or "")[:500],
+                     "seq": rep_seq_i})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
+                               report: dict, reason: str, run_cmd) -> dict:
+    """Refuse a completion envelope while the last turn's proof failed.
+
+    The first refusal hands the evidence back to the dispatcher once (a
+    resume carrying the failed report's paths, status, and proof exit
+    code, so the ladder can correct); a completion that insists on the
+    same failed turn blocks with the refusal reason, visible in ``status``.
+    """
+    try:
+        rep_seq = report.get("seq")
+        rep_seq_i = int(rep_seq) if rep_seq is not None else None
+    except (TypeError, ValueError):
+        rep_seq_i = None
+    st = _load_controller_state(core.get_job(state_dir, request_id))
+    if "completion_refused_seq" in st and st.get("completion_refused_seq") == rep_seq_i:
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "completion_refused"}
+    _record_completion_refusal(state_dir, request_id, report, reason)
+    job = core.get_job(state_dir, request_id)
+    fields = {
+        "completion_refused": reason,
+        "turn_status": report.get("status"),
+        "turn_error": report.get("error"),
+        "route": report.get("route") or job.get("route"),
+        "proof_command": report.get("proof_command"),
+        "proof_exit_code": report.get("proof_exit_code"),
+        "report": report.get("report_path"),
+        "proof_log": report.get("proof_log"),
+        "diff": report.get("diff"),
+        "worker_text": report.get("worker_text"),
+        "seq": report.get("seq"),
+    }
+    evidence = (json.dumps(fields, sort_keys=True) + "\nCompletion is refused: "
+                "the last implementation turn's proof failed. Fix the work and "
+                "request implementation again; do not complete until the proof passes.")
+    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                    label="COMPLETION REFUSED")
+    if r.get("action") == "blocked":
+        return r
+    return {"action": "completion-refused-resumed", "luna_action": r.get("luna_action"),
+            "reason": "completion_refused"}
+
+
 def _handle_question_action(state_dir, request_id: str, envelope: dict,
-                            run_cmd) -> dict:
+                             run_cmd) -> dict:
     """Persist question -> Claude --resume exact planner session ->
     persist answer -> resume exact Luna task. Never forks a session.
     An answer already persisted (public ``answer`` or earlier callback)
@@ -2243,6 +2345,14 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> 
     if action_name == "implementation":
         return _handle_implementation_action(state_dir, request_id, last, run_cmd, token=token)
     if action_name == "completion":
+        # A job can never succeed while its last implementation turn's
+        # proof failed: refuse the envelope, hand the evidence back once,
+        # and block if the dispatcher insists.
+        _latest = core.latest_turn_report(state_dir, request_id)
+        _refusal = core.completion_refusal_reason(_latest)
+        if _refusal is not None and isinstance(_latest, dict):
+            return _handle_completion_refusal(state_dir, request_id, last,
+                                              _latest, _refusal, run_cmd)
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
                              last.get("artifact"))
@@ -2339,7 +2449,8 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     # the spawn; a finished action is reused, never rerun.
     durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
     continuing = ("dispatched", "question-answered-resumed",
-                  "implementation-resumed", "transferred_to_go", "route_switched",
+                  "implementation-resumed", "completion-refused-resumed",
+                  "transferred_to_go", "route_switched",
                   "stalled_retry")
     for _ in range(MAX_LOOP_STEPS):
         try:
