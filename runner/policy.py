@@ -752,6 +752,23 @@ def kit_hash(kit: dict) -> str:
 
 # -- installed-kit checks (local directories; fakes in tests) -------------
 
+def _is_real_opencode_home(cand: Path) -> bool:
+    """True when ``cand`` is a real OpenCode home, not run-time scratch.
+
+    OpenCode creates ``$XDG_CONFIG_HOME/opencode/`` at startup for its
+    plugin dependencies (``package.json``, ``node_modules/``), so mere
+    existence proves nothing. Only a home holding ``opencode.json``,
+    ``opencode.jsonc``, ``skills/``, or ``plugins/`` counts.
+    """
+    for name in ("opencode.json", "opencode.jsonc", "skills", "plugins"):
+        try:
+            if (cand / name).exists():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _opencode_home() -> Path:
     override = os.environ.get("MODEL_ROUTER_OPENCODE_HOME")
     if override:
@@ -760,12 +777,13 @@ def _opencode_home() -> Path:
     if xdg:
         cand = Path(xdg).expanduser() / "opencode"
         try:
-            if cand.exists():
+            if _is_real_opencode_home(cand):
                 return cand
         except OSError:
             pass
         # Inside an owned-server worker XDG points at the per-kit mirror,
-        # which carries every user config entry except opencode: fall back
+        # which carries every user config entry except opencode, plus the
+        # run-time scratch OpenCode writes there at startup: fall back
         # to the user's real opencode home so this project's own proof
         # resolves its installed skills without extra variables.
         return Path.home() / ".config" / "opencode"

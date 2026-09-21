@@ -216,10 +216,15 @@ kit names plus OpenCode's built-in `customize-opencode`. The OpenCode
 binary already resolves its global config directory as
 `OPENCODE_CONFIG_DIR ?? XDG_CONFIG_HOME/opencode`, so `OPENCODE_CONFIG_DIR`
 alone keeps the user's `~/.config/opencode` out, and
-`policy._opencode_home` falls back to `~/.config/opencode` when
-`XDG_CONFIG_HOME/opencode` does not exist (the mirror carries no
-`opencode` entry), so this project's own proof passes inside a worker
-without extra variables (`MODEL_ROUTER_OPENCODE_HOME` keeps precedence).
+`policy._opencode_home` prefers `XDG_CONFIG_HOME/opencode` only when it
+is a real OpenCode home (it holds `opencode.json`, `opencode.jsonc`,
+`skills/`, or `plugins/`); otherwise it falls back to
+`~/.config/opencode`. OpenCode writes its plugin scratch (`package.json`,
+`package-lock.json`, `node_modules/`, `.gitignore`) into
+`XDG_CONFIG_HOME/opencode` at startup, so the mirror gains an `opencode`
+entry the resolver ignores, and this project's own proof passes inside a
+worker without extra variables (`MODEL_ROUTER_OPENCODE_HOME` keeps
+precedence).
 The supervisor authenticates
 with Basic auth (`opencode:<password>`) and scopes every call with
 `directory=<workspace>`. It creates or reuses the saved session and saves

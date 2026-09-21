@@ -192,6 +192,7 @@ class TestOpencodeHomeFallback(unittest.TestCase):
                  ("MODEL_ROUTER_OPENCODE_HOME", "XDG_CONFIG_HOME")}
         xdg = self.base / "xdg-with-opencode"
         (xdg / "opencode").mkdir(parents=True, exist_ok=True)
+        (xdg / "opencode" / "opencode.json").write_text("{}\n")
         try:
             os.environ.pop("MODEL_ROUTER_OPENCODE_HOME", None)
             os.environ["XDG_CONFIG_HOME"] = str(xdg)

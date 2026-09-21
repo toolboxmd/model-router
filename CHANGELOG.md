@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.22.0] - 2026-09-21
+
+### Added
+
+- Policy resolver ignores OpenCode's run-time scratch directory in the XDG mirror so the project's proof passes inside a worker
+
 ## [0.21.0] - 2026-09-21
 
 ### Added
