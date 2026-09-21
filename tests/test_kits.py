@@ -213,6 +213,10 @@ class TestKitPolicy(unittest.TestCase):
         self.assertIn("keeps the user's own session", doc)
         self.assertIn("never", doc)
         self.assertNotIn("opencode serve --pure", doc)
+        # #53: the kit no longer needs an XDG shadow; the manual recipe
+        # drops it while the doc still explains why XDG is left alone.
+        self.assertNotIn("xdg-shadow", doc)
+        self.assertNotIn("XDG_CONFIG_HOME=/tmp", doc)
 
 
 class TestKitMaterialization(unittest.TestCase):
@@ -250,11 +254,14 @@ class TestKitMaterialization(unittest.TestCase):
         self.assertTrue((dest / "skills" / "project-direction").exists())
         self.assertTrue((dest / "plugins" / "agentsmd-project-direction.js").exists())
         self.assertTrue((dest / "AGENTS.md").is_file())
-        self.assertTrue((dest / "xdg-shadow").is_dir())
+        # #53: no XDG shadow dir; the kit env leaves XDG alone so the
+        # owned server inherits the user's shell environment.
+        self.assertFalse((dest / "xdg-shadow").exists())
         env = kitmod.opencode_kit_env(dest)
         self.assertEqual(env["OPENCODE_CONFIG_DIR"], str(dest))
         self.assertEqual(env["OPENCODE_CONFIG"], str(dest / "opencode.json"))
-        self.assertTrue(env["XDG_CONFIG_HOME"].startswith(str(dest)))
+        self.assertNotIn("XDG_CONFIG_HOME", env)
+        self.assertEqual(set(env), {"OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"})
 
     def test_opencode_dispatcher_kit_without_mcp(self):
         dest = self.base / "kit-dispatcher"
@@ -649,7 +656,11 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertTrue(kit_env["OPENCODE_CONFIG_DIR"].startswith(str(Path(sd).resolve()))
                         or kit_env["OPENCODE_CONFIG_DIR"].startswith(sd),
                         kit_env)
-        self.assertTrue(kit_env["XDG_CONFIG_HOME"].startswith(kit_env["OPENCODE_CONFIG_DIR"]))
+        # #53: no XDG override on the owned server; it keeps the parent's
+        # value (or absence) while the kit vars still point at the kit.
+        self.assertEqual(kit_env.get("XDG_CONFIG_HOME", ""), env.get("XDG_CONFIG_HOME", ""),
+                         kit_env)
+        self.assertNotIn("xdg-shadow", kit_env.get("XDG_CONFIG_HOME", ""))
         self.assertEqual(kit_env["OPENCODE_CONFIG"],
                          kit_env["OPENCODE_CONFIG_DIR"] + "/opencode.json")
         # Generated configuration equals the worker kit (paid treg kept, other dropped).
@@ -666,7 +677,7 @@ class TestKitPublicCLI(unittest.TestCase):
         cfg = json.loads((kit_dir / "opencode.json").read_text())
         self.assertEqual(set(cfg["mcp"]), {"treg"})
         self.assertTrue((kit_dir / "skills" / "operations").exists())
-        self.assertTrue((kit_dir / "xdg-shadow").is_dir())
+        self.assertFalse((kit_dir / "xdg-shadow").exists())
         # Session settings equal the kit: full permissions, policy model/variant/agent.
         reqs = [json.loads(l) for l in (fs / "opencode-requests.jsonl").read_text().splitlines()]
         creates = [r for r in reqs if r["method"] == "POST" and r["path"] == "/session"]
@@ -720,6 +731,20 @@ class TestKitPublicCLI(unittest.TestCase):
         self.assertEqual(prompts[0]["body"].get("agent"), "plan")
         self.assertEqual(prompts[0]["body"]["model"],
                          {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
+        # #53: the dispatcher turn also carries no XDG override; it keeps
+        # the parent's value while the kit vars still point at the kit.
+        env_lines = (fs / "opencode-env.jsonl").read_text().splitlines() if (fs / "opencode-env.jsonl").exists() else []
+        self.assertTrue(env_lines)
+        disp_env = json.loads(env_lines[-1])
+        self.assertEqual(disp_env.get("XDG_CONFIG_HOME", ""), env.get("XDG_CONFIG_HOME", ""),
+                         disp_env)
+        self.assertNotIn("xdg-shadow", disp_env.get("XDG_CONFIG_HOME", ""))
+        self.assertTrue(disp_env["OPENCODE_CONFIG_DIR"].startswith(str(Path(sd).resolve()))
+                        or disp_env["OPENCODE_CONFIG_DIR"].startswith(sd),
+                        disp_env)
+        self.assertEqual(disp_env["OPENCODE_CONFIG"],
+                         disp_env["OPENCODE_CONFIG_DIR"] + "/opencode.json")
+        self.assertFalse((kit_dir / "xdg-shadow").exists())
 
 
 if __name__ == "__main__":

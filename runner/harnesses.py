@@ -882,10 +882,12 @@ class OpenCodeServer(Harness):
         """Owned server runs on the route's kit, never ``--pure``.
 
         The configuration directory is generated from policy
-        (``runner/kits.py``): ``OPENCODE_CONFIG_DIR``, ``XDG_CONFIG_HOME``
-        (shadow), and ``OPENCODE_CONFIG`` point at it, so the kit's
-        plugins, skills, and MCP subset are allowed and nothing is
-        inherited from the user's configuration.
+        (``runner/kits.py``): ``OPENCODE_CONFIG_DIR`` and
+        ``OPENCODE_CONFIG`` point at it, so the kit's plugins, skills,
+        and MCP subset are allowed and nothing is inherited from the
+        user's OpenCode configuration. ``XDG_CONFIG_HOME`` is left
+        alone, so the server inherits the runner's user environment for
+        ``gh``, git, and every other XDG-aware tool.
         """
         from . import kits as _kits
 
