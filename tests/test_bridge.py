@@ -218,7 +218,8 @@ class TestAdapterSessions(Base):
                                                "qid": "q1", "prompt": "Confirm?"})
             return 0, out, ""
 
-        res = controller.dispatch(self.sd, "r1", run_cmd=fake_run)
+        res = controller.dispatch(self.sd, "r1", run_cmd=fake_run,
+                                    probe=lambda *a: None)
         self.assertEqual(res["codex_task_id"], "codex-task-123")
         job = core.get_job(self.sd, "r1")
         self.assertEqual(job["codex_task_id"], "codex-task-123")
@@ -231,7 +232,8 @@ class TestAdapterSessions(Base):
         def boom(cmd, cwd=None, timeout=120, **kw):
             raise AssertionError("must not fork a second Codex task")
 
-        res2 = controller.dispatch(self.sd, "r1", run_cmd=boom)
+        res2 = controller.dispatch(self.sd, "r1", run_cmd=boom,
+                                     probe=lambda *a: None)
         self.assertEqual(res2["codex_task_id"], "codex-task-123")
         self.assertEqual(core.get_job(self.sd, "r1")["codex_task_id"], "codex-task-123")
 
@@ -241,7 +243,8 @@ class TestAdapterSessions(Base):
         def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
             return 0, codex_out("codex-saved-9", {"action": "completion", "output": "x"}), ""
 
-        controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
+        controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch,
+                              probe=lambda *a: None)
         captured = {}
 
         def fake_resume(cmd, cwd=None, timeout=120, **kw):
@@ -388,7 +391,8 @@ class TestPlannerBusyAndCallback(Base):
                                               "qid": "q-live-1",
                                               "prompt": "Confirm paragraph?"}), ""
 
-        d = controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch)
+        d = controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch,
+                                  probe=lambda *a: None)
         luna_action = d["luna_action"]
         self.assertEqual(luna_action["action"], "planner_question")
 

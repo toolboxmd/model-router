@@ -385,7 +385,8 @@ DEFAULT_LANE = "implementation_default"
 SIGNAL_CLASSES = {
     "exhausted": {"action": "next_pool", "retries": 0,
                   "retry_reasons": ["free_tier_limit"],
-                  "error_names": ["FreeUsageLimitError", "GoUsageLimitError", "insufficient_quota"]},
+                  "error_names": ["FreeUsageLimitError", "GoUsageLimitError", "insufficient_quota",
+                                  "UsageLimitExceeded"]},
     "overloaded": {"action": "next_family", "retries": 2, "window_secs": 45,
                    "next_cap_secs": 20, "degraded_secs": 900,
                    "retry_reasons": ["overloaded", "rate_limit", "account_rate_limit"],
@@ -1141,6 +1142,64 @@ def _reset_in_text(text, now_ts: float) -> str | None:
     return None
 
 
+_HUMAN_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5,
+                 "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10,
+                 "nov": 11, "dec": 12}
+
+# Codex names the usage-limit reset in prose ("try again at Sep 22nd, 2026
+# 9:51 AM", live 2026-09-21): month, day with an optional ordinal suffix,
+# year, and 12-hour time. No timezone travels with it, so it is read as
+# UTC like every other provider reset on this ledger.
+_HUMAN_RESET_RE = None
+
+
+def _human_reset_re():
+    global _HUMAN_RESET_RE
+    if _HUMAN_RESET_RE is None:
+        import re
+        _HUMAN_RESET_RE = re.compile(
+            r"(?i)\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+            r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+            r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+            r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+"
+            r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?\b")
+    return _HUMAN_RESET_RE
+
+
+def _human_reset_in_text(text, now_ts: float) -> str | None:
+    """A provider reset written as a human date in free text.
+
+    Only the full month-day-year-time shape counts ("Sep 22nd, 2026 9:51
+    AM"); a bare date or time without the rest is None, so prose can never
+    invent a reset. A moment more than a day in the past is stale and also
+    None. Read as UTC.
+    """
+    import datetime
+    if not isinstance(text, str) or not text:
+        return None
+    for match in _human_reset_re().finditer(text):
+        try:
+            month = _HUMAN_MONTHS[match.group(1).lower()[:3]]
+            day = int(match.group(2))
+            year = int(match.group(3))
+            hour = int(match.group(4))
+            minute = int(match.group(5))
+            second = int(match.group(6) or 0)
+            meridiem = match.group(7).lower()
+            if not (1 <= day <= 31 and 1 <= hour <= 12
+                    and minute < 60 and second < 60):
+                continue
+            hour = hour % 12 + (12 if meridiem == "p" else 0)
+            moment = datetime.datetime(year, month, day, hour, minute,
+                                       second, tzinfo=datetime.timezone.utc)
+        except (ValueError, OverflowError):
+            continue
+        if moment.timestamp() < now_ts - 86400:
+            continue
+        return moment.isoformat()
+    return None
+
+
 def _walk_dicts(evidence) -> list[dict]:
     """Every nested dict in provider evidence (stall probes nest the probe
     answer under ``probe``/``transport_evidence``/``status``/
@@ -1190,9 +1249,10 @@ def parse_provider_reset(evidence, now_ts: float | None = None) -> str | None:
 
     Reads explicit reset fields first (Codex ``resets_at`` in epoch or ISO;
     OpenCode Go ``Retry-After`` in seconds as now plus the delay, which is
-    the exact reset), then a reset moment named in message text (Claude).
+    the exact reset), then a reset moment named in message text (Claude's
+    ISO moment, Codex's human "Sep 22nd, 2026 9:51 AM" date).
     Zen free and Grok name no reset and yield None: the assumed-window rule
-    applies only then. Model-authored text without an ISO moment never
+    applies only then. Model-authored text without a full reset moment never
     counts. Stall-probe nesting is scanned, so a probe-discovered reset on
     the same route counts without re-shaping the evidence.
     """
@@ -1223,6 +1283,10 @@ def parse_provider_reset(evidence, now_ts: float | None = None) -> str | None:
                         + datetime.timedelta(seconds=delay)).isoformat()
     for text in _evidence_strings(evidence):
         moment = _reset_in_text(text, now)
+        if moment is not None:
+            return moment
+    for text in _evidence_strings(evidence):
+        moment = _human_reset_in_text(text, now)
         if moment is not None:
             return moment
     return None

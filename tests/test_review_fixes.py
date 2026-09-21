@@ -56,6 +56,14 @@ class Base(unittest.TestCase):
             except Exception:
                 pass
 
+    @staticmethod
+    def _restore_env(saved):
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     def ws(self, name="w"):
         d = self.base / name
         d.mkdir(exist_ok=True)
@@ -322,7 +330,8 @@ class TestRoundThree(Base):
                 {"type": "thread.started", "thread_id": "th"},
                 {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(env)}})), ""
 
-        res = controller.dispatch(self.sd, "r1", run_cmd=fake)
+        res = controller.dispatch(self.sd, "r1", run_cmd=fake,
+                                    probe=lambda *a: None)
         self.assertEqual(res["action"], "blocked")
         self.assertEqual(core.get_job(self.sd, "r1")["codex_task_id"], "th")
 
@@ -705,6 +714,14 @@ class TestRoundEight(Base):
             self.assertEqual("controller_exited" in kinds, expect_event)
 
     def test_collected_dispatch_is_reused_after_the_controller_dies(self):
+        # Hermetic probe: the step below runs the default pre-dispatch
+        # probe, which must not consult the operator's live Codex account.
+        cx_home = self.base / "cx-home"
+        cx_home.mkdir(exist_ok=True)
+        saved = {k: os.environ.get(k) for k in ("MODEL_ROUTER_CODEX_HOME", "CODEX_HOME")}
+        os.environ["MODEL_ROUTER_CODEX_HOME"] = str(cx_home)
+        os.environ.pop("CODEX_HOME", None)
+        self.addCleanup(self._restore_env, saved)
         ws = self.ws()
         core.submit(self.sd, "r1", {"g": 1}, ws, "p")
         job = core.get_job(self.sd, "r1")
