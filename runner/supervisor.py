@@ -690,11 +690,15 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
                 "opencode_session_id": saved}, saved, "opencode_session_id"
-    # Direction supply (ISSUE_30): the owned server has no working hook, so
-    # the runner prepends the loader's verbatim block (status, three files
-    # with hashes, core link, project AGENTS.md) or the three-file fallback
-    # when the loader is missing. Hook hosts never reach this drive path.
+    # Direction supply (ISSUE_30, ISSUE_50): the owned server has no working
+    # hook, so the runner prepends the loader's verbatim block (status,
+    # three files with hashes, core link, project AGENTS.md) or the
+    # three-file fallback when the loader is missing. Hook hosts never reach
+    # this drive path. The ledger records what was actually sent: `runner`
+    # when the block was injected here, `none` with the reason otherwise,
+    # with the direction hash in every injected case.
     _final_prompt = meta.get("prompt") or ""
+    _supply_rec = None
     try:
         from . import direction as _direction
         _stored_block = meta.get("direction_block")
@@ -717,6 +721,36 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             meta.get("prompt") or "", workspace, "opencode", _din)
     except Exception:
         pass
+    if isinstance(_supply_rec, dict):
+        # Truthful ledger: the row carries what this turn actually sent,
+        # not what the insert-time probe saw, so a runner-injected block
+        # never records `none`.
+        try:
+            from . import store as _store
+            _con = _store.connect(state_dir)
+            try:
+                _con.execute("BEGIN IMMEDIATE")
+                _con.execute(
+                    "UPDATE invocations SET direction_supply=?, direction_hash=?,"
+                    " direction_status=?, direction_reason=? WHERE invocation_id=?",
+                    (str(_supply_rec.get("supply") or "none"),
+                     _supply_rec.get("block_hash"),
+                     str(_supply_rec.get("status") or "gap"),
+                     _supply_rec.get("reason"),
+                     invocation_id))
+                _con.execute("COMMIT")
+            except Exception:
+                try:
+                    _con.execute("ROLLBACK")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    _con.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     try:
         client.prompt_async(saved, _final_prompt, model=model, variant=variant, agent=agent)
     except adapters.OpenCodeHTTPError as e:

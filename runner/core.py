@@ -1174,17 +1174,31 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             _event(con, request_id, "luna_action",
                    {"action": str(action_name or "unknown")[:64], "phase": "consumed-invocation"})
             if action_name == "completion":
-                output = str(envelope.get("output") or "done")
-                result = {"ok": True, "output": json.dumps({"output": output,
-                                                            "artifact": envelope.get("artifact")},
-                                                           sort_keys=True)}
-                con.execute(
-                    "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
-                    " head_commit=?, updated_at=? WHERE request_id=?",
-                    (json.dumps(result), head_commit, now, request_id),
-                )
-                _event(con, request_id, "completed", {"via": "consumed-invocation"})
-                applied = "completed"
+                # A job can never succeed while its last implementation
+                # turn's proof failed: refuse the envelope, record the
+                # refusal, and block with its reason.
+                _refusal = completion_refusal_reason(
+                    latest_turn_report(state_dir, request_id))
+                if _refusal is not None:
+                    con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
+                                " AND status NOT IN ('succeeded','failed','cancelled')",
+                                (_refusal, now, request_id))
+                    _event(con, request_id, "completion_refused",
+                           {"reason": _refusal[:200], "via": "consumed-invocation"})
+                    _event(con, request_id, "blocked", {"reason": _refusal[:120]})
+                    applied = "blocked"
+                else:
+                    output = str(envelope.get("output") or "done")
+                    result = {"ok": True, "output": json.dumps({"output": output,
+                                                                "artifact": envelope.get("artifact")},
+                                                               sort_keys=True)}
+                    con.execute(
+                        "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
+                        " head_commit=?, updated_at=? WHERE request_id=?",
+                        (json.dumps(result), head_commit, now, request_id),
+                    )
+                    _event(con, request_id, "completed", {"via": "consumed-invocation"})
+                    applied = "completed"
             elif action_name == "planner_question":
                 qid = str(envelope.get("qid") or envelope.get("question_id") or "q1")
                 prompt = str(envelope.get("prompt") or envelope.get("question") or
@@ -4235,6 +4249,103 @@ def recover_all(state_dir) -> list[dict]:
     finally:
         con.close()
     return [recover_one(state_dir, rid) for rid in ids]
+
+
+def latest_turn_report(state_dir, request_id: str) -> dict | None:
+    """Latest implementation turn report, or None when no turn ran yet.
+
+    Reads every ``turn-*/report.json`` under the job directory and returns
+    the one with the highest ``seq`` (ties break on the path, so a suffixed
+    retry ``turn-<seq>-<n>`` wins over the original). Never raises: an
+    unreadable directory or report is None, which lets completion proceed.
+    """
+    try:
+        root = store.ensure_state_dir(state_dir)
+    except Exception:
+        return None
+    try:
+        job_dir = store.job_dir_for(root, request_id)
+    except Exception:
+        return None
+    try:
+        exists = job_dir.exists()
+    except Exception:
+        return None
+    if not exists:
+        return None
+    best: dict | None = None
+    best_seq = -1
+    best_retry = -1
+    best_path = ""
+    try:
+        candidates = list(job_dir.glob("turn-*/report.json"))
+    except Exception:
+        return None
+    for path in candidates:
+        try:
+            rep = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rep, dict):
+            continue
+        try:
+            seq = int(rep.get("seq")) if rep.get("seq") is not None else -1
+        except (TypeError, ValueError):
+            seq = -1
+        spath = str(path)
+        try:
+            dirname = Path(path).parent.name
+        except Exception:
+            dirname = ""
+        base = f"turn-{seq}"
+        retry = 0
+        if dirname != base and dirname.startswith(base + "-"):
+            suffix = dirname[len(base) + 1:]
+            try:
+                retry = int(suffix)
+            except (TypeError, ValueError):
+                # Any suffixed retry still wins over the original.
+                retry = 1
+        if best is None or seq > best_seq or (
+            seq == best_seq
+            and (retry, spath) > (best_retry, best_path)
+        ):
+            best = rep
+            best_seq = seq
+            best_retry = retry
+            best_path = spath
+    if best is not None and not best.get("report_path"):
+        best = dict(best)
+        best["report_path"] = best_path
+    return best
+
+
+def completion_refusal_reason(report: dict | None) -> str | None:
+    """Block reason when completion must be refused for a failed last turn.
+
+    A non-zero ``proof_exit_code`` or a ``failed`` report status refuses
+    completion as ``completion_refused: ...``. None lets completion proceed
+    (no turn yet, or the last turn passed).
+    """
+    if not isinstance(report, dict):
+        return None
+    proof_rc = report.get("proof_exit_code")
+    status = report.get("status")
+    if isinstance(proof_rc, bool):
+        proof_rc = int(proof_rc)
+    if isinstance(proof_rc, int) and proof_rc != 0:
+        return f"completion_refused: proof failed rc={proof_rc}"
+    if status == "failed":
+        if isinstance(proof_rc, int) and proof_rc != 0:
+            return f"completion_refused: proof failed rc={proof_rc}"
+        err = report.get("error")
+        try:
+            detail = json.dumps(err, sort_keys=True)[:200] if err else "failed"
+        except (TypeError, ValueError):
+            detail = str(err)[:200] if err else "failed"
+        detail = " ".join(str(detail).split())
+        return f"completion_refused: last turn failed ({detail[:160]})"
+    return None
 
 
 def result_view(state_dir, request_id: str) -> dict:
