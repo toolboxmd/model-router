@@ -340,13 +340,16 @@ class TestSupplyPublicCLI(unittest.TestCase):
         return tmp, base, sd, ws, fs, env, rid
 
     def test_worker_dispatch_review_inputs_carry_block(self):
-        # Dispatch fallback (Codex fails) and worker (Codex ok) are both
-        # owned-server sessions and must carry the block. The reviewer kit
-        # on the owned server is proven by
+        # Dispatch fallback (Codex fails) and worker (Codex ok) run on the
+        # owned server with kits that name agentsmd-project-direction
+        # (ISSUE_52): they record hook with the hash and carry no duplicate
+        # block (the kit hook supplies direction). The reviewer kit on the
+        # owned server is proven by
         # test_review_input_carries_block_through_owned_server_seam: review
         # stages execute on hosts, so no controller flow spawns a review
         # turn. Two jobs keep workspaces disjoint (one active job per
-        # workspace).
+        # workspace). The runner-injection shape (kit without the plugin)
+        # is proven by tests/test_supply52.py.
         tmp1, base1, sd1, ws1, fs1, env1, rid1 = self._start(
             FAKE_CODEX_FAIL, FAKE_LOADER_OK, "supply-disp-001")
         self.assertTrue(wait_for(lambda: core.get_job(sd1, rid1)["status"] == "succeeded", 30),
@@ -354,46 +357,37 @@ class TestSupplyPublicCLI(unittest.TestCase):
         texts = prompt_texts(fs1)
         self.assertEqual(len(texts), 1, texts)
         for text in texts:
-            self.assertIn(direction.BLOCK_START, text)
-            self.assertIn(direction.BLOCK_END, text)
-            self.assertIn("ready", text)
-            for name in ("VISION.md", "MISSION.md", "OBJECTIVE.md"):
-                self.assertIn(name, text)
-            for h in ("a1b2c3d4e5f6a1b2", "b2c3d4e5f6a1b2c3", "c3d4e5f6a1b2c3d4"):
-                self.assertIn(h, text)
-            self.assertIn("/fake/canonical/AGENTS.md", text)
-            self.assertIn("WORKSPACE_MARKER_30", text)
-        # Ledger: dispatch fallback carries dispatcher kit with runner supply.
+            self.assertNotIn(direction.BLOCK_START, text)
+            self.assertNotIn(direction.BLOCK_END, text)
+        # Ledger: dispatch fallback carries dispatcher kit with hook supply.
         meas = core.invocation_measurements(sd1, rid1)
         kinds = [m for m in meas if m["kind"] == "opencode_control"]
         self.assertEqual(len(kinds), 1, meas)
         disp = kinds[0]
         self.assertEqual(disp["kit"], "dispatcher")
-        self.assertEqual(disp["supply"], "runner")
+        self.assertEqual(disp["supply"], "hook")
         self.assertEqual(disp["kit_hash"], policy.kit_hash(policy.kit_for_role("dispatcher")))
         self.assertEqual(disp["direction_status"], "ready")
         self.assertIsNotNone(disp["direction_hash"])
         self.assertEqual(disp["skills_loaded"], policy.kit_for_role("dispatcher")["skills"])
         # Text-only turn: no tool parts observed.
         self.assertEqual(disp["tools_called"], [])
-        # Worker job (Codex ok): worker session input carries the block.
-        # FAKE_OC_TOOLS makes the fake emit one tool part, proving
-        # distinct tool-part recording is non-empty when tools run.
+        # Worker job (Codex ok): worker kit names the direction plugin, so
+        # the session input carries no duplicate block (hook). FAKE_OC_TOOLS
+        # makes the fake emit one tool part, proving distinct tool-part
+        # recording is non-empty when tools run.
         tmp2, base2, sd2, ws2, fs2, env2, rid2 = self._start(
             FAKE_CODEX_OK, FAKE_LOADER_OK, "supply-work-001", tools=True)
         self.assertTrue(wait_for(lambda: core.get_job(sd2, rid2)["status"] == "succeeded", 30),
                         core.get_job(sd2, rid2))
         texts2 = prompt_texts(fs2)
         self.assertEqual(len(texts2), 1, texts2)
-        self.assertIn(direction.BLOCK_START, texts2[0])
-        self.assertIn("WORKSPACE_MARKER_30", texts2[0])
-        for name in ("VISION.md", "MISSION.md", "OBJECTIVE.md"):
-            self.assertIn(name, texts2[0])
+        self.assertNotIn(direction.BLOCK_START, texts2[0])
         meas2 = core.invocation_measurements(sd2, rid2)
         workers = [m for m in meas2 if m["kit"] == "worker"]
         self.assertTrue(workers, meas2)
         worker = workers[0]
-        self.assertEqual(worker["supply"], "runner")
+        self.assertEqual(worker["supply"], "hook")
         self.assertEqual(worker["kit_hash"], policy.kit_hash(policy.kit_for_role("worker")))
         invs = core._list_invocations(sd2, rid2)
         winv = next(i for i in invs if (json.loads(i.get("meta_json") or "{}").get("kit")) == "worker")
@@ -498,22 +492,17 @@ class TestSupplyPublicCLI(unittest.TestCase):
         texts = [t for t in prompt_texts(fs) if "review the change" in t]
         self.assertEqual(len(texts), 1, texts)
         text = texts[0]
-        self.assertIn(direction.BLOCK_START, text)
-        self.assertIn(direction.BLOCK_END, text)
-        self.assertIn("ready", text)
-        for name in ("VISION.md", "MISSION.md", "OBJECTIVE.md"):
-            self.assertIn(name, text)
-        for h in ("a1b2c3d4e5f6a1b2", "b2c3d4e5f6a1b2c3", "c3d4e5f6a1b2c3d4"):
-            self.assertIn(h, text)
-        self.assertIn("/fake/canonical/AGENTS.md", text)
-        self.assertIn("WORKSPACE_MARKER_30", text)
-        # Ledger: reviewer kit with runner supply, block hash, and skills.
+        # Reviewer kit names the direction plugin (ISSUE_52): hook with no
+        # duplicate block; the hash still comes from the runner's own read.
+        self.assertNotIn(direction.BLOCK_START, text)
+        self.assertNotIn(direction.BLOCK_END, text)
+        # Ledger: reviewer kit with hook supply, block hash, and skills.
         meas = core.invocation_measurements(sd, rid)
         kinds = [m for m in meas if m["kind"] == "opencode_control"]
         self.assertEqual(len(kinds), 1, meas)
         rev = kinds[0]
         self.assertEqual(rev["kit"], "reviewer")
-        self.assertEqual(rev["supply"], "runner")
+        self.assertEqual(rev["supply"], "hook")
         self.assertEqual(rev["kit_hash"], policy.kit_hash(policy.kit_for_role("reviewer")))
         self.assertEqual(rev["direction_status"], "ready")
         self.assertIsNotNone(rev["direction_hash"])
@@ -550,7 +539,8 @@ class TestSupplyPublicCLI(unittest.TestCase):
         argv_text = codex_log.read_text()
         self.assertNotIn(direction.BLOCK_START, argv_text)
         meas = {m["kit"]: m for m in core.invocation_measurements(sd, rid)}
-        # Dispatch ran on Codex (hook), worker on the owned server (runner).
+        # Dispatch ran on Codex (hook), worker on the owned server with its
+        # plugin kit (hook, ISSUE_52).
         dispatches = [m for m in core.invocation_measurements(sd, rid)
                       if m["kind"] in ("codex_dispatch",)]
         self.assertTrue(dispatches, meas)
@@ -560,7 +550,7 @@ class TestSupplyPublicCLI(unittest.TestCase):
         workers = [m for m in core.invocation_measurements(sd, rid)
                    if m["kit"] == "worker"]
         self.assertTrue(workers)
-        self.assertEqual(workers[0]["supply"], "runner")
+        self.assertEqual(workers[0]["supply"], "hook")
 
     def test_loader_failure_records_none_and_continues(self):
         tmp, base, sd, ws, fs, env, rid = self._start(
