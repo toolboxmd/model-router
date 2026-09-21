@@ -195,13 +195,19 @@ its transcript counts as busy.
 
 Each turn starts a fresh `opencode serve` with a random password in its
 environment only. The server runs on a runner-generated configuration
-directory built from the route's kit (`runner/kits.py`): `OPENCODE_CONFIG_DIR`,
-`XDG_CONFIG_HOME` (shadow), and `OPENCODE_CONFIG` point at
+directory built from the route's kit (`runner/kits.py`): `OPENCODE_CONFIG_DIR`
+and `OPENCODE_CONFIG` point at
 `state/kits/<request>.<invocation>.<kit>/`, which holds `kit.json`
 (kit identity and hash), `AGENTS.md` (AgentsMD link), `opencode.json`
 (the kit's MCP subset only), and `skills/` plus `plugins/` equal to the
 kit. Plugins the kit names are allowed; nothing is inherited from the
-user's own configuration (`--pure` is gone). The supervisor authenticates
+user's own OpenCode configuration (`--pure` is gone). `XDG_CONFIG_HOME`
+is never set, so the shell inside a worker or dispatcher session sees the
+same user environment as the user's own shell (`gh auth status`, the
+global git config, and other XDG-aware tools behave the same); the
+OpenCode binary already resolves its global config directory as
+`OPENCODE_CONFIG_DIR ?? XDG_CONFIG_HOME/opencode`, so `OPENCODE_CONFIG_DIR`
+alone keeps the user's `~/.config/opencode` out. The supervisor authenticates
 with Basic auth (`opencode:<password>`) and scopes every call with
 `directory=<workspace>`. It creates or reuses the saved session and saves
 the session ID before the model request. The session's permission rules
@@ -276,7 +282,7 @@ directory, and point the harness at it:
 python3 -c "from runner import kits, policy; kits.materialize_opencode_kit(
   policy.kit_name_for_route('muse-spark-xhigh-free'),
   '/tmp/manual-kit', route='muse-spark-xhigh-free')"
-OPENCODE_CONFIG_DIR=/tmp/manual-kit XDG_CONFIG_HOME=/tmp/manual-kit/xdg-shadow \
+OPENCODE_CONFIG_DIR=/tmp/manual-kit \
   OPENCODE_CONFIG=/tmp/manual-kit/opencode.json \
   opencode serve --hostname 127.0.0.1 --port 0
 # Codex dispatcher on the dispatcher kit (nothing inherited except the

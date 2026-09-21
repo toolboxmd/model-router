@@ -5,10 +5,15 @@ per-launch configuration directories the harnesses spawn on. Every
 directory is generated from the route's kit with nothing inherited from
 the user's own configuration:
 
-- OpenCode: ``OPENCODE_CONFIG_DIR`` + ``XDG_CONFIG_HOME`` (shadow) +
-  ``OPENCODE_CONFIG`` point at the generated directory, which holds
-  ``kit.json``, ``AGENTS.md``, ``opencode.json`` (the kit's MCP subset),
-  ``skills/`` and ``plugins/`` equal to the kit.
+- OpenCode: ``OPENCODE_CONFIG_DIR`` + ``OPENCODE_CONFIG`` point at
+  the generated directory, which holds ``kit.json``, ``AGENTS.md``,
+  ``opencode.json`` (the kit's MCP subset), ``skills/`` and ``plugins/``
+  equal to the kit. ``XDG_CONFIG_HOME`` is left alone so the owned
+  server's shell sees the same user environment as the user's own shell
+  (``gh``, global git config, and other XDG-aware tools); the OpenCode
+  binary already resolves its global config as ``OPENCODE_CONFIG_DIR ??
+  XDG_CONFIG_HOME/opencode``, so ``OPENCODE_CONFIG_DIR`` alone keeps the
+  user's ``~/.config/opencode`` out.
 - Codex: ``CODEX_HOME`` points at the generated directory, which holds
   ``kit.json``, ``AGENTS.md``, ``config.toml`` (kit lists plus the installed
   ``[mcp_servers.NAME]`` sections named by the kit), ``mcp.json`` (the kit's
@@ -32,7 +37,7 @@ from pathlib import Path
 
 from . import policy
 
-OPENCODE_KIT_ENV_VARS = ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG")
+OPENCODE_KIT_ENV_VARS = ("OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG")
 CODEX_KIT_ENV_VAR = "CODEX_HOME"
 CLAUDE_KIT_ENV_VAR = "CLAUDE_CONFIG_DIR"
 GROK_KIT_ENV_VAR = "GROK_HOME"
@@ -392,9 +397,6 @@ def materialize_opencode_kit(kit_name: str, dest, route: str | None = None) -> P
             raise ValueError(f"kit {kit_name}: plugin {plugin!r} is not installed")
         _link_or_copy(src, dest / "plugins" / src.name)
     _write_agentsmd_link(dest / "AGENTS.md")
-    # XDG shadow: an empty home so the real ~/.config/opencode is never read.
-    xdg = dest / "xdg-shadow"
-    xdg.mkdir(mode=0o700, parents=True, exist_ok=True)
     return dest
 
 
@@ -534,11 +536,16 @@ def materialize_grok_kit(kit_name: str, dest) -> Path:
 
 
 def opencode_kit_env(kit_dir: Path) -> dict:
-    """Environment overrides launching the owned server on a kit dir."""
+    """Environment overrides launching the owned server on a kit dir.
+
+    Only ``OPENCODE_CONFIG_DIR`` and ``OPENCODE_CONFIG`` point at the
+    kit; ``XDG_CONFIG_HOME`` is never set so the server inherits the
+    runner's value (the user's shell environment) for ``gh``, git, and
+    every other XDG-aware tool.
+    """
     kit_dir = str(kit_dir)
     return {
         "OPENCODE_CONFIG_DIR": kit_dir,
-        "XDG_CONFIG_HOME": str(Path(kit_dir) / "xdg-shadow"),
         "OPENCODE_CONFIG": str(Path(kit_dir) / "opencode.json"),
     }
 

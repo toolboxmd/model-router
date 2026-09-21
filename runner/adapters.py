@@ -900,10 +900,11 @@ def build_opencode_serve_cmd(hostname: str = "127.0.0.1", port: str | int = 0) -
     """Owned ephemeral serve argv. Password is environment-only, never argv.
 
     The server runs on a runner-generated configuration directory built
-    from the route's kit (see ``runner/kits.py``): ``OPENCODE_CONFIG_DIR``,
-    ``XDG_CONFIG_HOME`` (shadow), and ``OPENCODE_CONFIG`` point at it in
-    the child's environment. ``--pure`` is gone: plugins the kit names
-    are allowed, and nothing is inherited from the user's configuration.
+    from the route's kit (see ``runner/kits.py``): ``OPENCODE_CONFIG_DIR``
+    and ``OPENCODE_CONFIG`` point at it in the child's environment, while
+    ``XDG_CONFIG_HOME`` is left alone so the shell keeps the user's
+    environment. ``--pure`` is gone: plugins the kit names are allowed,
+    and nothing is inherited from the user's OpenCode configuration.
     """
     if hostname not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("ephemeral serve allows localhost only")
