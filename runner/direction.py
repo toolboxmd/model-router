@@ -3,21 +3,30 @@
 Every role session's input carries the current Project Direction of its
 workspace. The installed AgentsMD loader (``project-direction`` on PATH,
 the ``project-direction hook`` for the host) owns the block; the runner
-attaches it verbatim where the host has no working hook (the owned
-OpenCode server) and records the supply mechanism everywhere else.
+attaches it verbatim only where no hook supplies it, and records the
+supply mechanism everywhere.
 
-Supply mechanisms (Agent Observer ``supply``):
+Supply mechanisms (Agent Observer ``supply``), decided from the route's
+kit on the owned OpenCode server:
 
-- ``runner``: the owned OpenCode server. The runner ran the installed
+- ``runner``: the owned OpenCode server with a kit that does not name
+  the ``agentsmd-project-direction`` plugin. The runner ran the installed
   loader for the job's workspace and prepended its verbatim block (plus
   the core instruction link and the project's own AGENTS.md when present)
   to the session input.
 - ``hook``: a host whose own hook supplies direction (Codex, Claude,
-  Grok). The runner ran the loader to learn the block hash for the
-  ledger but did not duplicate the block in the prompt.
+  Grok, plus any owned-OpenCode kit that names the
+  ``agentsmd-project-direction`` plugin). The runner still ran the loader
+  once per invocation to learn the block hash for the ledger but did not
+  duplicate the block in the prompt.
 - ``none``: the loader was missing or failed. The invocation records the
   reason, the worker prompt names VISION.md, MISSION.md, and OBJECTIVE.md
   to read, and the job continues.
+
+Every loader call from the runner uses a unique ``session_id``
+(``model-router-<request>-<invocation>-<uuid>``) so the loader's
+per-session hook cache never suppresses a block; the loader is still
+called exactly once per invocation.
 
 The loader is never fabricated: absence or failure is recorded, never
 invented. ``status`` carries the loader payload status (``ready``,
@@ -39,11 +48,40 @@ BLOCK_END = "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"
 REQUIRED_FILES = ("VISION.md", "MISSION.md", "OBJECTIVE.md")
 
 # Hosts whose own hook supplies direction; the runner records hook and
-# does not duplicate the block. The owned OpenCode server has no working
-# hook (its experimental system-prompt hook is not required), so the
-# runner attaches the block there.
+# does not duplicate the block. On the owned OpenCode server the kit
+# decides: a kit naming the agentsmd-project-direction plugin is a hook
+# host (the plugin's SessionStart transform supplies direction); a kit
+# without it gets the runner's verbatim injection.
 HOOK_HOSTS = frozenset({"codex", "claude", "grok"})
 RUNNER_HOSTS = frozenset({"opencode"})
+
+# Kit plugin that makes an owned-OpenCode kit a hook host.
+DIRECTION_PLUGIN = "agentsmd-project-direction"
+
+
+def _plugins_for_kit_name(kit_name: str | None) -> list:
+    """Plugin names for a kit role, or [] when unknown. Never raises."""
+    if not isinstance(kit_name, str) or not kit_name:
+        return []
+    try:
+        from . import policy as _policy
+        kit = _policy.KITS.get(kit_name)
+        if isinstance(kit, dict) and isinstance(kit.get("plugins"), list):
+            return [p for p in kit["plugins"] if isinstance(p, str)]
+    except Exception:
+        pass
+    return []
+
+
+def kit_has_direction_plugin(kit_name: str | None = None,
+                             kit_plugins: list | None = None) -> bool:
+    """True when the kit carries the direction hook plugin. Never raises."""
+    try:
+        if kit_plugins is not None:
+            return DIRECTION_PLUGIN in list(kit_plugins or [])
+        return DIRECTION_PLUGIN in _plugins_for_kit_name(kit_name)
+    except Exception:
+        return False
 
 LOADER_BIN_NAME = "project-direction"
 LOADER_ENV = "MODEL_ROUTER_PROJECT_DIRECTION_BIN"
@@ -166,21 +204,37 @@ def core_link_text(payload: dict | None) -> str | None:
 
 def load_direction(workspace: str, host: str = "opencode",
                    loader: str | None = None,
-                   timeout: float = LOADER_TIMEOUT_SECS) -> dict:
+                   timeout: float = LOADER_TIMEOUT_SECS,
+                   session_id: str | None = None) -> dict:
     """Run the installed loader for ``workspace``. Never raises.
 
-    Returns ``{ok, block, payload, status, files, reason, loader}``. ``ok``
-    is True only when a verbatim block with a parseable payload was read;
-    otherwise ``block`` is None and ``reason`` names the gap (``loader
-    missing``, ``loader failed ...``, ``no block in loader output``).
+    ``session_id`` is the loader hook session id. Every call uses a unique
+    one (``model-router-<request>-<invocation>-<uuid>`` from the caller,
+    else a fresh ``model-router-<uuid>`` here) so the loader's per-session
+    hook cache never suppresses a block. The loader is still called exactly
+    once per invocation by the caller.
+
+    Returns ``{ok, block, payload, status, files, reason, loader,
+    session_id}``. ``ok`` is True only when a verbatim block with a
+    parseable payload was read; otherwise ``block`` is None and ``reason``
+    names the gap (``loader missing``, ``loader failed ...``, ``no block
+    in loader output``).
     """
+    if not isinstance(session_id, str) or not session_id.strip():
+        try:
+            import secrets as _secrets
+            session_id = f"model-router-{_secrets.token_hex(4)}"
+        except Exception:
+            session_id = "model-router-fallback"
+    else:
+        session_id = session_id.strip()
     exe = loader or find_loader()
     if not exe:
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": "loader missing: project-direction not on PATH",
-                "loader": None}
+                "loader": None, "session_id": session_id}
     stdin_obj = {"cwd": str(workspace), "hook_event_name": "UserPromptSubmit",
-                 "session_id": "model-router-direction"}
+                 "session_id": session_id}
     try:
         proc = subprocess.run(
             [exe, "--host", host, "hook"],
@@ -191,15 +245,15 @@ def load_direction(workspace: str, host: str = "opencode",
     except FileNotFoundError:
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": "loader missing: project-direction not executable",
-                "loader": exe}
+                "loader": exe, "session_id": session_id}
     except subprocess.TimeoutExpired:
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": "loader failed: timeout",
-                "loader": exe}
+                "loader": exe, "session_id": session_id}
     except OSError as e:
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": f"loader failed: {type(e).__name__}",
-                "loader": exe}
+                "loader": exe, "session_id": session_id}
     out = proc.stdout or ""
     if proc.returncode != 0:
         # A failing loader may still print a block on stdout; prefer it
@@ -210,12 +264,12 @@ def load_direction(workspace: str, host: str = "opencode",
             return {"ok": True, "block": block, "payload": payload,
                     "status": str((payload or {}).get("status") or "ready"),
                     "files": (payload or {}).get("files") if isinstance((payload or {}).get("files"), list) else [],
-                    "reason": None, "loader": exe}
+                    "reason": None, "loader": exe, "session_id": session_id}
         err = (proc.stderr or "").strip().splitlines()
         detail = err[-1][:200] if err else f"exit {proc.returncode}"
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": f"loader failed: {detail}",
-                "loader": exe}
+                "loader": exe, "session_id": session_id}
     block = _extract_block(out)
     payload = _payload_from_block(block) if block else None
     if payload is None:
@@ -230,19 +284,41 @@ def load_direction(workspace: str, host: str = "opencode",
     if not block or payload is None:
         return {"ok": False, "block": None, "payload": None, "status": "gap",
                 "files": [], "reason": "loader failed: no direction block in loader output",
-                "loader": exe}
+                "loader": exe, "session_id": session_id}
     status = str(payload.get("status") or "ready")
     files = payload.get("files") if isinstance(payload.get("files"), list) else []
     return {"ok": True, "block": block, "payload": payload, "status": status,
-            "files": files, "reason": None, "loader": exe}
+            "files": files, "reason": None, "loader": exe, "session_id": session_id}
 
 
-def supply_for_harness(harness: str | None, direction_ok: bool) -> str:
-    """``runner``, ``hook``, or ``none`` for a harness and loader outcome."""
+def supply_for_harness(harness: str | None, direction_ok: bool,
+                       kit_name: str | None = None,
+                       kit_plugins: list | None = None) -> str:
+    """``runner``, ``hook``, or ``none`` for a harness, loader outcome, and kit.
+
+    Codex, Claude, and Grok are always hook hosts when the loader read.
+    On the owned OpenCode server the route's kit decides: a kit naming the
+    ``agentsmd-project-direction`` plugin is a hook host (supply ``hook``,
+    hash recorded, no block prepended); a kit without it gets the runner
+    injection (supply ``runner``). ``none`` means the loader failed or was
+    absent. ``kit_plugins`` overrides the policy lookup for ``kit_name``
+    when given (deterministic tests for a kit without the plugin).
+    """
     if not direction_ok:
         return "none"
     if (harness or "") in HOOK_HOSTS:
         return "hook"
+    if (harness or "") in RUNNER_HOSTS:
+        if kit_plugins is not None:
+            try:
+                if DIRECTION_PLUGIN in list(kit_plugins or []):
+                    return "hook"
+            except Exception:
+                pass
+            return "runner"
+        if kit_has_direction_plugin(kit_name):
+            return "hook"
+        return "runner"
     return "runner"
 
 
@@ -289,14 +365,18 @@ def fallback_text(reason: str | None = None) -> str:
 
 
 def session_input(original: str, workspace: str | None, harness: str | None,
-                  direction: dict | None) -> tuple[str, dict]:
+                  direction: dict | None, kit_name: str | None = None,
+                  kit_plugins: list | None = None) -> tuple[str, dict]:
     """(prompt to send, supply record) for one role session.
 
-    - ``runner`` (owned OpenCode server, loader ok): verbatim block plus
-      the core instruction link and the project's own AGENTS.md when
-      present, then the original prompt.
-    - ``hook`` (Codex, Claude, Grok, loader ok): the original prompt
-      unchanged; the host hook supplies the block.
+    - ``runner`` (owned OpenCode server with a kit that does not name the
+      direction plugin, loader ok): verbatim block plus the core
+      instruction link and the project's own AGENTS.md when present, then
+      the original prompt.
+    - ``hook`` (Codex, Claude, Grok, or an owned-OpenCode kit naming the
+      direction plugin, loader ok): the original prompt unchanged; the
+      host hook supplies the block. The hash still comes from the runner's
+      own loader read.
     - ``none`` (loader missing/failed): the fallback naming the three
       files plus the original prompt on the owned server; unchanged
       elsewhere. The job continues.
@@ -304,7 +384,7 @@ def session_input(original: str, workspace: str | None, harness: str | None,
     direction = direction or {"ok": False, "block": None, "status": "gap",
                               "reason": "loader missing"}
     ok = bool(direction.get("ok") and direction.get("block"))
-    supply = supply_for_harness(harness, ok)
+    supply = supply_for_harness(harness, ok, kit_name, kit_plugins)
     base = original or ""
     if supply == "hook":
         return base, {"supply": supply,

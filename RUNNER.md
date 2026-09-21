@@ -236,12 +236,20 @@ secret values.
 Direction supply (`runner/direction.py`): every role session's input
 carries the current Project Direction of the job's workspace. The
 installed AgentsMD loader (`project-direction` on PATH, `project-direction
-hook --host HOST` with `{"cwd": workspace}` on stdin) owns the block; the
-runner attaches it verbatim and never fabricates it. On the owned OpenCode
-server the runner prepends the loader's verbatim block (status, the three
-files VISION.md, MISSION.md, OBJECTIVE.md with hashes, the core instruction
-link, and the workspace's own AGENTS.md when present) to every session the
-runner spawns there (worker, correction, recovery, and dispatch fallback).
+hook --host HOST` with `{"cwd": workspace, "hook_event_name":
+"UserPromptSubmit", "session_id": "model-router-<request>-<invocation>-<uuid>"}`
+on stdin) owns the block; the runner attaches it verbatim and never
+fabricates it. Every loader call from the runner uses a unique
+`session_id` per invocation, so the loader's per-session hook cache never
+suppresses a block; the loader is still called exactly once per
+invocation. On the owned OpenCode server the route's kit decides: a kit
+whose `plugins` name `agentsmd-project-direction` is a hook host (supply
+`hook`, direction hash recorded from the runner's own loader read, no
+runner block prepended to the prompt); a kit without that plugin gets the
+runner injection (supply `runner`, the loader's verbatim block with
+status, the three files VISION.md, MISSION.md, OBJECTIVE.md with hashes,
+the core instruction link, and the workspace's own AGENTS.md when present
+prepended, hash recorded). Codex, Claude, and Grok stay `hook`.
 Review sessions run on hosts whose own hook supplies direction (Codex,
 Claude, Grok) or manually from the role's kit below; the runner records
 that hook supply and does not duplicate the block. When the loader is missing or fails, the
@@ -249,10 +257,11 @@ invocation records supply `none` with the reason, the owned-server prompt
 names the three files to read, `status` shows the gap in the invocation
 measurements, and the job continues. The ledger records what was actually
 sent: `runner` when the runner injected the block on the owned server,
-`hook` when the host hook supplied it, and `none` only when neither happened,
-with the direction hash in every injected case. The owned-server drive path
-persists its actual supply back to the invocation row, so a runner-injected
-block never records `none`. Per invocation the ledger records kit
+`hook` when the host or kit hook supplied it, and `none` only when neither happened,
+with the direction hash in every supplied case (`hook` and `runner`).
+The owned-server drive path persists its actual supply back to the invocation row, so a runner-injected
+block never records `none` and a kit-hook turn never records `runner`.
+Per invocation the ledger records kit
 identity and hash, supply (`hook`, `runner`, `none`), hash of the supplied
 block, direction status, skills loaded (the kit's skills), and tools called
 (distinct tool part names in the turn, empty on text-only turns); `status`

@@ -690,13 +690,15 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     if _STOP["requested"]:
         return {"ok": False, "rc": 143, "error": "terminated before the prompt",
                 "opencode_session_id": saved}, saved, "opencode_session_id"
-    # Direction supply (ISSUE_30, ISSUE_50): the owned server has no working
-    # hook, so the runner prepends the loader's verbatim block (status,
-    # three files with hashes, core link, project AGENTS.md) or the
-    # three-file fallback when the loader is missing. Hook hosts never reach
-    # this drive path. The ledger records what was actually sent: `runner`
-    # when the block was injected here, `none` with the reason otherwise,
-    # with the direction hash in every injected case.
+    # Direction supply (ISSUE_30, ISSUE_50, ISSUE_52): on the owned server
+    # the route's kit decides. A kit naming agentsmd-project-direction is a
+    # hook host (the plugin's SessionStart transform supplies direction, so
+    # no block is prepended); a kit without it gets the loader's verbatim
+    # block (status, three files with hashes, core link, project AGENTS.md)
+    # or the three-file fallback when the loader is missing. Hook hosts
+    # never reach this drive path. The ledger records what was actually
+    # sent: `hook` with the hash from the runner's own loader read, `runner`
+    # when the block was injected here, `none` with the reason otherwise.
     _final_prompt = meta.get("prompt") or ""
     _supply_rec = None
     try:
@@ -717,8 +719,16 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
             _din = {"ok": False, "block": None,
                     "status": meta.get("direction_status") or "gap",
                     "reason": meta.get("direction_reason") or "loader missing"}
+        _drive_kit = meta.get("kit") if isinstance(meta.get("kit"), str) else None
+        if _drive_kit is None:
+            try:
+                _drive_kit, _, _ = _direction.kit_for_invocation(
+                    meta.get("route"), meta.get("stage"))
+            except Exception:
+                _drive_kit = None
         _final_prompt, _supply_rec = _direction.session_input(
-            meta.get("prompt") or "", workspace, "opencode", _din)
+            meta.get("prompt") or "", workspace, "opencode", _din,
+            kit_name=_drive_kit)
     except Exception:
         pass
     if isinstance(_supply_rec, dict):

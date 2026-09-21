@@ -414,8 +414,11 @@ class TestSupplyLabels(unittest.TestCase):
 
     def test_owned_server_drive_persists_runner_supply(self):
         # The drive-time ledger update records what was actually sent, so a
-        # runner-injected block never stays `none`. Exercises the real
-        # supervisor drive path, not a manual UPDATE.
+        # hook-kit turn records hook (no duplicate block) and never stays
+        # `none`. Exercises the real supervisor drive path, not a manual
+        # UPDATE. The worker kit names agentsmd-project-direction (ISSUE_52).
+        # The runner-injection shape (kit without the plugin) is proven by
+        # tests/test_supply52.py.
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
@@ -521,11 +524,12 @@ class TestSupplyLabels(unittest.TestCase):
             adapters.OpenCodeClient = orig_client
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(result.get("rc"), 0, result)
-        # The prompt actually sent carries the verbatim block.
-        self.assertIn(direction.BLOCK_START, captured.get("prompt", ""))
+        # The worker kit is a hook host: no duplicate block is sent, but
+        # the hash from the runner's own loader read is recorded.
+        self.assertNotIn(direction.BLOCK_START, captured.get("prompt", ""))
         self.assertTrue(captured.get("prompt", "").rstrip().endswith("do work"))
         meas = {m["kind"]: m for m in core.invocation_measurements(sd, "supply50")}
-        self.assertEqual(meas["opencode_control"]["supply"], "runner")
+        self.assertEqual(meas["opencode_control"]["supply"], "hook")
         self.assertIsNotNone(meas["opencode_control"]["direction_hash"])
         self.assertEqual(meas["opencode_control"]["direction_status"], "ready")
         self.assertEqual(
@@ -614,23 +618,26 @@ class TestPublicFallbackDrill(unittest.TestCase):
             if payload.get("to") == "luna-go/max":
                 switched.append(payload)
         self.assertTrue(switched, [dict(r) for r in rows])
-        # Supply labels: the fallback dispatcher and the worker both ran
-        # on the owned server, so both record runner with a direction
-        # hash; the dispatcher kit is dispatcher, the worker kit is
-        # worker. A dispatcher on a host hook would record hook instead
-        # (covered by test_supply30's Codex-native drill).
+        # Supply labels (ISSUE_52): the fallback dispatcher and the worker
+        # both ran on the owned server with kits naming
+        # agentsmd-project-direction, so both record hook with a direction
+        # hash and no duplicate block; the dispatcher kit is dispatcher,
+        # the worker kit is worker. A dispatcher on a host hook would
+        # record hook instead (covered by test_supply30's Codex-native
+        # drill). The runner-injection shape (kit without the plugin) is
+        # proven by tests/test_supply52.py.
         meas = core.invocation_measurements(sd, rid)
         by_kit_stage = {(m.get("kit"), m.get("stage")): m for m in meas}
         disp = by_kit_stage.get(("dispatcher", "dispatch"))
         self.assertIsNotNone(disp, meas)
         self.assertEqual(disp["requested_route"], "luna-go/max", disp)
-        self.assertEqual(disp["supply"], "runner", disp)
+        self.assertEqual(disp["supply"], "hook", disp)
         self.assertIsNotNone(disp["direction_hash"], disp)
         self.assertEqual(disp["direction_status"], "ready", disp)
         workers = [m for m in meas if m.get("kit") == "worker"]
         self.assertTrue(workers, meas)
         worker = workers[0]
-        self.assertEqual(worker["supply"], "runner", worker)
+        self.assertEqual(worker["supply"], "hook", worker)
         self.assertIsNotNone(worker["direction_hash"], worker)
         self.assertEqual(worker["direction_status"], "ready", worker)
 

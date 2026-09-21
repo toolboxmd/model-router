@@ -685,14 +685,20 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
 
     job = get_job(state_dir, request_id)
     workspace = cwd or job["workspace"]
-    # Direction supply through the harness seam (ISSUE_30): the installed
-    # AgentsMD loader owns the block. The owned OpenCode server gets the
-    # verbatim block in its session input (runner); hook hosts record the
-    # hash without duplication (hook); a missing/failed loader records
-    # none with its reason and the job continues. Computed before the
-    # insert so every invocation row carries kit, supply, and hashes; the
-    # action key above stays on the original prompt (direction fields are
-    # extra keys the harness seam ignores), so retries keep one identity.
+    # Direction supply through the harness seam (ISSUE_30, ISSUE_52): the
+    # installed AgentsMD loader owns the block. On the owned OpenCode
+    # server the route's kit decides: a kit naming
+    # agentsmd-project-direction records hook with the block hash and no
+    # duplicate block; a kit without it gets the verbatim block (runner).
+    # Hook hosts (Codex, Claude, Grok) record the hash without duplication;
+    # a missing/failed loader records none with its reason and the job
+    # continues. Every loader call uses a unique session_id
+    # (model-router-<request>-<invocation>-<uuid>) so the loader's
+    # per-session hook cache never suppresses a block; the loader is still
+    # called exactly once per invocation here. Computed before the insert
+    # so every invocation row carries kit, supply, and hashes; the action
+    # key above stays on the original prompt (direction fields are extra
+    # keys the harness seam ignores), so retries keep one identity.
     _dir_info: dict = {"ok": False, "block": None, "status": "gap",
                        "reason": "loader missing"}
     _dir_supply = "none"
@@ -700,19 +706,29 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     _kit_name: str | None = None
     _kit_hash: str | None = None
     _kit_skills: list = []
+    _dir_session_id: str | None = None
     try:
         from . import direction as _direction
         _harness_name = getattr(harness, "name", None) or "opencode"
-        try:
-            _dir_info = _direction.load_direction(workspace, host=_harness_name)
-        except Exception:
-            _dir_info = {"ok": False, "block": None, "status": "gap",
-                         "reason": "loader failed: exception"}
-        _dir_supply = _direction.supply_for_harness(_harness_name, bool(_dir_info.get("ok")))
-        if bool(_dir_info.get("ok")) and _dir_info.get("block"):
-            _dir_hash = _direction.block_hash(_dir_info.get("block"))
         _kit_name, _kit_hash, _kit_skills = _direction.kit_for_invocation(
             route_name or (meta or {}).get("route"), stage_name)
+        try:
+            import secrets as _secrets
+            _dir_session_id = (
+                f"model-router-{request_id}-{invocation_id}-{_secrets.token_hex(4)}")
+        except Exception:
+            _dir_session_id = f"model-router-{request_id}-{invocation_id}"
+        try:
+            _dir_info = _direction.load_direction(
+                workspace, host=_harness_name, session_id=_dir_session_id)
+        except Exception:
+            _dir_info = {"ok": False, "block": None, "status": "gap",
+                         "reason": "loader failed: exception",
+                         "session_id": _dir_session_id}
+        _dir_supply = _direction.supply_for_harness(
+            _harness_name, bool(_dir_info.get("ok")), _kit_name)
+        if bool(_dir_info.get("ok")) and _dir_info.get("block"):
+            _dir_hash = _direction.block_hash(_dir_info.get("block"))
     except Exception:
         pass
     _meta_store = dict(meta or {})
@@ -734,6 +750,8 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
         _meta_store["kit"] = _kit_name
     if _kit_hash:
         _meta_store["kit_hash"] = _kit_hash
+    if _dir_session_id:
+        _meta_store["direction_session_id"] = _dir_session_id
     # Key redaction cannot see inside free-text values (for example a
     # credential in the task prompt), so mask secret shapes as well. No
     # truncation: the supervisor re-reads this prompt from the ledger.
