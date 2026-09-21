@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.21.0] - 2026-09-21
+
+### Added
+
+- Skill isolation on the owned OpenCode server: XDG mirror keeps the user's environment, external skill roots disabled, skills_loaded observed
+
 ## [0.20.0] - 2026-09-21
 
 ### Added

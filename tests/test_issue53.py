@@ -58,13 +58,24 @@ def make_fake_homes(base: Path) -> dict:
 
 
 class TestNoXdgShadow(unittest.TestCase):
+    """Issue #53 shape, as amended by #57: the owned server keeps the user's
+    environment through a per-kit XDG mirror, not by leaving XDG alone."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
         self.homes = make_fake_homes(self.base)
-        self._saved = {k: os.environ.get(k) for k in self.homes}
+        self._saved = {k: os.environ.get(k) for k in list(self.homes) + ["XDG_CONFIG_HOME"]}
         os.environ.update(self.homes)
+        # Fake user config source for the mirror (every entry except
+        # opencode must appear as a symlink).
+        self.user_config = self.base / "fake-user-config-53"
+        (self.user_config / "gh").mkdir(parents=True, exist_ok=True)
+        (self.user_config / "gh" / "hosts.yml").write_text("user: u\n")
+        (self.user_config / "sometool").mkdir(parents=True, exist_ok=True)
+        (self.user_config / "opencode").mkdir(parents=True, exist_ok=True)
+        os.environ["XDG_CONFIG_HOME"] = str(self.user_config)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -74,7 +85,7 @@ class TestNoXdgShadow(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_kit_env_omits_xdg(self):
+    def test_kit_env_carries_mirror_and_flag(self):
         dest = self.base / "kit-worker"
         kitmod.materialize_opencode_kit("worker", dest, route="muse-spark-xhigh-free")
         self.assertFalse((dest / "xdg-shadow").exists())
@@ -82,9 +93,16 @@ class TestNoXdgShadow(unittest.TestCase):
         self.assertEqual(env, {
             "OPENCODE_CONFIG_DIR": str(dest),
             "OPENCODE_CONFIG": str(dest / "opencode.json"),
+            "XDG_CONFIG_HOME": str(dest / "xdg-mirror"),
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
         })
+        mirror = dest / "xdg-mirror"
+        self.assertTrue(mirror.is_dir())
+        self.assertFalse((mirror / "opencode").exists())
+        self.assertTrue((mirror / "gh").is_symlink())
+        self.assertTrue((mirror / "sometool").is_symlink())
 
-    def test_spawn_spec_keeps_parent_xdg_for_worker_and_dispatcher(self):
+    def test_spawn_spec_sets_mirror_for_worker_and_dispatcher(self):
         for route, stage in (("muse-spark-xhigh-free", "implementation"),
                              ("luna-go/max", "dispatch")):
             with self.subTest(route=route):
@@ -92,31 +110,29 @@ class TestNoXdgShadow(unittest.TestCase):
                 inv = {"request_id": "r53", "invocation_id": f"i-{stage}",
                        "stdout_path": str(self.base / "state" / "outputs" / f"r53.{stage}.stdout"),
                        "meta_json": json.dumps({"route": route, "stage": stage})}
-                parent_xdg = "/user/xdg-parent-53"
                 env, _pwd = harnesses.harness_named("opencode").spawn_spec(
-                    inv, {"PATH": "x", "XDG_CONFIG_HOME": parent_xdg})
-                self.assertEqual(env.get("XDG_CONFIG_HOME"), parent_xdg)
-                self.assertNotIn("xdg-shadow", env.get("XDG_CONFIG_HOME", ""))
+                    inv, {"PATH": "x", "XDG_CONFIG_HOME": str(self.user_config)})
                 kit_dir = Path(env["OPENCODE_CONFIG_DIR"])
+                self.assertEqual(env.get("XDG_CONFIG_HOME"), str(kit_dir / "xdg-mirror"))
+                self.assertEqual(env.get("OPENCODE_DISABLE_EXTERNAL_SKILLS"), "1")
+                self.assertNotIn("xdg-shadow", env.get("XDG_CONFIG_HOME", ""))
                 self.assertTrue((kit_dir / "kit.json").is_file())
                 self.assertEqual(env["OPENCODE_CONFIG"], str(kit_dir / "opencode.json"))
                 self.assertFalse((kit_dir / "xdg-shadow").exists())
+                self.assertTrue((kit_dir / "xdg-mirror" / "gh").is_symlink())
+                self.assertFalse((kit_dir / "xdg-mirror" / "opencode").exists())
 
-    def test_spawn_spec_without_parent_xdg_sets_no_xdg(self):
+    def test_spawn_spec_without_parent_xdg_sets_mirror_from_runner_env(self):
         (self.base / "state" / "outputs").mkdir(parents=True, exist_ok=True)
         inv = {"request_id": "r53", "invocation_id": "i-absent",
                "stdout_path": str(self.base / "state" / "outputs" / "r53.i-absent.stdout"),
                "meta_json": json.dumps({"route": "muse-spark-xhigh-free",
                                         "stage": "implementation"})}
-        base_env = {"PATH": "x"}
-        base_env.pop("XDG_CONFIG_HOME", None)
-        saved = os.environ.pop("XDG_CONFIG_HOME", None)
-        try:
-            env, _pwd = harnesses.harness_named("opencode").spawn_spec(inv, dict(base_env))
-        finally:
-            if saved is not None:
-                os.environ["XDG_CONFIG_HOME"] = saved
-        self.assertNotIn("XDG_CONFIG_HOME", env)
+        env, _pwd = harnesses.harness_named("opencode").spawn_spec(inv, {"PATH": "x"})
+        kit_dir = Path(env["OPENCODE_CONFIG_DIR"])
+        # The runner's own XDG (fake source) still feeds the mirror.
+        self.assertEqual(env.get("XDG_CONFIG_HOME"), str(kit_dir / "xdg-mirror"))
+        self.assertEqual(env.get("OPENCODE_DISABLE_EXTERNAL_SKILLS"), "1")
 
 
 class TestValidateWithKitConfigDir(unittest.TestCase):

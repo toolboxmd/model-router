@@ -1011,16 +1011,24 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                     result["native_ids"] = {"session_id": saved,
                                             "assistant_message_ids": [(m.get("info") or {}).get("id") for m in new],
                                             "user_message_ids": user_ids}
-                    # Skills loaded and tools called (ISSUE_30): the kit's
-                    # skills are what the session may invoke; tools are the
-                    # distinct tool part names in this turn's assistant
-                    # messages (empty on the fake and on text-only turns).
+                    # Skills loaded and tools called (ISSUE_30, ISSUE_57):
+                    # observed from the materialized kit dir's
+                    # skills/*/SKILL.md names plus OpenCode's built-in, not
+                    # copied from policy; tools are the distinct tool part
+                    # names in this turn's assistant messages (empty on the
+                    # fake and on text-only turns).
                     try:
                         from . import direction as _direction2
+                        from . import kits as _kits2
                         _rroute = meta.get("route") or ((job or {}).get("route") if isinstance(job, dict) else None)
                         _rsize = meta.get("stage") or "implementation"
                         _kn2, _kh2, _sk2 = _direction2.kit_for_invocation(_rroute, _rsize)
-                        result["skills_loaded"] = list(_sk2)
+                        try:
+                            _obs2 = _kits2.observed_skills_for_invocation(
+                                state_dir, request_id, invocation_id)
+                        except Exception:
+                            _obs2 = None
+                        result["skills_loaded"] = list(_obs2) if isinstance(_obs2, list) else list(_sk2)
                         result["kit"] = _kn2
                         result["kit_hash"] = _kh2
                     except Exception:

@@ -8,12 +8,13 @@ the user's own configuration:
 - OpenCode: ``OPENCODE_CONFIG_DIR`` + ``OPENCODE_CONFIG`` point at
   the generated directory, which holds ``kit.json``, ``AGENTS.md``,
   ``opencode.json`` (the kit's MCP subset), ``skills/`` and ``plugins/``
-  equal to the kit. ``XDG_CONFIG_HOME`` is left alone so the owned
-  server's shell sees the same user environment as the user's own shell
-  (``gh``, global git config, and other XDG-aware tools); the OpenCode
-  binary already resolves its global config as ``OPENCODE_CONFIG_DIR ??
-  XDG_CONFIG_HOME/opencode``, so ``OPENCODE_CONFIG_DIR`` alone keeps the
-  user's ``~/.config/opencode`` out.
+  equal to the kit, plus ``xdg-mirror/`` (one symlink per entry of the
+  user's ``~/.config`` except ``opencode``). ``XDG_CONFIG_HOME`` points
+  at ``xdg-mirror/`` so the owned server's shell keeps the user's
+  environment (``gh``, global git config, and other XDG-aware tools)
+  while OpenCode scans no user skills; ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1``
+  disables the ``~/.claude`` and ``~/.agents`` skill roots. ``OPENCODE_CONFIG_DIR``
+  alone keeps the user's ``~/.config/opencode`` out.
 - Codex: ``CODEX_HOME`` points at the generated directory, which holds
   ``kit.json``, ``AGENTS.md``, ``config.toml`` (kit lists plus the installed
   ``[mcp_servers.NAME]`` sections named by the kit), ``mcp.json`` (the kit's
@@ -37,10 +38,18 @@ from pathlib import Path
 
 from . import policy
 
-OPENCODE_KIT_ENV_VARS = ("OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG")
+OPENCODE_KIT_ENV_VARS = ("OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG",
+                           "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS")
 CODEX_KIT_ENV_VAR = "CODEX_HOME"
 CLAUDE_KIT_ENV_VAR = "CLAUDE_CONFIG_DIR"
 GROK_KIT_ENV_VAR = "GROK_HOME"
+
+# Per-kit XDG mirror holding the user's environment without user skills.
+XDG_MIRROR_DIRNAME = "xdg-mirror"
+OPENCODE_DISABLE_EXTERNAL_SKILLS_ENV = "OPENCODE_DISABLE_EXTERNAL_SKILLS"
+# OpenCode's own built-in skill, invocable on every owned-server session
+# beside the kit's skills; recorded in skills_loaded as observed.
+OPENCODE_BUILTIN_SKILLS = ("customize-opencode",)
 
 # Config-directory logins shared by link, never copied. Codex keeps the
 # user's login as ``auth.json`` directly under ``CODEX_HOME``; the Grok kit
@@ -56,6 +65,218 @@ def kit_dir_for(state_dir, request_id: str, invocation_id: str, kit_name: str) -
     safe_req = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(request_id))[:64] or "job"
     safe_inv = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(invocation_id))[:32] or "inv"
     return Path(state_dir) / "kits" / f"{safe_req}.{safe_inv}.{kit_name}"
+
+
+def _user_config_dir() -> Path:
+    """User config directory the XDG mirror reflects.
+
+    ``$XDG_CONFIG_HOME`` when the runner itself runs under one, else
+    ``~/.config``. Read from the process environment at materialization
+    time, so each turn mirrors the current user environment.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if isinstance(xdg, str) and xdg.strip():
+        return Path(os.path.expanduser(xdg.strip()))
+    return Path.home() / ".config"
+
+
+def materialize_xdg_mirror(dest) -> Path:
+    """Build ``xdg-mirror/`` in a kit dir; rebuilt per invocation.
+
+    One symlink per entry of the user's config directory except
+    ``opencode``. Entries added to ``~/.config`` later appear on the next
+    turn; removed entries disappear. Never raises for a missing source:
+    the mirror is then empty (the shell keeps working, only with fewer
+    XDG entries).
+    """
+    dest = Path(dest)
+    mirror = dest / XDG_MIRROR_DIRNAME
+    mirror.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(mirror, 0o700)
+    except OSError:
+        pass
+    source = _user_config_dir()
+    try:
+        src_real = os.path.realpath(str(source))
+        mir_real = os.path.realpath(str(mirror))
+        if src_real == mir_real or src_real.startswith(mir_real + os.sep):
+            return mirror
+    except Exception:
+        pass
+    wanted: dict[str, Path] = {}
+    try:
+        if source.is_dir():
+            for entry in source.iterdir():
+                try:
+                    name = entry.name
+                except Exception:
+                    continue
+                if not isinstance(name, str) or not name or name in (".", ".."):
+                    continue
+                if "/" in name:
+                    continue
+                if name == "opencode":
+                    continue
+                wanted[name] = entry
+    except OSError:
+        wanted = {}
+    try:
+        for child in list(mirror.iterdir()):
+            try:
+                if child.name not in wanted:
+                    if child.is_symlink() or child.is_file():
+                        child.unlink()
+                    elif child.is_dir():
+                        import shutil
+                        shutil.rmtree(child)
+                    else:
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+            except OSError:
+                continue
+    except OSError:
+        pass
+    for name, src in wanted.items():
+        target = mirror / name
+        try:
+            if target.is_symlink():
+                try:
+                    if os.path.realpath(str(target)) == os.path.realpath(str(src)):
+                        continue
+                except OSError:
+                    pass
+                target.unlink()
+            elif target.exists():
+                try:
+                    if target.is_dir():
+                        import shutil
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                except OSError:
+                    continue
+            os.symlink(str(src), str(target))
+        except OSError:
+            continue
+    return mirror
+
+
+def _skill_names_in_dir(skills_dir: Path) -> set[str]:
+    """Skill names from ``skills/*/SKILL.md`` plus file-shaped skills."""
+    names: set[str] = set()
+    try:
+        if not skills_dir.is_dir():
+            return names
+        for child in skills_dir.iterdir():
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    try:
+                        if (child / "SKILL.md").is_file():
+                            names.add(child.name)
+                    except OSError:
+                        continue
+                elif child.is_symlink():
+                    try:
+                        real = Path(os.path.realpath(str(child)))
+                        if real.is_dir():
+                            if (real / "SKILL.md").is_file() or (child / "SKILL.md").is_file():
+                                names.add(child.name)
+                        elif real.is_file():
+                            if child.name.endswith(".md"):
+                                stem = child.name[:-3]
+                                if stem and stem != "SKILL":
+                                    names.add(stem)
+                            else:
+                                names.add(child.name)
+                        else:
+                            if (child / "SKILL.md").is_file():
+                                names.add(child.name)
+                    except OSError:
+                        continue
+                elif child.is_file():
+                    if child.name.endswith(".md"):
+                        stem = child.name[:-3]
+                        if stem and stem != "SKILL":
+                            names.add(stem)
+                    else:
+                        names.add(child.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return names
+
+
+def observed_opencode_skills(kit_dir) -> list[str]:
+    """Observed invocable skills for an owned-server kit dir.
+
+    The kit directory's ``skills/*/SKILL.md`` names plus OpenCode's
+    built-in ``customize-opencode``. Sorted; never raises.
+    """
+    try:
+        names = _skill_names_in_dir(Path(kit_dir) / "skills")
+    except Exception:
+        names = set()
+    for builtin in OPENCODE_BUILTIN_SKILLS:
+        names.add(builtin)
+    return sorted(names)
+
+
+def observed_skills_for_kit_dir(kit_dir) -> list[str] | None:
+    """Observed skills from a materialized kit dir, or None when absent.
+
+    OpenCode kits (holding ``opencode.json``) include the built-in;
+    other kits list only their ``skills/`` directories. None when the
+    kit dir holds no skills directory at all.
+    """
+    try:
+        kit_p = Path(kit_dir)
+    except Exception:
+        return None
+    try:
+        skills_dir = kit_p / "skills"
+        if not skills_dir.is_dir():
+            return None
+    except OSError:
+        return None
+    try:
+        if (kit_p / "opencode.json").is_file():
+            return observed_opencode_skills(kit_p)
+        return sorted(_skill_names_in_dir(skills_dir))
+    except Exception:
+        return None
+
+
+def observed_skills_for_invocation(state_dir, request_id: str,
+                                   invocation_id: str) -> list[str] | None:
+    """Observed skills from an invocation's materialized kit dir, if any."""
+    try:
+        dirs = kit_dirs_for_invocation(state_dir, request_id, invocation_id or "")
+    except Exception:
+        return None
+    for cand in dirs or []:
+        try:
+            kit_file = Path(cand) / "kit.json"
+            if kit_file.is_file():
+                try:
+                    obj = json.loads(kit_file.read_text(encoding="utf-8"))
+                except ValueError:
+                    obj = None
+                if isinstance(obj, dict) and isinstance(obj.get("skills_loaded"), list) \
+                        and all(isinstance(v, str) for v in obj["skills_loaded"]):
+                    return sorted(set(obj["skills_loaded"]))
+        except OSError:
+            pass
+        try:
+            observed = observed_skills_for_kit_dir(cand)
+        except Exception:
+            observed = None
+        if observed is not None:
+            return observed
+    return None
 
 
 def _link_login_files(home, filenames, dest: Path) -> dict:
@@ -159,8 +380,9 @@ def kit_contents_for_ledger(kit_dir) -> dict | None:
     """Kit contents from a materialized kit.json without secrets.
 
     Returns ``{"kit", "hash", "skills", "plugins", "mcp", "auth"}`` with
-    filenames and status only; secret file contents are never read.
-    None when the kit.json is missing or unparsable.
+    filenames and status only, plus ``skills_loaded`` when the kit
+    recorded its observed skills at materialization; secret file contents
+    are never read. None when the kit.json is missing or unparsable.
     """
     try:
         raw = (Path(kit_dir) / "kit.json").read_text(encoding="utf-8")
@@ -186,6 +408,9 @@ def kit_contents_for_ledger(kit_dir) -> dict | None:
         "auth": {"linked": _names(auth.get("linked")),
                  "missing": _names(auth.get("missing"))},
     }
+    if isinstance(obj.get("skills_loaded"), list) \
+            and all(isinstance(v, str) for v in obj["skills_loaded"]):
+        out["skills_loaded"] = _names(obj.get("skills_loaded"))
     return out
 
 
@@ -358,7 +583,13 @@ def _materialize_skills_and_plugins(kit_name: str, kit: dict, dest: Path) -> Non
 
 
 def materialize_opencode_kit(kit_name: str, dest, route: str | None = None) -> Path:
-    """Build the owned-server config directory for a kit. Returns the dir."""
+    """Build the owned-server config directory for a kit. Returns the dir.
+
+    Besides the kit files, builds ``xdg-mirror/`` (one symlink per entry
+    of the user's config directory except ``opencode``, rebuilt on every
+    call) and records the observed ``skills_loaded`` (the kit dir's
+    ``skills/*/SKILL.md`` names plus OpenCode's built-in) in ``kit.json``.
+    """
     kit = policy.kit_for_role(kit_name)
     dest = Path(dest)
     dest.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -397,6 +628,19 @@ def materialize_opencode_kit(kit_name: str, dest, route: str | None = None) -> P
             raise ValueError(f"kit {kit_name}: plugin {plugin!r} is not installed")
         _link_or_copy(src, dest / "plugins" / src.name)
     _write_agentsmd_link(dest / "AGENTS.md")
+    materialize_xdg_mirror(dest)
+    try:
+        loaded = observed_opencode_skills(dest)
+    except Exception:
+        loaded = sorted(set(list(kit.get("skills", [])) + list(OPENCODE_BUILTIN_SKILLS)))
+    try:
+        raw = json.loads((dest / "kit.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if isinstance(raw, dict):
+        raw["skills_loaded"] = list(loaded)
+        raw["xdg_mirror"] = XDG_MIRROR_DIRNAME
+        _secure_write_json(dest / "kit.json", raw)
     return dest
 
 
@@ -538,15 +782,18 @@ def materialize_grok_kit(kit_name: str, dest) -> Path:
 def opencode_kit_env(kit_dir: Path) -> dict:
     """Environment overrides launching the owned server on a kit dir.
 
-    Only ``OPENCODE_CONFIG_DIR`` and ``OPENCODE_CONFIG`` point at the
-    kit; ``XDG_CONFIG_HOME`` is never set so the server inherits the
-    runner's value (the user's shell environment) for ``gh``, git, and
-    every other XDG-aware tool.
+    ``OPENCODE_CONFIG_DIR`` and ``OPENCODE_CONFIG`` point at the kit;
+    ``XDG_CONFIG_HOME`` points at the kit's ``xdg-mirror/`` so the shell
+    keeps the user's environment (``gh``, git, XDG-aware tools) while
+    OpenCode scans no user skills; ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1``
+    disables the ``~/.claude`` and ``~/.agents`` skill roots.
     """
     kit_dir = str(kit_dir)
     return {
         "OPENCODE_CONFIG_DIR": kit_dir,
         "OPENCODE_CONFIG": str(Path(kit_dir) / "opencode.json"),
+        "XDG_CONFIG_HOME": str(Path(kit_dir) / XDG_MIRROR_DIRNAME),
+        OPENCODE_DISABLE_EXTERNAL_SKILLS_ENV: "1",
     }
 
 

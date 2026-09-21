@@ -885,9 +885,13 @@ class OpenCodeServer(Harness):
         (``runner/kits.py``): ``OPENCODE_CONFIG_DIR`` and
         ``OPENCODE_CONFIG`` point at it, so the kit's plugins, skills,
         and MCP subset are allowed and nothing is inherited from the
-        user's OpenCode configuration. ``XDG_CONFIG_HOME`` is left
-        alone, so the server inherits the runner's user environment for
-        ``gh``, git, and every other XDG-aware tool.
+        user's OpenCode configuration. ``XDG_CONFIG_HOME`` points at the
+        kit's ``xdg-mirror/`` (one symlink per user config entry except
+        ``opencode``, rebuilt per invocation) so the shell keeps the
+        user's environment for ``gh``, git, and every other XDG-aware
+        tool while OpenCode scans no user skills;
+        ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1`` disables the ``~/.claude``
+        and ``~/.agents`` roots.
         """
         from . import kits as _kits
 

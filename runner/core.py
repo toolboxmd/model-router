@@ -1610,6 +1610,16 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
         tools_json = json.dumps(tools, sort_keys=True)
     except Exception:
         tools_json = "[]"
+    try:
+        from . import kits as _kits_meas
+        _observed = _kits_meas.observed_skills_for_invocation(
+            state_dir, request_id, invocation_id)
+    except Exception:
+        _observed = None
+    try:
+        _skills_json = json.dumps(_observed, sort_keys=True) if isinstance(_observed, list) else None
+    except Exception:
+        _skills_json = None
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -1624,6 +1634,10 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
             (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
              observed, variant, json.dumps(ids, sort_keys=True) if ids else None,
              store.SCHEMA_VERSION, longest, tools_json, invocation_id))
+        if _skills_json is not None:
+            con.execute(
+                "UPDATE invocations SET skills_json=? WHERE invocation_id=?",
+                (_skills_json, invocation_id))
         # First measurement wins for tools when the row still holds the
         # insert-time empty list; later measures keep observed tools.
         con.execute(
@@ -1672,6 +1686,18 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
                 skills = _sk
             except Exception:
                 skills = []
+        # Observed wins when a materialized kit recorded it: the ledger
+        # reports what the session could actually invoke (the kit dir's
+        # skills/*/SKILL.md names plus OpenCode's built-in on the owned
+        # server), not the policy list.
+        try:
+            from . import kits as _kits_obs
+            _obs = _kits_obs.observed_skills_for_invocation(
+                state_dir, request_id, inv.get("invocation_id") or "")
+            if isinstance(_obs, list):
+                skills = _obs
+        except Exception:
+            pass
         try:
             tools = json.loads(inv.get("tools_json") or "null")
         except ValueError:

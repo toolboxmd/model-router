@@ -37,7 +37,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Dispatch probe | The best-effort Codex rate-limit read before dispatch when due (`account/rateLimits/read` through the app-server first, newest rollout as fallback, else `unknown` with its reason); never blocks dispatch. | pre-dispatch probe |
 | Dispatcher envelope | Luna's action object on the OpenCode-hosted dispatcher: the last complete JSON object of the turn's last assistant message (prose then envelope, optionally fenced), validated as an action; the raw text stays in the ledger, and a missing envelope blocks quoting its first 200 characters. | luna action |
 | Raw shape | The keys-only outline of a probe response that carried no rate record, stored in the reading detail so the parser can be fixed from the ledger; values never travel. | payload outline |
-| Skills loaded | The kit's skills recorded per invocation as what the session may invoke. | loaded plugins |
+| Skills loaded | The observed invocable skills recorded per invocation at materialization: the kit directory's `skills/*/SKILL.md` names plus OpenCode's built-in `customize-opencode` on the owned server, not the policy list. | loaded plugins |
 | Tools called | Distinct tool part names observed in the turn's assistant messages (empty on text-only turns). | tool usage |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |
 | Handoff summary | The durable summary stored on the job at submit (explicit or derived from the task packet) and carried before every callback question; the Astra fallback answers from it in a fresh session with no resume. | handoff note |
