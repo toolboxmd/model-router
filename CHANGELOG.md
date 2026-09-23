@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.25.1] - 2026-09-23
+
+### Changed
+
+- Isolate deterministic proof from host installations and verify pull requests before release
+
 ## [0.25.0] - 2026-09-23
 
 ### Added

@@ -769,9 +769,14 @@ applies them on both worker paths, driven through the harness seam.
 ## Verification
 
 ```
-python -m unittest discover -s tests
-python -m compileall -q runner tests
+python3 scripts/test.py
+python3 -m compileall -q runner scripts tests
 ```
+
+The test entry point creates disposable dependency homes using the suite's fake
+skill, plugin and MCP inventory. It preserves the user's installation and removes
+the fixtures afterward. Pass unittest arguments for a targeted run, for example
+`python3 scripts/test.py tests.test_release`.
 
 The suite uses fake `codex`, `claude`, `opencode`, and `grok` executables shaped like
 the real contracts (`tests/fakes.py`) and real detached processes. The fake
