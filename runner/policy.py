@@ -110,8 +110,10 @@ ZEN_FREE_ASSUMED_REQUESTS = 50
 # conversation at cold-cache prices. The job also carries a durable handoff
 # summary, so a callback can be answered from the ledger alone, including
 # by the Astra fallback planner in a fresh session with no resume.
-# Verified 2026-09-20: `claude -p --resume <sid> "/compact <focus>"`
-# returns local_command compact and persists the summary in the transcript.
+# `claude -p --output-format json --resume <sid> "/compact <focus>"` returns
+# a result with local_command compact and persists the summary in the
+# transcript. Without --output-format json, Claude Code 2.1.280 prints
+# nothing on success (toolboxmd/model-router#71, 2026-09-23).
 COMPACT_FOCUS_TEMPLATE = (
     "job {request_id} (Issue {issue}): keep the decisions and the "
     "proof command, drop the planning noise. "
@@ -1788,7 +1790,7 @@ def render_skill_table() -> str:
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",
         "- After a successful submit with `--start`, the Claude planner session "
-        "compacts headlessly around the job (`claude -p --resume <sid> "
+        "compacts headlessly around the job (`claude -p --output-format json --resume <sid> "
         "\"/compact <focus>\"`, focus from `COMPACT_FOCUS_TEMPLATE` naming the "
         "request id, Issue, decisions, and proof command), recorded as a "
         "`claude_compact` invocation with elapsed time and usage; a compact "

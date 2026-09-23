@@ -81,7 +81,7 @@ summary on the job; without it the summary is derived from the task packet
 ID and payload return the existing job, including the stored summary; a
 changed summary conflicts like any other payload field. After a successful
 submit with `--start`, the Claude planner harness compacts the planner
-session headlessly (`claude -p --resume SID "/compact <focus>"`) with the
+session headlessly (`claude -p --output-format json --resume SID "/compact <focus>"`) with the
 policy focus template naming the job (request id, Issue, decisions, proof
 command), recorded as a `claude_compact` invocation with elapsed time and
 usage; a compact failure is recorded and never blocks the job, and no
@@ -264,7 +264,11 @@ Changing any of them is a policy edit with no state-machine change;
 plugin, or MCP server that is not installed, and the generated skill
 table lists each role's kit. The Codex kit links the user's `auth.json`
 by symlink from the Codex home (honoring `MODEL_ROUTER_CODEX_HOME` and
-`CODEX_HOME` overrides) and the Grok kit links `auth.json` the same way
+`CODEX_HOME` overrides), and its `sessions/` links to one directory per job
+(`<state-dir>/codex-sessions/<request-id>`) shared by every Codex
+invocation of the job, so `codex exec resume` finds the thread its
+dispatch wrote; a rollout left in an earlier kit of the same job is copied
+there before a resume. The Grok kit links `auth.json` the same way
 when the Grok home keeps its login under that filename (recorded as
 missing otherwise); `kit.json` records the linked
 filenames without secrets, and `status`/`result` list the kit contents

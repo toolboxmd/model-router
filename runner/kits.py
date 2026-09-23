@@ -32,8 +32,11 @@ isolates ``claude_callback``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
+import sqlite3
 from pathlib import Path
 
 from . import policy
@@ -359,6 +362,91 @@ def _grok_auth_link(dest: Path) -> dict:
     except Exception:
         return {"linked": [], "missing": list(GROK_AUTH_FILES)}
     return _link_login_files(home, GROK_AUTH_FILES, dest)
+
+
+def _safe_request(request_id: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_"
+                   for c in str(request_id))[:64] or "job"
+
+
+def codex_sessions_dir_for(state_dir, request_id: str) -> Path:
+    """One Codex sessions directory per job, shared by every Codex kit of the
+    job, so a resume finds the rollout its dispatch wrote. Each invocation
+    still gets its own kit directory; only ``sessions/`` is shared. The name
+    carries a hash of the full request id, so two ids that sanitize alike
+    (``a/b`` and ``a_b``) never share a directory."""
+    digest = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
+    return Path(state_dir) / "codex-sessions" / f"{_safe_request(request_id)[:40]}-{digest}"
+
+
+def _job_invocation_ids(state_dir, request_id: str) -> list[str]:
+    """Invocation ids the ledger records for exactly this request id."""
+    db = Path(state_dir) / "jobs.db"
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        try:
+            return [row[0] for row in con.execute(
+                "SELECT invocation_id FROM invocations WHERE request_id=?",
+                (str(request_id),))]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def link_codex_sessions(kit_dir, shared) -> Path:
+    """Point ``<kit_dir>/sessions`` at the job's shared sessions directory.
+
+    A kit that already holds real rollouts (materialized before sessions
+    were shared) keeps them: they are copied into the shared directory
+    before the link replaces the directory.
+    """
+    kit_dir = Path(kit_dir)
+    shared = Path(shared)
+    shared.mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = kit_dir / "sessions"
+    if link.is_symlink():
+        if link.resolve() == shared.resolve():
+            return link
+        link.unlink()
+    elif link.is_dir():
+        shutil.copytree(link, shared, dirs_exist_ok=True)
+        shutil.rmtree(link)
+    link.symlink_to(shared, target_is_directory=True)
+    return link
+
+
+def adopt_codex_thread(state_dir, request_id: str, thread_id: str, shared) -> Path | None:
+    """Make a thread's rollout available in the shared sessions directory.
+
+    A job dispatched before sessions were shared wrote its rollout into the
+    dispatch invocation's own kit; copy it so the resume finds it. The
+    earlier kit keeps its copy as evidence. Returns the rollout path, or
+    None when no kit of the job holds the thread.
+    """
+    if not thread_id:
+        return None
+    shared = Path(shared)
+    pattern = f"rollout-*-{thread_id}.jsonl"
+    for path in shared.rglob(pattern):
+        return path
+    # Only kits of this job's own invocations: a kit directory name is
+    # derived from the sanitized request id, which other ids can share.
+    kits = []
+    for invocation_id in _job_invocation_ids(state_dir, request_id):
+        kits.extend(kit_dirs_for_invocation(state_dir, request_id, invocation_id))
+    for kit in sorted(set(kits)):
+        sessions = kit / "sessions"
+        if sessions.is_symlink() or not sessions.is_dir():
+            continue
+        for path in sorted(sessions.rglob(pattern)):
+            dest = shared / path.relative_to(sessions)
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+            return dest
+    return None
 
 
 def kit_dirs_for_invocation(state_dir, request_id: str, invocation_id: str) -> list[Path]:

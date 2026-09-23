@@ -1,8 +1,9 @@
 """Issue #38: compact the planner session at handoff, durable handoff summary.
 
 Stdlib only, no live CLIs. The fake Claude CLI (tests/fakes.py) emulates
-the verified headless shape `claude -p --resume <sid> "/compact <focus>"`
-returning local_command compact.
+the verified headless shape `claude -p --output-format json --resume <sid>
+"/compact <focus>"` returning local_command compact, and prints nothing in
+text mode as Claude Code 2.1.280 does.
 """
 import json
 import os
@@ -115,8 +116,9 @@ class CompactAfterSubmit(Base):
         def fake_compact(cmd, cwd=None, timeout=120, **kw):
             calls.append((list(cmd), dict(kw.get("meta") or {})))
             sid = cmd[cmd.index("--resume") + 1]
-            self.assertEqual(cmd[:4], ["claude", "-p", "--resume", sid])
-            self.assertEqual(len(cmd), 5)
+            self.assertEqual(cmd[:2], ["claude", "-p"])
+            self.assertEqual(cmd[cmd.index("--output-format") + 1], "json")
+            self.assertTrue(cmd[-1].startswith("/compact "))
             return 0, claude_compact_out(sid), ""
 
         task = {"goal": "fix typo", "issue": "38",
@@ -309,8 +311,12 @@ class PolicyData(Base):
 
     def test_compact_cmd_and_parse(self):
         cmd = adapters.build_claude_compact_cmd("sid-1", "focus words")
-        self.assertEqual(cmd, ["claude", "-p", "--resume", "sid-1",
-                               "/compact focus words"])
+        # Headless, JSON result, the exact saved session, one prefix last.
+        self.assertEqual(cmd[:2], ["claude", "-p"])
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "json")
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "sid-1")
+        self.assertNotIn("--fork-session", cmd)
+        self.assertEqual(cmd[-1], "/compact focus words")
         self.assertEqual(cmd[-1].count("/compact"), 1)
         # The builder owns the single prefix: a caller-carried copy is
         # dropped, never doubled.
@@ -323,6 +329,12 @@ class PolicyData(Base):
         ok = adapters.parse_claude_compact_result(claude_compact_out("sid-1"))
         self.assertTrue(ok["ok"])
         self.assertEqual(ok["session_id"], "sid-1")
+        live = adapters.parse_claude_compact_result(json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Compacted.", "local_command": "compact",
+            "session_id": "sid-1", "num_turns": 0}))
+        self.assertTrue(live["ok"])
+        self.assertFalse(adapters.parse_claude_compact_result("")["ok"])
         bad = adapters.parse_claude_compact_result("not json")
         self.assertFalse(bad["ok"])
         with self.assertRaises(ValueError):

@@ -269,6 +269,19 @@ def _kit_state_dir(inv):
     return None
 
 
+def _codex_resume_thread(inv) -> str | None:
+    """Thread id a ``codex exec resume <thread>`` invocation resumes."""
+    if (inv or {}).get("kind") != KIND_CODEX_RESUME:
+        return None
+    try:
+        cmd = json.loads((inv or {}).get("cmd_json") or "[]")
+    except ValueError:
+        return None
+    if isinstance(cmd, list) and len(cmd) >= 4 and cmd[1:3] == ["exec", "resume"]:
+        return str(cmd[3])
+    return None
+
+
 def _kit_name_for_inv(inv, default: str | None = None) -> str | None:
     meta = _kit_meta(inv)
     route = meta.get("route")
@@ -313,6 +326,13 @@ class CodexCLI(Harness):
             invocation_id = str((inv or {}).get("invocation_id") or "inv")
             kit_dir = _kits.kit_dir_for(str(state_dir), request_id, invocation_id, kit_name)
             _kits.materialize_codex_kit(kit_name, kit_dir)
+            # Every Codex invocation of the job shares one sessions
+            # directory, so a resume finds the thread its dispatch wrote.
+            shared = _kits.codex_sessions_dir_for(str(state_dir), request_id)
+            _kits.link_codex_sessions(kit_dir, shared)
+            thread = _codex_resume_thread(inv)
+            if thread:
+                _kits.adopt_codex_thread(str(state_dir), request_id, thread, shared)
             env.update(_kits.codex_kit_env(kit_dir))
         return env, None
 
