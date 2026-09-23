@@ -56,9 +56,12 @@ not grant delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
 ## Automatic releases
 
 A `VERSION` change merged into `main` starts the [release workflow](.github/workflows/release.yml).
-It runs the complete deterministic test suite and validates the exact commit
-with released AgentsMD versionctl before creating an annotated tag and stable
-GitHub Release. `.version-policy.json` authorizes this through
+It runs the same complete deterministic proof used for pull requests, then
+validates the exact commit with released AgentsMD versionctl before creating an
+annotated tag and stable GitHub Release. Tests use disposable dependency homes;
+they require no installed agent plugins or credentials. Pull-request proof has
+read-only permissions; only the main-branch publishing job can write releases.
+`.version-policy.json` authorizes this through
 `githubReleasePolicy: on-version-commit`.
 Release runs queue instead of replacing waiting runs, up to GitHub's limit of
 100 pending runs.
