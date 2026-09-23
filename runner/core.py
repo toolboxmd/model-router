@@ -2127,7 +2127,7 @@ def _default_compact_run(cmd: list[str], cwd: str | None = None,
 def compact_planner_session(state_dir, request_id: str, run_cmd=None) -> dict:
     """Compact the planner session headlessly after submit with --start.
 
-    Runs ``claude -p --resume SID "/compact <focus>"`` with the policy
+    Runs ``claude -p --output-format json --resume SID "/compact <focus>"`` with the policy
     focus template naming the job (request id, Issue, decisions, proof
     command), recorded as a ``claude_compact`` invocation with elapsed
     time and usage. A compact failure is recorded and never blocks the

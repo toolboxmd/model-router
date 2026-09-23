@@ -410,12 +410,16 @@ sid = argv[argv.index("--resume") + 1]
 import time
 time.sleep(float(os.environ.get("FAKE_CLAUDE_DELAY", "0")))
 if is_compact:
-    # Headless `claude -p --resume <sid> "/compact <focus>"` shape: the
-    # live CLI returns local_command compact and persists the summary.
+    # Headless `claude -p --output-format json --resume <sid> "/compact
+    # <focus>"` shape: the live CLI returns local_command compact and
+    # persists the summary. Like Claude Code 2.1.280, text mode prints
+    # nothing on success.
     cmode = os.environ.get("FAKE_CLAUDE_COMPACT_MODE", "ok")
     if cmode == "fail":
         sys.stderr.write("compact failed\n")
         sys.exit(1)
+    if "--output-format" not in argv or argv[argv.index("--output-format") + 1] != "json":
+        sys.exit(0)
     if cmode == "fork":
         sid = "00000000-0000-4000-8000-000000000000"
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False,

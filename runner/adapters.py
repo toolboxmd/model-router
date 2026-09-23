@@ -485,7 +485,8 @@ def build_claude_cmd(planner_session_id: str, prompt: str,
 def build_claude_compact_cmd(planner_session_id: str, focus: str) -> list[str]:
     """Headless post-submit compaction of the exact saved planner session.
 
-    ``claude -p --resume SID "/compact <focus>"`` compacts the session
+    ``claude -p --output-format json --resume SID "/compact <focus>"``
+    compacts the session
     around the submitted job (request id, Issue, decisions, proof command)
     so a later callback resumes a small context. Never forks a new
     session; a missing session is a caller error so the failure is
@@ -502,12 +503,14 @@ def build_claude_compact_cmd(planner_session_id: str, focus: str) -> list[str]:
         stripped = stripped[len("/compact"):].strip()
     if not stripped:
         raise ValueError("missing compaction focus")
-    return [CLAUDE_BIN, "-p", "--resume", planner_session_id,
-            "/compact " + stripped]
+    # JSON output is required: in text mode a successful compaction prints
+    # nothing, which cannot be told apart from a failure.
+    return [CLAUDE_BIN, "-p", "--output-format", "json", "--resume",
+            planner_session_id, "/compact " + stripped]
 
 
 def parse_claude_compact_result(stdout: str) -> dict:
-    """Parse the headless ``claude -p --resume SID "/compact ..."`` result.
+    """Parse the headless ``claude -p --output-format json --resume SID "/compact ..."`` result.
 
     Returns ``{ok, session_id, error}``. Only a ``result`` object with
     ``is_error`` false from a session counts: the verified live shape
