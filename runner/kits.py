@@ -39,7 +39,8 @@ from pathlib import Path
 from . import policy
 
 OPENCODE_KIT_ENV_VARS = ("OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG",
-                           "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS")
+                           "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+                           "OPENCODE_DISABLE_PROJECT_CONFIG")
 CODEX_KIT_ENV_VAR = "CODEX_HOME"
 CLAUDE_KIT_ENV_VAR = "CLAUDE_CONFIG_DIR"
 GROK_KIT_ENV_VAR = "GROK_HOME"
@@ -786,7 +787,9 @@ def opencode_kit_env(kit_dir: Path) -> dict:
     ``XDG_CONFIG_HOME`` points at the kit's ``xdg-mirror/`` so the shell
     keeps the user's environment (``gh``, git, XDG-aware tools) while
     OpenCode scans no user skills; ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1``
-    disables the ``~/.claude`` and ``~/.agents`` skill roots.
+    disables the ``~/.claude`` and ``~/.agents`` skill roots. Project-local
+    config and Skills are disabled too; otherwise OpenCode merges the target
+    workspace's MCP and Skills into this kit despite the isolated config dir.
     """
     kit_dir = str(kit_dir)
     return {
@@ -794,6 +797,7 @@ def opencode_kit_env(kit_dir: Path) -> dict:
         "OPENCODE_CONFIG": str(Path(kit_dir) / "opencode.json"),
         "XDG_CONFIG_HOME": str(Path(kit_dir) / XDG_MIRROR_DIRNAME),
         OPENCODE_DISABLE_EXTERNAL_SKILLS_ENV: "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
     }
 
 

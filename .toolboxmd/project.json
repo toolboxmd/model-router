@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/toolboxmd/marketplace/v0.3.0/schemas/project-record-v1.schema.json",
+  "id": "model-router",
+  "kind": "agent-module",
+  "outcome": "Complete authorized software work through one durable routing policy that selects subscription capacity and returns the target project's proof.",
+  "factSources": {
+    "version": "VERSION",
+    "delivery": {
+      "codex": ".codex-plugin/plugin.json",
+      "claude-code": ".claude-plugin/plugin.json",
+      "grok-build": ".grok-plugin/plugin.json"
+    },
+    "skills": ["skills/model-routing/SKILL.md"],
+    "documentation": ["README.md", "RUNNER.md"],
+    "requirements": ["RUNNER.md"],
+    "proof": ["tests/test_distribution.py", "tests/test_project_isolation.py", "tests/test_supply52.py", "tests/test_policy_v2.py"]
+  }
+}

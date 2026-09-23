@@ -534,7 +534,7 @@ class ProbeJoins(unittest.TestCase):
         self.assertTrue(readings)
         sd, _ = fresh_state(self)
         self._store_all(sd, readings)
-        for route in ("fable-5.1/max", "opus-5/high"):
+        for route in ("fable-5.1/max", "opus-5.5/high"):
             self.assertIn(route, core.exhausted_routes(sd), route)
 
     def test_grok_monthly_joins_both_xai_routes_not_go(self):

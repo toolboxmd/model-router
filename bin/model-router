@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Run the runtime shipped beside this launcher, from any working directory."""
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+if sys.argv[1:] == ["--version"]:
+    print((ROOT / "VERSION").read_text(encoding="utf-8").strip())
+else:
+    from runner.cli import main
+
+    raise SystemExit(main())

@@ -464,7 +464,7 @@ class TestQuotaClassification(Base):
 
     def test_non_implementation_routes_rejected_at_submit(self):
         for route in ("luna-max-review", "luna-go/max", "luna/max",
-                      "fable-5.1/max", "opus-5/high-review", "astra/medium"):
+                      "fable-5.1/max", "opus-5.5/high-review", "astra/medium"):
             with self.assertRaises(ValueError):
                 core.submit(self.sd, "r-" + route.replace("/", "-"), {"g": 1}, self.ws(), "p", route=route)
 

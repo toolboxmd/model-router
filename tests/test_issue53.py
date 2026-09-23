@@ -95,6 +95,7 @@ class TestNoXdgShadow(unittest.TestCase):
             "OPENCODE_CONFIG": str(dest / "opencode.json"),
             "XDG_CONFIG_HOME": str(dest / "xdg-mirror"),
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         })
         mirror = dest / "xdg-mirror"
         self.assertTrue(mirror.is_dir())

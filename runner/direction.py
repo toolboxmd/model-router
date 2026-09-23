@@ -186,6 +186,22 @@ def project_agentsmd(workspace: str | None) -> tuple[str | None, str | None]:
     return None, None
 
 
+def project_instructions(workspace: str | None) -> str:
+    """Applicable AGENTS.md files, from repository root to the workspace."""
+    if not workspace:
+        return ""
+    directory = Path(workspace).resolve()
+    ancestors = [directory, *directory.parents]
+    root = next((path for path in ancestors if (path / ".git").exists()), directory)
+    applicable = ancestors[:ancestors.index(root) + 1]
+    parts = []
+    for path in reversed(applicable):
+        ag_path, content = project_agentsmd(str(path))
+        if ag_path and content:
+            parts.append(f"Project AGENTS.md ({ag_path}):\n{content.rstrip()}")
+    return "\n\n".join(parts)
+
+
 def core_link_text(payload: dict | None) -> str | None:
     """Human-readable core instruction link from the loader payload."""
     if not isinstance(payload, dict):
@@ -374,9 +390,9 @@ def session_input(original: str, workspace: str | None, harness: str | None,
       instruction link and the project's own AGENTS.md when present, then
       the original prompt.
     - ``hook`` (Codex, Claude, Grok, or an owned-OpenCode kit naming the
-      direction plugin, loader ok): the original prompt unchanged; the
-      host hook supplies the block. The hash still comes from the runner's
-      own loader read.
+      direction plugin, loader ok): the host hook supplies the block. The
+      hash still comes from the runner's own loader read. OpenCode also
+      receives the workspace AGENTS.md because project discovery is disabled.
     - ``none`` (loader missing/failed): the fallback naming the three
       files plus the original prompt on the owned server; unchanged
       elsewhere. The job continues.
@@ -386,6 +402,12 @@ def session_input(original: str, workspace: str | None, harness: str | None,
     ok = bool(direction.get("ok") and direction.get("block"))
     supply = supply_for_harness(harness, ok, kit_name, kit_plugins)
     base = original or ""
+    if (harness or "") in RUNNER_HOSTS and supply != "runner":
+        # The isolation flag suppresses OpenCode's root instruction discovery.
+        # The direction hook owns the triad, not the project's AGENTS.md.
+        instructions = project_instructions(workspace)
+        if instructions:
+            base = instructions + "\n\n" + base
     if supply == "hook":
         return base, {"supply": supply,
                       "block_hash": block_hash(direction.get("block")),
@@ -395,13 +417,13 @@ def session_input(original: str, workspace: str | None, harness: str | None,
         block = direction.get("block") or ""
         digest = block_hash(block)
         link = core_link_text(direction.get("payload"))
-        ag_path, ag_content = project_agentsmd(workspace)
+        instructions = project_instructions(workspace)
         parts = [f"PROJECT DIRECTION (status={direction.get('status')}, hash={digest}):",
                  block]
         if link:
             parts.append(f"Core instructions: {link}")
-        if ag_path and ag_content:
-            parts.append(f"Project AGENTS.md ({ag_path}):\n{ag_content.rstrip()}")
+        if instructions:
+            parts.append(instructions)
         parts.append("END PROJECT DIRECTION.")
         return "\n\n".join(parts) + "\n\n" + base, {
             "supply": supply, "block_hash": digest,

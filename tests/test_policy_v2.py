@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -36,6 +37,12 @@ class PolicyData(unittest.TestCase):
         models = {s["model"].split("/", 1)[-1].removesuffix("-free") for s in policy.ROUTES.values()}
         self.assertFalse(models & set(policy.EXCLUDED_MODELS))
         self.assertNotIn("gpt-5.6-sol", models)
+
+    def test_superseded_native_opus_is_rejected(self):
+        route = policy.STAGES["review_final"]["routes"][0]
+        with patch.dict(policy.ROUTES[route], model="claude-opus-5"):
+            self.assertTrue(any("excluded older generation claude-opus-5" in problem
+                                for problem in policy.validate_policy()))
 
     def test_never_implementers_absent_from_lanes(self):
         lane_routes = set(policy.implementation_routes()) | set(policy.stage_routes("correction"))
@@ -119,17 +126,17 @@ class PolicyData(unittest.TestCase):
         # Planner and review fallback routes on other subscriptions.
         self.assertEqual(s["planning"]["routes"], ["fable-5.1/max", "astra/max"])
         self.assertEqual(s["planner_rungs"]["executor"], "planner")
-        self.assertEqual(s["planner_rungs"]["routes"], ["astra/medium", "opus-5/high"])
+        self.assertEqual(s["planner_rungs"]["routes"], ["astra/medium", "opus-5.5/high"])
         self.assertTrue(s["planner_rungs"]["planner_selects"])
         self.assertTrue(policy.ROUTES["astra/medium"]["planner_chosen"])
-        self.assertTrue(policy.ROUTES["opus-5/high"]["planner_chosen"])
+        self.assertTrue(policy.ROUTES["opus-5.5/high"]["planner_chosen"])
         self.assertEqual(policy.ROUTES["astra/max"]["model"], "gpt-6-astra")
         self.assertEqual(policy.ROUTES["astra/max"]["pool"], "codex")
-        self.assertEqual(policy.ROUTES["opus-5/high"]["harness"], "claude")
+        self.assertEqual(policy.ROUTES["opus-5.5/high"]["harness"], "claude")
         self.assertEqual(s["review_ticket"]["routes"], ["luna-max-review", "luna-go-review"])
         self.assertEqual(policy.ROUTES["luna-go-review"]["agent"], "plan")
         self.assertEqual(s["review_final"]["routes"],
-                         ["opus-5/high-review", "astra/high-review", "luna-max-review"])
+                         ["opus-5.5/high-review", "astra/high-review", "luna-max-review"])
         self.assertEqual(s["review_final"]["executor"], "host")
         self.assertEqual(s["critical"]["executor"], "planner")
         self.assertEqual(s["critical"]["routes"], [])
@@ -235,7 +242,7 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(on_disk, rendered, "run policy.main(['render-skill']) and commit the result")
         self.assertNotIn("sol", rendered.lower())
         self.assertIn("critical", rendered)
-        self.assertIn("python -m runner submit", rendered)
+        self.assertIn("<plugin-root>/bin/model-router submit", rendered)
         self.assertEqual(policy.main(["validate"]), 0)
 
     def test_signal_classes(self):

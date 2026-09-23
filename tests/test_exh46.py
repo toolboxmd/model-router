@@ -14,6 +14,7 @@ and completes.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sys
@@ -26,12 +27,19 @@ sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, harnesses, policy  # noqa: E402
 
+# Keep the recorded refusal shape, but project its reset into the future.
+# A fixed live date expires because the parser rejects text older than a day.
+_RESET = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).replace(
+    hour=9, minute=51, second=0, microsecond=0)
+_DAY_SUFFIX = "th" if 10 < _RESET.day % 100 < 14 else {1: "st", 2: "nd", 3: "rd"}.get(_RESET.day % 10, "th")
+_RESET_TEXT = f"{_RESET:%b} {_RESET.day}{_DAY_SUFFIX}, {_RESET.year} 9:51 AM"
+LIVE_RESET_ISO = _RESET.isoformat()
+LIVE_RESET_Z = LIVE_RESET_ISO.replace("+00:00", "Z")
 LIVE_USAGE_MESSAGE = (
     "You've hit your usage limit. Visit "
     "https://chatgpt.com/codex/settings/usage to purchase more credits "
-    "or try again at Sep 22nd, 2026 9:51 AM."
+    f"or try again at {_RESET_TEXT}."
 )
-LIVE_RESET_ISO = "2026-09-22T09:51:00+00:00"
 
 
 def fresh_state(testcase, request_id="e46-1"):
@@ -145,15 +153,14 @@ class TestUsageLimitClassification(unittest.TestCase):
             {"type": "item.completed",
              "item": {"type": "error", "code": "UsageLimitExceeded",
                       "message": "quota hit",
-                      "resets_at": "2026-09-22T09:51:00Z"}},
+                      "resets_at": LIVE_RESET_Z}},
         )
         self.assertEqual(policy.classify_signal({"name": "UsageLimitExceeded"}),
                          "exhausted")
         signal, evidence = h.dispatch_limit_signal(out, "", None, 1)
         self.assertEqual(signal, "exhausted")
         self.assertEqual(evidence["code"], "UsageLimitExceeded")
-        self.assertEqual(policy.parse_provider_reset(evidence),
-                         "2026-09-22T09:51:00+00:00")
+        self.assertEqual(policy.parse_provider_reset(evidence), LIVE_RESET_ISO)
 
     def test_error_item_ratelimit_with_resets_at(self):
         h = harnesses.harness_named("codex")
@@ -162,7 +169,7 @@ class TestUsageLimitClassification(unittest.TestCase):
             {"type": "item.completed",
              "item": {"type": "error", "code": "RateLimitExceeded",
                       "message": "slow down",
-                      "resets_at": "2026-09-22T09:51:00Z"}},
+                      "resets_at": LIVE_RESET_Z}},
         )
         signal, evidence = h.dispatch_limit_signal(out, "", None, 1)
         self.assertEqual(signal, "exhausted")
@@ -219,7 +226,7 @@ class TestUsageLimitClassification(unittest.TestCase):
         self.assertEqual(
             policy._human_reset_in_text(
                 "or try again at Sep 22nd, 2026 9:51 AM.", now),
-            LIVE_RESET_ISO)
+            "2026-09-22T09:51:00+00:00")
         self.assertIsNone(policy._human_reset_in_text("no date here", now))
         self.assertIsNone(policy._human_reset_in_text(
             "Sep 22nd, 2026 9:51 AM", now + 10 * 86400))
@@ -263,7 +270,7 @@ class TestDispatchExhaustionFallback(unittest.TestCase):
             {"type": "item.completed",
              "item": {"type": "error", "code": "UsageLimitExceeded",
                       "message": "quota hit",
-                      "resets_at": "2026-09-22T09:51:00Z"}},
+                      "resets_at": LIVE_RESET_Z}},
         )
         res = controller.dispatch(sd, "e46-d2",
                                   run_cmd=combined_run(out),
@@ -333,7 +340,7 @@ class TestCodexProbeAppServer(unittest.TestCase):
             "primary": {"usedPercent": 12.0, "windowDurationMins": 300,
                         "resetsAt": "2026-09-21T03:00:00Z"},
             "secondary": {"usedPercent": 61.0, "windowDurationMins": 10080,
-                          "resetsAt": "2026-09-22T09:51:00Z"},
+                          "resetsAt": LIVE_RESET_Z},
             "planType": "plus"},
             "rateLimitsByLimitId": {}}
 

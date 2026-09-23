@@ -309,7 +309,7 @@ class TestKitSupplyLabels(unittest.TestCase):
 
 
 class TestOwnedServerDriveKitSupply(unittest.TestCase):
-    def _drive(self, kit_name, block=None, reason="loader missing"):
+    def _drive(self, kit_name, block=None, reason="loader missing", nested=False):
         from runner import supervisor as supervisor_mod
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
@@ -318,6 +318,11 @@ class TestOwnedServerDriveKitSupply(unittest.TestCase):
         ws = base / "ws"
         ws.mkdir()
         (ws / "AGENTS.md").write_text("# workspace agents: WORKSPACE_MARKER_52\n")
+        if nested:
+            subprocess.run(["git", "init", "-q", str(ws)], check=True)
+            ws = ws / "subproject"
+            ws.mkdir()
+            (ws / "AGENTS.md").write_text("# closer instructions: NESTED_MARKER_52\n")
         core.submit(sd, "drive52", {"goal": "x"}, str(ws), "pl")
         con = store.connect(sd)
         try:
@@ -420,11 +425,29 @@ class TestOwnedServerDriveKitSupply(unittest.TestCase):
         self.assertNotIn(direction.BLOCK_START, prompt)
         self.assertNotIn(direction.BLOCK_END, prompt)
         self.assertNotIn("END PROJECT DIRECTION", prompt)
-        self.assertNotIn("WORKSPACE_MARKER_52", prompt)
+        self.assertEqual(prompt.count("WORKSPACE_MARKER_52"), 1)
         self.assertTrue(prompt.rstrip().endswith("do work"))
         self.assertEqual(row["supply"], "hook")
         self.assertEqual(row["direction_hash"], direction.block_hash(block))
         self.assertEqual(row["direction_status"], "ready")
+
+    def test_loader_gap_still_supplies_workspace_instructions(self):
+        result, captured, row = self._drive("worker", reason="loader missing")
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(captured["prompt"].count("WORKSPACE_MARKER_52"), 1)
+        self.assertEqual(row["supply"], "none")
+        self.assertEqual(row["direction_status"], "gap")
+
+    def test_nested_workspace_receives_parent_and_closer_instructions(self):
+        block = direction.BLOCK_START + json.dumps({"status": "ready"}) + direction.BLOCK_END
+        for kit in ("worker", "planner"):
+            with self.subTest(kit=kit):
+                result, captured, row = self._drive(kit, block=block, nested=True)
+                self.assertTrue(result.get("ok"), result)
+                prompt = captured["prompt"]
+                self.assertEqual(prompt.count("WORKSPACE_MARKER_52"), 1)
+                self.assertEqual(prompt.count("NESTED_MARKER_52"), 1)
+                self.assertLess(prompt.index("WORKSPACE_MARKER_52"), prompt.index("NESTED_MARKER_52"))
 
     def test_runner_kit_prompt_carries_block(self):
         payload = {

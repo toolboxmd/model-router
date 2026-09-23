@@ -3,30 +3,44 @@
 A small local runner that accepts prepared work from a Claude planner, hands
 it to a persistent Codex Luna dispatcher, and returns questions and
 completion without depending on the planner process staying open. Python
-standard library only. No services, plugins, dependencies, or network
+standard library only. No additional services, runtime dependencies, or network
 listeners beyond one owned loopback OpenCode server per implementation turn.
 
 AgentsMD and the target project own workflow, authority, proof, and review.
 The runner persists the handoff, owns child processes, and follows one
 versioned route policy. It cannot grant new authority.
 
+## Requirements
+
+Use Python 3.11 or newer, Git, and authenticated harness CLIs for the routes you
+intend to execute. Keep the full Model Router plugin together. Install AgentsMD
+and the Skills, plugins, and MCP integrations named by the selected role kit;
+missing dependencies block that dispatch. No credentials ship in this package.
+The current planner callback requires an existing Claude Code session.
+
 ## Public CLI
 
+Set `MODEL_ROUTER_ROOT` to the installed plugin's real root. Its launcher resolves
+its bundled runtime without changing the caller's working directory, so relative
+task files and workspace paths keep their meaning. State belongs outside the
+plugin cache. `python -m runner` remains available from a source checkout for
+development.
+
 ```
-python -m runner --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
   --workspace PATH --planner-session SID [--planner-cwd PATH] \
   [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
   [--timeout-secs S] [--job-kind ordinary|experiment|replay] [--replay-of ID] \
   [--planner-harness claude] [--handoff-summary TEXT | --handoff-summary-file F] \
   [--start | --no-start]
-python -m runner --state-dir DIR start --request-id ID
-python -m runner --state-dir DIR status --request-id ID
-python -m runner --state-dir DIR questions --request-id ID [--all | --clear QID]
-python -m runner --state-dir DIR answer --request-id ID --qid Q --answer TEXT
-python -m runner --state-dir DIR cancel --request-id ID
-python -m runner --state-dir DIR recover (--request-id ID | --all)
-python -m runner --state-dir DIR result --request-id ID
-python -m runner --state-dir DIR capacity [--clear ROUTE]
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR start --request-id ID
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR status --request-id ID
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR questions --request-id ID [--all | --clear QID]
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR answer --request-id ID --qid Q --answer TEXT
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR cancel --request-id ID
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR recover (--request-id ID | --all)
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR result --request-id ID
+"$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR capacity [--clear ROUTE]
 ```
 
 `submit` commits the task, workspace claim, policy identity, planner session,
@@ -171,7 +185,7 @@ the xAI subscription, then OpenCode's xAI provider; those pool moves are not
 second escalations; recovery never reuses a rung the job already ran, and
 when every rung was used the job blocks with `recovery_exhausted`). After
 the escalation the evidence returns to the planner, which may itself choose
-a rung from the policy's planner-chosen rungs (Astra medium on Codex, Opus 5
+a rung from the policy's planner-chosen rungs (Astra medium on Codex, Opus 5.5
 high on the Claude harness) and run it in its own session; the runner never
 selects those automatically. A fourth failure ends the job as `failed` with
 `ESCALATION_EXHAUSTED` and
@@ -679,13 +693,13 @@ Codex; Sonnet medium only as the explicit live-test override), dispatch (Luna
 max on Codex read-only first; `luna-go/max` on Go in OpenCode plan mode as the
 recorded fallback; Terra max is a manual-only option), the implementation
 lanes default, small, and hard, planner-chosen rungs (Astra medium on Codex,
-Opus 5 high on the Claude harness; the planner itself chooses and runs them),
+Opus 5.5 high on the Claude harness; the planner itself chooses and runs them),
 critical
 (planner-executed), correction (Kimi K2.7 Code after the same session), recovery
 (Grok 4.6 on Go, then native Grok Build on the xAI subscription, then
 OpenCode's xAI provider; pool moves inside recovery are not second
 escalations; recovery skips rungs the job already used), ticket review (Luna max on Codex, then Luna on OpenCode Go in plan
-mode), and final review (Opus 5 high on the Claude harness, then Astra high
+mode), and final review (Opus 5.5 high on the Claude harness, then Astra high
 on Codex, then Luna max). Worker pools in order: Zen free, Go, xAI;
 subscription logins only. The default lane carries the full Go implementer
 chain in intelligence order: Muse xhigh on Zen free, Muse xhigh on Go, GLM
@@ -761,3 +775,14 @@ free-to-Go transfer through this runner, and recovery routes. Known limits:
 an interactive planner that is open but idle, without the session ID in its
 arguments, is not detectable as busy; OpenCode does not confine Bash at the
 OS level; any process running as the same user can read the state directory.
+
+Project-local OpenCode configuration and Skills are disabled on owned servers
+with `OPENCODE_DISABLE_PROJECT_CONFIG=1`. The kit remains the source of allowed
+Skills and MCP configuration. The flag also suppresses root instruction
+discovery, so the runner supplies applicable `AGENTS.md` files from the repository
+root through the workspace in each OpenCode input, including when the direction
+loader fails. The AgentsMD hook continues
+to supply Project Direction. The `skills_loaded` materialization
+inventory describes kit files and the known built-in Skill; it does not count
+which Skills the model invoked. The optional local discovery regression checks
+the installed OpenCode binary without sending a model request.
