@@ -120,8 +120,7 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(s["correction"]["routes"], ["kimi-k2.7-code-go"])
         self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"])
         self.assertEqual(s["dispatch"]["routes"], ["luna/max", "luna-go/max"])
-        self.assertEqual(s["dispatch"]["manual"], ["terra/max"])
-        self.assertTrue(policy.ROUTES["terra/max"]["manual"])
+        self.assertNotIn("manual", s["dispatch"])
         self.assertEqual(policy.ROUTES["luna-go/max"]["agent"], "plan")
         # Planner and review fallback routes on other subscriptions.
         self.assertEqual(s["planning"]["routes"], ["fable-5.1/max", "astra/max"])
@@ -148,7 +147,7 @@ class PolicyData(unittest.TestCase):
                 self.assertFalse(policy.ROUTES[route].get("planner_chosen"), (stage, route))
                 self.assertFalse(policy.ROUTES[route].get("manual"), (stage, route))
         for route in policy.implementation_routes() + policy.stage_routes("correction"):
-            self.assertNotEqual(policy.route_spec(route).get("variant"), "terra")
+            self.assertFalse(policy.route_spec(route).get("manual"))
 
     def test_route_params_and_pool_moves(self):
         self.assertEqual(policy.opencode_route_params("glm-5.3-flash-go"),
@@ -542,7 +541,7 @@ class ValidateFixes(unittest.TestCase):
     def test_guarded_route_in_lane_recovery_or_dispatch_fails(self):
         orig_routes = list(policy.STAGES["implementation_default"]["routes"])
         try:
-            policy.STAGES["implementation_default"]["routes"] = orig_routes + ["terra/max"]
+            policy.STAGES["implementation_default"]["routes"] = orig_routes + ["astra/medium"]
             problems = policy.validate_policy()
             self.assertTrue(any("implementation_default" in p and "never" in p for p in problems),
                             problems)
@@ -550,7 +549,7 @@ class ValidateFixes(unittest.TestCase):
             policy.STAGES["implementation_default"]["routes"] = orig_routes
         orig_rec = list(policy.STAGES["recovery"]["routes"])
         try:
-            policy.STAGES["recovery"]["routes"] = orig_rec + ["terra/max"]
+            policy.STAGES["recovery"]["routes"] = orig_rec + ["astra/medium"]
             problems = policy.validate_policy()
             self.assertTrue(any("recovery" in p and "never" in p for p in problems), problems)
         finally:
