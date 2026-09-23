@@ -416,14 +416,7 @@ def kit_contents_for_ledger(kit_dir) -> dict | None:
 
 
 def _find_skill_source(name: str) -> Path | None:
-    for root in policy._skill_search_roots():
-        for cand in (root / name, root / f"{name}.md"):
-            try:
-                if cand.is_dir() or cand.is_file():
-                    return cand
-            except OSError:
-                continue
-    return None
+    return policy.skill_source(name)
 
 
 def _find_plugin_source(name: str) -> Path | None:
@@ -477,7 +470,7 @@ def _link_or_copy(src: Path, dest: Path) -> None:
         data = src.read_bytes()
         dest.write_bytes(data)
     try:
-        os.chmod(dest, 0o600)
+        os.chmod(dest, 0o700 if src.is_dir() else 0o600)
     except OSError:
         pass
 
@@ -571,10 +564,20 @@ def _installed_codex_mcp_blocks() -> dict:
 
 def _materialize_skills_and_plugins(kit_name: str, kit: dict, dest: Path) -> None:
     """Link the kit's skills and plugins into the kit dir; raise when missing."""
-    for skill in kit.get("skills", []):
-        src = _find_skill_source(skill)
-        if src is None:
-            raise ValueError(f"kit {kit_name}: skill {skill!r} is not installed")
+    try:
+        sources = policy.kit_skill_sources(kit)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"kit {kit_name}: {exc}") from exc
+    if "project-direction" in kit.get("skills", []) and "project-direction" not in sources:
+        # A reused kit may still hold the former separately invocable skill.
+        for name in ("project-direction", "project-direction.md"):
+            stale = dest / "skills" / name
+            if stale.is_symlink() or stale.is_file():
+                stale.unlink()
+            elif stale.is_dir():
+                import shutil
+                shutil.rmtree(stale)
+    for src in sources.values():
         _link_or_copy(src, dest / "skills" / src.name)
     for plugin in kit.get("plugins", []):
         src = _find_plugin_source(plugin)
@@ -616,18 +619,9 @@ def materialize_opencode_kit(kit_name: str, dest, route: str | None = None) -> P
         "$schema": "https://opencode.ai/config.json",
         "mcp": subset,
         "plugin": list(kit.get("plugins", [])),
-        "skills": list(kit.get("skills", [])),
+        "skills": list(policy.kit_skill_sources(kit)),
     })
-    for skill in kit.get("skills", []):
-        src = _find_skill_source(skill)
-        if src is None:
-            raise ValueError(f"kit {kit_name}: skill {skill!r} is not installed")
-        _link_or_copy(src, dest / "skills" / src.name)
-    for plugin in kit.get("plugins", []):
-        src = _find_plugin_source(plugin)
-        if src is None:
-            raise ValueError(f"kit {kit_name}: plugin {plugin!r} is not installed")
-        _link_or_copy(src, dest / "plugins" / src.name)
+    _materialize_skills_and_plugins(kit_name, kit, dest)
     _write_agentsmd_link(dest / "AGENTS.md")
     materialize_xdg_mirror(dest)
     try:
@@ -727,7 +721,7 @@ def materialize_claude_kit(kit_name: str, dest) -> Path:
     _secure_write_json(dest / "settings.json", {
         "kit": kit_name, "kitHash": policy.kit_hash(kit),
         "permissions": kit.get("permission_set"),
-        "skills": list(kit.get("skills", [])),
+        "skills": list(policy.kit_skill_sources(kit)),
         "plugins": list(kit.get("plugins", [])),
         "mcp": list(kit.get("mcp", [])),
     })

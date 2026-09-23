@@ -271,6 +271,23 @@ filenames without secrets, and `status`/`result` list the kit contents
 (skills, plugins, MCP, auth link state) from the materialized kit without
 secret values.
 
+AgentsMD compatibility follows [AgentsMD #120](https://github.com/toolboxmd/agentsmd/issues/120).
+The single `operations` skill can contain ordinary on-demand procedures under
+`workflows/`. Its `SKILL.md` declares `agentsmd-layout: procedures-v1` inside
+the frontmatter's block-style `metadata` map. Unsupported layouts fail clearly.
+Its `workflows/project-direction/index.md` and
+`workflows/project-direction/references/context.md` satisfy the worker and
+correction kits' `project-direction` policy dependency. The observed invocable
+skills then contain only `operations` (plus OpenCode's built-in skill).
+Legacy installations still supply the separate `project-direction` skill.
+A partial new bundle fails validation and materialization instead of borrowing
+an older direction skill. The entire operations tree is linked or copied so
+nested procedures and relative Markdown links remain available on every host.
+The canonical global instructions, executable `bin/project-direction`, and
+`agentsmd-project-direction` hooks remain supported installation components.
+Role permissions, direction metadata, and authority boundaries remain unchanged.
+Generated kits and other job artifacts stay under the runner's state directory.
+
 Direction supply (`runner/direction.py`): every role session's input
 carries the current Project Direction of the job's workspace. The
 installed AgentsMD loader (`project-direction` on PATH, `project-direction

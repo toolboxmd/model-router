@@ -842,6 +842,79 @@ def is_skill_installed(name: str) -> bool:
     return False
 
 
+def skill_source(name: str) -> Path | None:
+    """Resolve an installed skill using the same precedence on every host."""
+    if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+        return None
+    for root in _skill_search_roots():
+        for candidate in (root / name, root / f"{name}.md"):
+            if candidate.is_file() or (candidate / "SKILL.md").is_file():
+                return candidate
+    return None
+
+
+def _agentsmd_layout(operations: Path) -> str | None:
+    """Read the bundle's scalar metadata field, without a YAML dependency.
+
+    AgentsMD declares this in the frontmatter's block-style metadata map.
+    Ordinary procedure prose is never interpreted as a layout declaration.
+    """
+    entry = operations / "SKILL.md" if operations.is_dir() else operations
+    lines = entry.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    metadata = False
+    layout = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        value = line.split("#", 1)[0].rstrip()
+        if not value:
+            continue
+        if not value[0].isspace():
+            metadata = value == "metadata:"
+            if value.startswith("metadata:") and "agentsmd-layout" in value:
+                raise ValueError(f"AgentsMD layout needs a block-style metadata map: {entry}")
+        elif metadata and value.strip().startswith("agentsmd-layout:"):
+            declared = value.split(":", 1)[1].strip()
+            if len(declared) >= 2 and declared[0] == declared[-1] and declared[0] in "\"'":
+                declared = declared[1:-1]
+            if layout is not None or declared != "procedures-v1":
+                raise ValueError(f"unsupported AgentsMD layout {declared!r}: {entry}")
+            layout = declared
+    return layout
+
+
+def kit_skill_sources(kit: dict) -> dict[str, Path]:
+    """Resolve policy dependencies to invocable skills, including legacy kits.
+
+    AgentsMD's operations bundle supplies project-direction as an ordinary
+    procedure. Never combine a partial new bundle with a legacy repair skill.
+    Return the whole operations directory so copied kits retain relative links.
+    """
+    names = kit.get("skills", [])
+    sources: dict[str, Path] = {}
+    operations = skill_source("operations") if "operations" in names else None
+    layout = _agentsmd_layout(operations) if operations is not None else None
+    bundled = operations is not None and (layout == "procedures-v1"
+                                         or (operations / "workflows").exists()
+                                         or (operations / "workflows").is_symlink())
+    if bundled:
+        for relative in ("workflows/project-direction/index.md",
+                         "workflows/project-direction/references/context.md"):
+            required = operations / relative
+            if not required.is_file():
+                raise ValueError(f"required AgentsMD procedure is missing: {required}")
+    for name in names:
+        if name == "project-direction" and bundled:
+            continue
+        source = operations if name == "operations" else skill_source(name)
+        if source is None:
+            raise ValueError(f"skill {name!r} is not installed")
+        sources[name] = source
+    return sources
+
+
 def is_plugin_installed(name: str) -> bool:
     """True when a plugin module with this name exists locally."""
     if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
@@ -923,6 +996,12 @@ def kit_problems(role: str | None = None) -> list[str]:
             items = kit.get(field)
             if not isinstance(items, list) or any(not isinstance(i, str) for i in items):
                 problems.append(f"kit {name}: {field} must be a list of names")
+                continue
+            if field == "skills":
+                try:
+                    kit_skill_sources(kit)
+                except (OSError, ValueError) as exc:
+                    problems.append(f"kit {name}: {exc}")
                 continue
             for item in items:
                 if not check(item):
