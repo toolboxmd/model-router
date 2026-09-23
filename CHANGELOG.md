@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.23.0] - 2026-09-23
+
+### Added
+
+- Bundle the MIT-licensed routing plugin, preserve project instructions in isolated OpenCode sessions, and update Opus routes to 5.5
+
 ## [0.22.0] - 2026-09-21
 
 ### Added

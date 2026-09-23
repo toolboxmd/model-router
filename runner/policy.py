@@ -18,11 +18,12 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.4.0"
+POLICY_VERSION = "2.5.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
-                 "#34 (usage probes, 2026-09-20), and #38 (planner handoff, 2026-09-20)")
+                 "#34 (usage probes, 2026-09-20), #38 (planner handoff, 2026-09-20), "
+                 "and #17 (Opus 5.5, human request, 2026-09-23)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -156,6 +157,7 @@ CONCURRENT_CAP_TIERS_USD = (15, 30)
 # Older generations of pooled models are never routes.
 EXCLUDED_MODELS = (
     "muse-spark-1.2-contributor",
+    "claude-opus-5",
 )
 
 # The 2026-09-20 Go plan: never implementers on Go. grok-4.6 is allowed only
@@ -210,9 +212,10 @@ ROUTES = {
     "astra/high-review": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
                           "variant": "high", "role": "review", "family": "gpt",
                           "context_window": 400_000},
-    "opus-5/high-review": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
+    # Verified model id and context: https://platform.claude.com/docs/en/models/opus-5-5/overview
+    "opus-5.5/high-review": {"harness": "claude", "pool": "claude", "model": "claude-opus-5-5",
                            "variant": "high", "role": "review", "family": "claude",
-                           "planner_requested": True, "context_window": 200_000},
+                           "planner_requested": True, "context_window": 1_000_000},
     "muse-spark-xhigh-free": {"harness": "opencode", "pool": "zen-free",
                               "model": "opencode/muse-spark-1.3-contributor-free",
                               "variant": "xhigh", "agent": "build", "role": "implementation",
@@ -275,9 +278,9 @@ ROUTES = {
                      "variant": "medium", "role": "implementation", "family": "gpt",
                      "planner_chosen": True, "context_window": 400_000,
                      "note": "planner-chosen rung; runs in the planner's own session"},
-    "opus-5/high": {"harness": "claude", "pool": "claude", "model": "claude-opus-5",
+    "opus-5.5/high": {"harness": "claude", "pool": "claude", "model": "claude-opus-5-5",
                     "variant": "high", "role": "implementation", "family": "claude",
-                    "planner_chosen": True, "context_window": 200_000,
+                    "planner_chosen": True, "context_window": 1_000_000,
                     "note": "planner-chosen rung; runs in the planner's Claude session"},
     "grok-4.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/grok-4.6",
                     "variant": "medium", "agent": "build", "role": "recovery",
@@ -345,7 +348,7 @@ STAGES = {
                                      "hard lane's last Go rung, then native Grok Build on "
                                      "the xAI subscription, then OpenCode's xAI provider"},
     "planner_rungs": {"executor": "planner",
-                      "routes": ["astra/medium", "opus-5/high"],
+                      "routes": ["astra/medium", "opus-5.5/high"],
                       "capabilities": [],
                       "planner_selects": True,
                       "note": "the planner itself chooses a rung and runs it in its own session; "
@@ -366,9 +369,9 @@ STAGES = {
                       "capabilities": ["read_only"],
                       "note": "native Codex subagent first, then Luna on OpenCode Go in plan mode"},
     "review_final": {"executor": "host",
-                     "routes": ["opus-5/high-review", "astra/high-review", "luna-max-review"],
+                     "routes": ["opus-5.5/high-review", "astra/high-review", "luna-max-review"],
                      "capabilities": ["read_only"],
-                     "note": "the planner chooses; Opus 5 high on Claude, then Astra high on "
+                     "note": "the planner chooses; Opus 5.5 high on Claude, then Astra high on "
                              "Codex, then Luna max"},
 }
 IMPLEMENTATION_LANES = ["implementation_default", "implementation_small", "implementation_hard"]
@@ -1491,6 +1494,11 @@ def validate_policy() -> list[str]:
         size = spec.get("context_window")
         if type(size) is not int or size <= 0:
             problems.append(f"{name}: context_window must be a positive int of tokens")
+        model_id = spec.get("model")
+        if isinstance(model_id, str):
+            model_id = model_id.split("/", 1)[-1].removesuffix("-free")
+            if model_id in EXCLUDED_MODELS:
+                problems.append(f"{name}: excluded older generation {model_id}")
         if spec["harness"] == "grok":
             if spec["pool"] != "xai":
                 problems.append(f"{name}: the native Grok Build harness serves the xai pool, "
@@ -1508,8 +1516,6 @@ def validate_policy() -> list[str]:
                 problems.append(f"{name}: zen-free route must use a -free model")
             if spec["pool"] == "go" and model_id not in GO_MONTHLY_LIMIT_USD:
                 problems.append(f"{name}: no monthly limit recorded for {model_id}")
-            if model_id.removesuffix("-free") in EXCLUDED_MODELS:
-                problems.append(f"{name}: excluded older generation {model_id}")
             if spec["pool"] == "go":
                 limit = GO_MONTHLY_LIMIT_USD.get(model_id)
                 scarce = (limit or 0) <= SCARCE_MONTHLY_LIMIT_USD
@@ -1587,9 +1593,9 @@ def validate_policy() -> list[str]:
 
 
 def render_skill_table() -> str:
-    """The Codex skill reference, generated from this policy."""
+    """The shared Skill reference, generated from this policy."""
     lines = [
-        "# Codex routing policy",
+        "# Routing policy",
         "",
         f"Generated from `runner/policy.py` (`{POLICY_ID}` {POLICY_VERSION}); do not edit by hand.",
         f"Source: {POLICY_SOURCE}. Evidence: {POLICY_EVIDENCE}.",
@@ -1623,8 +1629,8 @@ def render_skill_table() -> str:
         "Rules:",
         "",
         "- Implementation, correction, and recovery use the routes declared for "
-        "the runner (`python -m runner submit`). Use a native Codex subagent only "
-        "for `review_ticket`.",
+        "the bundled runner (`<plugin-root>/bin/model-router submit`). On Codex, "
+        "use a native subagent only for `review_ticket`.",
         "- Classify by consequences, not file type. A step or prose that the rest "
         "of the work depends on is `critical`: do it in the planner session yourself, "
         "then submit the remainder. Changes to agent instructions, security rules, "

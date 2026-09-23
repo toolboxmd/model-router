@@ -210,7 +210,7 @@ class TestPolicy(Base):
         self.assertEqual(policy.next_recovery_route("grok-4.6-go"), "grok-4.6-build")
         self.assertEqual(policy.next_recovery_route("grok-4.6-build"), "grok-4.6-xai")
         self.assertIsNone(policy.next_recovery_route("grok-4.6-xai"))
-        self.assertIsNone(policy.next_recovery_route("opus-5/high-review"))
+        self.assertIsNone(policy.next_recovery_route("opus-5.5/high-review"))
 
     def test_envelope(self):
         a = policy.make_action("implementation", "muse-spark-xhigh-free", {"t": 1})

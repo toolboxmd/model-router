@@ -271,7 +271,8 @@ class TestKitMaterialization(unittest.TestCase):
         self.assertEqual(env["XDG_CONFIG_HOME"], str(dest / "xdg-mirror"))
         self.assertEqual(env["OPENCODE_DISABLE_EXTERNAL_SKILLS"], "1")
         self.assertEqual(set(env), {"OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG",
-                                    "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS"})
+                                    "XDG_CONFIG_HOME", "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+                                    "OPENCODE_DISABLE_PROJECT_CONFIG"})
         mirror = dest / "xdg-mirror"
         self.assertTrue(mirror.is_dir())
         self.assertFalse((mirror / "opencode").exists())

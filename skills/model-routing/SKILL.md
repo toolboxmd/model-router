@@ -1,29 +1,40 @@
 ---
 name: model-routing
-description: Select the route for delegated software work. Implementation, correction, and recovery go through the Model Router runner on subscription pools; native Codex subagents handle ticket review. Use when dispatching delegated work; keep project workflow and authority unchanged.
+description: Route delegated software work through one durable, capacity-aware subscription policy. Use when coordinating implementation, correction, recovery, or review across supported harnesses. Preserve the project's workflow, authority, and proof requirements.
 ---
 
 # Model routing
 
-The coordinator selects routes; it never chooses a model for the human. Project
-instructions own delegation, authority, proof, review, and delivery. Keep their
-small-direct-work exception; do not change the human-facing model or override
-explicit user choices.
+Project instructions own delegation, authority, proof, review, and delivery.
+Keep their small-direct-work exception and explicit user choices. Do not change
+the human-facing model.
 
-Read [the routing policy](references/codex.md), relative to this Skill. It is
-generated from the runner's policy data and lists every stage, its routes in
-order, and the rules. Reuse it while unchanged.
+Resolve this `SKILL.md` to its real filesystem path, including symlinks. The
+plugin root is two directories above its containing `model-routing` directory.
+Read [the routing policy](references/codex.md) relative to this Skill. That
+shared reference is generated from `runner/policy.py`; reuse it while unchanged.
+The filename remains stable for existing consumers.
 
-Implementation, correction, and recovery are submitted to the runner
-(`python -m runner submit --lane default|small|hard ...`), which owns the
-routes, capacity windows, fallback, and the terminal report. A step or prose
-that the rest of the work depends on is critical: the planner does it itself
-and submits the remainder. Use a native Codex subagent only for the
-`review_ticket` stage, passing the listed model and effort explicitly with
-fresh context. If a route is unavailable, stop that dispatch with the reason;
-never substitute silently.
+Use the bundled `<plugin-root>/bin/model-router` from the target workspace.
+Do not depend on the caller's Python path or a separate source checkout.
+The package must contain `bin/`, `runner/`, and `skills/` together. Stop the
+affected dispatch if any required component is missing.
 
-In the existing handoff, identify the policy version, the requested and
-observed route, and any override or escalation reason. Distinguish requested
-from observed execution. Reuse the existing proof, elapsed time, and usage
-evidence; leave unavailable measurements unknown.
+Submit prepared implementation, correction, and recovery work through this
+launcher using the policy's lane. The runner owns capacity, fallback, durable
+state, and the terminal report. Read [the runner contract](../../RUNNER.md)
+for task fields, proof, and commands. A critical step stays with the planner;
+submit the remainder.
+
+Only Claude Code planner callbacks are implemented. Starting a job requires a
+real Claude planner session and its working directory. Never invent a session
+id or substitute the current harness's id. Other hosts can load the shared
+Skill and operate existing jobs; package compatibility does not add planner
+adapters. On Codex, also read [native ticket review](references/codex-host.md)
+before using a Codex subagent. Do not emulate that host-specific operation on
+another harness.
+
+In the existing handoff, identify the policy version, requested and observed
+route, and any override or escalation reason. Reuse proof, elapsed time, and
+usage evidence. Leave unavailable measurements unknown. Stop an unavailable
+route with its reason; never substitute silently.
