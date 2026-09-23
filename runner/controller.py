@@ -607,6 +607,81 @@ def _dispatch_fallback_routes(dispatch_route: str) -> list:
             and harnesses.route_uses_owned_server(r)]
 
 
+def _codex_stall_marker(err) -> str | None:
+    """The supervisor's stall marker in Codex stderr, or None.
+
+    The supervisor ends a turn whose stream stays silent past the harness
+    window with ``runner: stalled: ...`` on stderr (rc 4) and records the
+    invocation as signal ``stalled``. The marker is the controller's
+    evidence that this failure is a stall, checked before auth so command
+    output quoting auth-pattern text can never win.
+    """
+    for line in (err or "").splitlines():
+        if "runner: stalled" in line:
+            return line.strip()
+    return None
+
+
+def _codex_dispatch_stalled(state_dir, request_id: str, dispatch_route: str,
+                            prompt: str, run_cmd, out, err, cmd, rc) -> dict | None:
+    """Lateral move when the supervisor ended a Codex dispatch turn silent.
+
+    Records the stall (signal ``stalled``, never ``hard``) and dispatches
+    on the next dispatch route, Luna on OpenCode Go, in the same step
+    without retrying Codex. Returns None when the output carries no stall
+    marker: the caller keeps its auth/exhausted/generic failure handling.
+    """
+    marker = _codex_stall_marker(err)
+    if marker is None:
+        return None
+    try:
+        detail = adapters.redact_text(marker)
+    except Exception:
+        detail = marker
+    detail = " ".join(detail.split())[:200] or "no harness output past the silence window"
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "codex_dispatch", "rc": rc,
+                             "signal": "stalled",
+                             "evidence": {"source": "stream_silence",
+                                          "detail": detail},
+                             "stderr": (err or "")[-1000:],
+                             "stdout": (out or "")[-1000:]})
+    fallback = _dispatch_fallback_routes(dispatch_route)
+    if not fallback:
+        _mark_blocked(state_dir, request_id,
+                      f"dispatch_stalled: no eligible route after stalled on {dispatch_route}")
+        return {"action": "blocked", "reason": "dispatch_stalled"}
+    _record_dispatch_reason(state_dir, request_id, dispatch_route,
+                            fallback[0], "dispatch_stalled")
+    return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
+                                 reason="dispatch_stalled")
+
+
+def _codex_resume_stalled(state_dir, request_id: str, rc, out, err) -> dict | None:
+    """Blocked stalled result when the supervisor ended a Codex resume silent.
+
+    Records the stall (signal ``stalled``, never ``hard``/``auth``) and
+    blocks with a stalled reason a later resume can retry; a resume has no
+    lateral route. Returns None without a stall marker.
+    """
+    marker = _codex_stall_marker(err)
+    if marker is None:
+        return None
+    try:
+        detail = adapters.redact_text(marker)
+    except Exception:
+        detail = marker
+    detail = " ".join(detail.split())[:200] or "no harness output past the silence window"
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "codex_resume", "rc": rc,
+                             "signal": "stalled",
+                             "evidence": {"source": "stream_silence",
+                                          "detail": detail},
+                             "stderr": (err or "")[-1000:]})
+    _mark_blocked(state_dir, request_id, f"codex_resume_stalled rc={rc}: {detail}")
+    return {"action": "blocked", "reason": "codex_resume_stalled"}
+
+
 def _dispatch_exhausted(state_dir, request_id: str, dispatch_route: str,
                         prompt: str, run_cmd, out, err, cmd, rc) -> dict | None:
     """Fallback when the Codex dispatch answers its usage-limit message.
@@ -722,6 +797,10 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
                   session_id=task_id, output_text=(out or "") + (err or ""))
     if not task_id:
+        stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
+                                          prompt, run_cmd, out, err, cmd, rc)
+        if stalled is not None:
+            return stalled
         auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
         if auth_blocked is not None:
             return auth_blocked
@@ -744,6 +823,14 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
                      effort=dispatch["variant"], dispatch_route=dispatch_route)
     if not codex_h.turn_ok("codex_dispatch", rc, out, cmd):
+        # A stall the supervisor ended for stream silence moves laterally
+        # with signal stalled, before auth is even consulted: command
+        # output quoting auth-pattern text is not error evidence.
+        stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
+                                          prompt, run_cmd, out, err, cmd, rc)
+        if stalled is not None:
+            stalled["codex_task_id"] = task_id
+            return stalled
         # A missing or rejected login blocks with its reason: no other
         # route holds the same login, so there is no fallback.
         auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
@@ -1018,6 +1105,12 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
                   session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
     if not codex_h.turn_ok("codex_resume", rc, out, cmd):
+        # A stall the supervisor ended for stream silence stays stalled,
+        # never auth: command output quoting auth-pattern text is not
+        # error evidence.
+        stalled = _codex_resume_stalled(state_dir, request_id, rc, out, err)
+        if stalled is not None:
+            return stalled
         # A missing or rejected login blocks with its reason like dispatch:
         # no other route holds the same login.
         auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)

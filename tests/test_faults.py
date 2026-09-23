@@ -796,14 +796,23 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertNotEqual(job["status"], "succeeded")
         self.assertIsNone(controller._load_controller_state(job).get("last_action"))
 
-    def test_hung_turn_times_out_with_abort(self):
+    def test_hung_turn_stalls_before_timeout_with_abort(self):
+        # The default 180-second window is clamped strictly below the
+        # 3-second turn timeout (toolboxmd/model-router#73), so a silent
+        # hang ends as stalled before the deadline instead of running to
+        # it: still bounded, still aborted, on the same route.
         run = self._setup("hang", timeout_secs=3)
         res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
-        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(res["action"], "stalled_retry")
         self.assertTrue((self.fake_state / "aborted").exists())
         job = core.get_job(self.sd, "oc1")
-        self.assertIn("timed out", job["block_reason"] + job["last_error_json"])
+        self.assertEqual(json.loads(job["last_error_json"] or "{}").get("signal"), "stalled")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        inv = core._list_invocations(self.sd, "oc1")[-1]
+        envelope = (json.loads(inv["result_json"] or "{}").get("envelope") or {})
+        self.assertEqual(envelope.get("signal"), "stalled")
+        self.assertLess(envelope["signal_evidence"]["silence_secs"], 3)
+        self.assertLess(envelope.get("longest_silence_secs", 3), 3)
 
 
 FAKE_LUNA = r"""

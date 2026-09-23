@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.6.0"
+POLICY_VERSION = "2.6.1"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
@@ -46,6 +46,36 @@ STALL_SILENCE_SECS = 180
 STALL_EVIDENCE = ("2026-09-20 OpenCode session database: healthy worker sessions "
                   "(330-463 parts) longest inter-part gap 110-161s; stalled session "
                   "gaps of 321s then nothing (toolboxmd/model-router#33)")
+# Per-harness silence windows (toolboxmd/model-router#73). Live 2026-09-23
+# (job ao-router-1, runner v0.26.1): Luna at max effort on Codex reasoned
+# silently for 181 seconds while reading, emitting no stream events, and the
+# shared 180-second window ended the turn. Codex dispatch and resume
+# therefore wait 300 seconds of stream silence: the observed 181-second
+# silent-reasoning interval plus margin for longer max-effort turns, still
+# inside the per-turn timeout that stays the outer budget. OpenCode worker
+# detection stays unchanged at 180 seconds.
+STALL_SILENCE_SECS_BY_HARNESS = {
+    "codex": 300,
+    "claude": 180,
+    "opencode": 180,
+    "grok": 180,
+}
+STALL_CODEX_EVIDENCE = ("2026-09-23 Codex dispatch (job ao-router-1, runner v0.26.1): "
+                        "Luna at max effort reasoned silently for 181s with no stream "
+                        "events (toolboxmd/model-router#73)")
+
+
+def stall_window_secs_for(harness_name: str | None) -> float:
+    """Silence window in seconds for a harness name, from policy data.
+
+    Unknown or missing harness names get the default: the supervisor never
+    fails a turn for lack of a window entry.
+    """
+    try:
+        return float(STALL_SILENCE_SECS_BY_HARNESS.get(harness_name or "",
+                                                       STALL_SILENCE_SECS))
+    except (TypeError, ValueError):
+        return float(STALL_SILENCE_SECS)
 # The supervisor polls stream activity this often; a stall ends within the
 # silence window plus one poll interval.
 STALL_POLL_SECS = 1.0
@@ -1530,6 +1560,26 @@ def validate_policy() -> list[str]:
         problems.append("STALL_SILENCE_SECS must be a positive number of seconds")
     if not STALL_EVIDENCE:
         problems.append("STALL_SILENCE_SECS needs its session-database evidence beside it")
+    if not isinstance(STALL_SILENCE_SECS_BY_HARNESS, dict):
+        problems.append("STALL_SILENCE_SECS_BY_HARNESS must map each harness to a window")
+    else:
+        for _harness, _secs in STALL_SILENCE_SECS_BY_HARNESS.items():
+            if not isinstance(_secs, (int, float)) or _secs <= 0:
+                problems.append(f"stall window for {_harness} must be a positive number of seconds")
+        if "codex" not in STALL_SILENCE_SECS_BY_HARNESS \
+                or "opencode" not in STALL_SILENCE_SECS_BY_HARNESS:
+            problems.append("STALL_SILENCE_SECS_BY_HARNESS must carry codex and opencode windows")
+        else:
+            # The observed max-effort silent-reasoning interval is 181 seconds
+            # (toolboxmd/model-router#73): the Codex window must clear it.
+            if STALL_SILENCE_SECS_BY_HARNESS["codex"] <= 181:
+                problems.append("codex stall window must exceed the observed 181s silent interval")
+            # OpenCode worker detection stays unchanged.
+            if STALL_SILENCE_SECS_BY_HARNESS["opencode"] != STALL_SILENCE_SECS:
+                problems.append("opencode stall window stays at STALL_SILENCE_SECS")
+    if not STALL_CODEX_EVIDENCE or "#73" not in STALL_CODEX_EVIDENCE \
+            or "181" not in STALL_CODEX_EVIDENCE:
+        problems.append("STALL_CODEX_EVIDENCE must name #73 and the observed 181s interval")
     if ASSUMED_WINDOW_DEFAULT not in WINDOW_SECS:
         problems.append("ASSUMED_WINDOW_DEFAULT must name a window in WINDOW_SECS")
     if not (0 < PROBE_FIRST_DELAY_SECS <= PROBE_MAX_DELAY_SECS):
@@ -1727,9 +1777,12 @@ def render_skill_table() -> str:
         "aborts instead of waiting), then moves to the next "
         "model family within one minute. "
         "Hard errors end the turn as `implementation_failed` for the ladder; they never move routes.",
-        f"- A worker turn that stops streaming is stalled: no new part for {STALL_SILENCE_SECS} "
-        "seconds while busy ends the turn within the window plus one poll "
-        f"(evidence: {STALL_EVIDENCE}). The detector probes the same route with a minimal request "
+        f"- A turn that stops streaming is stalled: no new output for its harness "
+        f"silence window while busy ends the turn within the window plus one poll "
+        f"(Codex dispatch and resume: {STALL_SILENCE_SECS_BY_HARNESS['codex']} seconds, "
+        f"evidence: {STALL_CODEX_EVIDENCE}; worker and other harnesses: "
+        f"{STALL_SILENCE_SECS} seconds, evidence: {STALL_EVIDENCE}). "
+        "The detector probes the same route with a minimal request "
         "first, so a stall that is exhaustion in disguise moves pools instead of retrying the same "
         "route. Stalled is treated like overload: a bounded same-route retry inside "
         f"{SIGNAL_CLASSES['stalled']['window_secs']} seconds, then a lateral move with the route "

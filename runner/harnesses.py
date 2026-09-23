@@ -27,6 +27,18 @@ KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
 KIND_GROK_CONTROL = "grok_control"
 
+# Stall-window bound against the per-turn timeout (toolboxmd/model-router#73).
+# The effective silence window is always strictly shorter than the
+# invocation's turn timeout: this many seconds before the deadline are
+# reserved so a clamped window never ties or outlives it, and the floor
+# keeps tiny turn budgets positive. The reserve covers two supervisor poll
+# ticks (at most 1 second each) plus the activity-note lag, so a genuinely
+# silent turn is still detected as stalled before the deadline instead of
+# racing it. The supervisor floors the deadline the same way (at least 1
+# second), so the bound below always holds.
+STALL_WINDOW_DEADLINE_RESERVE_SECS = 3.0
+STALL_WINDOW_MIN_SECS = 0.5
+
 
 class StreamActivity:
     """Last-activity tracking for one turn, behind the harness seam.
@@ -163,8 +175,13 @@ class Harness:
         """Silence window for this turn in seconds: a per-invocation
         ``stall_secs`` override wins, then the ``RUNNER_STALL_SECS``
         environment override (deterministic drills only; unset in
-        production), else the policy default (whose session-database
-        evidence lives beside it in the policy)."""
+        production), else the policy's per-harness window (Codex dispatch
+        and resume wait longer for silent max-effort reasoning; worker
+        harnesses keep the session-database default).
+
+        This is the raw configured window. The supervisor never uses it
+        directly: ``effective_stall_window_secs`` bounds it strictly below
+        the invocation's turn timeout first."""
         try:
             override = (meta or {}).get("stall_secs")
             if override is not None and float(override) > 0:
@@ -178,7 +195,29 @@ class Harness:
                 return float(env_override)
         except (TypeError, ValueError):
             pass
-        return float(policy.STALL_SILENCE_SECS)
+        return float(policy.stall_window_secs_for(self.name))
+
+    def effective_stall_window_secs(self, meta=None, timeout_secs=None) -> float:
+        """Silence window actually enforced for one turn: the configured
+        window (``stall_secs``, then ``RUNNER_STALL_SECS``, then policy)
+        clamped strictly below the invocation's effective per-turn timeout.
+
+        A window at or above the timeout is clamped, never rejected: the
+        turn still ends as stalled on genuine silence, but always before
+        the deadline, so the stall detector cannot outlive the outer turn
+        budget. A missing or non-positive timeout leaves the configured
+        window untouched (the supervisor always passes a real timeout)."""
+        window = self.stall_window_secs(meta)
+        try:
+            timeout = float(timeout_secs) if timeout_secs is not None else None
+        except (TypeError, ValueError):
+            timeout = None
+        if timeout is None or not (timeout > 0):
+            return window
+        effective_timeout = max(1.0, timeout)
+        bound = max(STALL_WINDOW_MIN_SECS,
+                    effective_timeout - STALL_WINDOW_DEADLINE_RESERVE_SECS)
+        return min(window, bound)
 
     def new_activity_tracker(self, now=None) -> StreamActivity:
         import time as _time
@@ -439,6 +478,52 @@ class CodexCLI(Harness):
     # "4010" or "14012" are not auth failures. Only a standalone 401 token
     # (e.g. "HTTP error: 401 Unauthorized") counts, via word boundaries.
     CODEX_AUTH_CODE_RE = re.compile(r"\b401\b")
+    # Top-level failed-turn events whose own error fields are auth evidence.
+    CODEX_FAILED_EVENT_TYPES = ("turn.failed", "turn_failed", "error")
+    # Error fields read on those events (plus one level of a nested error
+    # dict). Never ``item``/``data``: a command result nests there.
+    CODEX_AUTH_ERROR_KEYS = ("message", "error", "text", "reason", "code", "name")
+
+    def _auth_error_field_texts(self, event: dict) -> list[str]:
+        """Candidate auth strings from a failed-turn event's own fields."""
+        texts: list[str] = []
+        if not isinstance(event, dict):
+            return texts
+        for key in self.CODEX_AUTH_ERROR_KEYS:
+            val = event.get(key)
+            if isinstance(val, str) and val.strip():
+                texts.append(val)
+            elif type(val) is int:
+                texts.append(str(val))
+        nested = event.get("error")
+        if isinstance(nested, dict):
+            for key in self.CODEX_AUTH_ERROR_KEYS:
+                val = nested.get(key)
+                if isinstance(val, str) and val.strip() and val not in texts:
+                    texts.append(val)
+                elif type(val) is int and str(val) not in texts:
+                    texts.append(str(val))
+        return texts
+
+    def _auth_text_hit(self, text: str | None) -> str | None:
+        """The stripped text when it carries an auth marker, else None."""
+        if not isinstance(text, str) or not text.strip():
+            return None
+        low = text.strip().lower()
+        if (any(m in low for m in self.CODEX_AUTH_TEXT_MARKERS)
+                or self.CODEX_AUTH_CODE_RE.search(low) is not None):
+            return text.strip()
+        return None
+
+    @staticmethod
+    def _short_auth_reason(text: str) -> str:
+        """A redacted single-line auth reason, at most 120 chars."""
+        try:
+            reason = adapters.redact_text(text.strip())
+        except Exception:
+            reason = text.strip()
+        reason = " ".join(reason.split())
+        return reason[:120] or "codex authentication failed"
 
     # A usage-limit refusal arrives as the turn's terminal provider message
     # (live 2026-09-21: an agent_message "You've hit your usage limit. ...
@@ -665,32 +750,53 @@ class CodexCLI(Harness):
         return cand[:limit] if cand else "empty provider output"
 
     def auth_failure_reason(self, stdout: str | None, stderr: str | None) -> str | None:
-        """Short redacted auth reason from Codex CLI text, or None.
+        """Short redacted auth reason from Codex error evidence, or None.
 
-        Scans stderr then stdout line by line for a missing-auth marker
-        or a standalone 401 token (word-boundary match, so "4010" or
-        "14012" never count). Returns the first matching line truncated
-        to 120 chars (redacted), never a secret value. None when no auth
-        marker is present: the caller keeps its generic dispatch failure.
+        Reads only error evidence (toolboxmd/model-router#73): stderr
+        transport text, a top-level ``turn.failed`` or ``error`` event's own
+        error fields, and the last ``agent_message`` of a failed turn (a
+        turn with no ``turn.completed`` event). It never reads
+        ``command_execution`` output, file contents, other tool-result
+        items, earlier agent messages, completed-turn messages, or
+        untyped stdout text: a stalled turn whose command output quotes
+        auth-pattern text stays unknown, never auth, and an ambiguous or
+        unknown failure returns None. The standalone-401 word-boundary
+        rule still applies (``4010`` or ``14012`` never count). Returns
+        the first matching line truncated to 120 chars (redacted), never
+        a secret value.
         """
-        blobs = [stderr or "", stdout or ""]
-        for blob in blobs:
-            for line in blob.splitlines():
-                low = line.strip().lower()
-                if not low:
-                    continue
-                if (any(m in low for m in self.CODEX_AUTH_TEXT_MARKERS)
-                        or self.CODEX_AUTH_CODE_RE.search(low) is not None):
-                    try:
-                        reason = adapters.redact_text(line.strip())
-                    except Exception:
-                        reason = line.strip()
-                    reason = " ".join(reason.split())
-                    return reason[:120] or "codex authentication failed"
+        for line in (stderr or "").splitlines():
+            if self._auth_text_hit(line) is not None:
+                return self._short_auth_reason(line)
+        events = [o for o in _jsonl(stdout or "") if isinstance(o, dict)]
+        for obj in events:
+            if obj.get("type") in self.CODEX_FAILED_EVENT_TYPES:
+                for text in self._auth_error_field_texts(obj):
+                    hit = self._auth_text_hit(text)
+                    if hit is None:
+                        continue
+                    for line in hit.splitlines():
+                        if self._auth_text_hit(line) is not None:
+                            return self._short_auth_reason(line)
+                    return self._short_auth_reason(hit)
+        if not any(o.get("type") == "turn.completed" for o in events):
+            texts = self._agent_message_texts(stdout)
+            if texts:
+                last = texts[-1]
+                for line in last.splitlines():
+                    if self._auth_text_hit(line) is not None:
+                        return self._short_auth_reason(line)
+                if self._auth_text_hit(last) is not None:
+                    return self._short_auth_reason(last)
         return None
 
     def classify_signal(self, evidence):
-        """Codex signals: structured shapes via policy, 401 text as hard."""
+        """Codex signals: structured shapes via policy, 401 text as hard.
+
+        The text fallback reads curated error evidence only (message,
+        error, stderr, text): never raw stdout, where a command result
+        can quote auth-pattern text.
+        """
         try:
             cls = policy.classify_signal(evidence)
         except Exception:
@@ -699,7 +805,7 @@ class CodexCLI(Harness):
             return cls
         if isinstance(evidence, dict):
             blobs = []
-            for key in ("message", "error", "stderr", "stdout", "text"):
+            for key in ("message", "error", "stderr", "text"):
                 val = evidence.get(key)
                 if isinstance(val, str) and val.strip():
                     blobs.append(val)

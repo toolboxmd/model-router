@@ -571,17 +571,26 @@ class GrokDurable(GrokBase):
         self.assertTrue((store.job_dir_for(store.ensure_state_dir(self.sd), "gd1")
                          / "turn-1" / "report.json").exists())
 
-    def test_timeout_kills_the_worker_and_records_it(self):
+    def test_hung_worker_is_killed_and_recorded_before_the_timeout(self):
+        # The default 180-second window is clamped strictly below the
+        # 2-second turn timeout (toolboxmd/model-router#73), so a silent
+        # hang is killed and recorded as stalled before the deadline
+        # instead of running to it.
         run = self._setup("hang")
         cmd, _env = adapters.build_grok_cmd("hang on", str(self.ws), "grok-4.6", "medium")
         rc, out, err = run(cmd, str(self.ws), 2, kind="grok_control",
                            meta={"stage": "implementation", "route": "grok-4.6-build",
                                  "reason": "test", "seq": 0})
-        self.assertEqual(rc, 124)
+        self.assertEqual(rc, 4)
         inv = [i for i in core._list_invocations(self.sd, "gd1")
                if i["kind"] == "grok_control"][-1]
-        self.assertEqual(inv["terminal_class"], "timeout")
+        self.assertEqual(inv["terminal_class"], "stalled")
+        result = json.loads(inv["result_json"] or "{}")
+        self.assertEqual(result.get("signal"), "stalled")
+        self.assertLess(result["signal_evidence"]["window_secs"], 2)
         self.assertGreater(inv["elapsed_secs"], 0)
+        # The turn's own measured duration stays inside the outer budget.
+        self.assertLess(inv["elapsed_secs"], 2)
 
     def test_finished_action_reuses_without_a_second_writer(self):
         run = self._setup("ok")

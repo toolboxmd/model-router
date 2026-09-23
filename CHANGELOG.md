@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.26.2] - 2026-09-23
+
+### Changed
+
+- Codex turns wait 300 seconds of stream silence before a stall, and command or file output no longer reads as an auth failure (policy 2.6.1)
+
 ## [0.26.1] - 2026-09-23
 
 ### Changed
