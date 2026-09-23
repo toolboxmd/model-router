@@ -1,0 +1,56 @@
+name: Version release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+concurrency:
+  group: version-release-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.repository == 'toolboxmd/model-router' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: source
+
+      - name: Check out released version validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: toolboxmd/agentsmd
+          ref: 298a08830fca7fe5be950af68ac2d41747d674e1 # v12.0.0
+          path: release-tools
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Run complete deterministic proof
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          python3 -m compileall -q runner scripts tests
+
+      - name: Validate and publish exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py --versionctl "$GITHUB_WORKSPACE/release-tools/bin/versionctl"

@@ -14,8 +14,8 @@ Install the complete plugin from an exact released source. The package contains
 `skills/`, `bin/model-router`, and `runner/`; installing only the Skill subtree
 omits the runtime and is unsupported.
 
-This package has no published release yet. Once Toolybara promotes a release
-into ToolboxMD Marketplace, install it through your host's native plugin path:
+Once Toolybara promotes a release into ToolboxMD Marketplace, install it through
+your host's native plugin path:
 
 ```sh
 # Codex
@@ -52,6 +52,26 @@ The shared Skill can load across harnesses, but starting a job still requires
 an existing Claude Code planner session. Additional planner callbacks are not
 implemented. Installing the package starts no service or model request and does
 not grant delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
+
+## Automatic releases
+
+A `VERSION` change merged into `main` starts the [release workflow](.github/workflows/release.yml).
+It runs the complete deterministic test suite and validates the exact commit
+with released AgentsMD versionctl before creating an annotated tag and stable
+GitHub Release. `.version-policy.json` authorizes this through
+`githubReleasePolicy: on-version-commit`.
+Release runs queue instead of replacing waiting runs, up to GitHub's limit of
+100 pending runs.
+
+Toolybara already enrolls Model Router and discovers published releases in its
+hourly Marketplace scan. No additional source-repository credentials are needed.
+Check the resulting Marketplace version separately; a source release alone does
+not prove promotion, installation or behavioral verification.
+
+If publication fails, rerun the failed workflow. It can finish a release whose
+annotated tag already identifies the same exact commit. Conflicting tags,
+draft releases and prereleases stop without replacement. A manual workflow
+dispatch on `main` also supports recovery; other branches cannot publish.
 
 ## Project Direction
 

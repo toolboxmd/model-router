@@ -4,7 +4,7 @@
   "versionSource": "VERSION",
   "tagPattern": "v{version}",
   "tagPolicy": "every-version",
-  "githubReleasePolicy": "manual",
+  "githubReleasePolicy": "on-version-commit",
   "distributionPolicy": "released-tags-only",
   "publishPolicy": "manual",
   "releaseBranch": "main",

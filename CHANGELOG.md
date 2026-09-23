@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.25.0] - 2026-09-23
+
+### Added
+
+- Automatically release validated Model Router versions after merge
+
 ## [0.24.0] - 2026-09-23
 
 ### Added
