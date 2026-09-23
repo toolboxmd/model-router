@@ -287,9 +287,8 @@ def _save_codex_task(state_dir, request_id: str, task_id: str,
                      effort: str = adapters.CODEX_EFFORT,
                      adapter: str = "codex",
                      dispatch_route: str | None = None) -> dict:
-    """Persist the dispatcher task and, for the OpenCode fallback, its route
-    in one transaction, so a crash between two writes cannot leave a session
-    without its harness."""
+    """Persist the dispatcher task and its active route in one transaction,
+    so a crash between two writes cannot leave a session without its harness."""
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -743,7 +742,7 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     # The thread exists even when the turn failed: save it so recovery
     # resumes it instead of creating a replacement task.
     _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
-                     effort=dispatch["variant"])
+                     effort=dispatch["variant"], dispatch_route=dispatch_route)
     if not codex_h.turn_ok("codex_dispatch", rc, out, cmd):
         # A missing or rejected login blocks with its reason: no other
         # route holds the same login, so there is no fallback.
@@ -1008,12 +1007,12 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
                                      reason="resume", session_id=task_id, phase="resumed")
     last_path = _last_message_path(state_dir, request_id,
                                    "codex-resume-" + _prompt_digest(message))
-    dispatch = policy.ROUTES[policy.stage_routes("dispatch")[0]]
+    dispatch = policy.ROUTES[active]
     cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
                                           model=dispatch["model"], effort=dispatch["variant"])
     # Resume uses the saved workspace as cwd; never --cd/--reasoning.
     rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
-                           meta={"stage": "dispatch", "route": "luna/max", "reason": "resume"})
+                           meta={"stage": "dispatch", "route": active, "reason": "resume"})
     codex_h = harnesses.harness_named("codex")
     resumed_id, _skind = codex_h.parse_session("codex_resume", out, err, job)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -258,6 +259,43 @@ class TestAdapterSessions(Base):
         self.assertIn("--json", cmd)
         # Never contains a different task ID.
         self.assertNotIn("codex-other", " ".join(cmd))
+
+    def test_dispatch_persists_its_codex_route_and_resume_uses_it(self):
+        # A second Codex dispatch route listed first: dispatch must persist
+        # the route it actually ran on, and resume must use that route even
+        # after the stage order changes back.
+        alt = dict(policy.ROUTES["luna/max"], model="gpt-5.6-luna-alt")
+        orig_routes = list(policy.STAGES["dispatch"]["routes"])
+        captured = {}
+
+        def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
+            captured["dispatch_cmd"] = list(cmd)
+            return 0, codex_out("codex-active-1", {"action": "planner_question",
+                                                   "qid": "q1", "prompt": "Confirm?"}), ""
+
+        def fake_resume(cmd, cwd=None, timeout=120, **kw):
+            captured["cmd"] = list(cmd)
+            captured["meta"] = kw["meta"]
+            return 0, codex_out("codex-active-1", {"action": "completion", "output": "done"}), ""
+
+        with mock.patch.dict(policy.ROUTES, {"luna-alt/max": alt}):
+            policy.STAGES["dispatch"]["routes"] = ["luna-alt/max"] + orig_routes
+            try:
+                core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-1")
+                controller.dispatch(self.sd, "r1", run_cmd=fake_dispatch,
+                                    probe=lambda *a: None)
+            finally:
+                policy.STAGES["dispatch"]["routes"] = orig_routes
+            job = core.get_job(self.sd, "r1")
+            self.assertEqual(controller._load_controller_state(dict(job))["dispatch_route"],
+                             "luna-alt/max")
+            self.assertEqual(policy.stage_routes("dispatch")[0], "luna/max")
+            controller.resume_luna(self.sd, "r1", "follow up", run_cmd=fake_resume)
+        dispatch_cmd = captured["dispatch_cmd"]
+        self.assertEqual(dispatch_cmd[dispatch_cmd.index("--model") + 1], "gpt-5.6-luna-alt")
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-m") + 1], "gpt-5.6-luna-alt")
+        self.assertIn('model_reasoning_effort="max"', captured["cmd"])
+        self.assertEqual(captured["meta"]["route"], "luna-alt/max")
 
     def test_planner_resume_never_forks_new_session(self):
         core.submit(self.sd, "r1", {"goal": "t"}, self.ws(), "claude-exact-77")

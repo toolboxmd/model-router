@@ -708,7 +708,7 @@ test keeps the two equal; `policy.main(['validate'])` checks the data.
 Stages in order: planning (Fable 5.1 max in Claude Code, then Astra max on
 Codex; Sonnet medium only as the explicit live-test override), dispatch (Luna
 max on Codex read-only first; `luna-go/max` on Go in OpenCode plan mode as the
-recorded fallback; Terra max is a manual-only option), the implementation
+recorded fallback), the implementation
 lanes default, small, and hard, planner-chosen rungs (Astra medium on Codex,
 Opus 5.5 high on the Claude harness; the planner itself chooses and runs them),
 critical

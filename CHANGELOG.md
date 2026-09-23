@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.26.0] - 2026-09-23
+
+### Added
+
+- Remove the manual-only Codex dispatch route and resume Codex on the job's active dispatch route
+
 ## [0.25.1] - 2026-09-23
 
 ### Changed

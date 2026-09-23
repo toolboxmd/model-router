@@ -18,12 +18,13 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.5.0"
+POLICY_VERSION = "2.6.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
                  "#34 (usage probes, 2026-09-20), #38 (planner handoff, 2026-09-20), "
-                 "and #17 (Opus 5.5, human request, 2026-09-23)")
+                 "#17 (Opus 5.5, human request, 2026-09-23), "
+                 "and #62 (manual-only dispatch route removed, human direction, 2026-09-23)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -189,10 +190,6 @@ ROUTES = {
                       "variant": "medium", "role": "planning", "family": "claude",
                       "override_only": True, "context_window": 200_000,
                       "note": "explicit live-test override only, never a default"},
-    "terra/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-terra",
-                  "variant": "max", "role": "dispatch", "family": "gpt",
-                  "manual": True, "context_window": 400_000,
-                  "note": "manual-only option; never selected automatically"},
     "luna/max": {"harness": "codex", "pool": "codex", "model": "gpt-5.6-luna",
                  "variant": "max", "role": "dispatch", "family": "gpt",
                  "sandbox": "read-only", "context_window": 400_000},
@@ -309,10 +306,9 @@ STAGES = {
                  "note": "Fable 5.1 in Claude Code, then Astra max on Codex; "
                          "Sonnet medium only as the explicit live-test override"},
     "dispatch": {"executor": "runner", "routes": ["luna/max", "luna-go/max"],
-                 "manual": ["terra/max"],
                  "capabilities": ["read_only", "session_resume", "structured_output"],
                  "note": "read-only Codex sandbox first; the same model on Go in OpenCode plan mode "
-                         "when Codex cannot start the task; Terra max is a manual-only option"},
+                         "when Codex cannot start the task"},
     "implementation_default": {"executor": "runner",
                                "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
                                           "glm-5.3-flash-go", "qwen3.8-flash-go",
