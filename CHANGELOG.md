@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.27.0] - 2026-09-24
+
+### Added
+
+- Codex dispatch and resume record the observed model from the thread rollout and block the job on a model switch
+
 ## [0.26.2] - 2026-09-23
 
 ### Changed

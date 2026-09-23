@@ -583,6 +583,90 @@ def _codex_failure_message(out, err, cmd) -> str:
     return msg[:200] or "empty provider output"
 
 
+def codex_model_mismatch_reason(requested_model, observed_model) -> str | None:
+    """Block reason when the observed Codex model differs, else None.
+
+    A mismatch is never a capacity signal: unknown on either side never
+    blocks, and the reason names both models.
+    """
+    if isinstance(requested_model, str) and requested_model \
+            and isinstance(observed_model, str) and observed_model:
+        if requested_model != observed_model:
+            return f"model_mismatch: requested={requested_model} observed={observed_model}"
+    return None
+
+
+def _latest_codex_invocation(state_dir, request_id: str, kind: str) -> dict | None:
+    """The just-measured invocation for one Codex kind, or None.
+
+    The latest row by id wins, so prior dispatch/resume rows never shadow
+    the current turn. Fake run_cmd closures leave no invocation rows, which
+    reads as unknown and never blocks. Database failures propagate so the
+    caller blocks safely instead of passing as unknown.
+    """
+    invs = [i for i in core._list_invocations(state_dir, request_id)
+            if i.get("kind") == kind]
+    if not invs:
+        return None
+    try:
+        return max(invs, key=lambda r: int(r.get("id") or 0))
+    except (TypeError, ValueError):
+        return invs[-1]
+
+
+def check_codex_observed_model(state_dir, request_id: str, kind: str,
+                               requested_route: str) -> tuple:
+    """(observed_model, block_reason|None) for one measured Codex turn.
+
+    Compares the invocation row's observed_model with
+    ``policy.ROUTES[requested_route]['model']``. The requested route comes
+    from the invocation when it names a policy route, else from the
+    caller's controller state. Unknown on either side never blocks.
+    Only expected missing rollout cases return unknown; database, policy,
+    or implementation failures propagate so the caller blocks safely.
+    """
+    route_name = requested_route if requested_route in policy.ROUTES else None
+    inv = _latest_codex_invocation(state_dir, request_id, kind)
+    if inv is not None:
+        inv_route = inv.get("requested_route")
+        if isinstance(inv_route, str) and inv_route in policy.ROUTES:
+            route_name = inv_route
+    if not route_name:
+        return None, None
+    requested_model = policy.ROUTES[route_name].get("model")
+    if not isinstance(requested_model, str) or not requested_model:
+        return None, None
+    observed = inv.get("observed_model") if isinstance(inv, dict) else None
+    if not isinstance(observed, str) or not observed:
+        return None, None
+    return observed, codex_model_mismatch_reason(requested_model, observed)
+
+
+def _block_codex_observation_failure(state_dir, request_id: str, kind: str,
+                                     exc: Exception, task_id: str | None = None) -> dict:
+    """Block safely on an unexpected observation failure, with evidence.
+
+    Never retries, falls back, marks capacity, moves routes, or applies an
+    envelope. Expected missing or unreadable rollout cases never reach
+    here; they stay unknown.
+    """
+    try:
+        detail = f"{type(exc).__name__}: {str(exc)[:150]}"
+    except Exception:
+        detail = "observation failed"
+    reason = f"model_observation_failed: {kind} {detail}"[:300]
+    try:
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": kind, "error": detail[:1000]})
+    except Exception:
+        pass
+    _mark_blocked(state_dir, request_id, reason)
+    out = {"action": "blocked", "reason": reason}
+    if task_id is not None:
+        out["codex_task_id"] = task_id
+    return out
+
+
 def _assistant_text_quote(full) -> str:
     """First 200 characters of an OpenCode summary's assistant text.
 
@@ -788,14 +872,47 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     if harnesses.route_uses_owned_server(dispatch_route):
         return _dispatch_on_opencode(state_dir, request_id, dispatch_route, prompt, run_cmd, "initial")
     cmd = adapters.build_codex_dispatch_cmd(workspace, prompt, model=dispatch["model"],
-                                            effort=dispatch["variant"],
-                                            last_message_path=last_path)
-    rc, out, err = run_cmd(cmd, workspace, None, kind="codex_dispatch",
-                           meta={"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
+                                             effort=dispatch["variant"],
+                                             last_message_path=last_path)
+    try:
+        rc, out, err = run_cmd(cmd, workspace, None, kind="codex_dispatch",
+                               meta={"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
+    except Exception as e:
+        # A failed measurement (including a failed observed_model write) or
+        # any other turn failure must block safely with evidence, never let
+        # a completion through as unknown.
+        return _block_codex_observation_failure(
+            state_dir, request_id, "codex_dispatch", e)
     codex_h = harnesses.harness_named("codex")
     task_id, _skind = codex_h.parse_session("codex_dispatch", out, err, job)
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
                   session_id=task_id, output_text=(out or "") + (err or ""))
+    if task_id:
+        # The thread exists even when the turn failed: save it so recovery
+        # resumes it instead of creating a replacement task.
+        _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
+                         effort=dispatch["variant"], dispatch_route=dispatch_route)
+    # Observed-model gate before any failure classification, auth or
+    # usage-limit fallback, envelope, or route movement. A known
+    # requested-versus-observed mismatch blocks with model_mismatch naming
+    # both models, with no retry, fallback, capacity mark, or envelope.
+    # Unknown never blocks, and only genuinely missing or unreadable
+    # rollout cases stay unknown inside the rollout reader. Any other
+    # observation failure blocks safely with evidence.
+    # Failed turns gate alike: a mismatched failed
+    # turn beats usage-limit and generic failure handling.
+    try:
+        _obs, _mm_reason = check_codex_observed_model(
+            state_dir, request_id, "codex_dispatch", dispatch_route)
+    except Exception as e:
+        return _block_codex_observation_failure(
+            state_dir, request_id, "codex_dispatch", e, task_id)
+    if _mm_reason is not None:
+        _mark_blocked(state_dir, request_id, _mm_reason)
+        out_blocked = {"action": "blocked", "reason": _mm_reason}
+        if task_id:
+            out_blocked["codex_task_id"] = task_id
+        return out_blocked
     if not task_id:
         stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
                                           prompt, run_cmd, out, err, cmd, rc)
@@ -818,10 +935,6 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
                                          reason=f"dispatch_fallback rc={rc}")
         _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted: {message}")
         return {"action": "blocked", "reason": "codex_dispatch_failed"}
-    # The thread exists even when the turn failed: save it so recovery
-    # resumes it instead of creating a replacement task.
-    _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
-                     effort=dispatch["variant"], dispatch_route=dispatch_route)
     if not codex_h.turn_ok("codex_dispatch", rc, out, cmd):
         # A stall the supervisor ended for stream silence moves laterally
         # with signal stalled, before auth is even consulted: command
@@ -1098,12 +1211,31 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
                                           model=dispatch["model"], effort=dispatch["variant"])
     # Resume uses the saved workspace as cwd; never --cd/--reasoning.
-    rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
-                           meta={"stage": "dispatch", "route": active, "reason": "resume"})
+    try:
+        rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
+                               meta={"stage": "dispatch", "route": active, "reason": "resume"})
+    except Exception as e:
+        return _block_codex_observation_failure(
+            state_dir, request_id, "codex_resume", e)
     codex_h = harnesses.harness_named("codex")
     resumed_id, _skind = codex_h.parse_session("codex_resume", out, err, job)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
                   session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
+    # Observed-model gate before any failure classification, envelope, or
+    # route movement, like dispatch. A mismatched failed resume beats the
+    # generic failure handling. Only genuinely missing or unreadable rollout
+    # cases stay unknown inside the rollout reader; any other observation
+    # failure blocks safely with evidence.
+    try:
+        _resume_route = active if active in policy.ROUTES else policy.stage_routes("dispatch")[0]
+        _obs, _mm_reason = check_codex_observed_model(
+            state_dir, request_id, "codex_resume", _resume_route)
+    except Exception as e:
+        return _block_codex_observation_failure(
+            state_dir, request_id, "codex_resume", e)
+    if _mm_reason is not None:
+        _mark_blocked(state_dir, request_id, _mm_reason)
+        return {"action": "blocked", "reason": _mm_reason}
     if not codex_h.turn_ok("codex_resume", rc, out, cmd):
         # A stall the supervisor ended for stream silence stays stalled,
         # never auth: command output quoting auth-pattern text is not

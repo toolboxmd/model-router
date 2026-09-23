@@ -1115,7 +1115,58 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
         job_status = job_row["status"] if job_row else None
         applied = "consumed"
-        if planner_answer and job_row is not None and job_status not in store.TERMINAL \
+        cancelled = bool(job_row is not None and job_row["cancel_requested"])
+        is_dispatch = inv.get("stage") == "dispatch" or harness.is_dispatch(kind)
+        turn_ok = harness.turn_ok(kind, rc, stdout_text, inv_cmd)
+        # A dispatcher turn counts only from the saved task: a resume that
+        # reports another thread, or none, is never applied.
+        thread_ok = True
+        if is_dispatch:
+            saved_thread = job_row["codex_task_id"] if job_row is not None else None
+            thread_ok = harness.identity_ok(kind, sid, saved_thread)
+        live_job = job_row is not None and job_status not in store.TERMINAL and not cancelled
+        # Full measurement in this same transaction, before any planner or
+        # envelope application, for every recovered invocation kind. A
+        # measurement failure blocks safely here and skips all envelope
+        # effects, so no completed event, completion envelope, or
+        # successful result can commit. Unknown never blocks, and only
+        # genuinely missing or unreadable rollout cases stay unknown
+        # inside the rollout reader's file-read boundary. Any other
+        # observation or measurement failure (kit lookup, parser logic,
+        # database write) blocks safely with evidence.
+        _measured_observed = None
+        measure_failed = False
+        model_gate_applied = False
+        try:
+            _m_full = _compute_invocation_measurement(
+                state_dir, request_id, inv["invocation_id"], kind,
+                stdout_text, stderr_text, inv_meta,
+                inv.get("started_at"), inv.get("ended_at") or now,
+                rc, payload, crashed=inv.get("rc") is None)
+            _write_invocation_measurement(con, inv["invocation_id"], _m_full)
+            _obs = _m_full["observed"]
+            if not (isinstance(_obs, str) and _obs):
+                _obs = None
+            _measured_observed = _obs
+        except Exception as e:
+            measure_failed = True
+            model_gate_applied = True
+            if live_job:
+                try:
+                    _detail = f"{type(e).__name__}: {str(e)[:150]}"
+                except Exception:
+                    _detail = "measurement failed"
+                _is_codex = getattr(harness, "name", None) == "codex"
+                _prefix = "model_observation_failed" if _is_codex else "measurement_failed"
+                _mreason = f"{_prefix}: {kind} {_detail}"[:300]
+                con.execute(
+                    "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
+                    " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
+                    (_mreason, now, request_id))
+                _event(con, request_id, "blocked", {"reason": _mreason[:120]})
+                applied = "blocked"
+        if not measure_failed and planner_answer and job_row is not None \
+                and job_status not in store.TERMINAL \
                 and not job_row["cancel_requested"]:
             qid, text = planner_answer
             upd = con.execute(
@@ -1134,18 +1185,59 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                                 (now, request_id))
                     job_status = "running"
                 applied = "answer-persisted"
-        cancelled = bool(job_row is not None and job_row["cancel_requested"])
-        is_dispatch = inv.get("stage") == "dispatch" or harness.is_dispatch(kind)
-        turn_ok = harness.turn_ok(kind, rc, stdout_text, inv_cmd)
-        # A dispatcher turn counts only from the saved task: a resume that
-        # reports another thread, or none, is never applied.
-        thread_ok = True
-        if is_dispatch:
-            saved_thread = job_row["codex_task_id"] if job_row is not None else None
-            thread_ok = harness.identity_ok(kind, sid, saved_thread)
-        live_job = job_row is not None and job_status not in store.TERMINAL and not cancelled
+        # Observed-model gate for Codex dispatch turns in recovery, before
+        # any failure classification or envelope, using the measured
+        # observed_model above consistently. A known mismatch blocks with
+        # model_mismatch and no envelope. Failed turns gate alike, beating
+        # the generic failure handling below.
+        if not measure_failed and live_job and is_dispatch \
+                and getattr(harness, "name", None) == "codex":
+            try:
+                _m_observed = _measured_observed
+                _req_route = inv.get("requested_route")
+                if not (isinstance(_req_route, str) and _req_route in policy.ROUTES):
+                    _meta_route = inv_meta.get("route")
+                    if isinstance(_meta_route, str) and _meta_route in policy.ROUTES:
+                        _req_route = _meta_route
+                    else:
+                        try:
+                            _st = json.loads(job_row["controller_state"] or "{}") \
+                                if job_row is not None else {}
+                        except ValueError:
+                            _st = {}
+                        _dr = _st.get("dispatch_route") if isinstance(_st, dict) else None
+                        if isinstance(_dr, str) and _dr in policy.ROUTES:
+                            _req_route = _dr
+                        else:
+                            _req_route = None
+                _req_model = policy.ROUTES[_req_route].get("model") if _req_route else None
+                _obs_model = _m_observed
+                if isinstance(_req_model, str) and _req_model \
+                        and isinstance(_obs_model, str) and _obs_model:
+                    if _req_model != _obs_model:
+                        _mm = f"model_mismatch: requested={_req_model} observed={_obs_model}"
+                        con.execute(
+                            "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
+                            " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
+                            (_mm, now, request_id))
+                        _event(con, request_id, "blocked", {"reason": _mm[:120]})
+                        applied = "blocked"
+                        model_gate_applied = True
+            except Exception as e:
+                try:
+                    _detail = f"{type(e).__name__}: {str(e)[:150]}"
+                except Exception:
+                    _detail = "observation failed"
+                _oreason = f"model_observation_failed: {kind} {_detail}"[:300]
+                con.execute(
+                    "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
+                    " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
+                    (_oreason, now, request_id))
+                _event(con, request_id, "blocked", {"reason": _oreason[:120]})
+                applied = "blocked"
+                model_gate_applied = True
         planner_reason = None
-        if live_job and inv_meta.get("qid") is not None:
+        if not measure_failed and live_job and inv_meta.get("qid") is not None:
             # A planner turn matters only while its question is still open;
             # a question answered meanwhile (public `answer`) wins.
             cb_qid = inv_meta.get("qid")
@@ -1160,7 +1252,7 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                         (planner_reason, now, request_id))
             _event(con, request_id, "blocked", {"reason": planner_reason[:120]})
             applied = "blocked"
-        elif live_job and is_dispatch and (not turn_ok or not thread_ok):
+        elif not model_gate_applied and live_job and is_dispatch and (not turn_ok or not thread_ok):
             # The controller would have blocked on this result; recovery
             # records the same durable, sticky reason instead of leaving
             # the job running without an owner. Muse turns are left to the
@@ -1171,8 +1263,8 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                         " AND status NOT IN ('succeeded','failed','cancelled')", (reason, now, request_id))
             _event(con, request_id, "blocked", {"reason": reason[:120]})
             applied = "blocked"
-        if job_row is not None and job_status not in store.TERMINAL and isinstance(envelope, dict) \
-                and turn_ok and thread_ok and not cancelled:
+        if not model_gate_applied and job_row is not None and job_status not in store.TERMINAL \
+                and isinstance(envelope, dict) and turn_ok and thread_ok and not cancelled:
             action_name = envelope.get("action")
             # Persist the Luna envelope before any completion effect.
             st = {}
@@ -1262,7 +1354,9 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         raise
     finally:
         con.close()
-    _measure_invocation(state_dir, request_id, inv["invocation_id"], crashed=inv.get("rc") is None)
+    # Recovery measurement already ran inside the transaction above: no
+    # post-commit repeat. A measurement failure blocks in-transaction
+    # before any envelope, so no completion can commit.
     if applied == "completed":
         try:
             root = store.ensure_state_dir(state_dir)
@@ -1545,39 +1639,43 @@ def _runner_result_line(stdout: str) -> dict:
     return found if isinstance(found, dict) else {}
 
 
-def measure_output(kind: str, stdout: str, stderr: str, meta: dict | None = None) -> tuple:
+def measure_output(kind: str, stdout: str, stderr: str, meta: dict | None = None,
+                   inv_ctx: dict | None = None) -> tuple:
     """(usage, observed_model, observed_variant, native_ids) from the harness.
 
     Counters are copied verbatim under a ``source`` label and never folded;
     a harness that reports nothing leaves usage None. Model and variant stay
-    separate; the harness seam is the single place that knows them."""
-    measured = harnesses.harness_for(kind).measure(kind, stdout, stderr, meta or {})
+    separate; the harness seam is the single place that knows them.
+    ``inv_ctx`` carries request/invocation identity (request_id,
+    invocation_id, state_dir) for harnesses that read their own records
+    (Codex rollouts); it never enters public measurement fields."""
+    measured = harnesses.harness_for(kind).measure(kind, stdout, stderr, meta or {}, inv_ctx)
     if len(measured) == 3:
         usage, observed, ids = measured
         return usage, observed, None, ids
     return measured
 
-def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed: bool = False) -> None:
-    """Fill elapsed time, terminal class, usage, observed model and variant,
-    and native identities on a finished invocation from its own files."""
-    rows = [i for i in _list_invocations(state_dir, request_id) if i["invocation_id"] == invocation_id]
-    if not rows:
-        return
-    inv = rows[0]
-    stdout, stderr = _read_invocation_output(inv)
-    try:
-        result_obj = json.loads(inv.get("result_json") or "null")
-    except ValueError:
-        result_obj = None
-    try:
-        meta = json.loads(inv.get("meta_json") or "{}") or {}
-    except ValueError:
-        meta = {}
-    usage, observed, variant, ids = measure_output(inv.get("kind") or "", stdout, stderr, meta)
-    started = _parse_ts(inv.get("started_at"))
-    ended = _parse_ts(inv.get("ended_at")) or time.time()
+def _compute_invocation_measurement(state_dir, request_id: str, invocation_id: str,
+                                     kind: str, stdout: str, stderr: str,
+                                     meta: dict, started_at, ended_at,
+                                     rc, result_obj, crashed: bool = False) -> dict:
+    """Full measurement values for one finished invocation, without any write.
+
+    Shared by the live ``_measure_invocation`` path and recovery, so both
+    persist the same fields: elapsed time, terminal class, usage, observed
+    model and variant, native identities, longest silence, tools, and
+    skills. Expected missing or unreadable rollout cases stay unknown
+    inside the harness file-read boundary; any other observation failure
+    propagates so the caller blocks safely.
+    """
+    inv_ctx = {"state_dir": state_dir, "request_id": request_id,
+               "invocation_id": invocation_id}
+    usage, observed, variant, ids = measure_output(kind or "", stdout, stderr, meta or {},
+                                                   inv_ctx)
+    started = _parse_ts(started_at)
+    ended = _parse_ts(ended_at) or time.time()
     elapsed = round(max(0.0, ended - started), 3) if started is not None else None
-    tclass = terminal_class_for(inv.get("rc"), result_obj, crashed=crashed)
+    tclass = terminal_class_for(rc, result_obj, crashed=crashed)
     longest = None
     if isinstance(result_obj, dict):
         # Owned-server turns nest the drive result under ``envelope``; CLI
@@ -1620,36 +1718,73 @@ def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed:
         _skills_json = json.dumps(_observed, sort_keys=True) if isinstance(_observed, list) else None
     except Exception:
         _skills_json = None
+    return {"elapsed": elapsed, "terminal_class": tclass, "usage": usage,
+            "observed": observed, "variant": variant, "ids": ids,
+            "longest": longest, "tools_json": tools_json,
+            "skills_json": _skills_json}
+
+
+def _write_invocation_measurement(con, invocation_id: str, m: dict) -> None:
+    """Persist a computed measurement on an open connection, no commit."""
+    con.execute(
+        "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
+        " observed_model=COALESCE(?, observed_model),"
+        " observed_variant=COALESCE(?, observed_variant),"
+        " native_ids_json=?, schema_version=?,"
+        " longest_silence_secs=COALESCE(?, longest_silence_secs),"
+        " tools_json=COALESCE(NULLIF(tools_json,'[]'), ?)"
+        " WHERE invocation_id=?",
+        (m["elapsed"], m["terminal_class"],
+         json.dumps(m["usage"], sort_keys=True) if m["usage"] is not None else None,
+         m["observed"], m["variant"],
+         json.dumps(m["ids"], sort_keys=True) if m["ids"] else None,
+         store.SCHEMA_VERSION, m["longest"], m["tools_json"], invocation_id))
+    if m["skills_json"] is not None:
+        con.execute(
+            "UPDATE invocations SET skills_json=? WHERE invocation_id=?",
+            (m["skills_json"], invocation_id))
+    # First measurement wins for tools when the row still holds the
+    # insert-time empty list; later measures keep observed tools.
+    con.execute(
+        "UPDATE invocations SET tools_json=? WHERE invocation_id=?"
+        " AND (tools_json IS NULL OR tools_json='[]')",
+        (m["tools_json"], invocation_id))
+
+
+def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed: bool = False) -> None:
+    """Fill elapsed time, terminal class, usage, observed model and variant,
+    and native identities on a finished invocation from its own files."""
+    rows = [i for i in _list_invocations(state_dir, request_id) if i["invocation_id"] == invocation_id]
+    if not rows:
+        return
+    inv = rows[0]
+    stdout, stderr = _read_invocation_output(inv)
+    try:
+        result_obj = json.loads(inv.get("result_json") or "null")
+    except ValueError:
+        result_obj = None
+    try:
+        meta = json.loads(inv.get("meta_json") or "{}") or {}
+    except ValueError:
+        meta = {}
+    m = _compute_invocation_measurement(
+        state_dir, request_id, invocation_id, inv.get("kind") or "",
+        stdout, stderr, meta, inv.get("started_at"), inv.get("ended_at"),
+        inv.get("rc"), result_obj, crashed=crashed)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
-            " observed_model=COALESCE(?, observed_model),"
-            " observed_variant=COALESCE(?, observed_variant),"
-            " native_ids_json=?, schema_version=?,"
-            " longest_silence_secs=COALESCE(?, longest_silence_secs),"
-            " tools_json=COALESCE(NULLIF(tools_json,'[]'), ?)"
-            " WHERE invocation_id=?",
-            (elapsed, tclass, json.dumps(usage, sort_keys=True) if usage is not None else None,
-             observed, variant, json.dumps(ids, sort_keys=True) if ids else None,
-             store.SCHEMA_VERSION, longest, tools_json, invocation_id))
-        if _skills_json is not None:
-            con.execute(
-                "UPDATE invocations SET skills_json=? WHERE invocation_id=?",
-                (_skills_json, invocation_id))
-        # First measurement wins for tools when the row still holds the
-        # insert-time empty list; later measures keep observed tools.
-        con.execute(
-            "UPDATE invocations SET tools_json=? WHERE invocation_id=?"
-            " AND (tools_json IS NULL OR tools_json='[]')",
-            (tools_json, invocation_id))
+        _write_invocation_measurement(con, invocation_id, m)
         con.execute("COMMIT")
     except Exception:
+        # A failed observed_model write must never read as unknown and let a
+        # completion through: roll back and propagate so the live controller
+        # and recovery paths block with evidence before any envelope.
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
+        raise
     finally:
         con.close()
 

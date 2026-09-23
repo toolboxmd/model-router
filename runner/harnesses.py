@@ -123,7 +123,8 @@ class Harness:
     def classify_signal(self, evidence):
         return policy.classify_signal(evidence)
 
-    def measure(self, kind: str, stdout: str, stderr: str, meta: dict | None) -> tuple:
+    def measure(self, kind: str, stdout: str, stderr: str, meta: dict | None,
+                inv_ctx: dict | None = None) -> tuple:
         # (usage, observed_model, observed_variant, native_ids). Usage is
         # verbatim under a source label; model and variant stay separate so
         # the ledger never folds the variant into the model name.
@@ -340,6 +341,118 @@ def _kit_name_for_inv(inv, default: str | None = None) -> str | None:
     return default
 
 
+def parse_codex_rollout_model_text(text: str) -> str | None:
+    """Observed model from a Codex thread rollout, or None when unknown.
+
+    Rows are ``{type, payload}``. The only source is the model on the
+    LAST ``turn_context`` row (``payload.model``). Every turn_context is
+    authoritative: a missing or non-dict payload, or a missing, empty,
+    or invalid model, clears the result to unknown and never returns an
+    earlier model. A later valid turn_context may establish a model.
+    An empty file stays unknown: never guess from earlier rows, stdout,
+    or the requested route. The exact rollout string returns unchanged.
+    """
+    had_turn_context = False
+    last_turn_model: str | None = None
+    last_turn_has_model = False
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        row_type = row.get("type")
+        if row_type == "turn_context":
+            had_turn_context = True
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                # Authoritative latest context with no usable payload:
+                # clear any earlier model, never fall back to it.
+                last_turn_model = None
+                last_turn_has_model = False
+                continue
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                last_turn_model = model
+                last_turn_has_model = True
+            else:
+                # The last turn_context decides: a later row without a
+                # model clears an earlier guess, never falls back to it.
+                last_turn_model = None
+                last_turn_has_model = False
+            continue
+    if had_turn_context:
+        return last_turn_model if last_turn_has_model else None
+    return None
+
+
+def codex_rollout_paths_for_thread(kit_dirs, thread_id: str) -> list:
+    """Rollout files for one thread under per-invocation kit dirs."""
+    if not isinstance(thread_id, str) or not thread_id:
+        return []
+    # Never let a thread id escape the sessions tree.
+    if "/" in thread_id or "\\" in thread_id or ".." in thread_id \
+            or "\x00" in thread_id:
+        return []
+    suffix = f"{thread_id}.jsonl"
+    out: list = []
+    for kit_dir in kit_dirs or []:
+        try:
+            sessions = _KitPath(str(kit_dir)) / "sessions"
+        except (OSError, ValueError):
+            continue
+        try:
+            if not sessions.is_dir():
+                continue
+        except OSError:
+            continue
+        try:
+            candidates = list(sessions.rglob("*.jsonl"))
+        except (OSError, ValueError):
+            continue
+        for cand in candidates:
+            name = cand.name
+            if not name.startswith("rollout-") or not name.endswith(suffix):
+                continue
+            try:
+                if cand.is_file():
+                    out.append(cand)
+            except OSError:
+                continue
+    return sorted(out, key=lambda p: str(p))
+
+
+def codex_observed_model(state_dir, request_id: str,
+                         invocation_id: str, thread_id: str | None) -> str | None:
+    """Observed Codex model for one invocation's thread, or None unknown.
+
+    Searches ``sessions/**/rollout-*-<thread_id>.jsonl`` in each
+    per-invocation kit dir from ``kits.kit_dirs_for_invocation``. A missing
+    rollout, an unreadable file, or a missing model stays unknown. Only
+    expected missing or unreadable rollout errors (OSError, ValueError)
+    are treated as unknown; any other failure propagates so the caller
+    blocks safely instead of passing as unknown.
+    """
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+    from . import kits as _kits
+    dirs = _kits.kit_dirs_for_invocation(state_dir, request_id, invocation_id)
+    paths = codex_rollout_paths_for_thread(dirs, thread_id)
+    for path in paths:
+        try:
+            text = _KitPath(str(path)).read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        model = parse_codex_rollout_model_text(text)
+        if isinstance(model, str) and model:
+            return model
+    return None
+
+
 class CodexCLI(Harness):
     name = "codex"
     kinds = (KIND_CODEX_DISPATCH, KIND_CODEX_RESUME)
@@ -383,7 +496,7 @@ class CodexCLI(Harness):
         return adapters.parse_codex_agent_envelope(
             stdout, adapters.read_last_message_file(adapters.last_message_path_from_cmd(cmd)))
 
-    def measure(self, kind, stdout, stderr, meta):
+    def measure(self, kind, stdout, stderr, meta, inv_ctx=None):
         usage = None
         ids = {"thread_id": None, "turn_ids": [], "agent_message_ids": []}
         for obj in _jsonl(stdout):
@@ -398,7 +511,23 @@ class CodexCLI(Harness):
                 item = obj.get("item") or {}
                 if item.get("type") == "agent_message" and item.get("id"):
                     ids["agent_message_ids"].append(item["id"])
-        return usage, None, None, ids
+        observed = None
+        # No outer catch: expected missing or unreadable rollout cases stay
+        # unknown inside codex_observed_model's file-read boundary. Any other
+        # observation failure (invocation lookup, kit lookup, parser logic)
+        # propagates so the caller blocks safely instead of passing unknown.
+        ctx = inv_ctx if isinstance(inv_ctx, dict) else None
+        thread_id = ids.get("thread_id")
+        if ctx is not None and isinstance(thread_id, str) and thread_id:
+            state_dir = ctx.get("state_dir")
+            request_id = ctx.get("request_id")
+            invocation_id = ctx.get("invocation_id")
+            if state_dir is not None and request_id and invocation_id:
+                observed = codex_observed_model(
+                    state_dir, str(request_id), str(invocation_id), thread_id)
+                if not (isinstance(observed, str) and observed):
+                    observed = None
+        return usage, observed, None, ids
 
     def infer_rc(self, kind, stdout, cmd=None):
         last_text = None
@@ -884,7 +1013,7 @@ class ClaudeCLI(Harness):
                     break
         return obj if isinstance(obj, dict) else None
 
-    def measure(self, kind, stdout, stderr, meta):
+    def measure(self, kind, stdout, stderr, meta, inv_ctx=None):
         meta = meta or {}
         usage = None
         ids = {}
@@ -1101,7 +1230,7 @@ class OpenCodeServer(Harness):
                     continue
         return summary if isinstance(summary, dict) and summary else None
 
-    def measure(self, kind, stdout, stderr, meta):
+    def measure(self, kind, stdout, stderr, meta, inv_ctx=None):
         summary = self.parse_report(kind, stdout, None) or {}
         usage = summary.get("usage") if isinstance(summary.get("usage"), dict) else None
         ids = summary.get("native_ids") if isinstance(summary.get("native_ids"), dict) else {}
@@ -1347,7 +1476,7 @@ class GrokBuildCLI(Harness):
                 "signal": signal,
                 "signal_evidence": evidence}
 
-    def measure(self, kind, stdout, stderr, meta):
+    def measure(self, kind, stdout, stderr, meta, inv_ctx=None):
         """(usage, observed_model, observed_variant, native_ids).
 
         Counters verbatim under the ``grok`` source label, only where the

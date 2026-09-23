@@ -37,6 +37,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat as _stat
 from pathlib import Path
 
 from . import policy
@@ -450,19 +451,48 @@ def adopt_codex_thread(state_dir, request_id: str, thread_id: str, shared) -> Pa
 
 
 def kit_dirs_for_invocation(state_dir, request_id: str, invocation_id: str) -> list[Path]:
-    """Kit directories materialized for one invocation, if any."""
+    """Kit directories materialized for one invocation, if any.
+
+    Only a genuinely absent kits root (or a kits root that is not a
+    directory) returns an empty list. Every other filesystem failure
+    (permission, I/O, ...) propagates so the observed-model/controller
+    path blocks safely instead of treating the observation as unknown.
+    ``Path.is_dir`` suppresses filesystem errors, so this uses
+    ``stat``/``iterdir`` seams that preserve unexpected errors.
+    """
     def _safe(value: str, limit: int) -> str:
         return "".join(c if c.isalnum() or c in ("-", "_") else "_"
                        for c in str(value))[:limit] or "job"
+    root = Path(state_dir) / "kits"
+    prefix = f"{_safe(request_id, 64)}.{_safe(invocation_id, 32)}."
     try:
-        root = Path(state_dir) / "kits"
-        prefix = f"{_safe(request_id, 64)}.{_safe(invocation_id, 32)}."
-        if not root.is_dir():
-            return []
-        return sorted(p for p in root.iterdir()
-                      if p.is_dir() and p.name.startswith(prefix))
-    except OSError:
+        root_st = root.stat()
+    except FileNotFoundError:
         return []
+    except NotADirectoryError:
+        return []
+    if not _stat.S_ISDIR(root_st.st_mode):
+        return []
+    try:
+        entries = list(root.iterdir())
+    except FileNotFoundError:
+        return []
+    except NotADirectoryError:
+        return []
+    out = []
+    for cand in entries:
+        if not cand.name.startswith(prefix):
+            continue
+        try:
+            cand_st = cand.stat()
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError:
+            continue
+        if not _stat.S_ISDIR(cand_st.st_mode):
+            continue
+        out.append(cand)
+    return sorted(out)
 
 
 def kit_contents_for_ledger(kit_dir) -> dict | None:
