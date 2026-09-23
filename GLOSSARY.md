@@ -15,7 +15,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Window | A share of a Go model's monthly dollar limit: 5-hour, weekly, monthly. | quota period |
 | Signal class | How provider evidence is classified: exhausted, overloaded, stalled, context, hard. | error type |
 | Stall | A worker turn that stops streaming: busy with no new parts past the silence window. | hang |
-| Silence window | Policy seconds of stream silence that end a busy turn (default 180, with session-database evidence); the per-turn timeout stays the outer budget for active turns. | timeout |
+| Silence window | Per-harness policy seconds of stream silence that end a busy turn (Codex dispatch and resume 300, OpenCode and every other harness 180), held in `runner/policy.py` as `STALL_SILENCE_SECS_BY_HARNESS`; the per-turn timeout stays the outer budget, any override is clamped strictly below it, and the deadline is checked first. | timeout |
 | Probe | A fresh minimal request on the same route when a turn goes silent (stall evidence), on an assumed weekly or monthly mark to learn the real boundary, or a proactive usage read of a subscription window through the harness seam. | ping |
 | Reading | One proactive usage measurement per pool, model, and window: used, limit, reset_at, observed_at, and source (provider_reported, measured, derived, assumed). Unknown means the probe failed and the route stays eligible on error evidence alone. | usage snapshot |
 | Usage probe | A proactive window reading through the harness seam (Codex rate limits, Claude usage, Go cost sums, Zen request counts, Grok billing), on its policy interval or on demand, never blocking routing. | meter read |

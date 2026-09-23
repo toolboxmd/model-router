@@ -159,7 +159,13 @@ class StreamSeam(unittest.TestCase):
         self.assertEqual(tracker.longest, 2.0)
         # A per-invocation override wins over the policy default.
         self.assertEqual(h.stall_window_secs({"stall_secs": 3}), 3.0)
-        self.assertEqual(h.stall_window_secs({}), policy.STALL_SILENCE_SECS)
+        # Per-harness policy data (#73): Codex dispatch waits out silent
+        # max-effort reasoning, OpenCode workers keep the 180s default.
+        self.assertEqual(h.stall_window_secs({}),
+                         policy.STALL_SILENCE_SECS_BY_HARNESS["codex"])
+        self.assertGreater(h.stall_window_secs({}), 181)
+        oc = harnesses.harness_named("opencode")
+        self.assertEqual(oc.stall_window_secs({}), policy.STALL_SILENCE_SECS)
 
 
 class StallDrillBase(unittest.TestCase):

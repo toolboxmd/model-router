@@ -321,7 +321,9 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
             # seam: a live child whose JSON-line stream stops past the window
             # is stalled, while the per-turn timeout stays the outer budget.
             tracker = harness.new_activity_tracker(time.monotonic())
-            window = harness.stall_window_secs(meta)
+            # Bounded strictly below the turn timeout, so the stall
+            # detector cannot outlive the outer turn budget.
+            window = harness.effective_stall_window_secs(meta, timeout_f)
             poll_secs = min(1.0, max(0.2, window / 2.0))
             next_check = time.monotonic() + poll_secs
             while True:
@@ -340,6 +342,28 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                 if rc is not None:
                     break
                 now = time.monotonic()
+                # The turn deadline is the outer budget: it is checked
+                # before the stall window, inclusively, so at the boundary
+                # a turn that reaches its timeout reports a timeout, never
+                # a stall.
+                if now >= deadline:
+                    try:
+                        os.killpg(int(pgid or pid), 9)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        rc = proc.wait(timeout=5)
+                    except Exception:
+                        rc = 124
+                    if rc == -_signal.SIGKILL:
+                        # The deadline kill above: report the runner's
+                        # timeout code, as direct runs do, so the ledger
+                        # records a timeout instead of a bare signal death.
+                        rc = 124
+                    break
                 if now >= next_check:
                     next_check = now + poll_secs
                     _changed, _detail = harness.note_cli_output(
@@ -360,7 +384,11 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                             except Exception:
                                 pass
                         try:
-                            rc = proc.wait(timeout=5)
+                            # Stall cleanup stays inside the outer budget:
+                            # the graceful wait is capped by the remaining
+                            # deadline, then SIGKILL (which always lands).
+                            remaining = deadline - time.monotonic()
+                            rc = proc.wait(timeout=max(0.1, min(5.0, remaining)))
                         except Exception:
                             rc = None
                         if rc is None:
@@ -386,24 +414,6 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                         except OSError:
                             pass
                         break
-                if time.monotonic() > deadline:
-                    try:
-                        os.killpg(int(pgid or pid), 9)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                    try:
-                        rc = proc.wait(timeout=5)
-                    except Exception:
-                        rc = 124
-                    if rc == -_signal.SIGKILL:
-                        # The deadline kill above: report the runner's
-                        # timeout code, as direct runs do, so the ledger
-                        # records a timeout instead of a bare signal death.
-                        rc = 124
-                    break
                 time.sleep(0.05)
     finally:
         try:
@@ -797,7 +807,10 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     # last-activity timestamp, and a tool part in running state counts as
     # activity while its process is alive.
     tracker = harness.new_activity_tracker(time.monotonic())
-    window = harness.stall_window_secs(meta)
+    # Bounded strictly below the turn's remaining budget, so the stall
+    # detector cannot outlive the outer turn deadline.
+    window = harness.effective_stall_window_secs(
+        meta, max(1.0, deadline - time.monotonic()))
     route = meta.get("route")
     overload_spec = _policy.SIGNAL_CLASSES["overloaded"]
     overload_first = None
@@ -858,6 +871,16 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         typ = status.get("type")
         if typ in ("busy", "retry"):
             seen_active = True
+            # The turn deadline is the outer budget: it is checked before
+            # the stall window, inclusively, so at the boundary a turn
+            # that reaches its timeout reports a timeout, never a stall.
+            if now >= deadline:
+                result.update(rc=124, error="implementation turn timed out",
+                              longest_silence_secs=round(
+                                  max(tracker.longest,
+                                      tracker.silence(now)), 3))
+                abort_and_confirm()
+                break
             age = tracker.silence(now)
             if age > window:
                 # Silent past the window while busy: probe the same route
@@ -1083,7 +1106,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                 result.update(rc=1, error="prompt was not accepted within 60 seconds")
                 abort_and_confirm()
                 break
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             result.update(rc=124, error="implementation turn timed out",
                           longest_silence_secs=round(
                               max(tracker.longest,

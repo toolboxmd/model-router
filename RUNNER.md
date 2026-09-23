@@ -370,21 +370,31 @@ session's message parts at a one-second interval, and reads the new
 assistant messages when it is idle. Every part creation or update (text,
 reasoning, or tool parts) refreshes the turn's last-activity timestamp; a
 tool part in running state counts as activity while its process is alive.
-A turn whose status is busy with no activity past the policy silence window
-(180 seconds; evidence: healthy 2026-09-20 sessions showed 110 to 161 second
-gaps, the stalled session 321 seconds then nothing) is aborted, confirmed
-idle, and recorded with signal `stalled` carrying the last-activity age and
-the last part type. Before aborting, the detector probes the same route with
+A turn whose status is busy with no activity past its harness silence
+window is aborted, confirmed idle, and recorded with signal `stalled`
+carrying the last-activity age and the last part type. The windows are
+per-harness policy data in `runner/policy.py`
+(`STALL_SILENCE_SECS_BY_HARNESS`): Codex dispatch and resume wait 300
+seconds of stream silence (evidence: Luna at max effort reasoned silently
+for 181 seconds on 2026-09-23 with no stream events), while OpenCode
+worker turns and every other harness use 180 seconds (evidence: healthy
+2026-09-20 sessions showed 110 to 161 second gaps, the stalled session 321
+seconds then nothing). Before aborting, the detector probes the same route with
 a fresh minimal request, so a stall that is exhaustion in disguise moves
 pools instead of retrying the same route; the probe's answer (exhausted,
 overloaded, or unknown) is recorded as the signal evidence. An unknown probe
 retries the same route bounded by the overload window, then moves laterally
-with the route degraded. The Codex and Claude CLI harnesses apply the same
-rule to their JSON-line streams through the harness seam (last line time).
-The per-turn timeout (OpenCode 1800 s) stays as the outer budget for runaway
-but active turns; the silence window ends silent turns within minutes.
-`RUNNER_STALL_SECS` shrinks the window for deterministic drills only; it
-stays unset in production, where the policy value governs. Every invocation
+with the route degraded. The Codex and Claude CLI harnesses apply their own
+windows to their JSON-line streams through the harness seam (last line time).
+The per-turn timeout (1800 s for Codex and OpenCode turns, 900 s for
+Claude) stays as the outer budget for runaway but active turns: the
+effective silence window is always clamped strictly below it, and the
+supervisor checks the turn deadline before the stall window, so at the
+boundary a turn that reaches its timeout reports a timeout, never a stall.
+`RUNNER_STALL_SECS` and per-invocation `stall_secs` shrink the window for
+deterministic drills only; they stay unset in production, where the policy
+value governs, and an override at or above the timeout is clamped the same
+way. Every invocation
 records its longest observed stream silence (`longest_silence_secs`) so the
 window is tuned on data through Agent Observer. The server group stops after
 every turn.
