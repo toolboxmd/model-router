@@ -23,8 +23,16 @@ affected dispatch if any required component is missing.
 Submit prepared implementation, correction, and recovery work through this
 launcher using the policy's lane. The runner owns capacity, fallback, durable
 state, and the terminal report. Read [the runner contract](../../RUNNER.md)
-for task fields, proof, and commands. A critical step stays with the planner;
-submit the remainder.
+for task fields, proof, and commands. A critical step stays with the planner:
+do it in the planner session before submitting, then submit the remainder.
+Once submitted, the candidate stays dispatcher-owned: the dispatcher assigns
+implementation, debugging, test execution, and mechanical recovery, and a
+failure never authorizes the planner to take over. The planner returns
+direction (an approach or an eligible route) through the dispatcher, which
+assigns that work under the routing policy without silent substitution.
+Completion needs proof bound to the current candidate, one open PR pointing
+at it (the job's single PR identity; correction updates it, never a second),
+and required acceptance evidence.
 
 When Agent Observer is available, reuse its task identity in the prepared task
 JSON as `observer_task_id`, including related correction and review jobs. Keep

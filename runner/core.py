@@ -1191,6 +1191,37 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
         # Child and supervisor are dead: the harness's own record decides
         # whether the turn counts, including the last-message file fallback.
         rc = harness.infer_rc(kind, stdout_text, inv_cmd)
+    # Completion gates that need no write lock (files, git, the live PR
+    # read): the bound proof, named acceptance, PR presence and identity,
+    # and the PR's live state. Computed here so the transaction below
+    # only persists; a completion the live path would refuse refuses
+    # here too instead of succeeding through recovery.
+    pre_refusal = None
+    if isinstance(envelope, dict) and envelope.get("action") == "completion" \
+            and job.get("status") not in store.TERMINAL \
+            and not job.get("cancel_requested"):
+        _latest0 = latest_turn_report(state_dir, request_id)
+        pre_refusal = completion_refusal_reason(_latest0)
+        if pre_refusal is None:
+            pre_refusal = incomplete_proof_reason(
+                job.get("task_json"), _latest0, job.get("workspace"))
+        if pre_refusal is None:
+            pre_refusal = incomplete_acceptance_reason(job.get("task_json"), envelope)
+        if pre_refusal is None:
+            pre_refusal = missing_pr_url_reason(
+                job.get("job_kind"), envelope, job.get("workspace"))
+        if pre_refusal is None and pr_gate_applies(job.get("job_kind"),
+                                                   job.get("workspace")):
+            _cur0 = envelope.get("pr_url")
+            if isinstance(_cur0, str) and _cur0.strip():
+                pre_refusal = duplicate_pr_reason(
+                    known_pr_url(state_dir, request_id), envelope)
+                if pre_refusal is None:
+                    _head0 = _latest0.get("head_commit") \
+                        if isinstance(_latest0, dict) else None
+                    pre_refusal = verify_pr_for_completion(
+                        job.get("workspace"), _cur0.strip(), _head0,
+                        job.get("task_json"))
     if rc == 0:
         planner_answer = harness.planner_answer(kind, stdout_text, inv_meta, job)
     state = "completed" if rc == 0 else "failed"
@@ -1392,6 +1423,15 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             st["last_action"] = envelope
             st["last_action_name"] = action_name
             st["seq"] = int(st.get("seq") or 0) + 1
+            # One job owns one PR: preserve the envelope's identity here,
+            # inside the same transaction, so correction and recovery
+            # update the existing PR instead of opening another.
+            _cur = envelope.get("pr_url") if isinstance(envelope, dict) else None
+            if isinstance(_cur, str) and _cur.strip() and not (
+                    isinstance(st.get("pr_url"), str) and st["pr_url"].strip()):
+                st["pr_url"] = _cur.strip()
+                _event(con, request_id, "pr_identity_preserved",
+                       {"pr_url": _cur.strip()[:200]})
             con.execute(
                 "UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                 (json.dumps(st, sort_keys=True), now, request_id),
@@ -1401,19 +1441,12 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             if action_name == "completion":
                 # A job can never succeed while its last implementation
                 # turn's proof failed: refuse the envelope, record the
-                # refusal, and block with its reason. An ordinary job in a
-                # workspace with an origin push remote also needs an opened
-                # PR URL (never mislabeled as a proof failure); without a
-                # remote it succeeds as before, experiment and replay jobs
-                # skip that gate. The remote capability is checked with git
-                # once per completion here.
-                _refusal = completion_refusal_reason(
-                    latest_turn_report(state_dir, request_id))
-                if _refusal is None:
-                    _refusal = missing_pr_url_reason(
-                        job_row["job_kind"] if job_row is not None else None,
-                        envelope if isinstance(envelope, dict) else None,
-                        job_row["workspace"] if job_row is not None else None)
+                # refusal, and block with its reason. The same bound-proof,
+                # acceptance, PR-presence, PR-identity, and live-PR gates
+                # as the live path apply here (precomputed above without
+                # the write lock); without a remote the job succeeds as
+                # before, and experiment and replay jobs skip the PR gate.
+                _refusal = pre_refusal
                 if _refusal is not None:
                     con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
                                 " AND status NOT IN ('succeeded','failed','cancelled')",
@@ -1706,6 +1739,119 @@ def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -
     )
 
 
+def record_recovery_decision(state_dir, request_id: str, failures: int,
+                             rung: str, target: str | None, failed_seq,
+                             reason: str,
+                             lease_token: str | None = None) -> dict:
+    """Persist one recovery decision linking the failed attempt onward.
+
+    The decision records which attempt failed (``failed_seq``, the
+    ladder's counted seq), the rung chosen for the correction, the route
+    target (None for a same-route correction), and the next attempt seq
+    the standard flow assigns (one dispatcher resume between the
+    decision and the next attempt, so ``failed_seq + 1`` when the failed
+    seq is known, else unknown). ``failed_at`` comes from the failed
+    turn's own proof timestamps when the report carries them, else
+    unknown: Observer joins this event to the next attempt's report and
+    invocation rows to measure failure-to-restart and recovery success.
+    Returns the payload.
+    """
+    try:
+        failed_i = int(failed_seq) if failed_seq is not None else None
+    except (TypeError, ValueError):
+        failed_i = None
+    failed_at = None
+    try:
+        report = latest_turn_report(state_dir, request_id)
+        if isinstance(report, dict) and (failed_i is None or report.get("seq") == failed_i):
+            failed_at = report.get("proof_ended_at") or report.get("proof_started_at")
+    except Exception:
+        failed_at = None
+    decided_at = _utcnow()
+    payload = {"failures": int(failures), "rung": rung,
+               "target": target, "failed_seq": failed_i,
+               "next_attempt_seq": (failed_i + 1) if failed_i is not None else None,
+               "failed_at": failed_at, "decided_at": decided_at,
+               "reason": reason}
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if lease_token is not None:
+            _check_lease_locked(con, request_id, lease_token)
+        _event(con, request_id, "recovery_decision", payload)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+    return payload
+
+
+def exhaustion_context(state_dir, request_id: str) -> dict:
+    """Evidence summary for an exhausted escalation, from existing records.
+
+    Returns ``{"rungs": [...], "routes_tried": [...], "reports": [...],
+    "proof": {...}|None}``: the ladder rungs used so far, the routes
+    with turn counts, the turn reports (seq, route, status,
+    failure class, proof exit, path), and the latest proof outcome.
+    Everything derives from the ledger and the report files; missing
+    pieces stay absent, never invented.
+    """
+    ctx: dict = {"rungs": [], "routes_tried": [], "reports": [], "proof": None}
+    try:
+        job = get_job(state_dir, request_id)
+    except NotFoundError:
+        return ctx
+    try:
+        ladder = json.loads(job.get("controller_state") or "{}").get("ladder") or {}
+    except ValueError:
+        ladder = {}
+    if isinstance(ladder, dict):
+        if ladder.get("rung"):
+            ctx["rungs"].append(str(ladder["rung"]))
+        if ladder.get("failures") is not None:
+            ctx["failures"] = ladder["failures"]
+    try:
+        root = store.ensure_state_dir(state_dir)
+        job_dir = store.job_dir_for(root, request_id)
+        paths = sorted(job_dir.glob("turn-*/report.json")) if job_dir.exists() else []
+    except Exception:
+        paths = []
+    for path in paths:
+        try:
+            rep = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rep, dict):
+            continue
+        ctx["reports"].append({
+            "seq": rep.get("seq"), "route": rep.get("route"),
+            "status": rep.get("status"),
+            "failure_class": rep.get("failure_class"),
+            "proof_exit_code": rep.get("proof_exit_code"),
+            "report": str(path),
+        })
+    routes: dict = {}
+    for rep in ctx["reports"]:
+        route = rep.get("route")
+        if route:
+            routes[route] = routes.get(route, 0) + 1
+    ctx["routes_tried"] = sorted(routes.items())
+    try:
+        latest = latest_turn_report(state_dir, request_id)
+    except Exception:
+        latest = None
+    if isinstance(latest, dict):
+        ctx["proof"] = {"exit_code": latest.get("proof_exit_code"),
+                        "class": latest.get("proof_class"),
+                        "report": latest.get("report_path")}
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # Measurement (Agent Observer compatible)
 # ---------------------------------------------------------------------------
@@ -1760,6 +1906,62 @@ def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
     if rc in (143, -15):
         return "cancelled"
     return "failed"
+
+
+# Failure taxonomy for issue 87 (toolboxmd/model-router#87). Turn-level
+# classes Agent Observer measures: timeout (a turn or proof that ran out
+# of time), stall (stream silence past the harness window), provider (a
+# capacity signal: exhausted, overloaded, or context pressure),
+# infrastructure (a hard provider error, a missing runtime, a lost
+# supervisor, or an unconfirmed stop), implementation (the worker ran and
+# errored without a capacity signal), verification (the task's own proof
+# ran and failed). Intentional cancellation is separate and lives on the
+# job, never on a turn report. Missing causes stay unknown: this helper
+# never invents one.
+FAILURE_CLASSES = ("timeout", "stall", "provider", "infrastructure",
+                   "implementation", "verification", "cancelled", "unknown")
+
+# Proof-attempt classes for one verification run. ``timeout`` (the proof
+# ran past its budget and its whole process tree was stopped) is distinct
+# from ``not_found`` (the proof executable was missing, rc 127).
+# ``skipped`` means the runner deliberately did not run the suite for an
+# exhausted, stalled, crashed, or otherwise incomplete turn; the report's
+# ``proof_skipped`` names the reason truthfully.
+PROOF_CLASSES = ("pass", "failed", "timeout", "not_found", "skipped",
+                 "none", "error")
+
+
+def failure_class_for(signal=None, proof_class=None, rc=None,
+                      runtime_missing: bool = False,
+                      cancelled: bool = False) -> str:
+    """Classify one failed turn or verification attempt for the ledger.
+
+    Precedence follows evidence strength: an explicit cancellation
+    intent first (kept separate from every failure), then the harness
+    signal, then the proof outcome, then the raw exit code. Anything
+    without evidence is ``unknown``, never a guess.
+    """
+    if cancelled:
+        return "cancelled"
+    if runtime_missing or signal == "hard":
+        return "infrastructure"
+    if signal == "stalled":
+        return "stall"
+    if signal in ("exhausted", "overloaded", "context"):
+        return "provider"
+    if proof_class == "timeout" or rc == 124:
+        return "timeout"
+    if proof_class in ("failed", "not_found", "error"):
+        return "verification"
+    if rc is not None and rc != 0:
+        if rc in (143, -15, 125):
+            # An unconfirmed stop or a lost supervisor: ownership is
+            # ambiguous, so this is infrastructure, never a timeout and
+            # never an intentional cancellation (cancellation intent
+            # lives on the job's cancel_requested flag).
+            return "infrastructure"
+        return "implementation"
+    return "unknown"
 
 
 def _runner_result_line(stdout: str) -> dict:
@@ -3105,11 +3307,19 @@ def recover_one(state_dir, request_id: str) -> dict:
     _abandon_never_started(state_dir, request_id)
     _reconcile_dead_invocations(state_dir, request_id)
     # Terminal jobs are never resurrected and never assessed: recover
-    # --all must not add runtime_assessed noise to finished jobs.
+    # --all must not add runtime_assessed noise to finished jobs. Rows
+    # that finished after the job ended are still consumed once, so
+    # their measurements (classified outcome, timestamps) land on the
+    # ledger; consumption never changes a terminal status.
     terminal_status = get_job(state_dir, request_id)["status"]
     if terminal_status in store.TERMINAL:
+        try:
+            late = consume_finished_invocations(state_dir, request_id)
+        except Exception as e:  # noqa: BLE001 - reported, never resurrected
+            return {"request_id": request_id, "action": "noop-terminal",
+                    "status": terminal_status, "consume_error": str(e)[:200]}
         return {"request_id": request_id, "action": "noop-terminal",
-                "status": terminal_status}
+                "status": terminal_status, "consumed": len(late)}
     # Runtime recovery assessment for live jobs only: resolve the
     # currently installed runtime, decide explicitly whether it can read
     # the stored job and invocation state as is, and record the actual
@@ -3294,7 +3504,25 @@ def recover_one(state_dir, request_id: str) -> dict:
             if not lease_pid_alive and (job["codex_task_id"] or any(
                     _is_dispatch_row(i) for i in live_invocations)):
                 # A new controller waits for the live child's durable
-                # result through the same action identity.
+                # result through the same action identity. The
+                # compatibility decision gates this handoff like every
+                # other replacement-controller start: healthy owned work
+                # was adopted above and is never interrupted, but an
+                # unsupported state starts no controller on unreadable
+                # rows. The live child finishes on its own; its output is
+                # consumed once, and the next recovery blocks with the
+                # specific incompatibility instead of executing blind.
+                if not compat_ok:
+                    con.execute("BEGIN IMMEDIATE")
+                    _event(con, request_id, "runtime_incompatible_deferred",
+                           {"reason": compat_reason,
+                            "invocation_id": live_invocations[0]["invocation_id"][:16]})
+                    con.execute("COMMIT")
+                    out["resume_error"] = (
+                        f"runtime_incompatible: {compat_reason} (no replacement "
+                        "controller started while the adopted live child runs)")
+                    out["status"] = get_job(state_dir, request_id)["status"]
+                    return out
                 try:
                     out["pid"] = start_controller(state_dir, request_id).get("pid")
                 except (OwnershipError, TerminalError, BlockedError, RunnerError) as e:
@@ -3396,7 +3624,14 @@ def recover_one(state_dir, request_id: str) -> dict:
                 "SELECT COUNT(*) AS n FROM questions WHERE request_id=? AND status='pending'",
                 (request_id,),
             ).fetchone()["n"]
-            if pending_q > 0 and status == "question_pending" and job["codex_task_id"] \
+            # A job blocked only by a missing runtime still owes the same
+            # planner answer: one recover restarts its callback like a
+            # question_pending job instead of needing a second call.
+            runtime_missing_block = (
+                status == "blocked"
+                and str(job["block_reason"] or "").startswith("runtime_missing"))
+            if pending_q > 0 and (status == "question_pending" or runtime_missing_block) \
+                    and job["codex_task_id"] \
                     and int(job["attempts"]) < int(job["max_attempts"]):
                 # The controller asks the saved planner again through the
                 # same action identity: a finished callback is reused. The
@@ -4600,6 +4835,12 @@ def completion_refusal_reason(report: dict | None) -> str | None:
     if isinstance(proof_rc, bool):
         proof_rc = int(proof_rc)
     if isinstance(proof_rc, int) and proof_rc != 0:
+        # A proof timeout is classified apart from an executable-not-found
+        # rc127: the suite ran past its budget and its whole process tree
+        # was stopped, which is a different cause with a different remedy.
+        if report.get("proof_class") == "timeout":
+            return (f"completion_refused: proof timed out rc={proof_rc} "
+                    "(the suite ran past its budget and its process tree was stopped)")
         return f"completion_refused: proof failed rc={proof_rc}"
     if status == "failed":
         if isinstance(proof_rc, int) and proof_rc != 0:
@@ -4636,6 +4877,19 @@ def workspace_has_origin_push_remote(workspace: str | None) -> bool:
     return bool((out.stdout or "").strip())
 
 
+def pr_gate_applies(job_kind: str | None, workspace: str | None) -> bool:
+    """True when an ordinary completion must carry a verified PR URL.
+
+    Exactly when the workspace is a Git checkout with an origin push
+    remote (checked with git once per call) and the job is ordinary.
+    Experiment and replay jobs, and workspaces without a push remote,
+    complete as before with no PR identity or live check.
+    """
+    if job_kind in ("experiment", "replay"):
+        return False
+    return workspace_has_origin_push_remote(workspace)
+
+
 def missing_pr_url_reason(job_kind: str | None, envelope: dict | None,
                           workspace: str | None = None) -> str | None:
     """Block reason when an ordinary completion carries no usable PR URL.
@@ -4650,15 +4904,317 @@ def missing_pr_url_reason(job_kind: str | None, envelope: dict | None,
     refuse as ``completion_refused: ...`` naming the missing PR URL, never
     as a proof failure; a valid nonblank URL succeeds and is preserved.
     """
-    if job_kind in ("experiment", "replay"):
-        return None
-    if not workspace_has_origin_push_remote(workspace):
+    if not pr_gate_applies(job_kind, workspace):
         return None
     pr_url = envelope.get("pr_url") if isinstance(envelope, dict) else None
     if isinstance(pr_url, str) and pr_url.strip():
         return None
     return ("completion_refused: missing pr_url "
             "(an ordinary job succeeds only with an opened PR URL)")
+
+
+def task_completion_requirements(task_json: str | None) -> dict:
+    """Completion requirements named by the task packet, for the gates.
+
+    ``has_proof``: the task names a proof command. ``acceptance``: the
+    task's required acceptance evidence (a short description such as
+    ``real product interaction with the fleet pane``); completion then
+    needs the envelope's ``acceptance_evidence``. ``draft_pr_allowed``:
+    the task explicitly authorizes a draft PR. Missing fields stay
+    unknown/False: nothing is inferred from a shared session or an Issue
+    URL.
+    """
+    try:
+        task = json.loads(task_json or "null")
+    except ValueError:
+        task = None
+    if not isinstance(task, dict):
+        return {"has_proof": False, "acceptance": None,
+                "draft_pr_allowed": False}
+    proof = task.get("proof")
+    acceptance = task.get("acceptance")
+    return {
+        "has_proof": isinstance(proof, str) and bool(proof.strip()),
+        "acceptance": acceptance.strip() if isinstance(acceptance, str)
+        and acceptance.strip() else None,
+        "draft_pr_allowed": task.get("draft_pr_allowed") is True,
+    }
+
+
+def incomplete_proof_reason(task_json: str | None, report: dict | None,
+                            workspace: str | None) -> str | None:
+    """Refuse completion when the bound proof is missing, stale, or skipped.
+
+    The task's required proof must be bound to the current candidate: the
+    latest report carries the workspace HEAD the proof ran against
+    (``head_commit``), and completion compares it with the current HEAD.
+    A skipped proof (an exhausted, stalled, crashed, or otherwise
+    incomplete turn whose suite was deliberately not run) refuses as
+    incomplete, never as success: the dispatcher requests implementation
+    again for a coherent candidate. Reports that predate the binding
+    (no ``head_commit``) read as unknown and pass this gate; required
+    final verification is still enforced by ``completion_refusal_reason``.
+    """
+    reqs = task_completion_requirements(task_json)
+    if not reqs["has_proof"]:
+        return None
+    if not isinstance(report, dict):
+        return ("completion_refused: incomplete proof "
+                "(no implementation turn ran; request implementation again "
+                "so the task proof runs against the candidate)")
+    if report.get("proof_class") == "skipped" or (
+            report.get("proof_exit_code") is None
+            and report.get("proof_command")):
+        skipped = report.get("proof_skipped") or \
+            "the suite was not run for this turn"
+        return (f"completion_refused: incomplete proof ({skipped}); request "
+                "implementation again for a coherent candidate instead of "
+                "completing without proof")
+    head = report.get("head_commit")
+    if isinstance(head, str) and head:
+        current = _workspace_head(workspace)
+        if isinstance(current, str) and current and current != head:
+            return (f"completion_refused: stale proof (proof ran against "
+                    f"{head[:12]}, workspace HEAD is {current[:12]}; request "
+                    "implementation again so proof binds the candidate)")
+    return None
+
+
+def incomplete_acceptance_reason(task_json: str | None,
+                                 envelope: dict | None) -> str | None:
+    """Refuse completion when named acceptance evidence is missing.
+
+    Completion and acceptance stay distinct and tied to the candidate: a
+    worker exit zero, passing helper tests, and an open PR cannot
+    establish completion when the task's required acceptance evidence
+    (for example a real product interaction or an independent review) is
+    missing. The completion envelope then carries it as
+    ``acceptance_evidence``. Tasks that name no acceptance pass.
+    """
+    reqs = task_completion_requirements(task_json)
+    if not reqs["acceptance"]:
+        return None
+    ev = envelope.get("acceptance_evidence") if isinstance(envelope, dict) else None
+    if isinstance(ev, str) and ev.strip():
+        return None
+    return (f"completion_refused: missing acceptance evidence (task requires: "
+            f"{reqs['acceptance'][:200]}; carry acceptance_evidence in the "
+            "completion envelope)")
+
+
+def duplicate_pr_reason(known_pr_url: str | None,
+                        envelope: dict | None) -> str | None:
+    """Refuse a completion that names a different PR than the job's own.
+
+    One job owns exactly one PR identity: correction and recovery update
+    the existing PR, never open a second. The first usable PR URL wins;
+    a later envelope naming another URL refuses as a duplicate instead
+    of forking the job's identity.
+    """
+    cur = envelope.get("pr_url") if isinstance(envelope, dict) else None
+    if not (isinstance(known_pr_url, str) and known_pr_url.strip()):
+        return None
+    if not (isinstance(cur, str) and cur.strip()):
+        return None
+    if known_pr_url.strip() == cur.strip():
+        return None
+    return (f"completion_refused: duplicate PR (job already uses {known_pr_url.strip()}; "
+            "update that PR instead of opening another)")
+
+
+def known_pr_url(state_dir, request_id: str) -> str | None:
+    """The job's preserved PR identity, if a completion named one yet."""
+    try:
+        job = get_job(state_dir, request_id)
+    except NotFoundError:
+        return None
+    try:
+        st = json.loads(job.get("controller_state") or "{}") or {}
+    except ValueError:
+        return None
+    known = st.get("pr_url") if isinstance(st, dict) else None
+    return known.strip() if isinstance(known, str) and known.strip() else None
+
+
+def record_known_pr(state_dir, request_id: str, pr_url: str | None,
+                    lease_token: str | None = None) -> str | None:
+    """Preserve the job's PR identity from a completion envelope.
+
+    The first usable PR URL wins and is returned; a later call with the
+    same URL keeps it. A different URL never replaces it (callers refuse
+    that envelope via :func:`duplicate_pr_reason`). Never raises past
+    the caller on persistence failure: the identity is advisory beside
+    the envelope, while the refusal itself is recorded by the caller.
+    """
+    if not (isinstance(pr_url, str) and pr_url.strip()):
+        return known_pr_url(state_dir, request_id)
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if lease_token is not None:
+            _check_lease_locked(con, request_id, lease_token)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            return None
+        try:
+            st = json.loads(row["controller_state"] or "{}") or {}
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        if not (isinstance(st.get("pr_url"), str) and st["pr_url"].strip()):
+            st["pr_url"] = pr_url.strip()
+            con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                        (json.dumps(st, sort_keys=True), _utcnow(), request_id))
+            _event(con, request_id, "pr_identity_preserved",
+                   {"pr_url": pr_url.strip()[:200]})
+        known = st.get("pr_url")
+        con.execute("COMMIT")
+        return known.strip() if isinstance(known, str) else None
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        return known_pr_url(state_dir, request_id)
+    finally:
+        con.close()
+
+
+# The live PR check runs ``gh pr view`` once per completion through this
+# seam so deterministic tests stub it without network or auth. The seam
+# takes (workspace, pr_url) and returns a dict: {"ok": bool,
+# "state": "OPEN"|..., "is_draft": bool, "head_sha": str|None,
+# "repo": "owner/name"|None, "reason": str, "unknown": bool}. ``unknown``
+# marks an unavailable check (no gh, no auth), which refuses as
+# unverified rather than inventing an answer.
+PR_VERIFIER = None
+
+
+def default_pr_verifier(workspace: str | None, pr_url: str) -> dict:
+    """Read one PR's live state with ``gh pr view`` (read-only)."""
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json",
+             "number,state,isDraft,headRefOid,url,headRepository"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            cwd=workspace or None)
+    except FileNotFoundError:
+        return {"ok": False, "unknown": True,
+                "reason": "pr verifier unavailable: gh not installed"}
+    except OSError as e:
+        return {"ok": False, "unknown": True,
+                "reason": f"pr verifier unavailable: {type(e).__name__}: {e}"}
+    if proc.returncode != 0:
+        detail = " ".join(((proc.stderr or "") + " " + (proc.stdout or "")).split())[:200]
+        return {"ok": False, "unknown": False,
+                "reason": f"gh pr view failed rc={proc.returncode}: {detail or 'no such PR'}"}
+    try:
+        data = json.loads(proc.stdout or "null")
+    except ValueError:
+        return {"ok": False, "unknown": True,
+                "reason": "pr verifier unreadable: gh printed no JSON"}
+    if not isinstance(data, dict):
+        return {"ok": False, "unknown": True,
+                "reason": "pr verifier unreadable: gh printed no object"}
+    repo = data.get("headRepository")
+    if isinstance(repo, dict):
+        repo = repo.get("nameWithOwner")
+    return {"ok": True, "unknown": False,
+            "state": data.get("state"), "is_draft": data.get("isDraft") is True,
+            "head_sha": data.get("headRefOid")
+            if isinstance(data.get("headRefOid"), str) else None,
+            "repo": repo if isinstance(repo, str) and repo else None,
+            "url": data.get("url") if isinstance(data.get("url"), str) else None,
+            "reason": ""}
+
+
+def _origin_repo(workspace: str | None) -> str | None:
+    """``owner/name`` of the workspace's GitHub origin push remote, else None.
+
+    Best-effort and offline (one local git read): non-GitHub remotes
+    and unparseable URLs stay unknown rather than blocking completion
+    on a guess.
+    """
+    if not workspace or not isinstance(workspace, str):
+        return None
+    try:
+        out = subprocess.run(["git", "-C", workspace, "remote", "get-url",
+                              "--push", "origin"],
+                             capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    text = (out.stdout or "").strip()
+    if not text or "github.com" not in text:
+        return None
+    # https://github.com/owner/name(.git), git@github.com:owner/name(.git),
+    # ssh://git@github.com/owner/name(.git).
+    tail = text.split("github.com", 1)[1].lstrip("/:")
+    parts = [p for p in tail.split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[-2], parts[-1]
+    name = name[:-4] if name.endswith(".git") else name
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}"
+
+
+def verify_pr_for_completion(workspace: str | None, pr_url: str,
+                             head_commit: str | None, task_json: str | None,
+                             verifier=None) -> str | None:
+    """Bind the completion PR to the current candidate, live.
+
+    A nonblank URL alone is insufficient: the identified PR must exist
+    in the intended repository, be open, and point at the intended
+    current commit (the HEAD the bound proof ran against). A draft PR is
+    valid only when the task explicitly authorizes it
+    (``draft_pr_allowed``); draft status itself is not a defect. An
+    unavailable check refuses as unverified, never as verified. Returns
+    None when the PR verifies, else a ``completion_refused`` reason.
+    """
+    check = verifier or PR_VERIFIER or default_pr_verifier
+    try:
+        seen = check(workspace, pr_url)
+    except Exception as e:  # noqa: BLE001 - an unreadable check is unknown
+        return (f"completion_refused: pr_unverified (PR check failed: "
+                f"{type(e).__name__}: {str(e)[:150]}; cannot confirm the PR "
+                "exists and is open)")
+    if not isinstance(seen, dict) or not seen.get("ok"):
+        reason = (seen.get("reason") if isinstance(seen, dict) else None) or "PR check failed"
+        if isinstance(seen, dict) and seen.get("unknown"):
+            return (f"completion_refused: pr_unverified ({reason}; cannot confirm "
+                    "the PR exists and is open)")
+        return f"completion_refused: pr_check_failed ({reason})"
+    if str(seen.get("state") or "").upper() != "OPEN":
+        return (f"completion_refused: pr_not_open "
+                f"(state={str(seen.get('state') or 'unknown')[:20]}; only an open PR completes a job)")
+    if seen.get("is_draft"):
+        reqs = task_completion_requirements(task_json)
+        if not reqs["draft_pr_allowed"]:
+            return ("completion_refused: draft PR not explicitly authorized "
+                    "(set draft_pr_allowed in the task to complete with a draft)")
+    origin = _origin_repo(workspace)
+    repo = seen.get("repo")
+    if origin and isinstance(repo, str) and repo and origin != repo:
+        return (f"completion_refused: pr_wrong_repo (PR is in {repo}, "
+                f"workspace origin is {origin})")
+    head_sha = seen.get("head_sha")
+    if isinstance(head_sha, str) and head_sha:
+        if isinstance(head_commit, str) and head_commit and head_commit != head_sha:
+            return (f"completion_refused: pr_head_mismatch (PR points at "
+                    f"{head_sha[:12]}, bound proof ran against {head_commit[:12]}; "
+                    "update the PR to the candidate commit)")
+        current = _workspace_head(workspace)
+        if isinstance(current, str) and current and current != head_sha:
+            return (f"completion_refused: pr_head_mismatch (PR points at "
+                    f"{head_sha[:12]}, workspace HEAD is {current[:12]})")
+    return None
 
 
 def result_view(state_dir, request_id: str) -> dict:

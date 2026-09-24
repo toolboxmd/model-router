@@ -182,19 +182,20 @@ class TestProofThroughShell(unittest.TestCase):
         job = core.get_job(sd, "proofredact")
         full = {"assistant_text": "t", "usage": None, "native_ids": {},
                 "finish": "stop", "actual_model": None}
-        orig_run = _sp.run
+        orig_popen = _sp.Popen
 
         def _boom(*a, **k):
             raise OSError("boom password=hunter2-secret-shape")
 
-        _sp.run = _boom  # type: ignore
+        _sp.Popen = _boom  # type: ignore
         try:
             report = controller._write_turn_report(
                 sd, "proofredact", job, 1, "muse-spark-xhigh-free", full,
                 "ses")
         finally:
-            _sp.run = orig_run
+            _sp.Popen = orig_popen
         self.assertEqual(report["proof_exit_code"], 127)
+        self.assertEqual(report["proof_class"], "error")
         log = Path(report["proof_log"]).read_text()
         self.assertNotIn("hunter2-secret-shape", log)
         self.assertIn("password=<redacted>", log)
@@ -447,11 +448,20 @@ class TestCompletionRefused(unittest.TestCase):
                         job2["block_reason"])
         self.assertIn("pr_url", job2["block_reason"])
         # A valid PR URL still succeeds on the live path and is preserved.
+        # The live PR read is stubbed (no network or auth in unit tests);
+        # the gate logic itself is proved in tests/test_issue87.py.
         _tmp, sd, _ws, _rep = self._passing_job(
             "pr-ok", {"action": "completion", "output": "DONE",
                       "pr_url": "https://example.test/pr/1"},
             with_origin=True)
-        done = controller.step(sd, "pr-ok", run_cmd=self._completion_resume())
+        saved_verifier = core.PR_VERIFIER
+        core.PR_VERIFIER = lambda workspace, pr_url: {
+            "ok": True, "state": "OPEN", "is_draft": False,
+            "head_sha": _rep.get("head_commit"), "repo": None, "reason": ""}
+        try:
+            done = controller.step(sd, "pr-ok", run_cmd=self._completion_resume())
+        finally:
+            core.PR_VERIFIER = saved_verifier
         self.assertEqual(done["action"], "completed")
         self.assertEqual(core.get_job(sd, "pr-ok")["status"], "succeeded")
         self.assertIn("https://example.test/pr/1",

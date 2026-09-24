@@ -10,7 +10,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Report | The structured result of a worker turn written to the job directory. Agent Observer's *outcome evidence*. | output, summary |
 | Stage | A step of the flow with an executor and an ordered route list: planning, dispatch, the implementation lanes, critical, correction, recovery, review. | phase, step |
 | Lane | An implementation stage the planner picks by task class: default, small, hard. | tier, track |
-| Critical | A load-bearing step or prose the rest of the work depends on. Planner-executed, never dispatched. | important |
+| Critical | A load-bearing step or prose the rest of the work depends on. Planner-executed in its own session before submission, never inside a submitted job. | important |
 | Route | One dispatchable choice: harness, pool, model, variant, agent. | model (alone) |
 | Pool | A subscription allowance a route draws from: Zen free, Go, xAI, Codex, Claude. | provider, account |
 | Window | A share of a Go model's monthly dollar limit: 5-hour, weekly, monthly. | quota period |
@@ -27,7 +27,10 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Escalation | The single automatic move to the recovery stage after a failed implementation and one correction. | retry, fallback |
 | Sticky home | Muse on Zen free takes every new job (no concurrency cap; skipped only when exhausted or degraded); the `fewest running jobs` spread applies only among capped routes, ties going to the earlier route. | default route |
 | Concurrency cap | A route's `max_concurrent`: the most running jobs that may sit on it (exactly one on the 15 and 30 USD Go tiers, reserved atomically with the route record; Muse free carries no cap, so parallel jobs open parallel Muse free sessions). | slot limit |
-| Planner-chosen rung | A policy-listed route (Astra medium on Codex, Opus 5.5 high on Claude) the planner itself chooses and runs; never selected automatically by the runner. | automatic recovery |
+| Planner-chosen rung | A policy-listed route (Astra medium on Codex, Opus 5.5 high on Claude) the planner itself chooses and runs in its own session; never auto-selected by the runner and never assigned as a dispatcher worker turn. | automatic recovery |
+| Failure class | How a failed turn or verification attempt is classified for the ledger: timeout, stall, provider, infrastructure, implementation, verification. Intentional cancellation lives on the job, never on a turn. Unknown means the cause is missing, never a guess. | error type |
+| Recovery decision | The ledger event linking a failed attempt to its correction: failures so far, the chosen rung and route target, the failed attempt's seq and timestamps where known, and the next attempt seq. | retry record |
+| Acceptance evidence | The required proof that the work is accepted (for example a real product interaction or an independent review), named by the task and carried by the completion envelope, distinct from the worker's exit code, helper tests, and PR URL. | proof (alone) |
 | Report contract | The fields every role's report must carry. | schema |
 | Worker kit | The checked-in setup that gives a worker host its AgentsMD link and hook; the Grok kit lives in `worker-kits/grok`. | host setup |
 | Direction block | The installed AgentsMD loader's verbatim output for a workspace: status, VISION.md, MISSION.md, OBJECTIVE.md with hashes, the core instruction link, plus the workspace's own AGENTS.md when present. Never fabricated. | context block |

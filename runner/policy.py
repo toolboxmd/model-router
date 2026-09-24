@@ -299,11 +299,15 @@ ROUTES = {
     "astra/medium": {"harness": "codex", "pool": "codex", "model": "gpt-6-astra",
                      "variant": "medium", "role": "implementation", "family": "gpt",
                      "planner_chosen": True, "context_window": 400_000,
-                     "note": "planner-chosen rung; runs in the planner's own session"},
+                     "note": "planner-chosen rung; the planner itself chooses and runs it "
+                             "in its own session, never auto-selected by the runner and never "
+                             "assigned as a dispatcher worker turn"},
     "opus-5.5/high": {"harness": "claude", "pool": "claude", "model": "claude-opus-5-5",
                     "variant": "high", "role": "implementation", "family": "claude",
                     "planner_chosen": True, "context_window": 1_000_000,
-                    "note": "planner-chosen rung; runs in the planner's Claude session"},
+                    "note": "planner-chosen rung; the planner itself chooses and runs it "
+                            "in its Claude session, never auto-selected by the runner and never "
+                            "assigned as a dispatcher worker turn"},
     "grok-4.6-go": {"harness": "opencode", "pool": "go", "model": "opencode-go/grok-4.6",
                     "variant": "medium", "agent": "build", "role": "recovery",
                     "family": "grok", "next_pool": "grok-4.6-build", "one_turn_per_job": True,
@@ -550,6 +554,32 @@ def validate_implementation_route(route: str) -> dict:
         raise ValueError(f"route {route!r} is a {info.get('role')} route, not an implementation "
                          f"route; supported: {', '.join(implementation_routes())}")
     return info
+
+
+def is_dispatcher_assignable(route: str) -> bool:
+    """True when the dispatcher may assign this route to a worker turn.
+
+    Owned-server (OpenCode) and headless-worker (Grok) routes in the
+    implementation lanes, the correction stage, or the recovery stage
+    qualify. Planner-harness rungs (Codex, Claude) run in the planner
+    session, never as dispatcher-assigned turns; unknown routes never
+    qualify, so a bad name can never silently substitute a model.
+    """
+    try:
+        spec = route_spec(route)
+    except ValueError:
+        return False
+    if spec.get("harness") not in ("opencode", "grok"):
+        return False
+    if route in STAGES.get("recovery", {}).get("routes", ()):
+        return True
+    if route in STAGES.get("correction", {}).get("routes", ()):
+        return True
+    try:
+        validate_implementation_route(route)
+    except ValueError:
+        return False
+    return True
 
 
 def opencode_route_params(route: str | None) -> tuple[str, str | None, str]:
@@ -1707,7 +1737,12 @@ def render_skill_table() -> str:
         "use a native subagent only for `review_ticket`.",
         "- Classify by consequences, not file type. A step or prose that the rest "
         "of the work depends on is `critical`: do it in the planner session yourself, "
-        "then submit the remainder. Changes to agent instructions, security rules, "
+        "then submit the remainder. Critical work happens before submission; once a "
+        "task is submitted, the candidate stays dispatcher-owned and a failure never "
+        "authorizes the planner to take over implementation, debugging, test "
+        "execution, or recovery. The planner returns direction (an approach or an "
+        "eligible route) through the dispatcher, which assigns that work under the "
+        "routing policy. Changes to agent instructions, security rules, "
         "and specifications are at least `implementation_hard`.",
         f"- Pools in order: {', '.join(WORKER_POOL_ORDER)}. Subscription logins only; "
         "no pay-per-token API keys and no paid balance overflow.",
@@ -1789,7 +1824,12 @@ def render_skill_table() -> str:
         "policy bypass). Dispatch and review routes on OpenCode run read-only in plan mode: "
         "`edit`, outside-workspace writes, web fetch/search, doom-loop, `question` and `task` "
         "stay denied (the coordinator role never needs them).",
-        "- One escalation per job; afterwards evidence returns to the planner. No "
+        "- One escalation per job; afterwards the evidence returns to the planner "
+        "as a concrete decision (the decision required, the evidence, attempted "
+        "remedies, and the dispatcher's recommendation), never a request for the "
+        "planner to implement. The submitted candidate stays dispatcher-owned: "
+        "the planner returns direction through the dispatcher, which assigns that "
+        "work under the routing policy. No "
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",
         "- Every callback prompt carries the stored handoff summary before "
@@ -1802,10 +1842,14 @@ def render_skill_table() -> str:
         "records input, cache-read, and cache-creation tokens so the resumed "
         "context is visible per job; the Astra fallback answers from the handoff "
         "summary in a fresh session with no resume.",
-        "- The worker commits as it works, then pushes the branch and opens "
-        "exactly one PR without merging it, and reports its URL. The "
-        "dispatcher confirms the pushed branch and its one open PR before "
-        "completion, which carries the PR URL; `result` shows it.",
+        "- The worker commits as it works, then pushes the branch and updates "
+        "the existing PR without merging it (one PR per job, never a second), "
+        "and reports its URL. The dispatcher consumes the runner's exact-candidate "
+        "proof evidence bound to the current candidate commit (requesting new proof "
+        "only when it is missing, stale, or for another candidate), confirms the "
+        "pushed branch and its one open PR on that commit with required acceptance "
+        "evidence, before completion, which carries the PR URL and acceptance "
+        "evidence; `result` shows it.",
         "- Record the policy version, the requested and observed route, and any "
         "override or escalation in the existing handoff. Instructions describe "
         "the policy and its required evidence.",

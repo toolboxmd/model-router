@@ -65,24 +65,35 @@ GROK_EFFORT = _GROK_BUILD["variant"]
 # Luna must reply with exactly one JSON envelope as its final message.
 LUNA_ACTION_PROTOCOL = (
     "ROLE: you are the dispatcher for this runner job. Your sandbox is "
-    "read-only: do not edit files. Ask the saved planner with "
-    "planner_question when a decision belongs to the planner. Request code "
-    "changes with the implementation action; put complete worker "
+    "read-only: do not edit files. The submitted candidate stays yours: "
+    "assign implementation, debugging, test execution, and mechanical "
+    "recovery yourself with the implementation action; put complete worker "
     "instructions in payload.instructions. The runner sends them to the "
-    "implementation worker and returns its result to you. The worker "
-    "commits as it works, then pushes the branch and opens exactly one PR "
-    "without merging, and reports its URL. Inspect the workspace, confirm "
-    "the branch is pushed with one open PR, and run the task's proof "
-    "before reporting completion. Do not "
+    "implementation worker and returns its result to you with its evidence. "
+    "Ask the saved planner with planner_question only when a decision belongs "
+    "to the planner (missing authority, or a consequential scope or approach "
+    "choice): carry the decision required, the evidence, attempted remedies, "
+    "and your recommendation, then assign the planner's direction under the "
+    "routing policy (name an eligible policy route only to direct a stronger "
+    "agent; the runner never substitutes silently). A failure never authorizes "
+    "the planner to implement. "
+    "The worker commits as it works, then pushes the branch and updates the "
+    "existing PR without merging (one PR per job, never a second), "
+    "and reports its URL. Consume the runner's exact-candidate proof evidence "
+    "bound to the current candidate commit; request new proof only when that "
+    "evidence is missing, stale, or for a different candidate. Confirm the "
+    "branch is pushed with one open PR pointing at the current candidate, "
+    "with required acceptance evidence, before reporting completion. Do not "
     "start other agents or models yourself.\n"
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
     '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"},"route":"muse-spark-xhigh-free"}\n'
-    '{"action":"completion","output":"<final result text>","artifact":"<path or empty>","pr_url":"<opened PR URL>"}\n'
+    '{"action":"completion","output":"<final result text>","artifact":"<path or empty>","pr_url":"<opened PR URL>","acceptance_evidence":"<required acceptance evidence when the task names it>"}\n'
     "Rules: exactly one envelope; valid JSON; action must be one of "
     "planner_question, implementation, completion; use a new qid for each "
-    "new question; completion carries the opened PR URL; never invent a new planner or Codex session ID."
+    "new question; completion carries the opened PR URL and required acceptance "
+    "evidence; never invent a new planner or Codex session ID."
 )
 
 
