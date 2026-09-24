@@ -4,7 +4,8 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 
 | Term | Definition | Avoid |
 | --- | --- | --- |
-| Job | One accepted request in the runner, identified by its request id. Agent Observer's *task*. | task (in runner code) |
+| Job | One accepted request in the runner, identified by its request id. Several jobs may contribute to one Observer task through `observer_task_id`. | task (in runner code) |
+| Observer task | An explicitly owned work outcome in Agent Observer. Its identity can connect submissions and several Router jobs without replacing their native identities. | job (for the combined outcome) |
 | Invocation | One supervised child process run for a job: a dispatch turn, a planner callback, or a worker turn. Agent Observer's *dispatch* plus *attempt*. | call, run |
 | Report | The structured result of a worker turn written to the job directory. Agent Observer's *outcome evidence*. | output, summary |
 | Stage | A step of the flow with an executor and an ordered route list: planning, dispatch, the implementation lanes, critical, correction, recovery, review. | phase, step |

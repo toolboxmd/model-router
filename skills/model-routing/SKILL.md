@@ -26,6 +26,13 @@ state, and the terminal report. Read [the runner contract](../../RUNNER.md)
 for task fields, proof, and commands. A critical step stays with the planner;
 submit the remainder.
 
+When Agent Observer is available, reuse its task identity in the prepared task
+JSON as `observer_task_id`, including related correction and review jobs. Keep
+each Router request ID distinct. Use Observer's installed Skill to record the
+owning submission and any work outside Router; a shared planner session is not
+exclusive to a job. Preserve both identities in the existing handoff. Missing
+capture remains a measurement gap and does not block other authorized work.
+
 A planner in any supported harness (Claude Code, Codex, OpenCode, Grok Build)
 can submit a job: pass that harness's session id as --planner-session with
 --planner-harness, with no planner working directory. The dispatcher wakes the
