@@ -640,10 +640,6 @@ class TestRoundSix(Base):
             core.post_question(self.sd, "r1", "q1", "?", lease_token="tok")
         self.assertEqual(core.get_job(self.sd, "r1")["status"], "cancelling")
 
-    def test_missing_planner_directory_is_rejected_for_new_jobs(self):
-        with self.assertRaises(ValueError):
-            core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p", planner_cwd=str(self.base / "nope"))
-
 
 class TestRoundSeven(Base):
     """Regressions for the sixth Opus 5 high review."""

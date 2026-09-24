@@ -22,6 +22,9 @@ from pathlib import Path as _KitPath
 KIND_CODEX_DISPATCH = "codex_dispatch"
 KIND_CODEX_RESUME = "codex_resume"
 KIND_CLAUDE_CALLBACK = "claude_callback"
+KIND_CODEX_CALLBACK = "codex_callback"
+KIND_OPENCODE_CALLBACK = "opencode_callback"
+KIND_GROK_CALLBACK = "grok_callback"
 # Historical ledger kind only (pre-2.7.0 post-submit planner compaction,
 # removed 2026-09-24: the runner never created it after that and no new
 # command infers it). Old ledgers may still carry rows with this kind;
@@ -462,11 +465,13 @@ def codex_observed_model(state_dir, request_id: str,
 
 class CodexCLI(Harness):
     name = "codex"
-    kinds = (KIND_CODEX_DISPATCH, KIND_CODEX_RESUME)
+    kinds = (KIND_CODEX_DISPATCH, KIND_CODEX_RESUME, KIND_CODEX_CALLBACK)
     capabilities = frozenset({"read_only", "session_resume", "structured_output"})
     binary = adapters.CODEX_BIN
-    timeouts = {KIND_CODEX_DISPATCH: 1800, KIND_CODEX_RESUME: 1800}
-    stages = {KIND_CODEX_DISPATCH: "dispatch", KIND_CODEX_RESUME: "dispatch"}
+    timeouts = {KIND_CODEX_DISPATCH: 1800, KIND_CODEX_RESUME: 1800,
+                KIND_CODEX_CALLBACK: 900}
+    stages = {KIND_CODEX_DISPATCH: "dispatch", KIND_CODEX_RESUME: "dispatch",
+              KIND_CODEX_CALLBACK: "planning"}
     session_kind = "codex_task_id"
 
     def spawn_spec(self, inv, env):
@@ -474,10 +479,14 @@ class CodexCLI(Harness):
 
         The kit directory is generated from policy (see ``runner/kits.py``);
         nothing is inherited from the user's Codex configuration.
+        The planner callback keeps the user's own session and is never
+        isolated, like the Claude planner callback.
         """
         from . import kits as _kits
 
         env = dict(env)
+        if (inv or {}).get("kind") == KIND_CODEX_CALLBACK:
+            return env, None
         kit_name = _kit_name_for_inv(inv, default="dispatcher")
         state_dir = _kit_state_dir(inv)
         if kit_name is not None and state_dir is not None:
@@ -496,6 +505,11 @@ class CodexCLI(Harness):
         return env, None
 
     def parse_session(self, kind, stdout, stderr, job):
+        if kind == KIND_CODEX_CALLBACK:
+            # The planner thread resumes by its saved thread ID, recorded
+            # on the job as the planner session, never as a dispatcher task.
+            sid = adapters.parse_codex_task_id(stdout, stderr)
+            return (sid, "planner_session_id") if sid else (None, None)
         sid = adapters.parse_codex_task_id(stdout, stderr)
         return (sid, "codex_task_id") if sid else (None, None)
 
@@ -537,6 +551,8 @@ class CodexCLI(Harness):
         return usage, observed, None, ids
 
     def infer_rc(self, kind, stdout, cmd=None):
+        if kind == KIND_CODEX_CALLBACK:
+            return 0 if adapters.parse_codex_planner_answer(stdout).get("ok") else 1
         last_text = None
         if cmd is not None:
             try:
@@ -559,6 +575,8 @@ class CodexCLI(Harness):
         return 1
 
     def turn_ok(self, kind, rc, stdout, cmd=None):
+        if kind == KIND_CODEX_CALLBACK:
+            return rc == 0 and bool(adapters.parse_codex_planner_answer(stdout).get("ok"))
         if rc != 0:
             return False
         if "turn.completed" in (stdout or ""):
@@ -584,6 +602,30 @@ class CodexCLI(Harness):
 
     def identity_ok(self, kind, sid, saved):
         return bool(sid) and (saved is None or sid == saved)
+
+    def parsed_planner_result(self, kind, stdout):
+        """Structured Codex planner answer via the seam, so callers never
+        parse the harness output directly."""
+        return adapters.parse_codex_planner_answer(stdout)
+
+    def planner_answer(self, kind, stdout, meta, job):
+        if kind != KIND_CODEX_CALLBACK:
+            return None
+        parsed = adapters.parse_codex_planner_answer(stdout)
+        qid = (meta or {}).get("qid")
+        if parsed.get("ok") and qid and parsed.get("session_id") == (job or {}).get("planner_session_id"):
+            return qid, parsed["answer"]
+        return None
+
+    def callback_failure_reason(self, kind, rc, stdout, job):
+        if kind != KIND_CODEX_CALLBACK:
+            return None
+        parsed = adapters.parse_codex_planner_answer(stdout)
+        if rc != 0 or not parsed.get("ok"):
+            return f"planner_callback_failed rc={rc} (consumed by recovery)"
+        if parsed.get("session_id") != (job or {}).get("planner_session_id"):
+            return "planner_session_mismatch (consumed by recovery)"
+        return None
 
     def record_session(self, con, request_id, sid, skind, kind, job, meta, now):
         if skind == "codex_task_id" and kind == KIND_CODEX_DISPATCH:
@@ -1112,12 +1154,14 @@ class ClaudeCLI(Harness):
 
 class OpenCodeServer(Harness):
     name = "opencode"
-    kinds = (KIND_OPENCODE_CONTROL, KIND_OPENCODE_SERVE)
+    kinds = (KIND_OPENCODE_CONTROL, KIND_OPENCODE_SERVE, KIND_OPENCODE_CALLBACK)
     capabilities = frozenset({"workspace_write", "session_resume", "structured_output", "read_only"})
     owned_server = True
     binary = adapters.OPENCODE_BIN
-    timeouts = {KIND_OPENCODE_CONTROL: 1800, KIND_OPENCODE_SERVE: 1800}
-    stages = {KIND_OPENCODE_CONTROL: "implementation", KIND_OPENCODE_SERVE: "implementation"}
+    timeouts = {KIND_OPENCODE_CONTROL: 1800, KIND_OPENCODE_SERVE: 1800,
+                KIND_OPENCODE_CALLBACK: 900}
+    stages = {KIND_OPENCODE_CONTROL: "implementation", KIND_OPENCODE_SERVE: "implementation",
+              KIND_OPENCODE_CALLBACK: "planning"}
     session_kind = "opencode_session_id"
 
     def spawn_spec(self, inv, env):
@@ -1134,9 +1178,14 @@ class OpenCodeServer(Harness):
         tool while OpenCode scans no user skills;
         ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1`` disables the ``~/.claude``
         and ``~/.agents`` roots.
+
+        The planner callback keeps the user's own session and is never
+        isolated, like the Claude planner callback.
         """
         from . import kits as _kits
 
+        if (inv or {}).get("kind") == KIND_OPENCODE_CALLBACK:
+            return dict(env), None
         password = adapters.generate_control_password()
         env = dict(env)
         env["OPENCODE_SERVER_PASSWORD"] = password
@@ -1169,6 +1218,13 @@ class OpenCodeServer(Harness):
         return _drive_opencode_control(*args, **kwargs)
 
     def parse_session(self, kind, stdout, stderr, job):
+        if kind == KIND_OPENCODE_CALLBACK:
+            # The planner session resumes by its saved session ID through
+            # ``opencode run``; the ID is recorded as the planner session,
+            # never as a worker or dispatcher session.
+            parsed = adapters.parse_opencode_run_planner_answer(stdout)
+            sid = parsed.get("session_id")
+            return (sid, "planner_session_id") if sid else (None, None)
         # The owned server reports its session in this invocation's own
         # RUNNER_RESULT line; stderr carries no session. A missing or
         # unparsable line means no session, never a match.
@@ -1184,6 +1240,40 @@ class OpenCodeServer(Harness):
                 if isinstance(sid, str) and sid:
                     return sid, "opencode_session_id"
         return None, None
+
+    def parsed_planner_result(self, kind, stdout):
+        """Structured OpenCode planner answer via the seam, so callers
+        never parse the harness output directly."""
+        return adapters.parse_opencode_run_planner_answer(stdout)
+
+    def planner_answer(self, kind, stdout, meta, job):
+        if kind != KIND_OPENCODE_CALLBACK:
+            return None
+        parsed = adapters.parse_opencode_run_planner_answer(stdout)
+        qid = (meta or {}).get("qid")
+        if parsed.get("ok") and qid and parsed.get("session_id") == (job or {}).get("planner_session_id"):
+            return qid, parsed["answer"]
+        return None
+
+    def callback_failure_reason(self, kind, rc, stdout, job):
+        if kind != KIND_OPENCODE_CALLBACK:
+            return None
+        parsed = adapters.parse_opencode_run_planner_answer(stdout)
+        if rc != 0 or not parsed.get("ok"):
+            return f"planner_callback_failed rc={rc} (consumed by recovery)"
+        if parsed.get("session_id") != (job or {}).get("planner_session_id"):
+            return "planner_session_mismatch (consumed by recovery)"
+        return None
+
+    def infer_rc(self, kind, stdout, cmd=None):
+        if kind == KIND_OPENCODE_CALLBACK:
+            return 0 if adapters.parse_opencode_run_planner_answer(stdout).get("ok") else 1
+        return 1
+
+    def turn_ok(self, kind, rc, stdout, cmd=None):
+        if kind == KIND_OPENCODE_CALLBACK:
+            return rc == 0 and bool(adapters.parse_opencode_run_planner_answer(stdout).get("ok"))
+        return rc == 0
 
     def identity_ok(self, kind, sid, saved) -> bool:
         # A dispatch turn counts only from the saved dispatcher task: a
@@ -1218,6 +1308,12 @@ class OpenCodeServer(Harness):
         return summary if isinstance(summary, dict) and summary else None
 
     def measure(self, kind, stdout, stderr, meta, inv_ctx=None):
+        if kind == KIND_OPENCODE_CALLBACK:
+            parsed = adapters.parse_opencode_run_planner_answer(stdout)
+            ids = {}
+            if parsed.get("session_id"):
+                ids["session_id"] = parsed["session_id"]
+            return None, None, None, ids
         summary = self.parse_report(kind, stdout, None) or {}
         usage = summary.get("usage") if isinstance(summary.get("usage"), dict) else None
         ids = summary.get("native_ids") if isinstance(summary.get("native_ids"), dict) else {}
@@ -1382,13 +1478,13 @@ class GrokBuildCLI(Harness):
     """
 
     name = "grok"
-    kinds = (KIND_GROK_CONTROL,)
+    kinds = (KIND_GROK_CONTROL, KIND_GROK_CALLBACK)
     capabilities = frozenset({"workspace_write", "session_resume", "structured_output"})
     owned_server = False
     headless_worker = True
     binary = adapters.GROK_BIN
-    timeouts = {KIND_GROK_CONTROL: 1800}
-    stages = {KIND_GROK_CONTROL: "implementation"}
+    timeouts = {KIND_GROK_CONTROL: 1800, KIND_GROK_CALLBACK: 900}
+    stages = {KIND_GROK_CONTROL: "implementation", KIND_GROK_CALLBACK: "planning"}
     session_kind = "grok_session_id"
 
     def spawn_spec(self, inv, env):
@@ -1396,9 +1492,13 @@ class GrokBuildCLI(Harness):
 
         The kit directory is generated from policy (see ``runner/kits.py``);
         nothing is inherited from the user's Grok configuration.
+        The planner callback keeps the user's own session and is never
+        isolated, like the Claude planner callback.
         """
         from . import kits as _kits
 
+        if (inv or {}).get("kind") == KIND_GROK_CALLBACK:
+            return dict(env), None
         env = dict(env)
         kit_name = _kit_name_for_inv(inv, default="worker")
         state_dir = _kit_state_dir(inv)
@@ -1413,10 +1513,15 @@ class GrokBuildCLI(Harness):
     def parse_session(self, kind, stdout, stderr, job):
         # The headless JSON result carries the session; anything else
         # (empty output, plain text, an error object) means no session,
-        # never a match.
+        # never a match. A planner fallback answer arrives the same way
+        # but is recorded as the planner session, never a worker session.
         parsed = adapters.parse_grok_result(stdout)
         sid = parsed.get("session_id")
-        return (sid, "grok_session_id") if sid else (None, None)
+        if not sid:
+            return None, None
+        if kind == KIND_GROK_CALLBACK:
+            return sid, "planner_session_id"
+        return sid, "grok_session_id"
 
     def parse_report(self, kind, stdout, cmd):
         """Normalized turn summary for the controller's report path.
@@ -1563,6 +1668,32 @@ class GrokBuildCLI(Harness):
         # session or a forked session never applies, on the live path and
         # in recovery alike.
         return bool(sid) and (saved is None or sid == saved)
+
+    def parsed_planner_result(self, kind, stdout):
+        """Structured Grok planner answer via the seam, so callers never
+        parse the harness output directly."""
+        return adapters.parse_grok_result(stdout)
+
+    def planner_answer(self, kind, stdout, meta, job):
+        # The Grok planner fallback answers from a fresh session seeded
+        # with the handoff summary: no resume, so no session-identity
+        # check applies. Only a successful result with text counts.
+        if kind != KIND_GROK_CALLBACK:
+            return None
+        parsed = adapters.parse_grok_result(stdout)
+        qid = (meta or {}).get("qid")
+        if parsed.get("ok") and qid and isinstance(parsed.get("text"), str) \
+                and parsed["text"].strip():
+            return qid, parsed["text"].strip()
+        return None
+
+    def callback_failure_reason(self, kind, rc, stdout, job):
+        if kind != KIND_GROK_CALLBACK:
+            return None
+        parsed = adapters.parse_grok_result(stdout)
+        if rc != 0 or not parsed.get("ok"):
+            return f"planner_callback_failed rc={rc} (consumed by recovery)"
+        return None
 
     def record_session(self, con, request_id, sid, skind, kind, job, meta, now):
         if skind != "grok_session_id":
@@ -2427,7 +2558,11 @@ def kind_for_cmd(cmd: list) -> str:
     if name == "claude":
         return KIND_CLAUDE_CALLBACK
     if name == "opencode":
-        return KIND_OPENCODE_SERVE if "serve" in args else KIND_OPENCODE_CONTROL
+        if "serve" in args:
+            return KIND_OPENCODE_SERVE
+        if "run" in args:
+            return KIND_OPENCODE_CALLBACK
+        return KIND_OPENCODE_CONTROL
     if name == "grok":
         return KIND_GROK_CONTROL
     return "unknown"

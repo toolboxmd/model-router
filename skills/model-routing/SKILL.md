@@ -26,11 +26,12 @@ state, and the terminal report. Read [the runner contract](../../RUNNER.md)
 for task fields, proof, and commands. A critical step stays with the planner;
 submit the remainder.
 
-Only Claude Code planner callbacks are implemented. Starting a job requires a
-real Claude planner session and its working directory. Never invent a session
-id or substitute the current harness's id. Other hosts can load the shared
-Skill and operate existing jobs; package compatibility does not add planner
-adapters. On Codex, also read [native ticket review](references/codex-host.md)
+A planner in any supported harness (Claude Code, Codex, OpenCode, Grok Build)
+can submit a job: pass that harness's session id as --planner-session with
+--planner-harness, with no planner working directory. The dispatcher wakes the
+saved planner automatically in its own harness whenever its judgment is needed;
+`questions` and `answer` stay as an optional human override. Never invent a
+session id or substitute another session's id. On Codex, also read [native ticket review](references/codex-host.md)
 before using a Codex subagent. Do not emulate that host-specific operation on
 another harness.
 

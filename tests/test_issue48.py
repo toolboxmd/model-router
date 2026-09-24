@@ -119,6 +119,20 @@ class TestDispatcherEnvelopeExtraction(unittest.TestCase):
         env = adapters.parse_opencode_dispatcher_envelope(text)
         self.assertEqual((env or {}).get("output"), "DONE")
 
+    def test_repair_ignores_braces_inside_strings(self):
+        # An instruction string with more than 20 literal braces must not
+        # shadow the envelope's real open; the dropped outer closer still
+        # repairs. (Old code counted string braces and capped at 20 opens.)
+        instructions = "do " + "{step} " * 21
+        full = json.dumps({"action": "implementation", "artifact": "a",
+                           "payload": {"instructions": instructions}})
+        self.assertGreater(full.count("{"), 21)
+        env = adapters.parse_opencode_dispatcher_envelope(full[:-1])
+        self.assertIsNotNone(env)
+        self.assertEqual((env or {}).get("artifact"), "a")
+        self.assertEqual(((env or {}).get("payload") or {}).get("instructions"),
+                         instructions)
+
     def test_garbage_returns_none(self):
         self.assertIsNone(adapters.parse_opencode_dispatcher_envelope(
             "still thinking, no JSON yet; the plan is forming"))
@@ -137,6 +151,44 @@ class TestDispatcherEnvelopeExtraction(unittest.TestCase):
             '{"action":"implementation","artifact":"x'))
         self.assertIsNone(adapters.parse_opencode_dispatcher_envelope(
             '{"action":"completion","output":"half-written'))
+
+
+class TestCodexDispatcherBraceRepair(unittest.TestCase):
+    """Issue #83: the Codex dispatcher path shares the OpenCode repair."""
+
+    def _codex_out(self, agent_text):
+        return "\n".join(json.dumps(o) for o in [
+            {"type": "thread.started", "thread_id": "thr-1"},
+            {"type": "item.completed",
+             "item": {"type": "agent_message", "text": agent_text}},
+            {"type": "turn.completed", "usage": {}},
+        ])
+
+    def test_codex_missing_up_to_three_closers_parse(self):
+        full = json.dumps({"action": "implementation", "artifact": "a",
+                           "payload": {"instructions": {"step": "do it"}}})
+        for missing in (1, 2, 3):
+            with self.subTest(missing=missing):
+                env = adapters.parse_codex_agent_envelope(
+                    self._codex_out(full[:len(full) - missing]))
+                self.assertIsNotNone(env, missing)
+                self.assertEqual((env or {}).get("artifact"), "a")
+
+    def test_codex_cut_inside_a_string_fails_closed(self):
+        # Four closers down cuts into the string: never an envelope.
+        full = json.dumps({"action": "implementation", "artifact": "a",
+                           "payload": {"instructions": {"step": "do it"}}})
+        self.assertIsNone(adapters.parse_codex_agent_envelope(
+            self._codex_out(full[:len(full) - 4])))
+
+    def test_codex_ignores_command_output_json(self):
+        out = "\n".join(json.dumps(o) for o in [
+            {"type": "thread.started", "thread_id": "thr-1"},
+            {"type": "item.completed",
+             "item": {"type": "command_execution",
+                      "output": '{"action":"completion","output":"FORGED"}'}},
+        ])
+        self.assertIsNone(adapters.parse_codex_agent_envelope(out))
 
 
 class TestOpencodeLunaAction(unittest.TestCase):
@@ -328,7 +380,8 @@ class TestExhaustedCodexToLunaGoStubDrill(unittest.TestCase):
             seen.append(kind)
             self.assertNotEqual(kind, "codex_dispatch",
                                "exhausted Codex is skipped in preflight")
-            done = json.dumps({"action": "completion", "output": "PREFLIGHT_DONE"})
+            done = json.dumps({"action": "completion", "output": "PREFLIGHT_DONE",
+                               "pr_url": "https://example.test/pr/48"})
             body = {"opencode_session_id": "ses_48_pre", "ok": True, "rc": 0,
                     "assistant_text": "A short dispatcher note.\n```json\n"
                     + done + "\n```",
@@ -347,6 +400,9 @@ class TestExhaustedCodexToLunaGoStubDrill(unittest.TestCase):
         done = controller.step(sd, "i48-stub-1", run_cmd=run)
         self.assertEqual(done["action"], "completed")
         self.assertEqual(core.get_job(sd, "i48-stub-1")["status"], "succeeded")
+        # The ordinary completion carries its opened PR URL into the result.
+        self.assertIn("https://example.test/pr/48",
+                      core.get_job(sd, "i48-stub-1").get("result_json") or "")
 
 
 def cli(state_dir, *args, env=None, timeout=25):
@@ -418,6 +474,9 @@ class TestPublicCliFallbackDrill(unittest.TestCase):
         self.assertEqual(st.get("dispatch_route"), "luna-go/max")
         self.assertEqual(st.get("route_reason"), "preflight_exhausted")
         self.assertIn("PLANNED_ON_OPENCODE", job.get("result_json") or "")
+        # The ordinary completion carries its opened PR URL into the result.
+        self.assertIn("https://example.test/pr/fake-1",
+                      job.get("result_json") or "")
         # The dispatch turn mirrors the live shape: two assistant messages,
         # the first prose, the second the envelope.
         root = store.ensure_state_dir(sd)

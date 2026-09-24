@@ -182,6 +182,50 @@ class CallbackMeasurement(Base):
             self.assertIn(key, found[0]["usage"])
 
 
+class CodexPlannerCallback(Base):
+    def test_codex_planner_resume_answers_without_human_action(self):
+        core.submit(self.sd, "c1", {"goal": "t"}, self.ws("a"),
+                    "thr-codex-1", planner_harness="codex",
+                    handoff_summary="Ship the fix.")
+        captured = {}
+
+        def fake(cmd, cwd=None, timeout=120, **kw):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = cwd
+            captured["kind"] = kw.get("kind")
+            # The question is already persisted before the planner wakes.
+            pending = core.list_questions(self.sd, "c1", only_pending=True)
+            assert len(pending) == 1 and pending[0]["prompt"] == "Ship now?"
+            out = "\n".join(json.dumps(o) for o in [
+                {"type": "thread.started", "thread_id": "thr-codex-1"},
+                {"type": "item.completed",
+                 "item": {"type": "agent_message", "text": "Ship it."}},
+                {"type": "turn.completed", "usage": {}},
+            ])
+            return 0, out, ""
+
+        res = controller.planner_callback(self.sd, "c1", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "answered")
+        cmd = captured["cmd"]
+        # The saved Codex thread resumes, never forks.
+        self.assertEqual(cmd[:4], ["codex", "exec", "resume", "thr-codex-1"])
+        self.assertIn("--json", cmd)
+        self.assertEqual(captured["kind"], "codex_callback")
+        self.assertEqual(captured["cwd"],
+                         core.get_job(self.sd, "c1")["workspace"])
+        prompt = cmd[-1]
+        self.assertIn("HANDOFF SUMMARY", prompt)
+        self.assertIn("Ship the fix.", prompt)
+        self.assertIn("Ship now?", prompt)
+        self.assertLess(prompt.index("Ship the fix."),
+                        prompt.index("Ship now?"))
+        qs = core.list_questions(self.sd, "c1", only_pending=False)
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["status"], "answered")
+        self.assertEqual(qs[0]["answer"], "Ship it.")
+
+
 class PolicyData(Base):
     def test_astra_fallback_uses_summary_no_session(self):
         core.submit(self.sd, "a1", {"goal": "t"}, self.ws("a"),
