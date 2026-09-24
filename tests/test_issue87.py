@@ -358,6 +358,19 @@ class CompletionBinding(unittest.TestCase):
             core._workspace_head(str(ws)),
             task_json, verifier=stub_pr_verifier(wrong_repo))
         self.assertIn("pr_wrong_repo", reason)
+        # gh shapes without a repo field fall back to the resolved PR URL.
+        url_only = {"ok": True, "state": "OPEN", "is_draft": False,
+                    "head_sha": core._workspace_head(str(ws)),
+                    "repo": None,
+                    "url": "https://github.com/other/project/pull/1"}
+        reason = core.verify_pr_for_completion(
+            str(ws), "https://github.com/other/project/pull/1",
+            core._workspace_head(str(ws)),
+            task_json, verifier=stub_pr_verifier(url_only))
+        self.assertIn("pr_wrong_repo", reason)
+        self.assertEqual(core._repo_from_pr_url(
+            "https://github.com/toolboxmd/model-router/pull/100"),
+            "toolboxmd/model-router")
 
     def _refusing_resume(self, output="STILL DONE"):
         def run(cmd, cwd=None, timeout=None, kind=None, meta=None):

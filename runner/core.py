@@ -5131,6 +5131,20 @@ def default_pr_verifier(workspace: str | None, pr_url: str) -> dict:
             "reason": ""}
 
 
+def _repo_from_pr_url(pr_url: str | None) -> str | None:
+    """``owner/name`` from a PR URL path, else None (never guessed)."""
+    if not isinstance(pr_url, str) or "github.com" not in pr_url:
+        return None
+    tail = pr_url.split("github.com", 1)[1].lstrip("/:")
+    parts = [p for p in tail.split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[0], parts[1]
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}"
+
+
 def _origin_repo(workspace: str | None) -> str | None:
     """``owner/name`` of the workspace's GitHub origin push remote, else None.
 
@@ -5201,6 +5215,11 @@ def verify_pr_for_completion(workspace: str | None, pr_url: str,
                     "(set draft_pr_allowed in the task to complete with a draft)")
     origin = _origin_repo(workspace)
     repo = seen.get("repo")
+    if not (isinstance(repo, str) and repo):
+        # gh shapes vary by version (headRepository without
+        # nameWithOwner here): fall back to the canonical PR URL the
+        # check itself resolved, never a guess.
+        repo = _repo_from_pr_url(seen.get("url")) or _repo_from_pr_url(pr_url)
     if origin and isinstance(repo, str) and repo and origin != repo:
         return (f"completion_refused: pr_wrong_repo (PR is in {repo}, "
                 f"workspace origin is {origin})")
