@@ -18,13 +18,14 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.7.0"
+POLICY_VERSION = "2.7.1"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
                  "#34 (usage probes, 2026-09-20), #38 (planner handoff, 2026-09-20), "
                  "#17 (Opus 5.5, human request, 2026-09-23), "
-                 "and #62 (manual-only dispatch route removed, human direction, 2026-09-23)")
+                 "#62 (manual-only dispatch route removed, human direction, 2026-09-23), "
+                 "and #88 (no elapsed deadline for agent turns or jobs, human direction, 2026-09-24)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -34,14 +35,17 @@ ALLOW_DIRECT_PAID_API = False
 # Go usage windows as a share of each model's monthly dollar limit.
 WINDOWS = {"5h": 0.20, "weekly": 0.50, "monthly": 1.00}
 
-# Stall detection (toolboxmd/model-router#33). Evidence from the 2026-09-20
-# OpenCode session database: healthy worker sessions (330 to 463 parts each)
-# showed a longest gap between consecutive parts of 110 to 161 seconds, all
-# explained by tool calls such as the 100-second test suite; the stalled
-# session showed gaps of 321 seconds and then nothing. A 180-second silence
-# window catches today's stalls within three minutes with zero false
-# positives on today's healthy sessions. The per-turn timeout stays as the
-# outer budget for runaway but active turns.
+# Stall detection (toolboxmd/model-router#33, #73, #88). Evidence from the
+# 2026-09-20 OpenCode session database: healthy worker sessions (330 to
+# 463 parts each) showed a longest gap between consecutive parts of 110 to
+# 161 seconds, all explained by tool calls such as the 100-second test
+# suite; the stalled session showed gaps of 321 seconds and then nothing.
+# A 180-second silence window catches today's stalls within three minutes
+# with zero false positives on today's healthy sessions. Since #88 there
+# is no per-turn elapsed deadline: productive turns stay running
+# regardless of age, and genuine stream silence is the only time-based
+# end for an active turn (alongside explicit cancellation and real
+# terminal failures).
 STALL_SILENCE_SECS = 180
 STALL_EVIDENCE = ("2026-09-20 OpenCode session database: healthy worker sessions "
                   "(330-463 parts) longest inter-part gap 110-161s; stalled session "
@@ -51,9 +55,11 @@ STALL_EVIDENCE = ("2026-09-20 OpenCode session database: healthy worker sessions
 # silently for 181 seconds while reading, emitting no stream events, and the
 # shared 180-second window ended the turn. Codex dispatch and resume
 # therefore wait 300 seconds of stream silence: the observed 181-second
-# silent-reasoning interval plus margin for longer max-effort turns, still
-# inside the per-turn timeout that stays the outer budget. OpenCode worker
-# detection stays unchanged at 180 seconds.
+# silent-reasoning interval plus margin for longer max-effort turns.
+# OpenCode worker detection stays unchanged at 180 seconds. Since #88 no
+# per-turn elapsed deadline bounds these windows: they pass through
+# unclamped, and an active turn with stream activity runs as long as it
+# keeps producing.
 STALL_SILENCE_SECS_BY_HARNESS = {
     "codex": 300,
     "claude": 180,
@@ -1728,7 +1734,10 @@ def render_skill_table() -> str:
         "route. Stalled is treated like overload: a bounded same-route retry inside "
         f"{SIGNAL_CLASSES['stalled']['window_secs']} seconds, then a lateral move with the route "
         f"degraded {SIGNAL_CLASSES['stalled']['degraded_secs'] // 60} minutes. "
-        "The per-turn timeout stays as the outer budget for active turns.",
+        "Agent turns carry no elapsed deadline (toolboxmd/model-router#88): "
+        "a productive turn stays running regardless of total elapsed time, "
+        "and genuine stream silence is the only time-based end for an "
+        "active turn, alongside explicit cancellation and real failures.",
         "- A `context_length_exceeded` turn is a capacity signal: it moves to the next route in "
         "its lane with a larger `context_window`, and only ends as `implementation_failed` when no "
         "larger-context route is left.",

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.29.2] - 2026-09-24
+
+### Changed
+
+- delete elapsed-time termination of agent turns and jobs (#88)
+
 ## [0.29.1] - 2026-09-24
 
 ### Changed

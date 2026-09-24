@@ -14,7 +14,7 @@ called.
 
 Environment: ``FAKE_STATE`` (log directory), ``FAKE_OC_MODE`` (free-route
 behavior: ok, free_limit, api_free_error, rate_limit, model_text, hang,
-stall, hard_error, context_error), ``FAKE_OC_MODE_GO`` (same for Go routes),
+stall, idle_incomplete, idle_empty, hard_error, context_error), ``FAKE_OC_MODE_GO`` (same for Go routes),
 ``FAKE_OC_PROBE_MODE`` (stall-probe answer: ok, exhausted, overloaded),
 ``FAKE_OC_DELAY`` (seconds of busy time), ``FAKE_OC_WRITE`` (relative file the fake worker writes), ``FAKE_CLAUDE_MODE`` (ok, fail, fork),
 ``FAKE_CLAUDE_ANSWER``, ``FAKE_GROK_MODE`` (ok, exhaustion, overload,
@@ -123,6 +123,57 @@ def run_turn(sid, model, directory, aborted, prompt_text=""):
             msg = assistant(sid, model, text="ok")
         with lock:
             sessions[sid].append(msg)
+            status.pop(sid, None)
+        return
+    if mode == "idle_incomplete":
+        # #88 review fixture: stream incomplete assistant messages while
+        # busy (each part refreshes the drive loop's activity tracker, so
+        # no busy-branch stall fires), then go idle leaving the last new
+        # assistant message without time.completed or info.error. The
+        # drive loop must end the turn through the stream-silence stall
+        # machinery, never poll forever.
+        with lock:
+            status[sid] = {"type": "busy"}
+        for i in range(5):
+            time.sleep(0.5)
+            if aborted.is_set():
+                break
+            with lock:
+                incomplete = {"id": nid("msg"), "sessionID": sid, "role": "assistant",
+                              "time": {"created": 1},
+                              "providerID": model.get("providerID"),
+                              "modelID": model.get("modelID"),
+                              "variant": "xhigh", "finish": None,
+                              "tokens": {"input": 100, "output": 5, "reasoning": 2,
+                                         "cache": {"read": 0, "write": 0}},
+                              "cost": 0.0}
+                sessions[sid].append({"info": incomplete,
+                                      "parts": [{"type": "text",
+                                                 "text": "partial work %d, never completed" % i}]})
+        if not aborted.is_set():
+            with lock:
+                status.pop(sid, None)
+        while not aborted.is_set():
+            time.sleep(0.05)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
+            status.pop(sid, None)
+        return
+    if mode == "idle_empty":
+        # #88 review variant: report busy long enough for the drive loop
+        # to observe it (one poll per second) but shorter than the test
+        # silence window, then go idle with no new assistant message at
+        # all. Same stall expectation as idle_incomplete.
+        with lock:
+            status[sid] = {"type": "busy"}
+        time.sleep(1.5)
+        if not aborted.is_set():
+            with lock:
+                status.pop(sid, None)
+        while not aborted.is_set():
+            time.sleep(0.05)
+        with lock:
+            sessions[sid].append(assistant(sid, model, error={"name": "MessageAbortedError", "data": {"message": "aborted"}}))
             status.pop(sid, None)
         return
     if mode == "stall":

@@ -1964,10 +1964,13 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
         moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
         moved["report"] = move_report
         return moved
-    if rc in (124, 143):
-        # The worker process never finished its turn (a timeout or a stop);
-        # that is an ownership matter, not a worker failure, and it blocks
-        # as before, but the turn still leaves a report.
+    if rc in (124, 143, 125):
+        # The supervisor exited without a durable terminal result while the
+        # turn never finished: supervisor loss (rc 125, the CLI child still
+        # alive but unsupervised), a stop (143), or a legacy 124 record.
+        # That is an ownership matter, not a worker failure, and it blocks
+        # as before so no new attempt queues behind the unsupervised child;
+        # the turn still leaves a report. No elapsed deadline is restored.
         crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
                                           status="failed", error=full.get("error") or f"rc={rc}")
         _set_phase(state_dir, request_id, phase="implementation_failed",
