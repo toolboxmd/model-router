@@ -79,13 +79,7 @@ hosting the planner session; only `claude` is implemented.
 summary on the job; without it the summary is derived from the task packet
 (`handoff_summary`, else Issue, decisions, proof command, and goal). The same
 ID and payload return the existing job, including the stored summary; a
-changed summary conflicts like any other payload field. After a successful
-submit with `--start`, the Claude planner harness compacts the planner
-session headlessly (`claude -p --output-format json --resume SID "/compact <focus>"`) with the
-policy focus template naming the job (request id, Issue, decisions, proof
-command), recorded as a `claude_compact` invocation with elapsed time and
-usage; a compact failure is recorded and never blocks the job, and no
-compaction runs when the policy flag for the harness is off. The task JSON may
+changed summary conflicts like any other payload field. The task JSON may
 carry an optional `links` array of `{"rel": "...", "href": "..."}` objects
 (references for the worker, kept verbatim in the stored task); it changes no
 routing and needs no runner flag.
@@ -135,11 +129,12 @@ allowance; the runner never invents a reset time.
    resumed with `claude --resume SID --model M --effort E --output-format
    json --tools "" -p PROMPT` in the planner directory. PROMPT carries the
    stored handoff summary before the dispatcher's question, so a callback
-   hours later answers from the ledger even on the compacted session. The
+   hours later resumes the exact saved planner session and answers from
+   the ledger. The
    answer counts only when the JSON result is a success from the same
    session ID. The `claude_callback` invocation records the resumed
    context (input, cache-read, and cache-creation tokens) with elapsed
-   time, so the saving is visible per job in the Observer mapping
+   time, so the resumed context is visible per job in the Observer mapping
    (`status` and `result` measurements). A running `claude` process that
    names the session in its arguments is a busy planner. Busy, failed, or
    mismatched callbacks block the job with a reason; the question stays
@@ -713,8 +708,7 @@ keeps the raw text in the `luna_action` ledger event, and quotes the first
 
 `runner/policy.py` (`durable-runner-policy-v2`) is the single policy source:
 pools, routes, stages (lanes), each Go model's monthly dollar limit and its
-usage windows, signal classes, the planner-handoff compaction focus template
-and per-harness compact flag, and provenance. The Codex skill reference
+usage windows, signal classes, and provenance. The Codex skill reference
 `skills/model-routing/references/codex.md` is rendered from it with
 `python -c "from runner import policy; policy.main(['render-skill'])"` and a
 test keeps the two equal; `policy.main(['validate'])` checks the data.

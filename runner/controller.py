@@ -1127,7 +1127,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     summary = (job.get("handoff_summary") or "").strip()
     if summary:
         # The durable handoff summary travels before the question so the
-        # resumed (possibly compacted) session answers from the ledger,
+        # resumed session answers from the ledger,
         # and the Astra fallback can answer from this prompt alone.
         question = (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n" + question)
     try:
@@ -1179,7 +1179,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
 def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> str:
     """Prompt for the Astra fallback planner in a fresh session, no resume.
 
-    The Codex-harness Astra fallback never compacts and never resumes the
+    The Codex-harness Astra fallback never resumes the
     Claude planner session: it answers from the job's durable handoff
     summary carried before the dispatcher's question. Run it as a fresh
     Astra turn and persist the answer with ``answer`` plus ``recover``.

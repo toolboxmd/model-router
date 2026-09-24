@@ -562,14 +562,11 @@ class TestWorkerDispatcherResumeWithCacheLoader(unittest.TestCase):
         for text in texts:
             self.assertNotIn(direction.BLOCK_START, text)
         # The loader ran exactly once per durable invocation with unique
-        # session ids. The headless claude_compact path records no supply
-        # and never calls the loader (pre-existing, planner keeps its own
-        # session), so it is excluded from the exactly-once count.
+        # session ids.
         calls = loader_calls(loader_state)
         invs = core._list_invocations(sd, rid)
         loader_invs = [i for i in invs
-                       if i.get("state") != "abandoned"
-                       and i.get("kind") != "claude_compact"]
+                       if i.get("state") != "abandoned"]
         self.assertEqual(len(calls), len(loader_invs), (calls, len(loader_invs)))
         sids = [c["session_id"] for c in calls]
         self.assertEqual(len(set(sids)), len(sids))

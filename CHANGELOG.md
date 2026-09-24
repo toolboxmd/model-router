@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.28.0] - 2026-09-24
+
+### Added
+
+- Model Router no longer compacts the planner session after submit: callbacks resume the planner with the stored handoff summary, and policy 2.7.0 drops the compaction settings
+
 ## [0.27.1] - 2026-09-24
 
 ### Changed

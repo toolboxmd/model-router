@@ -22,7 +22,14 @@ from pathlib import Path as _KitPath
 KIND_CODEX_DISPATCH = "codex_dispatch"
 KIND_CODEX_RESUME = "codex_resume"
 KIND_CLAUDE_CALLBACK = "claude_callback"
+# Historical ledger kind only (pre-2.7.0 post-submit planner compaction,
+# removed 2026-09-24: the runner never created it after that and no new
+# command infers it). Old ledgers may still carry rows with this kind;
+# they are read through the neutral historical path in harness_for so
+# status, result, and recover never fail on them. Never add this to an
+# active harness registry.
 KIND_CLAUDE_COMPACT = "claude_compact"
+HISTORICAL_INVOCATION_KINDS = (KIND_CLAUDE_COMPACT,)
 KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
 KIND_GROK_CONTROL = "grok_control"
@@ -981,15 +988,12 @@ class CodexCLI(Harness):
 
 class ClaudeCLI(Harness):
     name = "claude"
-    kinds = (KIND_CLAUDE_CALLBACK, KIND_CLAUDE_COMPACT)
+    kinds = (KIND_CLAUDE_CALLBACK,)
     # The callback runs with no tools, so it cannot write: read-only holds.
-    # Compaction rewrites the planner's own transcript summary, which is
-    # the harness's session maintenance, not workspace work: read-only
-    # still holds for the runner's stage capabilities.
     capabilities = frozenset({"read_only", "session_resume", "structured_output"})
     binary = adapters.CLAUDE_BIN
-    timeouts = {KIND_CLAUDE_CALLBACK: 900, KIND_CLAUDE_COMPACT: 900}
-    stages = {KIND_CLAUDE_CALLBACK: "planning", KIND_CLAUDE_COMPACT: "planning"}
+    timeouts = {KIND_CLAUDE_CALLBACK: 900}
+    stages = {KIND_CLAUDE_CALLBACK: "planning"}
     session_kind = "planner_session_id"
 
     def parse_session(self, kind, stdout, stderr, job):
@@ -1030,20 +1034,12 @@ class ClaudeCLI(Harness):
         return usage, observed, None, ids
 
     def infer_rc(self, kind, stdout, cmd=None):
-        if kind == KIND_CLAUDE_COMPACT:
-            return 0 if adapters.parse_claude_compact_result(stdout).get("ok") else 1
         return 0 if adapters.parse_claude_result(stdout).get("ok") else 1
 
     def parsed_result(self, kind, stdout):
         """Structured Claude result via the seam, so callers never parse
         the harness output directly."""
-        if kind == KIND_CLAUDE_COMPACT:
-            return adapters.parse_claude_compact_result(stdout)
         return adapters.parse_claude_result(stdout)
-
-    def parsed_compact_result(self, kind, stdout):
-        """Structured Claude compact result via the seam."""
-        return adapters.parse_claude_compact_result(stdout)
 
     def planner_answer(self, kind, stdout, meta, job):
         parsed = adapters.parse_claude_result(stdout)
@@ -1058,15 +1054,6 @@ class ClaudeCLI(Harness):
             return f"planner_callback_failed rc={rc} (consumed by recovery)"
         if parsed.get("session_id") != (job or {}).get("planner_session_id"):
             return "planner_session_mismatch (consumed by recovery)"
-        return None
-
-    def compact_failure_reason(self, kind, rc, stdout, job):
-        """Recorded compact failure; never blocks the job."""
-        parsed = adapters.parse_claude_compact_result(stdout)
-        if rc != 0 or not parsed.get("ok"):
-            return f"planner_compact_failed rc={rc}"
-        if parsed.get("session_id") not in (None, (job or {}).get("planner_session_id")):
-            return "planner_compact_session_mismatch"
         return None
 
     def spawn_spec(self, inv, env):
@@ -2393,6 +2380,12 @@ HARNESSES = {h.name: h for h in (CodexCLI(), ClaudeCLI(), OpenCodeServer(), Grok
 KIND_TO_HARNESS = {kind: h for h in HARNESSES.values() for kind in h.kinds}
 INVOCATION_KINDS = tuple(KIND_TO_HARNESS)
 
+# Neutral reader for historical ledger rows (see KIND_CLAUDE_COMPACT):
+# the base Harness produces nothing (no session, no envelope, no usage)
+# and never infers success, so old rows are displayed and reconciled
+# without executing anything.
+_HISTORICAL_HARNESS = Harness()
+
 
 def kinds_for_stage(stage: str | None) -> list[str]:
     """Invocation kinds whose harness serves ``stage`` (worker turns share
@@ -2408,6 +2401,11 @@ def worker_control_kinds() -> list[str]:
 
 
 def harness_for(kind: str | None) -> Harness:
+    # Historical ledger kinds (pre-2.7.0 planner compaction rows) read
+    # through a neutral, non-producing harness: status, result, and
+    # recover handle them without creating or executing anything.
+    if (kind or "") in HISTORICAL_INVOCATION_KINDS:
+        return _HISTORICAL_HARNESS
     h = KIND_TO_HARNESS.get(kind or "")
     return h if h is not None else Harness()
 
@@ -2427,8 +2425,6 @@ def kind_for_cmd(cmd: list) -> str:
     if name == "codex":
         return KIND_CODEX_RESUME if "resume" in args else KIND_CODEX_DISPATCH
     if name == "claude":
-        if any(str(a).strip().startswith("/compact") for a in args):
-            return KIND_CLAUDE_COMPACT
         return KIND_CLAUDE_CALLBACK
     if name == "opencode":
         return KIND_OPENCODE_SERVE if "serve" in args else KIND_OPENCODE_CONTROL

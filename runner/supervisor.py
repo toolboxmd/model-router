@@ -121,8 +121,16 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
         if row is None or row["request_id"] != request_id or job_row is None:
             con.execute("ROLLBACK")
             return 2
+        from . import harnesses as _harnesses
+        try:
+            _historical = _harnesses.HISTORICAL_INVOCATION_KINDS
+        except AttributeError:
+            _historical = ()
+        inv_kind = row["kind"]
         refuse = None
-        if _STOP["requested"]:
+        if (inv_kind or "") in _historical:
+            refuse = f"historical invocation kind {inv_kind!r} is readable but never executable"
+        elif _STOP["requested"]:
             refuse = "termination requested before spawn"
         elif row["state"] != "running" or row["supervisor_pid"] not in (None, my_pid):
             refuse = "invocation already closed or claimed"
