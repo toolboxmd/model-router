@@ -1010,12 +1010,16 @@ def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
 
 def runtime_missing_for_action(state_dir, request_id: str, kind: str,
                                cmd: list[str], meta: dict | None) -> dict | None:
-    """Never-started runtime-missing evidence for one action, if any.
+    """Never-started runtime-missing evidence for one action, if still current.
 
     Recomputes the action key exactly as :func:`_durable_run` did and
-    returns the latest matching row's persisted ``{"cause": ...}`` detail
-    when that row carries explicit runtime-missing evidence, else None.
-    Callers use it to trade an opaque sticky failure for a recoverable
+    returns the newest matching row's persisted ``{"cause": ...}`` detail,
+    but only when that newest non-abandoned row itself carries explicit
+    runtime-missing evidence. An older missing-runtime row never wins
+    after a newer attempt for the same action completed, failed
+    otherwise, or otherwise superseded it: the repaired retry must not
+    be reblocked by the stale row it already repaired. Callers use it
+    to trade an opaque sticky failure for a recoverable
     ``runtime_missing`` block. Rows without the explicit marker never
     count, however empty their output is.
     """
@@ -1024,11 +1028,12 @@ def runtime_missing_for_action(state_dir, request_id: str, kind: str,
     except Exception:
         return None
     matches = [i for i in _list_invocations(state_dir, request_id)
-               if i.get("action_key") == key and i.get("state") != "abandoned"
-               and runtime.is_runtime_missing_row(i)]
+               if i.get("action_key") == key and i.get("state") != "abandoned"]
     if not matches:
         return None
     row = matches[-1]
+    if not runtime.is_runtime_missing_row(row):
+        return None
     try:
         obj = json.loads(row.get("result_json") or "null")
     except ValueError:
@@ -3068,10 +3073,25 @@ def _record_runtime_recovered(state_dir, request_id: str, old, new, trigger: str
 
 
 def _has_runtime_missing_failure(state_dir, request_id: str) -> bool:
-    """Any non-abandoned failed dispatch row with runtime-missing evidence."""
-    return any(_is_dispatch_row(i) and i.get("state") == "failed"
-               and runtime.is_runtime_missing_row(i)
-               for i in _list_invocations(state_dir, request_id))
+    """A dispatch action whose newest attempt never started for a missing runtime.
+
+    Grouped per action key: only the newest non-abandoned row decides.
+    An older missing-runtime row never counts after a newer attempt for
+    the same action completed or otherwise superseded it, so a repaired
+    retry stops reporting recovery once it succeeds (no false
+    ``runtime_recovered`` events on later recoveries).
+    """
+    by_key: dict[str, list[dict]] = {}
+    for i in _list_invocations(state_dir, request_id):
+        if i.get("state") == "abandoned" or not i.get("action_key"):
+            continue
+        by_key.setdefault(i["action_key"], []).append(i)
+    for rows in by_key.values():
+        newest = rows[-1]
+        if (_is_dispatch_row(newest) and newest.get("state") == "failed"
+                and runtime.is_runtime_missing_row(newest)):
+            return True
+    return False
 
 
 def recover_one(state_dir, request_id: str) -> dict:
@@ -3084,16 +3104,26 @@ def recover_one(state_dir, request_id: str) -> dict:
     _stop_orphaned_invocations(state_dir, request_id)
     _abandon_never_started(state_dir, request_id)
     _reconcile_dead_invocations(state_dir, request_id)
-    # Runtime recovery assessment first: resolve the currently installed
-    # runtime, decide explicitly whether it can read the stored job and
-    # invocation state as is, and record the actual runtime and policy
-    # before and after. It runs before output is consumed so an
-    # unsupported state is reported with its specific reason instead of
-    # being half-migrated by measurement. Finished work below is still
-    # preserved first; healthy work is never interrupted merely because
-    # an update occurred.
+    # Terminal jobs are never resurrected and never assessed: recover
+    # --all must not add runtime_assessed noise to finished jobs.
+    terminal_status = get_job(state_dir, request_id)["status"]
+    if terminal_status in store.TERMINAL:
+        return {"request_id": request_id, "action": "noop-terminal",
+                "status": terminal_status}
+    # Runtime recovery assessment for live jobs only: resolve the
+    # currently installed runtime, decide explicitly whether it can read
+    # the stored job and invocation state as is, and record the actual
+    # runtime and policy before and after. It runs before output is
+    # consumed because measurement during consume stamps current schema
+    # markers: the check must see the stored rows as they are. The
+    # compatibility decision itself only gates execution handoffs
+    # (starting a replacement controller) further down; healthy owned
+    # work adopted there is never interrupted merely because an update
+    # occurred.
     compat_ok, compat_reason, old_runtime, new_runtime = _assess_runtime(
         state_dir, request_id)
+    # Consume finished child output exactly once before considering the
+    # controller lease gone. A completed child must not be rerun.
     consumed = consume_finished_invocations(state_dir, request_id)
     if any(c.get("action") == "completed" for c in consumed):
         return {"request_id": request_id, "action": "consumed-completion",
@@ -3101,7 +3131,6 @@ def recover_one(state_dir, request_id: str) -> dict:
     live_invocations = _any_live_invocation(state_dir, request_id)
     if live_invocations:
         _capture_invocation_sessions(state_dir, request_id, live_invocations)
-    unresolved_invocations = _any_unresolved_invocation(state_dir, request_id)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -3140,17 +3169,6 @@ def recover_one(state_dir, request_id: str) -> dict:
                 (reason, _utcnow(), request_id),
             )
             _event(con, request_id, "blocked", {"reason": reason})
-
-        # An unsupported state or policy transition reports its specific
-        # incompatibility and retains the work: no new execution starts, no
-        # live child is signalled, the explicit route is never substituted,
-        # and nothing migrates. A job already blocked keeps its operative
-        # reason; the assessment event above still carries the diagnosis.
-        if not compat_ok and status in ("pending", "running", "question_pending"):
-            mark_blocked(f"runtime_incompatible: {compat_reason}")
-            con.execute("COMMIT")
-            return {"request_id": request_id, "action": "blocked-incompatible-runtime",
-                    "status": "blocked", "reason": compat_reason}
 
         # Only recover's own ownership blocks are re-evaluated. Any other
         # block (a failed turn, a session mismatch) stays blocked: recover
@@ -3381,7 +3399,15 @@ def recover_one(state_dir, request_id: str) -> dict:
             if pending_q > 0 and status == "question_pending" and job["codex_task_id"] \
                     and int(job["attempts"]) < int(job["max_attempts"]):
                 # The controller asks the saved planner again through the
-                # same action identity: a finished callback is reused.
+                # same action identity: a finished callback is reused. The
+                # compatibility check gates this handoff: an unsupported
+                # state blocks with its specific reason instead of starting
+                # execution on state this runtime cannot read.
+                if not compat_ok:
+                    mark_blocked(f"runtime_incompatible: {compat_reason}")
+                    con.execute("COMMIT")
+                    return {"request_id": request_id, "action": "blocked-incompatible-runtime",
+                            "status": "blocked", "reason": compat_reason}
                 con.execute(
                     "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL, updated_at=? WHERE request_id=?",
                     (_utcnow(), request_id))
@@ -3433,6 +3459,18 @@ def recover_one(state_dir, request_id: str) -> dict:
                 con.execute("COMMIT")
                 return {"request_id": request_id, "action": "budget-exhausted",
                         "status": "failed"}
+            # The installed runtime reads this state only when the
+            # recovery-boundary check says so. Healthy owned work was
+            # adopted above and is never interrupted; here no controller
+            # or child is alive, so an unsupported state or policy
+            # transition blocks with its specific reason and retains the
+            # work instead of starting execution on unreadable state: no
+            # migration, no route substitution, no replay.
+            if not compat_ok:
+                mark_blocked(f"runtime_incompatible: {compat_reason}")
+                con.execute("COMMIT")
+                return {"request_id": request_id, "action": "blocked-incompatible-runtime",
+                        "status": "blocked", "reason": compat_reason}
             con.execute(
                 "UPDATE jobs SET owner_token=NULL, owner_pid=NULL,"
                 " status=?, updated_at=? WHERE request_id=?",

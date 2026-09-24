@@ -31,6 +31,14 @@ def version(root: str | None = None) -> str:
     return text.strip() or "unknown"
 
 
+# The version of this loaded package, read once at import while its own
+# directory provably exists. ``installed_runtime()`` reports this instead
+# of re-reading ``VERSION`` at call time, so provenance recorded after
+# the old runtime path is removed still names the real old version
+# instead of ``unknown``.
+IMPORT_VERSION = version()
+
+
 def installed_runtime(root: str | None = None) -> dict:
     """Provenance of the runtime executing this call.
 
@@ -42,9 +50,13 @@ def installed_runtime(root: str | None = None) -> dict:
     from . import policy, store
 
     here = str(root or PKG_ROOT)
+    if root is None or here == PKG_ROOT:
+        ver = IMPORT_VERSION
+    else:
+        ver = version(here)
     return {
         "root": here,
-        "version": version(here),
+        "version": ver,
         "policy_id": policy.POLICY_ID,
         "policy_version": policy.POLICY_VERSION,
         "schema_version": store.SCHEMA_VERSION,
@@ -105,17 +117,6 @@ def _result_obj(inv: dict) -> dict | None:
     except ValueError:
         return None
     return obj if isinstance(obj, dict) else None
-
-
-def is_never_started_row(inv: dict) -> bool:
-    """True only with explicit evidence that the action never started.
-
-    A row counts only when its persisted result says a witnessed spawn
-    error preceded any child. Failed output, empty output, or a missing
-    result never counts: those effects are unknown.
-    """
-    obj = _result_obj(inv)
-    return bool(obj is not None and obj.get("never_started") is True)
 
 
 def is_runtime_missing_row(inv: dict) -> bool:

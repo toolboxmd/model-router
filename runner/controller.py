@@ -1151,10 +1151,13 @@ def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
                              answer: str | None, ok: bool, error: str | None,
                              reported_session: str | None,
                              planner_session: str | None,
-                             check_identity: bool) -> dict:
+                             check_identity: bool, meta: dict | None = None) -> dict:
     """Shared tail: stored-answer wins, then fail/mismatch blocks, else
     persist the answer. ``check_identity`` is false only for a fresh
-    fallback session, which is never a resume."""
+    fallback session, which is never a resume. A callback that provably
+    never started for a missing runtime blocks recoverably with its
+    cause and next action instead of an opaque callback failure; the
+    question stays pending for ``answer`` plus ``recover``."""
     _record_child(state_dir, request_id, kind, cmd, rc,
                   session_id=reported_session or planner_session,
                   output_text=(answer or "") + "\n" + (err or "")[-1000:])
@@ -1164,6 +1167,10 @@ def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
     if stored and (rc != 0 or not ok or mismatch):
         # Answered publicly while the callback ran: the stored answer wins.
         return {"action": "answered", "qid": qid}
+    runtime_blocked = _block_runtime_missing(state_dir, request_id, kind, cmd, meta)
+    if runtime_blocked is not None:
+        runtime_blocked["qid"] = qid
+        return runtime_blocked
     if rc != 0 or not ok:
         reason = f"planner_callback_failed rc={rc}: {error or 'error'}"
         _persist_error_evidence(state_dir, request_id,
@@ -1240,7 +1247,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
             state_dir, request_id, qid, harnesses.KIND_CODEX_CALLBACK,
             cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
             parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=True)
+            check_identity=True, meta=_planner_meta(qid, question, "astra/max"))
     if harness_name == "opencode":
         try:
             cmd = adapters.build_opencode_planner_cmd(planner_session, question, workspace)
@@ -1255,7 +1262,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
             state_dir, request_id, qid, harnesses.KIND_OPENCODE_CALLBACK,
             cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
             parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=True)
+            check_identity=True, meta=_planner_meta(qid, question, None))
     if harness_name == "grok":
         # No usable resume path: a fresh Grok session answers from the
         # handoff summary carried in the question above. Its new session
@@ -1269,7 +1276,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
             state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
             cmd, rc, err, parsed.get("text"), bool(parsed.get("ok")),
             parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=False)
+            check_identity=False, meta=_planner_meta(qid, question, None))
     busy = [] if asked else adapters.planner_session_in_use(
         planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
     if busy:
@@ -1297,7 +1304,7 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
         state_dir, request_id, qid, "claude_callback",
         cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
         parsed.get("error"), parsed.get("session_id"), planner_session,
-        check_identity=True)
+        check_identity=True, meta=_planner_meta(qid, question, planner_route))
 
 
 def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> str:
@@ -1838,13 +1845,14 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
     model, variant, agent = policy.opencode_route_params(route)
     saved_session = job.get("opencode_session_id")
     cmd = adapters.build_opencode_serve_cmd()
+    oc_meta = {"prompt": prompt, "allowance": allowance,
+               "model": model, "variant": variant, "agent": agent,
+               "session_id": saved_session, "seq": seq,
+               "try": attempt,
+               "stage": "implementation", "route": route,
+               "reason": route_reason}
     rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
-                           meta={"prompt": prompt, "allowance": allowance,
-                                 "model": model, "variant": variant, "agent": agent,
-                                 "session_id": saved_session, "seq": seq,
-                                 "try": attempt,
-                                 "stage": "implementation", "route": route,
-                                 "reason": route_reason})
+                           meta=oc_meta)
     # The result line comes from this invocation's own output file, read
     # through the harness seam.
     oc_h = harnesses.harness_named("opencode")
@@ -1854,6 +1862,15 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
                   session_id=session_id,
                   output_text=json.dumps({k: full.get(k) for k in (
                       "ok", "rc", "quota", "finish", "actual_model")}, sort_keys=True))
+    # A turn that provably never started for a missing runtime blocks
+    # recoverably with its cause and next action, before capacity-signal
+    # handling, the escalation ladder, or a sticky implementation failure
+    # could count an unstarted action as an ordinary provider failure or
+    # move its explicit route.
+    runtime_blocked = _block_runtime_missing(state_dir, request_id, "opencode_control",
+                                             cmd, oc_meta)
+    if runtime_blocked is not None:
+        return runtime_blocked
     if rc == 0 and full.get("ok"):
         report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
         _set_phase(state_dir, request_id, phase="implemented",
@@ -1953,12 +1970,13 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
     # The live turn's kit arrives via the harness spawn_spec (GROK_HOME);
     # the spec env returned here is the manual-run equivalent.
     cmd, _grok_kit_env = adapters.build_grok_cmd(prompt, workspace, model, effort, saved_session)
+    grok_meta = {"prompt": prompt, "model": model, "variant": effort,
+                 "session_id": saved_session, "seq": seq,
+                 "try": attempt,
+                 "stage": "implementation", "route": route,
+                 "reason": route_reason}
     rc, out, err = run_cmd(cmd, workspace, None, kind="grok_control",
-                           meta={"prompt": prompt, "model": model, "variant": effort,
-                                 "session_id": saved_session, "seq": seq,
-                                 "try": attempt,
-                                 "stage": "implementation", "route": route,
-                                 "reason": route_reason})
+                           meta=grok_meta)
     # The JSON result comes from this invocation's own output file, read
     # through the harness seam.
     full = grok_h.parse_report("grok_control", out, cmd) or {}
@@ -1978,6 +1996,14 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
                   session_id=session_id,
                   output_text=json.dumps({k: full.get(k) for k in (
                       "ok", "finish", "signal", "error")}, sort_keys=True))
+    # A turn that provably never started for a missing runtime blocks
+    # recoverably with its cause and next action, before signal handling
+    # or a sticky implementation failure could count an unstarted action
+    # as an ordinary provider failure or move its explicit route.
+    runtime_blocked = _block_runtime_missing(state_dir, request_id, "grok_control",
+                                             cmd, grok_meta)
+    if runtime_blocked is not None:
+        return runtime_blocked
     if rc == 0 and full.get("ok"):
         report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
         _set_phase(state_dir, request_id, phase="implemented",
