@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.27.1] - 2026-09-24
+
+### Changed
+
+- Project Direction: the next milestone delivers tasks from a planner in any harness to one review-ready final PR, with the dispatcher as the human's point of contact and the planner engaged only for escalations
+
 ## [0.27.0] - 2026-09-24
 
 ### Added
