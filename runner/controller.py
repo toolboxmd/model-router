@@ -286,12 +286,12 @@ def _block_runtime_missing(state_dir, request_id: str, kind: str,
                            cmd: list[str], meta: dict | None) -> dict | None:
     """Recoverable block when a turn provably never started for a missing runtime.
 
-    Returns the blocked outcome when the action's latest row carries
-    explicit never-started runtime-missing evidence, else None. The reason
-    names the concrete cause and the next action (run recover on the
-    installed runtime); the planner is never asked to restore cache
-    directories. Rows without the explicit marker keep their existing
-    handling, however empty their output is.
+    Returns the blocked outcome when the action's newest non-abandoned
+    row carries explicit never-started runtime-missing evidence, else
+    None. The reason names the concrete cause and the next action (run
+    recover on the installed runtime); the planner is never asked to
+    restore cache directories. Rows without the explicit marker keep
+    their existing handling, however empty their output is.
     """
     detail = core.runtime_missing_for_action(state_dir, request_id, kind, cmd, meta)
     if not detail:
