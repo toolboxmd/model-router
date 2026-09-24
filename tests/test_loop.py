@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tests.fakes import VERSION_GUARD  # noqa: E402
 
-from runner import core, store  # noqa: E402
+from runner import core, harnesses, store  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
@@ -199,20 +199,17 @@ class TestPublicLoopProof(unittest.TestCase):
             self.assertIn(THREAD_ID, r)
         self.assertEqual(len(codex_calls), len(dispatches) + len(resumes))
 
-        # One headless compact plus one Claude --resume of the exact
-        # original planner ID, both run in the planner's directory
-        # (default: the workspace).
-        self.assertEqual(len(claude_calls), 2, claude_calls)
-        compacts = [c for c in claude_calls
-                    if any("/compact" in str(a) for a in c)]
-        callbacks = [c for c in claude_calls
-                     if not any("/compact" in str(a) for a in c)]
-        self.assertEqual(len(compacts), 1, claude_calls)
-        self.assertEqual(len(callbacks), 1, claude_calls)
+        # One Claude --resume of the exact original planner ID, run in
+        # the planner's directory (default: the workspace). Submit never
+        # touches the planner session: the only Claude turn is a callback.
+        self.assertEqual(len(claude_calls), 1, claude_calls)
         for c in claude_calls:
+            self.assertEqual(harnesses.kind_for_cmd(["claude"] + list(c)),
+                             "claude_callback")
             self.assertIn("--resume", c)
             self.assertIn(PLANNER_SID, c)
-        self.assertIn(req, " ".join(str(a) for a in compacts[0]))
+        self.assertIn("HANDOFF SUMMARY", " ".join(str(a) for a in claude_calls[0]))
+        self.assertIn(req, " ".join(str(a) for a in claude_calls[0]))
         self.assertEqual(read_log("claude.log")[0]["cwd"], os.path.realpath(ws))
 
         # Owned ephemeral OpenCode server with the real API contract.
@@ -263,11 +260,9 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("claude_callback", kinds)
         self.assertIn("opencode_control", kinds)
         # Every model child ran under a supervisor and was collected once.
-        # The post-submit compact is a synchronous invocation (no
-        # supervisor), still recorded with elapsed time and usage.
         invs = core._list_invocations(sd, req)
         self.assertEqual(sorted(i["kind"] for i in invs),
-                         ["claude_callback", "claude_compact", "codex_dispatch",
+                         ["claude_callback", "codex_dispatch",
                           "codex_resume", "codex_resume", "opencode_control"])
         self.assertTrue(all(i["state"] == "completed" and i["consumed_at"] for i in invs))
 

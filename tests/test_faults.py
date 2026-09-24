@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, policy, store  # noqa: E402
+from runner import controller, core, harnesses, policy, store  # noqa: E402
 from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
@@ -932,9 +932,17 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         job = core.get_job(self.sd, "ib1")
         self.assertEqual(job["status"], "succeeded", job.get("block_reason"))
         lines = self._lines("claude.log")
-        self.assertEqual(len(lines), 2,
-                         "one compact plus one planner callback")
-        self.assertEqual(sum("/compact" in line for line in lines), 1)
+        # Exactly one planner turn: the callback resuming the saved
+        # session. Submit performs no planner mutation, so recovery
+        # asks once and never forks a second planner session.
+        self.assertEqual(len(lines), 1,
+                         "one planner callback, no planner mutation at submit")
+        entry = json.loads(lines[0])
+        argv = entry["argv"]
+        self.assertEqual(harnesses.kind_for_cmd(["claude"] + list(argv)),
+                         "claude_callback")
+        self.assertIn("p-ib", argv)
+        self.assertIn("HANDOFF SUMMARY", argv[-1])
         qs = core.list_questions(self.sd, "ib1", only_pending=False)
         self.assertEqual([(q["qid"], q["status"], q["answer"]) for q in qs],
                          [("q1", "answered", "Descending.")])

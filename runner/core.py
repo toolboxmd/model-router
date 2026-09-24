@@ -664,6 +664,9 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     only the controller cannot destroy output, IDs, or completion. A
     finished attempt of the same action is reused, never rerun.
     """
+    if (kind or "") in harnesses.HISTORICAL_INVOCATION_KINDS:
+        raise RunnerError(
+            f"historical invocation kind {kind!r} is readable but never creatable")
     harness = harnesses.harness_for(kind)
     if timeout is None:
         timeout = harness.timeout_for(kind)
@@ -1935,36 +1938,6 @@ def _derive_handoff_summary(task, request_id: str,
     return adapters.redact_text(canonical)
 
 
-def _compact_task_fields(task_json: str) -> tuple[str, str, str]:
-    """(issue, decisions, proof) extracted from the stored task packet."""
-    try:
-        obj = json.loads(task_json or "null")
-    except ValueError:
-        return "", "", ""
-    if not isinstance(obj, dict):
-        return "", "", ""
-    def _str(*keys) -> str:
-        for key in keys:
-            val = obj.get(key)
-            if isinstance(val, (str, int)) and str(val).strip():
-                return str(val).strip()
-            if isinstance(val, list) and val:
-                return "; ".join(str(v) for v in val)
-        return ""
-    return (_str("issue", "issue_id", "github_issue", "number"),
-            _str("decisions", "decision", "notes"),
-            _str("proof", "proof_command"))
-
-
-def compact_focus_for_job(job: dict) -> str:
-    """Focus instruction for this job from policy data and the packet."""
-    issue, decisions, proof = _compact_task_fields(job.get("task_json") or "")
-    return policy.compact_focus(
-        str(job.get("request_id") or ""), issue=issue,
-        decisions=decisions, proof=proof,
-        summary=str(job.get("handoff_summary") or ""))
-
-
 def submit(state_dir, request_id: str, task, workspace: str,
            planner_session_id: str, route: str | None = None,
            policy_id: str | None = None, max_attempts: int = 5,
@@ -2243,153 +2216,6 @@ def submit(state_dir, request_id: str, task, workspace: str,
     return get_job(state_dir, request_id)
 
 
-def _default_compact_run(cmd: list[str], cwd: str | None = None,
-                           timeout: int | None = None, **_kwargs) -> tuple[int, str, str]:
-    """Direct subprocess run for the headless compact turn (stdlib only)."""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout or 900, cwd=cwd or None,
-                              stdin=subprocess.DEVNULL)
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-    except FileNotFoundError as e:
-        return 127, "", f"command not found: {e}"
-    except subprocess.TimeoutExpired:
-        return 124, "", "command timeout"
-    except OSError as e:
-        return 127, "", f"spawn failed: {e}"
-
-
-def compact_planner_session(state_dir, request_id: str, run_cmd=None) -> dict:
-    """Compact the planner session headlessly after submit with --start.
-
-    Runs ``claude -p --output-format json --resume SID "/compact <focus>"`` with the policy
-    focus template naming the job (request id, Issue, decisions, proof
-    command), recorded as a ``claude_compact`` invocation with elapsed
-    time and usage. A compact failure is recorded and never blocks the
-    job. One compact per job: a second call reuses the first attempt.
-    No compaction when the policy flag for the planner harness is off.
-    """
-    job = get_job(state_dir, request_id)
-    harness_name = job.get("planner_harness") or "claude"
-    if not policy.compact_enabled(harness_name):
-        return {"action": "skipped", "reason": "compact_disabled"}
-    planner_session = job.get("planner_session_id")
-    if not planner_session:
-        return {"action": "skipped", "reason": "missing_planner_session"}
-    prior = [i for i in _list_invocations(state_dir, request_id)
-             if i.get("kind") == harnesses.KIND_CLAUDE_COMPACT
-             and i.get("state") != "abandoned"]
-    if prior:
-        return {"action": "already-compacted",
-                "invocation": prior[-1]["invocation_id"][:8]}
-    focus = compact_focus_for_job(job)
-    try:
-        cmd = adapters.build_claude_compact_cmd(planner_session, focus)
-    except ValueError as e:
-        return {"action": "failed", "reason": str(e)[:200]}
-    run_cmd = run_cmd or _default_compact_run
-    harness = harnesses.harness_named("claude")
-    route = harness.default_route(harnesses.KIND_CLAUDE_COMPACT, job)
-    meta = {"stage": "planning", "route": route, "reason": "compact_after_submit",
-            "prompt": focus,
-            "focus_sha256": hashlib.sha256(focus.encode("utf-8")).hexdigest()}
-    key = _action_key(harnesses.KIND_CLAUDE_COMPACT, cmd, meta)
-    root = store.ensure_state_dir(state_dir)
-    invocation_id = secrets.token_hex(8)
-    stdout_path, stderr_path = _invocation_output_paths(root, request_id, invocation_id)
-    store.secure_write_text(stdout_path, "")
-    store.secure_write_text(stderr_path, "")
-    started_at = _utcnow()
-    owner_token = job.get("owner_token") or "submit"
-    cwd = job.get("planner_cwd") or job["workspace"]
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "INSERT INTO invocations("
-            " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
-            " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
-            " state, task_json, timeout_secs, meta_json, action_key,"
-            " stage, requested_route, policy_version, reason, harness_version, schema_version"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?)",
-            (invocation_id, request_id, harnesses.KIND_CLAUDE_COMPACT,
-             json.dumps([c.replace("\x00", "") for c in cmd]),
-             cwd, owner_token, str(stdout_path), str(stderr_path),
-             started_at, job.get("task_json"), 900,
-             json.dumps(_redact_meta(dict(meta)), sort_keys=True), key,
-             "planning", route, policy.POLICY_VERSION, "compact_after_submit",
-             harness.version(), store.SCHEMA_VERSION),
-        )
-        _event(con, request_id, "invocation_attempting",
-               {"invocation_id": invocation_id[:16], "kind": harnesses.KIND_CLAUDE_COMPACT})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    try:
-        rc, out, err = run_cmd(cmd, cwd, 900, kind=harnesses.KIND_CLAUDE_COMPACT,
-                               meta=dict(meta))
-    except Exception as e:  # noqa: BLE001 - recorded, never raised
-        rc, out, err = 1, "", f"compact spawn failed: {type(e).__name__}: {e}"
-    try:
-        store.secure_write_text(Path(stdout_path), out or "")
-    except OSError:
-        pass
-    try:
-        store.secure_write_text(Path(stderr_path), err or "")
-    except OSError:
-        pass
-    parsed = adapters.parse_claude_compact_result(out or "")
-    failure_reason = harness.compact_failure_reason(
-        harnesses.KIND_CLAUDE_COMPACT, rc, out or "", job)
-    ok = failure_reason is None
-    state = "completed" if ok else "failed"
-    now = _utcnow()
-    error_text = None if ok else (parsed.get("error") or failure_reason)
-    result_payload: dict = {"rc": rc, "ok": ok,
-                            "session_id": parsed.get("session_id"),
-                            "error": error_text}
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "UPDATE invocations SET rc=?, state=?, ended_at=?, consumed_at=?, result_json=?,"
-            " session_id=COALESCE(?, session_id),"
-            " session_kind=COALESCE(?, session_kind) WHERE invocation_id=?",
-            (rc, state, now, now, json.dumps(result_payload, sort_keys=True),
-             parsed.get("session_id"), "planner_session_id", invocation_id),
-        )
-        _event(con, request_id,
-               "planner_compacted" if ok else "planner_compact_failed",
-               {"invocation_id": invocation_id[:16], "rc": rc,
-                "reason": (str(error_text or "")[:120]) if not ok else "compacted"})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    _measure_invocation(state_dir, request_id, invocation_id)
-    try:
-        log = store.output_path_for(root, request_id)
-        store.append_text(log, f"[claude_compact invocation={invocation_id[:8]} rc={rc}]\n")
-    except OSError:
-        pass
-    if ok:
-        return {"action": "compacted", "invocation": invocation_id[:8]}
-    return {"action": "failed",
-            "reason": str(error_text or f"planner_compact_failed rc={rc}")[:200],
-            "invocation": invocation_id[:8]}
-
-
 def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_session_id: str, route: str | None = None,
                      policy_id: str | None = None, max_attempts: int = 5,
@@ -2401,19 +2227,15 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      lane: str | None = None,
                      job_kind: str = "ordinary", replay_of: str | None = None,
                      planner_harness: str = "claude",
-                     handoff_summary: str | None = None,
-                     run_cmd=None) -> dict:
-    """Persist first, compact the planner session, then launch the controller.
+                     handoff_summary: str | None = None) -> dict:
+    """Persist first, then launch the controller.
 
     The durable row commits before any spawn, so controller death leaves
-    recoverable state. The headless compaction runs before the controller
-    launch (best-effort: a failure is recorded and never blocks the job).
-    ``launcher`` is a legacy test-only seam
+    recoverable state. ``launcher`` is a legacy test-only seam
     ``(state_dir, request_id) -> dict``; ``spawn`` is the preferred
     test-only seam ``(cmd) -> pid`` that keeps durable attempt rows
-    while staying offline; ``run_cmd`` is the test-only seam for the
-    compact turn ``(cmd, cwd, timeout, kind, meta) -> (rc, out, err)``.
-    Default spawns a detached controller process using built-in adapters.
+    while staying offline. Default spawns a detached controller process
+    using built-in adapters.
     """
     job = submit(state_dir, request_id, task, workspace, planner_session_id,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
@@ -2428,12 +2250,6 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
         return job
     if job["status"] in store.TERMINAL:
         return job
-    # The planner session compacts around the submitted job before the
-    # controller starts asking questions; a failure never blocks the job.
-    try:
-        compact_planner_session(state_dir, request_id, run_cmd=run_cmd)
-    except Exception:
-        pass
     # A repeated submission returns the existing job; it never forces a
     # second launch (use recover for ownership reconciliation).
     try:
