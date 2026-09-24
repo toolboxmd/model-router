@@ -612,12 +612,19 @@ def _prior_action_result(state_dir, request_id: str, key: str):
         if own == "live":
             # Adopt: the same action is already running under its own
             # supervisor. Wait for its durable result instead of copying it.
-            limit = float(inv.get("timeout_secs") or 1800) + 120.0
-            end = time.monotonic() + limit
-            while time.monotonic() < end:
+            # No elapsed deadline (#88): a productive turn stays running
+            # regardless of age, so adoption waits until ownership leaves
+            # live, or until cancellation/terminal state ends the wait.
+            while True:
                 cur = [i for i in _list_invocations(state_dir, request_id)
                        if i["invocation_id"] == inv["invocation_id"]]
                 if not cur or _invocation_ownership(cur[0]) != "live":
+                    break
+                try:
+                    _job = get_job(state_dir, request_id)
+                except NotFoundError:
+                    break
+                if _job.get("cancel_requested") or _job.get("status") in store.TERMINAL:
                     break
                 time.sleep(0.2)
             own = _invocation_ownership(
@@ -648,13 +655,23 @@ def _wait_other_invocations(state_dir, request_id: str, key: str) -> None:
     for inv in _list_invocations(state_dir, request_id):
         if inv.get("action_key") == key or inv.get("state") not in LIVE_INVOCATION_STATES:
             continue
-        end = time.monotonic() + float(inv.get("timeout_secs") or 1800) + 120.0
+        # No elapsed deadline (#88): wait until the other action's
+        # ownership leaves live, or until cancellation/terminal state.
+        # A productive turn stays running regardless of age; only
+        # unresolvable ownership still refuses the duplicate.
         own = _invocation_ownership(inv)
-        while own == "live" and time.monotonic() < end:
+        while own == "live":
             time.sleep(0.2)
             cur = [i for i in _list_invocations(state_dir, request_id)
                    if i["invocation_id"] == inv["invocation_id"]]
             own = _invocation_ownership(cur[0]) if cur else "finished"
+            if own == "live":
+                try:
+                    _job = get_job(state_dir, request_id)
+                except NotFoundError:
+                    break
+                if _job.get("cancel_requested") or _job.get("status") in store.TERMINAL:
+                    break
         if own in ("live", "unresolved", "orphaned", "never_started"):
             raise OwnershipError(
                 f"job {request_id}: invocation {inv['invocation_id'][:8]} is {own}; run recover")
@@ -671,13 +688,23 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     supervisor process group is detached from the controller so killing
     only the controller cannot destroy output, IDs, or completion. A
     finished attempt of the same action is reused, never rerun.
+
+    ``timeout`` is a legacy compatibility slot and is never enforced:
+    since #88 agent turns carry no elapsed deadline, so the value (when
+    given) is only recorded on the row for readability of pre-#88
+    ledgers. New rows store NULL (no deadline). Explicit cancellation,
+    real terminal failures, process ownership, and stream-stall handling
+    are the only ends for an active turn.
     """
     if (kind or "") in harnesses.HISTORICAL_INVOCATION_KINDS:
         raise RunnerError(
             f"historical invocation kind {kind!r} is readable but never creatable")
     harness = harnesses.harness_for(kind)
-    if timeout is None:
-        timeout = harness.timeout_for(kind)
+    if timeout is not None:
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = None
     stage_name = (meta or {}).get("stage") or harness.stage_for(kind)
     route_name = (meta or {}).get("route")
     if route_name:
@@ -831,7 +858,7 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             "?,?,?,?,?,?,?,?)",
             (invocation_id, request_id, kind, json.dumps(list(cmd)),
              workspace, owner_token, str(stdout_path), str(stderr_path),
-             started_at, job.get("task_json"), int(timeout), meta_json, key,
+             started_at, job.get("task_json"), timeout, meta_json, key,
              (meta or {}).get("stage") or harness.stage_for(kind),
              (meta or {}).get("route") or harness.default_route(kind, job),
              policy.POLICY_VERSION, (meta or {}).get("reason") or "initial",
@@ -903,11 +930,14 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
     # the row; the controller never writes them, so an unclaimed row stays
     # recognizable as never started.
 
-    # The supervisor enforces the child timeout, then may need to abort
-    # and confirm an idle OpenCode session before it records the result.
-    deadline = time.monotonic() + max(1.0, float(timeout) + 60.0)
-    rc = 124
-    while time.monotonic() < deadline:
+    # The supervisor owns the turn's end (completion, stall, explicit
+    # cancellation, or real failure) and records the result; the
+    # controller adopts that durable result with no elapsed deadline
+    # (#88). A productive turn stays running regardless of age. The
+    # supervisor reap below (10s) and the drain/cleanup bounds elsewhere
+    # are purpose-specific limits, not agent deadlines.
+    rc = 125
+    while True:
         invs = [i for i in _list_invocations(state_dir, request_id)
                 if i["invocation_id"] == invocation_id]
         if invs and invs[0].get("state") not in LIVE_INVOCATION_STATES:
@@ -932,15 +962,11 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
                         if i["invocation_id"] == invocation_id]
                 if invs and invs[0].get("state") not in LIVE_INVOCATION_STATES:
                     try:
-                        rc = int(invs[0]["rc"]) if invs[0].get("rc") is not None else 124
+                        rc = int(invs[0]["rc"]) if invs[0].get("rc") is not None else 125
                     except (TypeError, ValueError):
-                        rc = 124
+                        rc = 125
             break
         time.sleep(0.05)
-    else:
-        _terminate_invocations(state_dir, request_id, signal_no=signal.SIGKILL)
-        consume_finished_invocations(state_dir, request_id)
-        rc = 124
 
     stdout_text = ""
     stderr_text = ""
@@ -2059,7 +2085,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
     be overridden explicitly. The handoff summary is stored on the job
     (explicit argument wins, else derived from the task packet) so a
     callback prompt can carry it. Planner callbacks run in the job
-    workspace.
+    workspace. ``timeout_secs`` is a legacy compatibility slot, recorded
+    but never enforced: jobs carry no age deadline since #88.
     """
     _validate_request_id(request_id)
     if not planner_session_id:
@@ -3084,11 +3111,10 @@ def recover_one(state_dir, request_id: str) -> dict:
             raise NotFoundError(f"unknown request: {request_id}")
         status = job["status"]
         if status in store.TERMINAL:
-            # Never resurrect completed jobs; budgets stay as-is.
+            # Never resurrect completed jobs.
             con.execute("ROLLBACK")
             return {"request_id": request_id, "action": "noop-terminal",
                     "status": status}
-        now = _utcnow()
         # Cancellation intent persisted previously. Stop owned children and
         # finalize cancellation only after every owned process group is dead.
         if job["cancel_requested"]:
@@ -3101,23 +3127,13 @@ def recover_one(state_dir, request_id: str) -> dict:
                     "action": "timeout" if fin["error_class"] == "timeout" else "cancelled",
                     "status": fin["status"]}
 
-        # Timeout enforcement (bounded, persisted before ack).
-        # Mark timing-out intent, stop owned children, then finalize only after
-        # every owned process group is confirmed dead.
-        if job["timeout_secs"] is not None:
-            created = _parse_ts(job["created_at"])
-            if created is not None and (time.time() - created) > int(job["timeout_secs"]):
-                con.execute(
-                    "UPDATE jobs SET status='cancelling', cancel_requested=2, updated_at=? WHERE request_id=?",
-                    (now, request_id),
-                )
-                _event(con, request_id, "timing_out", {})
-                con.execute("COMMIT")
-                con.close()
-                all_dead = _drain_owned_children(state_dir, request_id, dict(job))
-                _finalize_stopped(state_dir, request_id, all_dead)
-                return {"request_id": request_id, "action": "timeout",
-                        "status": get_job(state_dir, request_id)["status"]}
+        # No job-age deadline (#88): recovery never cancels or drains an
+        # active job because of its age. ``timeout_secs`` (including legacy
+        # positive values on old rows) is readable but never enforced; only
+        # explicit cancellation above stops owned children. Rows already
+        # carrying a timeout drain intent (cancel_requested=2, written
+        # before #88) still finalize through _finalize_stopped below via
+        # the cancellation path, preserving their timeout origin.
         def mark_blocked(reason: str):
             con.execute(
                 "UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?",

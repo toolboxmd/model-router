@@ -48,8 +48,10 @@ development.
 ```
 
 `submit` commits the task, workspace claim, policy identity, planner session
-and harness, planner model, effort, route, attempt budget, and timeout before
-it acknowledges. The same ID and payload return the existing job, also with
+and harness, planner model, effort, route, and attempt budget before
+it acknowledges. `--timeout-secs` is still accepted for compatibility and
+recorded on the job, but since toolboxmd/model-router#88 it bounds nothing:
+agent turns and jobs carry no elapsed deadline. The same ID and payload return the existing job, also with
 `--start`. A changed payload conflicts. A new job's workspace
 must be an existing directory. A workspace that equals, contains,
 or lies inside the workspace of an active or cancelling job, or of a job
@@ -415,15 +417,15 @@ overloaded, or unknown) is recorded as the signal evidence. An unknown probe
 retries the same route bounded by the overload window, then moves laterally
 with the route degraded. The Codex and Claude CLI harnesses apply their own
 windows to their JSON-line streams through the harness seam (last line time).
-The per-turn timeout (1800 s for Codex and OpenCode turns, 900 s for
-Claude) stays as the outer budget for runaway but active turns: the
-effective silence window is always clamped strictly below it, and the
-supervisor checks the turn deadline before the stall window, so at the
-boundary a turn that reaches its timeout reports a timeout, never a stall.
+Agent turns carry no elapsed deadline (toolboxmd/model-router#88): a
+productive turn stays running regardless of total elapsed time, and genuine
+stream silence past the policy window is the only time-based end for an
+active turn, alongside explicit cancellation and real terminal failures.
+The silence window passes through unclamped: no per-turn timeout exists to
+clamp below, and no deadline is checked before the stall window.
 `RUNNER_STALL_SECS` and per-invocation `stall_secs` shrink the window for
 deterministic drills only; they stay unset in production, where the policy
-value governs, and an override at or above the timeout is clamped the same
-way. Every invocation
+value governs. Every invocation
 records its longest observed stream silence (`longest_silence_secs`) so the
 window is tuned on data through Agent Observer. The server group stops after
 every turn.
@@ -636,19 +638,29 @@ result. File-backed output survives controller death.
   work: no migration, no route substitution, no replay of live,
   successful, or uncertain actions. Other spawn failures (a missing job
   workspace, a bad command) keep their sticky semantics.
-- `cancel` and timeouts signal every proven child and supervisor group and
-  keep the workspace claimed until they are confirmed dead. If ownership
+- `cancel` signals every proven child and supervisor group and
+  keeps the workspace claimed until they are confirmed dead. If ownership
   stays unresolved, the job blocks and `recover` finalizes it once the
-  children are confirmed gone.
+  children are confirmed gone. (Pre-#88 timeout drains used the same stop
+  path; since #88 no new timeout intent is ever written.)
 - One guarded statement finishes a stop: the outcome follows the stop
   intent stored last (a cancel request overwrites a pending timeout), never
   replaces a terminal status, and the result file mirrors what was
   committed.
 
-Default child timeouts: Codex 1800 s, Claude 900 s, OpenCode 1800 s.
-`--timeout-secs` bounds the whole job and is enforced by `recover`; a job
-that completed before `recover` ran keeps its result. A timeout finalizes as
-`failed` with `timeout`, a cancellation as `cancelled`.
+Agent turns and jobs carry no elapsed deadline (toolboxmd/model-router#88):
+a productive turn stays running regardless of total elapsed time, and
+`recover` never cancels or drains an active job because of its age.
+`--timeout-secs` is a legacy compatibility slot: it is accepted and
+recorded (pre-#88 rows stay readable with their positive values), but it
+bounds nothing and is never enforced. Only explicit cancellation stops an
+active job: `cancel` persists the intent, signals every proven child and
+supervisor group, and keeps the workspace claimed until they are confirmed
+dead. If ownership stays unresolved, the job blocks and `recover`
+finalizes it once the children are confirmed gone. Rows that already
+carried a pre-#88 timeout drain intent (`cancel_requested=2`) still
+finalize with their timeout origin. A timeout finalizes as `failed` with
+`timeout` only for such legacy drains, a cancellation as `cancelled`.
 
 ## State
 
@@ -698,7 +710,8 @@ before they are persisted or forwarded.
 
 States: `pending -> running <-> question_pending -> succeeded | failed |
 cancelled`, with `cancelling` while children stop; the last stored stop
-intent decides between `cancelled` and a timeout. `blocked` always has a reason. `status`
+intent decides between `cancelled` and a timeout (only legacy pre-#88
+timeout drains still carry the timeout intent). `blocked` always has a reason. `status`
 shows summaries: the lease token, the task body, Luna envelopes, worker
 reports, the completion report, and child output stay in the private
 database and output files. It does show Luna's planner questions and block
@@ -849,7 +862,7 @@ under `FAKE_OC_PLAN=implement_then_complete`. The fake
 turn for controller-death drills. It covers
 duplicate and concurrent submission, workspace conflicts, launch races,
 controller and worker death, killed supervisors, pending questions,
-answer-plus-recover, cancellation, timeouts, trusted and untrusted quota
+answer-plus-recover, cancellation, legacy timeout drains, trusted and untrusted quota
 evidence, unsupported routes, and unknown ownership. It does not prove live
 model behavior. Live verification evidence is recorded on the owning Issue.
 

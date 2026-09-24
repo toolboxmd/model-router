@@ -195,35 +195,44 @@ class TestStallWindowPolicy(unittest.TestCase):
 
 
 class TestEffectiveStallWindowBound(unittest.TestCase):
-    """The effective stall window is always strictly shorter than the
-    invocation's turn timeout: overrides at or above it are clamped,
-    never rejected, so the detector cannot outlive the outer budget."""
+    """The effective stall window passes through unclamped (#88).
 
-    def test_policy_defaults_pass_through_below_their_timeouts(self):
+    There is no per-turn elapsed deadline since #88, so the legacy
+    ``timeout_secs`` slot is accepted for compatibility and ignored:
+    configured and override windows are never clamped below it. Stall
+    (genuine stream silence) is the only time-based end for active turns.
+    """
+
+    def test_policy_defaults_pass_through(self):
         self.assertEqual(
             harnesses.harness_named("codex").effective_stall_window_secs({}, 1800), 300.0)
         self.assertEqual(
             harnesses.harness_named("opencode").effective_stall_window_secs({}, 1800), 180.0)
         self.assertEqual(
             harnesses.harness_named("claude").effective_stall_window_secs({}, 900), 180.0)
+        # A missing timeout (new rows store NULL) gives the same windows.
+        self.assertEqual(
+            harnesses.harness_named("codex").effective_stall_window_secs({}, None), 300.0)
+        self.assertEqual(
+            harnesses.harness_named("opencode").effective_stall_window_secs({}, None), 180.0)
 
     def test_small_override_passes_through(self):
         h = harnesses.harness_named("codex")
         self.assertEqual(h.effective_stall_window_secs({"stall_secs": 3}, 30), 3.0)
 
-    def test_window_equal_to_timeout_is_clamped_below(self):
+    def test_window_equal_to_former_timeout_passes_through(self):
+        # #88 replaced the clamp: a window equal to a legacy timeout value
+        # is used as-is instead of being forced strictly below it.
         h = harnesses.harness_named("codex")
-        window = h.effective_stall_window_secs({"stall_secs": 8}, 8)
-        self.assertLess(window, 8)
-        self.assertGreater(window, 0)
+        self.assertEqual(h.effective_stall_window_secs({"stall_secs": 8}, 8), 8.0)
 
-    def test_window_above_timeout_is_clamped_below(self):
+    def test_window_above_former_timeout_passes_through(self):
+        # #88 replaced the clamp: a window above a legacy timeout value is
+        # used as-is; the active turn is never killed for its age.
         h = harnesses.harness_named("codex")
-        window = h.effective_stall_window_secs({"stall_secs": 600}, 8)
-        self.assertLess(window, 8)
-        self.assertGreater(window, 0)
+        self.assertEqual(h.effective_stall_window_secs({"stall_secs": 600}, 8), 600.0)
 
-    def test_env_override_above_timeout_is_clamped(self):
+    def test_env_override_above_former_timeout_passes_through(self):
         h = harnesses.harness_named("codex")
         prev = os.environ.get("RUNNER_STALL_SECS")
         os.environ["RUNNER_STALL_SECS"] = "600"
@@ -234,8 +243,7 @@ class TestEffectiveStallWindowBound(unittest.TestCase):
                 os.environ.pop("RUNNER_STALL_SECS", None)
             else:
                 os.environ["RUNNER_STALL_SECS"] = prev
-        self.assertLess(window, 8)
-        self.assertGreater(window, 0)
+        self.assertEqual(window, 600.0)
 
     def test_missing_or_invalid_timeout_leaves_the_window(self):
         h = harnesses.harness_named("codex")
@@ -243,11 +251,10 @@ class TestEffectiveStallWindowBound(unittest.TestCase):
             self.assertEqual(
                 h.effective_stall_window_secs({"stall_secs": 600}, bad), 600.0)
 
-    def test_tiny_timeout_stays_positive_and_below(self):
+    def test_tiny_former_timeout_leaves_the_window(self):
+        # #88: even a tiny legacy timeout no longer shrinks the window.
         h = harnesses.harness_named("codex")
-        window = h.effective_stall_window_secs({"stall_secs": 600}, 1)
-        self.assertGreater(window, 0)
-        self.assertLess(window, 1)
+        self.assertEqual(h.effective_stall_window_secs({"stall_secs": 600}, 1), 600.0)
 
 
 class TestDispatchStallPath(unittest.TestCase):
@@ -370,12 +377,14 @@ class TestSupervisorStallRecordsStalled(unittest.TestCase):
         self.assertIsNone(h.auth_failure_reason(out, err))
 
 
-class TestSupervisorStallTimeoutBoundary(unittest.TestCase):
-    """A stall window at or above the turn timeout cannot outlive the
-    deadline: the supervisor clamps it strictly below and the deadline is
-    checked before the stall window, so the turn ends before the timeout
-    as stalled (genuine silence) instead of running to the deadline or
-    misreporting a stall at it. An active turn still ends on the timeout."""
+class TestNoElapsedDeadlineBoundary(unittest.TestCase):
+    """No elapsed deadline ends an active turn (#88).
+
+    The legacy ``timeout`` argument to the durable run is recorded but
+    never enforced: a silent turn still ends as stalled on the policy
+    silence window, while an active turn with stream activity runs past
+    the former per-turn cap to completion instead of dying with rc 124.
+    """
 
     def _run_script(self, rid, body, timeout, stall_secs):
         from runner import store as _store
@@ -412,25 +421,21 @@ class TestSupervisorStallTimeoutBoundary(unittest.TestCase):
         inv = core._list_invocations(sd, rid)[-1]
         return rc, out, err, elapsed, json.loads(inv["result_json"] or "{}"), inv
 
-    def test_window_equal_to_timeout_ends_stalled_before_deadline(self):
-        timeout = 8
+    def test_silent_turn_ends_stalled_on_the_window(self):
+        # A legacy timeout value no longer bounds the turn: the silent
+        # script still ends as stalled, on the configured window.
         rc, _out, err, _elapsed, result, inv = self._run_script(
             "i73-b1",
             "import time\ntime.sleep(60)\n",
-            timeout=timeout, stall_secs=timeout)
+            timeout=30, stall_secs=2)
         self.assertEqual(rc, 4)
         self.assertEqual(result.get("signal"), "stalled")
-        self.assertLess(result["signal_evidence"]["window_secs"], timeout)
-        self.assertLess(result["signal_evidence"]["silence_secs"], timeout)
-        # The turn's own measured duration stays inside the outer budget:
-        # insert-to-finish on the invocation row is strictly below the
-        # supplied timeout, so the stall detector never outlived it.
+        self.assertEqual(result["signal_evidence"]["window_secs"], 2.0)
+        self.assertGreaterEqual(result["signal_evidence"]["silence_secs"], 2.0)
         self.assertIsNotNone(inv.get("elapsed_secs"))
-        self.assertLess(inv["elapsed_secs"], timeout)
         self.assertIn("stalled", err)
 
-    def test_window_above_timeout_ends_stalled_before_deadline(self):
-        timeout = 15
+    def test_silent_after_output_ends_stalled_on_the_window(self):
         rc, _out, err, _elapsed, result, inv = self._run_script(
             "i73-b2",
             "import json, sys, time\n"
@@ -441,31 +446,32 @@ class TestSupervisorStallTimeoutBoundary(unittest.TestCase):
             "'output': 'quiet'}}), flush=True)\n"
             "sys.stdout.flush()\n"
             "time.sleep(60)\n",
-            timeout=timeout, stall_secs=600)
+            timeout=30, stall_secs=2)
         self.assertEqual(rc, 4)
         self.assertEqual(result.get("signal"), "stalled")
-        self.assertLess(result["signal_evidence"]["window_secs"], timeout)
-        self.assertLess(result["signal_evidence"]["silence_secs"], timeout)
-        # Same outer-budget proof as above, with a live-like stream that
-        # goes silent after its first output.
+        self.assertEqual(result["signal_evidence"]["window_secs"], 2.0)
+        # A live-like stream that goes silent after its first output ends
+        # on the window however old the turn is allowed to grow.
         self.assertIsNotNone(inv.get("elapsed_secs"))
-        self.assertLess(inv["elapsed_secs"], timeout)
         self.assertIn("stalled", err)
 
-    def test_active_turn_still_ends_on_the_timeout(self):
-        timeout = 5
-        rc, _out, _err, _elapsed, result, inv = self._run_script(
+    def test_active_turn_runs_past_the_former_timeout(self):
+        # The #88 regression: an active turn (steady stream activity, no
+        # silence) used to die with rc 124 at the per-turn cap. With the
+        # legacy timeout recorded but unenforced, it runs ~7s of activity
+        # past a 3s legacy value to completion.
+        rc, _out, _err, elapsed, result, inv = self._run_script(
             "i73-b3",
             "import json, sys, time\n"
-            "for i in range(100):\n"
+            "for i in range(24):\n"
             "    print(json.dumps({'type': 'item.completed', 'i': i}), flush=True)\n"
             "    time.sleep(0.3)\n",
-            timeout=timeout, stall_secs=600)
-        self.assertEqual(rc, 124)
+            timeout=3, stall_secs=30)
+        self.assertEqual(rc, 0)
         self.assertIsNone(result.get("signal"))
+        self.assertGreater(elapsed, 3.0)
         self.assertIsNotNone(inv.get("elapsed_secs"))
-        self.assertGreaterEqual(inv["elapsed_secs"], timeout - 0.5)
-        self.assertLess(inv["elapsed_secs"], timeout + 10)
+        self.assertGreater(inv["elapsed_secs"], 3.0)
 
 
 if __name__ == "__main__":

@@ -37,17 +37,11 @@ KIND_OPENCODE_CONTROL = "opencode_control"
 KIND_OPENCODE_SERVE = "opencode_serve"
 KIND_GROK_CONTROL = "grok_control"
 
-# Stall-window bound against the per-turn timeout (toolboxmd/model-router#73).
-# The effective silence window is always strictly shorter than the
-# invocation's turn timeout: this many seconds before the deadline are
-# reserved so a clamped window never ties or outlives it, and the floor
-# keeps tiny turn budgets positive. The reserve covers two supervisor poll
-# ticks (at most 1 second each) plus the activity-note lag, so a genuinely
-# silent turn is still detected as stalled before the deadline instead of
-# racing it. The supervisor floors the deadline the same way (at least 1
-# second), so the bound below always holds.
-STALL_WINDOW_DEADLINE_RESERVE_SECS = 3.0
-STALL_WINDOW_MIN_SECS = 0.5
+# Stall detection owns liveness (toolboxmd/model-router#33, #73, #88).
+# There is no per-turn elapsed deadline: productive agent turns stay
+# running regardless of total elapsed time. The silence window below is
+# the only time-based end for an active turn (genuine stream silence),
+# alongside explicit cancellation and real terminal failures.
 
 
 class StreamActivity:
@@ -91,7 +85,6 @@ class Harness:
     owned_server = False  # a server process the runner owns per turn
     headless_worker = False  # one headless CLI process per worker turn
     binary = ""
-    timeouts: dict = {}
     stages: dict = {}
     session_kind = None
 
@@ -175,8 +168,14 @@ class Harness:
     def stage_for(self, kind: str) -> str | None:
         return self.stages.get(kind)
 
-    def timeout_for(self, kind: str) -> int:
-        return int(self.timeouts.get(kind, 1800))
+    def timeout_for(self, kind: str) -> None:
+        """No elapsed deadline for any invocation kind (#88).
+
+        Legacy compatibility only: always returns None. Agent turns stay
+        active regardless of total elapsed time; callers must not derive
+        a deadline from this. Persisted ``timeout_secs`` values from
+        before #88 stay readable but are never enforced."""
+        return None
 
     def default_route(self, kind: str, job: dict | None) -> str | None:
         return None
@@ -190,9 +189,10 @@ class Harness:
         and resume wait longer for silent max-effort reasoning; worker
         harnesses keep the session-database default).
 
-        This is the raw configured window. The supervisor never uses it
-        directly: ``effective_stall_window_secs`` bounds it strictly below
-        the invocation's turn timeout first."""
+        This is the enforced window. Since #88 there is no per-turn
+        elapsed deadline: the window passes through unclamped, and stall
+        (genuine stream silence) is the only time-based end for an
+        active turn."""
         try:
             override = (meta or {}).get("stall_secs")
             if override is not None and float(override) > 0:
@@ -210,25 +210,14 @@ class Harness:
 
     def effective_stall_window_secs(self, meta=None, timeout_secs=None) -> float:
         """Silence window actually enforced for one turn: the configured
-        window (``stall_secs``, then ``RUNNER_STALL_SECS``, then policy)
-        clamped strictly below the invocation's effective per-turn timeout.
+        window (``stall_secs``, then ``RUNNER_STALL_SECS``, then policy).
 
-        A window at or above the timeout is clamped, never rejected: the
-        turn still ends as stalled on genuine silence, but always before
-        the deadline, so the stall detector cannot outlive the outer turn
-        budget. A missing or non-positive timeout leaves the configured
-        window untouched (the supervisor always passes a real timeout)."""
-        window = self.stall_window_secs(meta)
-        try:
-            timeout = float(timeout_secs) if timeout_secs is not None else None
-        except (TypeError, ValueError):
-            timeout = None
-        if timeout is None or not (timeout > 0):
-            return window
-        effective_timeout = max(1.0, timeout)
-        bound = max(STALL_WINDOW_MIN_SECS,
-                    effective_timeout - STALL_WINDOW_DEADLINE_RESERVE_SECS)
-        return min(window, bound)
+        ``timeout_secs`` is a legacy compatibility slot and is ignored:
+        since #88 there is no per-turn elapsed deadline to clamp below,
+        so the window always passes through unclamped. Stall detection
+        (genuine stream silence) is the only time-based end for active
+        turns, alongside explicit cancellation and real failures."""
+        return self.stall_window_secs(meta)
 
     def new_activity_tracker(self, now=None) -> StreamActivity:
         import time as _time
@@ -468,8 +457,6 @@ class CodexCLI(Harness):
     kinds = (KIND_CODEX_DISPATCH, KIND_CODEX_RESUME, KIND_CODEX_CALLBACK)
     capabilities = frozenset({"read_only", "session_resume", "structured_output"})
     binary = adapters.CODEX_BIN
-    timeouts = {KIND_CODEX_DISPATCH: 1800, KIND_CODEX_RESUME: 1800,
-                KIND_CODEX_CALLBACK: 900}
     stages = {KIND_CODEX_DISPATCH: "dispatch", KIND_CODEX_RESUME: "dispatch",
               KIND_CODEX_CALLBACK: "planning"}
     session_kind = "codex_task_id"
@@ -1034,7 +1021,6 @@ class ClaudeCLI(Harness):
     # The callback runs with no tools, so it cannot write: read-only holds.
     capabilities = frozenset({"read_only", "session_resume", "structured_output"})
     binary = adapters.CLAUDE_BIN
-    timeouts = {KIND_CLAUDE_CALLBACK: 900}
     stages = {KIND_CLAUDE_CALLBACK: "planning"}
     session_kind = "planner_session_id"
 
@@ -1158,8 +1144,6 @@ class OpenCodeServer(Harness):
     capabilities = frozenset({"workspace_write", "session_resume", "structured_output", "read_only"})
     owned_server = True
     binary = adapters.OPENCODE_BIN
-    timeouts = {KIND_OPENCODE_CONTROL: 1800, KIND_OPENCODE_SERVE: 1800,
-                KIND_OPENCODE_CALLBACK: 900}
     stages = {KIND_OPENCODE_CONTROL: "implementation", KIND_OPENCODE_SERVE: "implementation",
               KIND_OPENCODE_CALLBACK: "planning"}
     session_kind = "opencode_session_id"
@@ -1344,8 +1328,9 @@ class OpenCodeServer(Harness):
     @staticmethod
     def _tool_running(part: dict) -> bool:
         """True when a tool part reports a running process. The part counts
-        as activity while its process is alive; the per-turn timeout stays
-        the outer budget for a tool that never finishes."""
+        as activity while its process is alive; a tool that never finishes
+        is ended by stall detection on genuine stream silence, never by an
+        elapsed deadline (removed in #88)."""
         for key in ("state", "status"):
             val = part.get(key)
             if isinstance(val, str) and val.lower() == "running":
@@ -1471,9 +1456,9 @@ class GrokBuildCLI(Harness):
 
     One process per worker turn: headless single prompt in the workspace
     with the route's model and effort as JSON, resumed by saved session id.
-    No owned server, so the generic supervisor path (spawn, wait, kill on
-    timeout) applies; there is no session to abort and confirm idle, the
-    process exit is the turn boundary. ``grok usage`` style counters are
+    No owned server, so the generic supervisor path (spawn, wait, end on
+    stream-silence stall) applies; there is no session to abort and confirm
+    idle, the process exit is the turn boundary. ``grok usage`` style counters are
     not read: usage is recorded only where the turn's own JSON reports it.
     """
 
@@ -1483,7 +1468,6 @@ class GrokBuildCLI(Harness):
     owned_server = False
     headless_worker = True
     binary = adapters.GROK_BIN
-    timeouts = {KIND_GROK_CONTROL: 1800, KIND_GROK_CALLBACK: 900}
     stages = {KIND_GROK_CONTROL: "implementation", KIND_GROK_CALLBACK: "planning"}
     session_kind = "grok_session_id"
 

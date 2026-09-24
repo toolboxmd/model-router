@@ -6,6 +6,12 @@
 
 - A failure caused by a removed plugin runtime recovers through the currently installed compatible runtime: the missing path is diagnosed with its cause and next action, only provably never-started actions are remade with identities preserved, and unsupported state is retained with its specific reason
 
+## [0.29.2] - 2026-09-24
+
+### Changed
+
+- delete elapsed-time termination of agent turns and jobs (#88)
+
 ## [0.29.1] - 2026-09-24
 
 ### Changed

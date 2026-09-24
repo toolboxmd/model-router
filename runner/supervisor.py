@@ -47,10 +47,13 @@ def _prepare_spawn(inv: dict, adapters):
     if not isinstance(cmd, list) or not cmd:
         return None
     timeout = inv.get("timeout_secs")
+    # Legacy slot only (#88): recorded for readability of pre-#88 ledgers,
+    # never enforced. Agent turns carry no elapsed deadline; the value is
+    # normalized for the row but no deadline is derived from it.
     try:
-        timeout_f = float(timeout) if timeout is not None else 120.0
+        timeout_f = float(timeout) if timeout is not None else None
     except (TypeError, ValueError):
-        timeout_f = 120.0
+        timeout_f = None
     meta = {}
     if inv.get("meta_json"):
         try:
@@ -94,6 +97,13 @@ def _read_paths(stdout_path: str, stderr_path: str) -> tuple[str, str]:
 # Termination requests are deferred until the child's PID is committed,
 # then honored by stopping the child, so no child can run unrecorded.
 _STOP = {"requested": False}
+
+# Bounded readiness budget for the owned ``opencode serve`` startup and
+# health check per turn (#88). This is a purpose-specific limit for
+# server readiness, not an agent deadline: the model turn itself carries
+# no elapsed deadline and runs until completion, stall, explicit
+# cancellation, or real failure.
+SERVER_STARTUP_TIMEOUT_SECS = 120.0
 
 
 def _defer_stop(signum, frame):  # noqa: ARG001
@@ -292,7 +302,10 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
 
     captured_session = None
     captured_kind = None
-    deadline = time.monotonic() + max(1.0, timeout_f)
+    # No elapsed deadline (#88): a productive turn stays running
+    # regardless of age. The turn ends on child exit, genuine stream
+    # silence past the (unclamped) policy window, explicit cancellation
+    # via _STOP, or a real failure. ``timeout_f`` above is legacy only.
     job = None
     try:
         job = core.get_job(state_dir, request_id)
@@ -309,7 +322,7 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                 control_result, captured_session, captured_kind = harness.drive(
                     state_dir, request_id, invocation_id, proc,
                     stdout_path, stderr_path, generated_password, meta, job,
-                    deadline, workspace)
+                    None, workspace)
             except Exception as e:  # noqa: BLE001 - recorded, never silent
                 control_result = {"ok": False, "rc": 1,
                                   "error": f"control failed: {type(e).__name__}: {str(e)[:300]}"}
@@ -330,12 +343,10 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                     pass
         else:
             stop_sent = False
-            # The same silence rule as the worker turns, through the harness
-            # seam: a live child whose JSON-line stream stops past the window
-            # is stalled, while the per-turn timeout stays the outer budget.
+            # The silence rule through the harness seam: a live child whose
+            # JSON-line stream stops past the policy window is stalled.
+            # Since #88 the window is unclamped (no outer turn budget).
             tracker = harness.new_activity_tracker(time.monotonic())
-            # Bounded strictly below the turn timeout, so the stall
-            # detector cannot outlive the outer turn budget.
             window = harness.effective_stall_window_secs(meta, timeout_f)
             poll_secs = min(1.0, max(0.2, window / 2.0))
             next_check = time.monotonic() + poll_secs
@@ -355,28 +366,6 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                 if rc is not None:
                     break
                 now = time.monotonic()
-                # The turn deadline is the outer budget: it is checked
-                # before the stall window, inclusively, so at the boundary
-                # a turn that reaches its timeout reports a timeout, never
-                # a stall.
-                if now >= deadline:
-                    try:
-                        os.killpg(int(pgid or pid), 9)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                    try:
-                        rc = proc.wait(timeout=5)
-                    except Exception:
-                        rc = 124
-                    if rc == -_signal.SIGKILL:
-                        # The deadline kill above: report the runner's
-                        # timeout code, as direct runs do, so the ledger
-                        # records a timeout instead of a bare signal death.
-                        rc = 124
-                    break
                 if now >= next_check:
                     next_check = now + poll_secs
                     _changed, _detail = harness.note_cli_output(
@@ -397,11 +386,9 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                             except Exception:
                                 pass
                         try:
-                            # Stall cleanup stays inside the outer budget:
-                            # the graceful wait is capped by the remaining
-                            # deadline, then SIGKILL (which always lands).
-                            remaining = deadline - time.monotonic()
-                            rc = proc.wait(timeout=max(0.1, min(5.0, remaining)))
+                            # Stall cleanup uses a fixed bounded wait, then
+                            # SIGKILL (which always lands).
+                            rc = proc.wait(timeout=5.0)
                         except Exception:
                             rc = None
                         if rc is None:
@@ -477,7 +464,7 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
     return 0 if rc == 0 else int(rc or 1)
 
 
-def _probe_silent_route(client, model, variant, agent, route, deadline):
+def _probe_silent_route(client, model, variant, agent, route):
     """A fresh minimal request on the same route when a turn goes silent.
 
     A stall can be exhaustion in disguise (the provider stops streaming
@@ -485,7 +472,9 @@ def _probe_silent_route(client, model, variant, agent, route, deadline):
     the signal evidence: ``exhausted`` moves pools, ``overloaded`` moves
     family, ``unknown`` keeps the stall handling. Never raises: an
     inconclusive probe is ``unknown`` with its error noted. The probe
-    session is aborted and left idle before returning.
+    session is aborted and left idle before returning. The probe budget is
+    the fixed policy probe timeout (bounded transport, not an agent
+    deadline).
     """
     from . import adapters
     from . import harnesses as _harnesses
@@ -494,8 +483,7 @@ def _probe_silent_route(client, model, variant, agent, route, deadline):
                      "evidence": {"source": "stall_probe", "route": route}}
     harness = _harnesses.harness_named("opencode")
     try:
-        budget = min(float(_policy.STALL_PROBE_TIMEOUT_SECS),
-                     max(1.0, deadline - time.monotonic()))
+        budget = float(_policy.STALL_PROBE_TIMEOUT_SECS)
         started = time.monotonic()
         created = client.create_session(
             title="model-router stall probe",
@@ -535,7 +523,7 @@ def _probe_silent_route(client, model, variant, agent, route, deadline):
             except Exception:  # noqa: BLE001 - best effort cleanup
                 pass
             return outcome
-        while time.monotonic() < min(deadline, started + budget):
+        while time.monotonic() < started + budget:
             if _STOP["requested"]:
                 outcome["evidence"]["error"] = "probe terminated with the turn"
                 break
@@ -620,18 +608,26 @@ def _probe_silent_route(client, model, variant, agent, route, deadline):
 
 def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                             stdout_path, stderr_path, password, meta, job,
-                            deadline, workspace):
+                            deadline_ignored, workspace):
     """Drive one implementation turn on the owned ``opencode serve``.
 
     Save the session before the model request, prompt asynchronously,
     and observe only that session. Free exhaustion requires trusted
     server evidence; the session is aborted and confirmed idle before
     the result allows a Go transfer.
+
+    ``deadline_ignored`` is a legacy positional slot (#88): pre-#88
+    callers passed the turn deadline here. It is accepted and ignored;
+    the turn carries no elapsed deadline. Server startup and health use
+    the fixed ``SERVER_STARTUP_TIMEOUT_SECS`` readiness budget below,
+    and the turn itself ends only on completion, stall, explicit
+    cancellation, or real failure.
     """
     from . import adapters
     meta = meta if isinstance(meta, dict) else {}
+    startup_end = time.monotonic() + SERVER_STARTUP_TIMEOUT_SECS
     base_url = None
-    while time.monotonic() < deadline:
+    while time.monotonic() < startup_end:
         if _STOP["requested"]:
             return {"ok": False, "rc": 143, "error": "terminated during server startup"}, None, None
         if proc.poll() is not None:
@@ -646,7 +642,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         return {"ok": False, "rc": 124, "error": "opencode serve did not emit a localhost URL"}, None, None
     client = adapters.OpenCodeClient(base_url, password, directory=workspace)
     health_err = None
-    while time.monotonic() < deadline:
+    while time.monotonic() < startup_end:
         if _STOP["requested"]:
             return {"ok": False, "rc": 143, "error": "terminated during server startup"}, None, None
         try:
@@ -820,10 +816,10 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
     # last-activity timestamp, and a tool part in running state counts as
     # activity while its process is alive.
     tracker = harness.new_activity_tracker(time.monotonic())
-    # Bounded strictly below the turn's remaining budget, so the stall
-    # detector cannot outlive the outer turn deadline.
-    window = harness.effective_stall_window_secs(
-        meta, max(1.0, deadline - time.monotonic()))
+    # Unclamped since #88: no per-turn elapsed deadline exists, so the
+    # policy silence window passes through as-is. Stall (genuine stream
+    # silence) is the only time-based end for an active turn.
+    window = harness.effective_stall_window_secs(meta, None)
     route = meta.get("route")
     overload_spec = _policy.SIGNAL_CLASSES["overloaded"]
     overload_first = None
@@ -848,7 +844,7 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
 
     while True:
         if _STOP["requested"]:
-            result.update(rc=143, error="terminated by cancellation or timeout")
+            result.update(rc=143, error="terminated by cancellation")
             abort_and_confirm()
             break
         if proc.poll() is not None:
@@ -884,23 +880,16 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
         typ = status.get("type")
         if typ in ("busy", "retry"):
             seen_active = True
-            # The turn deadline is the outer budget: it is checked before
-            # the stall window, inclusively, so at the boundary a turn
-            # that reaches its timeout reports a timeout, never a stall.
-            if now >= deadline:
-                result.update(rc=124, error="implementation turn timed out",
-                              longest_silence_secs=round(
-                                  max(tracker.longest,
-                                      tracker.silence(now)), 3))
-                abort_and_confirm()
-                break
+            # No elapsed deadline (#88): a busy turn with stream activity
+            # stays running regardless of age. Only genuine silence past
+            # the window ends it as stalled below.
             age = tracker.silence(now)
             if age > window:
                 # Silent past the window while busy: probe the same route
                 # with a fresh minimal request first, so a stall that is
                 # exhaustion in disguise moves pools instead of retrying.
                 probe = _probe_silent_route(client, model, variant, agent,
-                                            route, deadline)
+                                            route)
                 longest = round(max(tracker.longest, age), 3)
                 result.update(
                     rc=4, ok=False, signal="stalled",
@@ -1119,13 +1108,45 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                 result.update(rc=1, error="prompt was not accepted within 60 seconds")
                 abort_and_confirm()
                 break
-        if time.monotonic() >= deadline:
-            result.update(rc=124, error="implementation turn timed out",
-                          longest_silence_secs=round(
-                              max(tracker.longest,
-                                  tracker.silence(time.monotonic())), 3))
-            abort_and_confirm()
-            break
+            # Idle without a terminal assistant result after the turn showed
+            # activity (#88 review): the session reports idle but the last
+            # new assistant message carries neither time.completed nor
+            # info.error, or no new assistant message exists at all. The
+            # prompt-accept bound above already covers a turn that never
+            # became active; any other non-terminal idle state reuses the
+            # same stream-silence stall machinery as the busy branch, so
+            # the loop always ends on genuine silence without restoring an
+            # elapsed deadline. Live activity reflected by the tracker (a
+            # fresh part, a reasoning/tool update, or a running tool) keeps
+            # the turn alive: only silence past the window stalls.
+            if seen_active or new:
+                _idle_age = tracker.silence(time.monotonic())
+                if _idle_age > window:
+                    probe = _probe_silent_route(client, model, variant, agent,
+                                                route)
+                    longest = round(max(tracker.longest, _idle_age), 3)
+                    result.update(
+                        rc=4, ok=False, signal="stalled",
+                        probe_signal=probe.get("signal", "unknown"),
+                        signal_evidence={
+                            "source": "stream_silence",
+                            "silence_secs": round(_idle_age, 1),
+                            "last_part_type": tracker.last_part_type or "none",
+                            "parts_observed": tracker.events,
+                            "probe": adapters.redact_nested(probe),
+                            "idle_without_terminal_result": True,
+                        },
+                        longest_silence_secs=longest,
+                        error=(f"worker turn stalled: no stream activity for "
+                               f"{_idle_age:.0f}s"))
+                    abort_and_confirm()
+                    break
+        # No elapsed deadline (#88): the loop above ends the turn on
+        # completion, stall (busy or idle without a terminal result),
+        # overload/exhaustion/context/hard signals, serve exit,
+        # transport failure, or explicit cancellation. The
+        # 60-second prompt-accept bound above stays as a purpose-specific
+        # readiness limit.
         time.sleep(1.0)
     # Every turn records its longest observed silence for window tuning,
     # whatever ended it; branches above may already carry a fresher value.
