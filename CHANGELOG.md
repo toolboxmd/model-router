@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.28.1] - 2026-09-24
+
+### Changed
+
+- Project Direction: the delivery milestone is simplified to one open PR per job, with the planner woken automatically in its own harness when the dispatcher needs judgment
+
 ## [0.28.0] - 2026-09-24
 
 ### Added
