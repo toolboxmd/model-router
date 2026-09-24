@@ -1,8 +1,9 @@
 """Issue #33: stall detection from stream activity, assumed resets, probes.
 
 Deterministic fakes only. No live model CLIs. The silence window is
-overridden per test (policy default stays 180 seconds); the hang drill in
-test_faults keeps proving the outer per-turn timeout with the default.
+overridden per test (policy default stays 180 seconds); since #88 there
+is no outer per-turn timeout, so stall (genuine stream silence) is the
+only time-based end for an active turn.
 """
 from __future__ import annotations
 

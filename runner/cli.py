@@ -73,7 +73,10 @@ def main(argv=None) -> int:
     p.add_argument("--policy", default=policy.POLICY_ID)
     p.add_argument("--max-attempts", type=int, default=5,
                    help="controller launches per job (default 5: five 12-step launches cover the 48-step job budget)")
-    p.add_argument("--timeout-secs", type=int, default=None)
+    p.add_argument("--timeout-secs", type=int, default=None,
+                   help="legacy compatibility only: accepted and recorded, never enforced; "
+                        "agent turns and jobs carry no elapsed deadline since "
+                        "toolboxmd/model-router#88, so this bounds nothing")
     p.add_argument("--planner-model", default=None,
                    help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
     p.add_argument("--planner-effort", default=None,

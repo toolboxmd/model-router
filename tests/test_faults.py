@@ -796,13 +796,23 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertNotEqual(job["status"], "succeeded")
         self.assertIsNone(controller._load_controller_state(job).get("last_action"))
 
-    def test_hung_turn_stalls_before_timeout_with_abort(self):
-        # The default 180-second window is clamped strictly below the
-        # 3-second turn timeout (toolboxmd/model-router#73), so a silent
-        # hang ends as stalled before the deadline instead of running to
-        # it: still bounded, still aborted, on the same route.
-        run = self._setup("hang", timeout_secs=3)
-        res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+    def test_hung_turn_stalls_on_the_window_with_abort(self):
+        # #88: the legacy ``timeout_secs`` value is recorded but never
+        # enforced, so the suite pins the drill window through
+        # RUNNER_STALL_SECS (production leaves it unset for the 180s
+        # policy default). A silent hang still ends as stalled with the
+        # session aborted, on the same route: stall detection, not an
+        # elapsed deadline, ends it.
+        prev = os.environ.get("RUNNER_STALL_SECS")
+        os.environ["RUNNER_STALL_SECS"] = "2"
+        try:
+            run = self._setup("hang", timeout_secs=3)
+            res = controller.run_implementation(self.sd, "oc1", run_cmd=run)
+        finally:
+            if prev is None:
+                os.environ.pop("RUNNER_STALL_SECS", None)
+            else:
+                os.environ["RUNNER_STALL_SECS"] = prev
         self.assertEqual(res["action"], "stalled_retry")
         self.assertTrue((self.fake_state / "aborted").exists())
         job = core.get_job(self.sd, "oc1")
@@ -811,8 +821,6 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         inv = core._list_invocations(self.sd, "oc1")[-1]
         envelope = (json.loads(inv["result_json"] or "{}").get("envelope") or {})
         self.assertEqual(envelope.get("signal"), "stalled")
-        self.assertLess(envelope["signal_evidence"]["silence_secs"], 3)
-        self.assertLess(envelope.get("longest_silence_secs", 3), 3)
 
 
 FAKE_LUNA = r"""
@@ -1171,7 +1179,12 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
 
 
 class TestCancelTimeoutOwnChildren(unittest.TestCase):
-    def test_timeout_stops_child_group(self):
+    def test_legacy_timeout_leaves_active_job_running_and_cancel_stops_it(self):
+        # #88 replaced the job-age deadline: a legacy ``--timeout-secs``
+        # value is recorded but never enforced, so recover must not stop
+        # the active child for its age. Only explicit cancellation stops
+        # it. (Before #88 this same drill ended failed/blocked/cancelling
+        # on the 1-second job budget via recover.)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
@@ -1201,12 +1214,23 @@ time.sleep(60)
         self.assertEqual(rc, 0, err)
         self.assertTrue(wait_for(lambda: calls.exists()))
         child = json.loads(calls.read_text().splitlines()[0])
+        owner_pid = core.get_job(sd, "to1").get("owner_pid")
+        if owner_pid:
+            self.addCleanup(kill_pid, owner_pid)
         time.sleep(1.2)
+        # Past the legacy 1-second budget: recover leaves the active job
+        # and its child alone.
         rc, rec, err = cli(sd, "recover", "--request-id", "to1", env=env)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(alive(child["pid"]), "legacy timeout must not stop an active child")
+        job = core.get_job(sd, "to1")
+        self.assertNotIn(job["status"], ("failed", "cancelled"))
+        # Explicit cancellation still stops the whole group.
+        rc, cancelled, err = cli(sd, "cancel", "--request-id", "to1", env=env)
         self.assertEqual(rc, 0, err)
         self.assertTrue(wait_for(lambda: not alive(child["pid"]), secs=8))
         job = core.get_job(sd, "to1")
-        self.assertIn(job["status"], ("failed", "blocked", "cancelling"))
+        self.assertEqual(job["status"], "cancelled")
 
 
 class TestIssue14ReportContract(unittest.TestCase):
