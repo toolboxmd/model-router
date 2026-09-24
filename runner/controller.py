@@ -1078,13 +1078,90 @@ def _own_invocation_pids(state_dir, request_id: str) -> set:
     return pids
 
 
+PLANNER_CALLBACK_KINDS = (
+    harnesses.KIND_CLAUDE_CALLBACK, harnesses.KIND_CODEX_CALLBACK,
+    harnesses.KIND_OPENCODE_CALLBACK, harnesses.KIND_GROK_CALLBACK,
+)
+
+
+def _planner_question_text(request_id: str, qid: str, prompt: str,
+                           job: dict) -> str:
+    """The callback prompt: stored handoff summary before the question."""
+    question = ("The runner dispatcher for your submitted request "
+                f"{request_id} asks (question {qid}):\n{prompt}\n\n"
+                "Answer briefly with the decision only. Do not run tools.")
+    summary = (job.get("handoff_summary") or "").strip()
+    if summary:
+        # The durable handoff summary travels before the question so the
+        # resumed session answers from the ledger,
+        # and a fresh fallback session can answer from this prompt alone.
+        question = (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n" + question)
+    return question
+
+
+def _planner_meta(qid: str, question: str, route: str | None) -> dict:
+    meta: dict = {"qid": qid, "stage": "planning",
+                 "reason": "planner_question",
+                 "prompt_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest()}
+    if route is not None:
+        meta["route"] = route
+    return meta
+
+
+def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
+                             cmd, rc: int, err: str,
+                             answer: str | None, ok: bool, error: str | None,
+                             reported_session: str | None,
+                             planner_session: str | None,
+                             check_identity: bool) -> dict:
+    """Shared tail: stored-answer wins, then fail/mismatch blocks, else
+    persist the answer. ``check_identity`` is false only for a fresh
+    fallback session, which is never a resume."""
+    _record_child(state_dir, request_id, kind, cmd, rc,
+                  session_id=reported_session or planner_session,
+                  output_text=(answer or "") + "\n" + (err or "")[-1000:])
+    stored = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
+              if q["qid"] == qid and q["status"] == "answered"]
+    mismatch = check_identity and reported_session != planner_session
+    if stored and (rc != 0 or not ok or mismatch):
+        # Answered publicly while the callback ran: the stored answer wins.
+        return {"action": "answered", "qid": qid}
+    if rc != 0 or not ok:
+        reason = f"planner_callback_failed rc={rc}: {error or 'error'}"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": kind, "rc": rc,
+                                 "error": error,
+                                 "stderr": (err or "")[:1000]})
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "planner_callback_failed"}
+    if mismatch:
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": kind,
+                                 "expected_session": planner_session,
+                                 "reported_session": reported_session})
+        _mark_blocked(state_dir, request_id,
+                      "planner_session_mismatch: resumed result came from another session")
+        return {"action": "blocked", "reason": "planner_session_mismatch"}
+    # Persist the answer before resuming the same Luna task.
+    try:
+        core.answer(state_dir, request_id, qid, answer or "", lease_token=_LEASE["token"])
+    except core.ConflictError:
+        pass  # answered publicly meanwhile: the stored answer wins
+    return {"action": "answered", "qid": qid}
+
+
 def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
                      run_cmd=None) -> dict:
-    """Persist question before Claude --resume; persist answer before resume.
+    """Persist question before waking the planner; persist answer before resume.
 
-    Never forks a new planner session. A busy planner, a failed callback,
-    or a result from another session becomes a durable blocked state
-    with a reason; the question stays pending for ``answer`` + recover.
+    The planner wakes automatically in its own harness without human
+    action: Claude, Codex, and OpenCode resume the exact saved session,
+    while a harness without a usable resume path (such as Grok Build)
+    answers from a fresh session seeded with the stored handoff summary.
+    Never forks a new planner session except for that fresh fallback. A
+    busy planner, a failed callback, or a resumed result from another
+    session becomes a durable blocked state with a reason; the question
+    stays pending for ``answer`` + recover.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -1092,12 +1169,12 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     if not planner_session:
         _mark_blocked(state_dir, request_id, "missing planner session: refusing to fork a new session")
         return {"action": "blocked", "reason": "missing_planner_session"}
-    if (job.get("planner_harness") or "claude") != "claude":
+    harness_name = job.get("planner_harness") or "claude"
+    if harness_name not in ("claude", "codex", "opencode", "grok"):
         _mark_blocked(state_dir, request_id,
-                      f"planner_harness_unsupported: {job.get('planner_harness')!r} has no callback;"
-                      " only the Claude planner session is executed")
+                      f"planner_harness_unsupported: {harness_name!r} has no callback")
         return {"action": "blocked", "reason": "planner_harness_unsupported"}
-    # Persist the planner question before calling Claude.
+    # Persist the planner question before waking the planner.
     try:
         core.post_question(state_dir, request_id, qid, prompt, lease_token=_LEASE["token"])
     except core.ConflictError as e:
@@ -1105,10 +1182,56 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
         return {"action": "blocked", "reason": "question_conflict"}
     # An earlier controller may already have asked; that attempt is
     # adopted through its action key, so the busy checks do not apply.
-    asked = any(i.get("kind") == "claude_callback"
+    asked = any(i.get("kind") in PLANNER_CALLBACK_KINDS
                 and json.loads(i.get("meta_json") or "{}").get("qid") == qid
                 for i in core._list_invocations(state_dir, request_id)
                 if i.get("state") != "abandoned")
+    question = _planner_question_text(request_id, qid, prompt, job)
+    workspace = job["workspace"]
+    if harness_name == "codex":
+        try:
+            cmd = adapters.build_codex_planner_cmd(planner_session, question)
+        except ValueError as e:
+            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
+            return {"action": "blocked", "reason": "planner_resume_refused"}
+        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_CODEX_CALLBACK,
+                               meta=_planner_meta(qid, question, "astra/max"))
+        codex_h = harnesses.harness_named("codex")
+        parsed = codex_h.parsed_planner_result(harnesses.KIND_CODEX_CALLBACK, out)
+        return _finish_planner_callback(
+            state_dir, request_id, qid, harnesses.KIND_CODEX_CALLBACK,
+            cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
+            parsed.get("error"), parsed.get("session_id"), planner_session,
+            check_identity=True)
+    if harness_name == "opencode":
+        try:
+            cmd = adapters.build_opencode_planner_cmd(planner_session, question, workspace)
+        except ValueError as e:
+            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
+            return {"action": "blocked", "reason": "planner_resume_refused"}
+        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_OPENCODE_CALLBACK,
+                               meta=_planner_meta(qid, question, None))
+        opencode_h = harnesses.harness_named("opencode")
+        parsed = opencode_h.parsed_planner_result(harnesses.KIND_OPENCODE_CALLBACK, out)
+        return _finish_planner_callback(
+            state_dir, request_id, qid, harnesses.KIND_OPENCODE_CALLBACK,
+            cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
+            parsed.get("error"), parsed.get("session_id"), planner_session,
+            check_identity=True)
+    if harness_name == "grok":
+        # No usable resume path: a fresh Grok session answers from the
+        # handoff summary carried in the question above. Its new session
+        # ID is recorded as the answer's source, never as a resume.
+        cmd, _env = adapters.build_grok_cmd(question, workspace)
+        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_GROK_CALLBACK,
+                               meta=_planner_meta(qid, question, None))
+        grok_h = harnesses.harness_named("grok")
+        parsed = grok_h.parsed_planner_result(harnesses.KIND_GROK_CALLBACK, out)
+        return _finish_planner_callback(
+            state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
+            cmd, rc, err, parsed.get("text"), bool(parsed.get("ok")),
+            parsed.get("error"), parsed.get("session_id"), planner_session,
+            check_identity=False)
     busy = [] if asked else adapters.planner_session_in_use(
         planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
     if busy:
@@ -1121,59 +1244,22 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
         return {"action": "blocked", "reason": "planner_busy"}
     planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
     planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
-    question = ("The runner dispatcher for your submitted request "
-                f"{request_id} asks (question {qid}):\n{prompt}\n\n"
-                "Answer briefly with the decision only. Do not run tools.")
-    summary = (job.get("handoff_summary") or "").strip()
-    if summary:
-        # The durable handoff summary travels before the question so the
-        # resumed session answers from the ledger,
-        # and the Astra fallback can answer from this prompt alone.
-        question = (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n" + question)
     try:
         cmd = adapters.build_claude_cmd(planner_session, question,
                                          model=planner_model, effort=planner_effort)
     except ValueError as e:
         _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
         return {"action": "blocked", "reason": "planner_resume_refused"}
-    cwd = job.get("planner_cwd") or job["workspace"]
     planner_route = "sonnet/medium" if planner_model == adapters.CLAUDE_LIVE_MODEL else "fable-5.1/max"
-    rc, out, err = run_cmd(cmd, cwd, None, kind="claude_callback",
-                           meta={"qid": qid, "stage": "planning", "route": planner_route,
-                                 "reason": "planner_question",
-                                 "prompt_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest()})
+    rc, out, err = run_cmd(cmd, workspace, None, kind="claude_callback",
+                           meta=_planner_meta(qid, question, planner_route))
     claude_h = harnesses.harness_named("claude")
     parsed = claude_h.parsed_result("claude_callback", out)
-    _record_child(state_dir, request_id, "claude_callback", cmd, rc,
-                  session_id=parsed.get("session_id") or planner_session,
-                  output_text=(parsed.get("answer") or "") + "\n" + (err or "")[-1000:])
-    stored = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
-              if q["qid"] == qid and q["status"] == "answered"]
-    if stored and (rc != 0 or not parsed.get("ok") or parsed.get("session_id") != planner_session):
-        # Answered publicly while the callback ran: the stored answer wins.
-        return {"action": "answered", "qid": qid}
-    if rc != 0 or not parsed.get("ok"):
-        reason = f"planner_callback_failed rc={rc}: {parsed.get('error') or 'error'}"
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": "claude_callback", "rc": rc,
-                                 "error": parsed.get("error"),
-                                 "stderr": (err or "")[:1000]})
-        _mark_blocked(state_dir, request_id, reason)
-        return {"action": "blocked", "reason": "planner_callback_failed"}
-    if parsed.get("session_id") != planner_session:
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": "claude_callback",
-                                 "expected_session": planner_session,
-                                 "reported_session": parsed.get("session_id")})
-        _mark_blocked(state_dir, request_id,
-                      "planner_session_mismatch: resumed result came from another session")
-        return {"action": "blocked", "reason": "planner_session_mismatch"}
-    # Persist the answer before resuming the same Luna task.
-    try:
-        core.answer(state_dir, request_id, qid, parsed["answer"], lease_token=_LEASE["token"])
-    except core.ConflictError:
-        pass  # answered publicly meanwhile: the stored answer wins
-    return {"action": "answered", "qid": qid}
+    return _finish_planner_callback(
+        state_dir, request_id, qid, "claude_callback",
+        cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
+        parsed.get("error"), parsed.get("session_id"), planner_session,
+        check_identity=True)
 
 
 def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> str:
@@ -1277,9 +1363,11 @@ def _route_allowance(route: str) -> str:
 WORKER_RULES = (
     "WORKER RULES: you are the implementation worker for one runner job. "
     "Edit only what the task and instructions allow, inside this "
-    "workspace. Run the task's proof command when it has one. Do not "
-    "start other agents, commit, push, or install anything. Finish with a "
-    "short report of changed files and proof results."
+    "workspace. Run the task's proof command when it has one. Commit as "
+    "you work; at the end push the branch and open exactly one PR without "
+    "merging it, and report its URL. Do not start other agents or install "
+    "anything. Finish with a short report of changed files, the PR URL, "
+    "and proof results."
 )
 
 
@@ -2156,13 +2244,21 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
 
 
 def _complete_job(state_dir, request_id: str, token: str | None,
-                  output: str, artifact: str | None = None) -> dict:
+                  output: str, artifact: str | None = None,
+                  pr_url: str | None = None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
     job = core.get_job(state_dir, request_id)
     use_token = token or job.get("owner_token")
     result_payload = {"output": output}
     if artifact:
         result_payload["artifact"] = artifact
+    # A valid nonblank PR URL is preserved; otherwise record JSON null
+    # (no PR was possible or none was supplied) rather than a fabricated
+    # URL, matching the recovery result record.
+    if isinstance(pr_url, str) and pr_url.strip():
+        result_payload["pr_url"] = pr_url
+    else:
+        result_payload["pr_url"] = None
     if token:
         # Public path: only the lease holder may complete; a stale
         # controller never writes success.
@@ -2277,6 +2373,9 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
     resume carrying the failed report's paths, status, and proof exit
     code, so the ladder can correct); a completion that insists on the
     same failed turn blocks with the refusal reason, visible in ``status``.
+    An ordinary completion without an opened PR URL is refused through
+    the same once-then-block pattern, with evidence naming the missing
+    PR URL instead of a proof failure.
     """
     try:
         rep_seq = report.get("seq")
@@ -2302,9 +2401,14 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
         "worker_text": report.get("worker_text"),
         "seq": report.get("seq"),
     }
-    evidence = (json.dumps(fields, sort_keys=True) + "\nCompletion is refused: "
-                "the last implementation turn's proof failed. Fix the work and "
-                "request implementation again; do not complete until the proof passes.")
+    evidence = (json.dumps(fields, sort_keys=True) + "\n" + (
+        "Completion is refused: an ordinary job succeeds only with an "
+        "opened PR URL. Push the branch, open the PR, and complete again "
+        "with its pr_url; do not complete without one."
+        if "missing pr_url" in reason else
+        "Completion is refused: "
+        "the last implementation turn's proof failed. Fix the work and "
+        "request implementation again; do not complete until the proof passes."))
     r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
                     label="COMPLETION REFUSED")
     if r.get("action") == "blocked":
@@ -2315,8 +2419,9 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
 
 def _handle_question_action(state_dir, request_id: str, envelope: dict,
                              run_cmd) -> dict:
-    """Persist question -> Claude --resume exact planner session ->
-    persist answer -> resume exact Luna task. Never forks a session.
+    """Persist question -> wake the saved planner in its own harness ->
+    persist answer -> resume exact Luna task. Never forks a session
+    (except the fresh fallback for a harness without resume).
     An answer already persisted (public ``answer`` or earlier callback)
     is used without asking the planner again.
     """
@@ -2571,15 +2676,25 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> 
     if action_name == "completion":
         # A job can never succeed while its last implementation turn's
         # proof failed: refuse the envelope, hand the evidence back once,
-        # and block if the dispatcher insists.
+        # and block if the dispatcher insists. An ordinary completion in a
+        # workspace with an origin push remote also needs an opened PR URL
+        # (never as a proof failure); without a remote it succeeds as
+        # before, experiment and replay jobs keep their behavior. The
+        # remote capability is checked with git once per completion here.
         _latest = core.latest_turn_report(state_dir, request_id)
         _refusal = core.completion_refusal_reason(_latest)
         if _refusal is not None and isinstance(_latest, dict):
             return _handle_completion_refusal(state_dir, request_id, last,
                                               _latest, _refusal, run_cmd)
+        _pr_refusal = core.missing_pr_url_reason(
+            job.get("job_kind"), last, job.get("workspace"))
+        if _pr_refusal is not None:
+            return _handle_completion_refusal(state_dir, request_id, last,
+                                              _latest if isinstance(_latest, dict) else {},
+                                              _pr_refusal, run_cmd)
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
-                             last.get("artifact"))
+                             last.get("artifact"), last.get("pr_url"))
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}

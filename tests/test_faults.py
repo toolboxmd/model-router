@@ -1398,29 +1398,6 @@ class TestIssue14ReportContract(unittest.TestCase):
         rview = core.result_view(self.sd, "oc1")
         self.assertEqual(rview["measurements"][-1]["observed_variant"], "xhigh")
 
-    def test_planner_harness_codex_rejected_and_blocked(self):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
-        sd = str(Path(tmp.name) / "state")
-        ws = Path(tmp.name) / "ws"
-        ws.mkdir()
-        with self.assertRaises(ValueError):
-            core.submit(sd, "bad", {"g": 1}, str(ws), "p", planner_harness="codex")
-        rc, _, _ = cli(sd, "submit", "--request-id", "bad2", "--task", '{"g":1}',
-                       "--workspace", str(ws), "--planner-session", "p",
-                       "--planner-harness", "codex", "--no-start")
-        self.assertNotEqual(rc, 0)
-        # Legacy row naming codex must not execute Claude.
-        core.submit(sd, "legacy", {"g": 1}, str(ws), "p")
-        con = store.connect(sd)
-        try:
-            con.execute("UPDATE jobs SET planner_harness='codex' WHERE request_id='legacy'")
-        finally:
-            con.close()
-        out = controller.planner_callback(sd, "legacy", "q1", "prompt?")
-        self.assertEqual(out["reason"], "planner_harness_unsupported")
-        self.assertIn("planner_harness_unsupported", core.get_job(sd, "legacy")["block_reason"])
-
     def test_supervisor_spawn_failure_is_measured(self):
         self._setup_owned("ok")
         import subprocess as _sp

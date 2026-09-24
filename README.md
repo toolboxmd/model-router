@@ -48,9 +48,10 @@ Start a fresh host session and confirm `model-routing` is available. Resolve
 "$MODEL_ROUTER_ROOT/bin/model-router" --help
 ```
 
-The shared Skill can load across harnesses, but starting a job still requires
-an existing Claude Code planner session. Additional planner callbacks are not
-implemented. Installing the package starts no service or model request and does
+The shared Skill can load across harnesses, and a planner in any supported
+harness (Claude Code, Codex, OpenCode, Grok Build) can submit a job: the
+dispatcher wakes that planner automatically in its own harness whenever its
+judgment is needed. Installing the package starts no service or model request and does
 not grant delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
 
 ## Automatic releases
@@ -83,7 +84,8 @@ Active work belongs in GitHub Issues.
 
 ## Durable runner (opt-in, stdlib only)
 
-The bundled `bin/model-router` accepts prepared work from a Claude planner, hands it to a
+The bundled `bin/model-router` accepts prepared work from a planner in any
+supported harness, hands it to a
 persistent Codex Luna dispatcher, returns planner questions, and runs
 implementation turns through an owned local OpenCode server, following the
 policy's lanes across the full OpenCode Go implementer chain with sticky

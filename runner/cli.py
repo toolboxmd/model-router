@@ -51,7 +51,7 @@ def _err(msg, code=1) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="runner",
-                                 description="Durable local Claude-to-Codex task runner.")
+                                 description="Durable local task runner.")
     ap.add_argument("--state-dir", default=None, help="private state directory (0700)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -78,13 +78,11 @@ def main(argv=None) -> int:
                    help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
     p.add_argument("--planner-effort", default=None,
                    help="planner effort (default: policy planning route; live-test override medium)")
-    p.add_argument("--planner-cwd", default=None,
-                   help="directory where the planner session was started (default: workspace)")
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
-    p.add_argument("--planner-harness", default="claude", choices=("claude",),
-                   help="harness that hosts the planner session (only claude is implemented)")
+    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex", "opencode", "grok"),
+                   help="harness that hosts the planner session (its session id goes in --planner-session)")
     p.add_argument("--handoff-summary", default=None,
                    help="durable handoff summary stored on the job (default: derived from the task packet)")
     p.add_argument("--handoff-summary-file", default=None,
@@ -154,7 +152,6 @@ def main(argv=None) -> int:
                                             timeout_secs=args.timeout_secs,
                                             planner_model=args.planner_model,
                                             planner_effort=args.planner_effort,
-                                            planner_cwd=args.planner_cwd,
                                             lane=args.lane, job_kind=args.job_kind,
                                             replay_of=args.replay_of,
                                             planner_harness=args.planner_harness,
@@ -166,7 +163,6 @@ def main(argv=None) -> int:
                                   timeout_secs=args.timeout_secs,
                                   planner_model=args.planner_model,
                                   planner_effort=args.planner_effort,
-                                  planner_cwd=args.planner_cwd,
                                   lane=args.lane, job_kind=args.job_kind,
                                   replay_of=args.replay_of,
                                   planner_harness=args.planner_harness,

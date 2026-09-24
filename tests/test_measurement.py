@@ -37,9 +37,15 @@ class Provenance(unittest.TestCase):
         job = core.submit(self.sd, "r1", {"g": 1}, self.ws("b"), "p", job_kind="replay", replay_of="o1",
                           planner_harness="claude")
         self.assertEqual((job["job_kind"], job["replay_of"], job["planner_harness"]), ("replay", "o1", "claude"))
-        # Only the Claude planner callback is implemented.
+        # Every supported planner harness is accepted; unknown ones are not.
+        for harness in ("claude", "codex", "opencode", "grok"):
+            job = core.submit(self.sd, f"plan-{harness}", {"g": 1},
+                              self.ws(f"ws-{harness}"), "p",
+                              planner_harness=harness)
+            self.assertEqual(job["planner_harness"], harness)
         with self.assertRaises(ValueError):
-            core.submit(self.sd, "codex-plan", {"g": 1}, self.ws("b2"), "p", planner_harness="codex")
+            core.submit(self.sd, "bad-harness", {"g": 1}, self.ws("ws-bad"),
+                        "p", planner_harness="smoke")
         with self.assertRaises(ValueError):
             core.submit(self.sd, "bad1", {"g": 1}, self.ws("c"), "p", job_kind="replay")
         with self.assertRaises(ValueError):

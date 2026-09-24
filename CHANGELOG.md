@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.29.0] - 2026-09-24
+
+### Added
+
+- A planner in any harness hands off to Model Router: submit accepts Claude, Codex, OpenCode or Grok planners, the dispatcher wakes the planner automatically in its own harness, workers commit and open the job's PR, and the Codex dispatcher path repairs up to three missing closing braces
+
 ## [0.28.1] - 2026-09-24
 
 ### Changed

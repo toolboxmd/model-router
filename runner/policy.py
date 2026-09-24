@@ -694,7 +694,8 @@ KITS = {
     "dispatcher": {
         "instructions": ("You are the read-only dispatcher. Coordinate and verify; never edit. "
                          "Ask the planner for decisions and request implementation with "
-                         "complete worker instructions."),
+                         "complete worker instructions. Confirm the pushed branch and its "
+                         "one open PR before completion, and carry the PR URL."),
         "skills": ["operations"],
         "plugins": ["agentsmd-project-direction"],
         "mcp": [],
@@ -713,7 +714,9 @@ KITS = {
     "worker": {
         "instructions": ("You are the implementation worker. Edit only what the task allows "
                          "inside the workspace. Run the task's proof command when it has one. "
-                         "Finish with changed files and proof results."),
+                         "Commit as you work; at the end push the branch and open exactly one "
+                         "PR without merging it, and report its URL. "
+                         "Finish with changed files, the PR URL, and proof results."),
         "skills": ["operations", "project-direction"],
         "plugins": ["agentsmd-project-direction"],
         "mcp": ["treg"],
@@ -1781,10 +1784,19 @@ def render_skill_table() -> str:
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",
         "- Every callback prompt carries the stored handoff summary before "
-        "the question, and its `claude_callback` invocation records input, "
-        "cache-read, and cache-creation tokens so the resumed context is "
-        "visible per job; the Astra fallback answers from the handoff "
+        "the question. The dispatcher wakes the saved planner automatically "
+        "in its own harness: Claude, Codex, and OpenCode resume the saved "
+        "session (the answer counts only from that session), while a harness "
+        "without resume (such as Grok Build) answers from a fresh session "
+        "seeded with the summary; `questions` and `answer` stay as an "
+        "optional human override. The Claude `claude_callback` invocation "
+        "records input, cache-read, and cache-creation tokens so the resumed "
+        "context is visible per job; the Astra fallback answers from the handoff "
         "summary in a fresh session with no resume.",
+        "- The worker commits as it works, then pushes the branch and opens "
+        "exactly one PR without merging it, and reports its URL. The "
+        "dispatcher confirms the pushed branch and its one open PR before "
+        "completion, which carries the PR URL; `result` shows it.",
         "- Record the policy version, the requested and observed route, and any "
         "override or escalation in the existing handoff. Instructions describe "
         "the policy and its required evidence.",

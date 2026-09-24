@@ -369,6 +369,245 @@ class TestCompletionRefused(unittest.TestCase):
         self.assertEqual(job["status"], "blocked")
         self.assertTrue((job["block_reason"] or "").startswith("completion_refused"))
 
+    def _passing_job(self, rid, completion, job_kind="ordinary", proof="true",
+                       with_origin=False):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        if with_origin:
+            # PR-possible workspace: a Git checkout with an origin push
+            # remote, so the ordinary PR-URL gate applies.
+            subprocess.run(["git", "init"], cwd=str(ws), check=True,
+                           capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.test"],
+                           cwd=str(ws), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"],
+                           cwd=str(ws), check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin",
+                            "https://example.test/repo.git"],
+                           cwd=str(ws), check=True, capture_output=True)
+        core.submit(sd, rid, {"goal": "x", "proof": proof}, str(ws), "pl",
+                    job_kind=job_kind)
+        job = core.get_job(sd, rid)
+        full = {"assistant_text": "did stuff", "usage": None, "native_ids": {},
+                "finish": "stop", "actual_model": None}
+        report = controller._write_turn_report(
+            sd, rid, job, 1, "muse-spark-xhigh-free", full, "ses")
+        self.assertEqual(report["status"], "ok")
+        con = store.connect(sd)
+        try:
+            con.execute("UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id=?",
+                        (rid,))
+        finally:
+            con.close()
+        _set_controller_state(sd, rid, seq=1,
+                              last_action=completion,
+                              last_action_name="completion")
+        return tmp, sd, ws, report
+
+    def test_ordinary_completion_without_pr_url_refuses_once_then_blocks(self):
+        # With an origin push remote, every unusable pr_url shape refuses
+        # on the live path; none succeeds, and the reason names the
+        # missing PR URL (never a proof failure, which passes here).
+        bad = [{"action": "completion", "output": "DONE"},
+               {"action": "completion", "output": "DONE", "pr_url": None},
+               {"action": "completion", "output": "DONE", "pr_url": 123},
+               {"action": "completion", "output": "DONE", "pr_url": ""},
+               {"action": "completion", "output": "DONE", "pr_url": "   "}]
+        for i, completion in enumerate(bad):
+            with self.subTest(completion=completion):
+                _tmp, sd, _ws, _rep = self._passing_job(f"nopr-{i}", completion,
+                                                        with_origin=True)
+                run = self._completion_resume()
+                first = controller.step(sd, f"nopr-{i}", run_cmd=run)
+                self.assertEqual(first["action"], "completion-refused-resumed")
+                job = core.get_job(sd, f"nopr-{i}")
+                self.assertNotEqual(job["status"], "succeeded", job)
+                st = controller._load_controller_state(job)
+                self.assertEqual(st.get("completion_refused_seq"), 1)
+                reason = st.get("completion_refused_reason") or ""
+                self.assertIn("pr_url", reason)
+                self.assertNotIn("proof failed", reason)
+        # Insistence on the same turn blocks durably with that reason.
+        _tmp, sd, _ws, _rep = self._passing_job(
+            "nopr-block", {"action": "completion", "output": "DONE"},
+            with_origin=True)
+        run = self._completion_resume()
+        self.assertEqual(controller.step(sd, "nopr-block", run_cmd=run)["action"],
+                         "completion-refused-resumed")
+        second = controller.step(sd, "nopr-block", run_cmd=run)
+        self.assertEqual(second["action"], "blocked")
+        self.assertEqual(second["reason"], "completion_refused")
+        job2 = core.get_job(sd, "nopr-block")
+        self.assertEqual(job2["status"], "blocked")
+        self.assertTrue((job2["block_reason"] or "").startswith("completion_refused:"),
+                        job2["block_reason"])
+        self.assertIn("pr_url", job2["block_reason"])
+        # A valid PR URL still succeeds on the live path and is preserved.
+        _tmp, sd, _ws, _rep = self._passing_job(
+            "pr-ok", {"action": "completion", "output": "DONE",
+                      "pr_url": "https://example.test/pr/1"},
+            with_origin=True)
+        done = controller.step(sd, "pr-ok", run_cmd=self._completion_resume())
+        self.assertEqual(done["action"], "completed")
+        self.assertEqual(core.get_job(sd, "pr-ok")["status"], "succeeded")
+        self.assertIn("https://example.test/pr/1",
+                      core.get_job(sd, "pr-ok").get("result_json") or "")
+        # Experiment jobs keep their current behavior: no PR URL needed.
+        _tmp, sd, _ws, _rep = self._passing_job(
+            "pr-exp", {"action": "completion", "output": "DONE"},
+            job_kind="experiment")
+        exp = controller.step(sd, "pr-exp", run_cmd=self._completion_resume())
+        self.assertEqual(exp["action"], "completed")
+        self.assertEqual(core.get_job(sd, "pr-exp")["status"], "succeeded")
+
+    def test_ordinary_completion_without_remote_succeeds_and_records_null(self):
+        # Without an origin push remote, ordinary completion succeeds as
+        # before and records pr_url as JSON null, on the live path.
+        for ws_kind, setup in (("plain", None), ("git-no-remote", "git")):
+            with self.subTest(workspace=ws_kind):
+                tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+                self.addCleanup(tmp.cleanup)
+                base = Path(tmp.name)
+                sd = str(base / "state")
+                ws = base / "ws"
+                ws.mkdir()
+                if setup == "git":
+                    subprocess.run(["git", "init"], cwd=str(ws), check=True,
+                                   capture_output=True)
+                    subprocess.run(["git", "config", "user.email",
+                                    "test@example.test"], cwd=str(ws),
+                                   check=True, capture_output=True)
+                    subprocess.run(["git", "config", "user.name", "Test"],
+                                   cwd=str(ws), check=True, capture_output=True)
+                rid = f"noremote-live-{ws_kind}"
+                core.submit(sd, rid, {"goal": "x", "proof": "true"},
+                            str(ws), "pl")
+                job = core.get_job(sd, rid)
+                full = {"assistant_text": "did stuff", "usage": None,
+                        "native_ids": {}, "finish": "stop",
+                        "actual_model": None}
+                report = controller._write_turn_report(
+                    sd, rid, job, 1, "muse-spark-xhigh-free", full, "ses")
+                self.assertEqual(report["status"], "ok")
+                con = store.connect(sd)
+                try:
+                    con.execute("UPDATE jobs SET codex_task_id='thr',"
+                                " status='running' WHERE request_id=?", (rid,))
+                finally:
+                    con.close()
+                _set_controller_state(sd, rid, seq=1,
+                                      last_action={"action": "completion",
+                                                   "output": "DONE"},
+                                      last_action_name="completion")
+                done = controller.step(sd, rid,
+                                       run_cmd=self._completion_resume())
+                self.assertEqual(done["action"], "completed", done)
+                finished = core.get_job(sd, rid)
+                self.assertEqual(finished["status"], "succeeded", finished)
+                outer = json.loads(finished.get("result_json") or "null")
+                self.assertTrue(outer.get("ok"), outer)
+                # Live offline writes a flat record, the leased path nests
+                # the payload as a JSON string: both carry pr_url null.
+                if "pr_url" in outer:
+                    self.assertIsNone(outer.get("pr_url"), outer)
+                else:
+                    inner = json.loads(outer.get("output") or "{}")
+                    self.assertIn("pr_url", inner, outer)
+                    self.assertIsNone(inner.get("pr_url"), outer)
+
+    def test_recovery_consume_blocks_ordinary_completion_without_pr_url(self):
+        _tmp, sd, ws, _rep = self._passing_job(
+            "nopr-rec", {"action": "completion", "output": "DONE"},
+            with_origin=True)
+        root = store.ensure_state_dir(sd)
+        env = {"action": "completion", "output": "RECOVERY_DONE", "artifact": ""}
+        lines = [json.dumps({"type": "thread.started", "thread_id": "thr"}),
+                 json.dumps({"type": "item.completed",
+                             "item": {"type": "agent_message",
+                                      "text": json.dumps(env)}}),
+                 json.dumps({"type": "turn.completed"})]
+        store.secure_write_text(root / "outputs" / "nrec1.stdout",
+                                "\n".join(lines) + "\n")
+        store.secure_write_text(root / "outputs" / "nrec1.stderr", "")
+        con = store.connect(sd)
+        try:
+            con.execute("INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
+                        "pid,pgid,stdout_path,stderr_path,started_at,state,rc) VALUES"
+                        "('nrec1','nopr-rec','codex_resume','[]',?,'old',999999,999999,?,?,?,?,?)",
+                        (str(ws), str(root / "outputs" / "nrec1.stdout"),
+                         str(root / "outputs" / "nrec1.stderr"), core._utcnow(),
+                         "completed", 0))
+        finally:
+            con.close()
+        applied = core.consume_finished_invocations(sd, "nopr-rec")
+        self.assertTrue(any(a.get("action") == "blocked" for a in applied), applied)
+        job = core.get_job(sd, "nopr-rec")
+        self.assertEqual(job["status"], "blocked")
+        self.assertNotEqual(job["status"], "succeeded")
+        self.assertTrue((job["block_reason"] or "").startswith("completion_refused:"),
+                        job["block_reason"])
+        self.assertIn("pr_url", job["block_reason"])
+        # An experiment job with the same envelope still succeeds in recovery.
+        _tmp2, sd2, ws2, _rep2 = self._passing_job(
+            "nopr-rec-exp", {"action": "completion", "output": "DONE"},
+            job_kind="experiment")
+        root2 = store.ensure_state_dir(sd2)
+        store.secure_write_text(root2 / "outputs" / "nrec2.stdout",
+                                "\n".join(lines) + "\n")
+        store.secure_write_text(root2 / "outputs" / "nrec2.stderr", "")
+        con = store.connect(sd2)
+        try:
+            con.execute("INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
+                        "pid,pgid,stdout_path,stderr_path,started_at,state,rc) VALUES"
+                        "('nrec2','nopr-rec-exp','codex_resume','[]',?,'old',999999,999999,?,?,?,?,?)",
+                        (str(ws2), str(root2 / "outputs" / "nrec2.stdout"),
+                         str(root2 / "outputs" / "nrec2.stderr"), core._utcnow(),
+                         "completed", 0))
+        finally:
+            con.close()
+        applied2 = core.consume_finished_invocations(sd2, "nopr-rec-exp")
+        self.assertTrue(any(a.get("action") == "completed" for a in applied2), applied2)
+        self.assertEqual(core.get_job(sd2, "nopr-rec-exp")["status"], "succeeded")
+
+    def test_recovery_consume_succeeds_without_remote_and_records_null(self):
+        # Without an origin push remote, recovery consumes an ordinary
+        # completion without a PR URL as success, recording null.
+        _tmp, sd, ws, _rep = self._passing_job(
+            "nopr-rec-ok", {"action": "completion", "output": "DONE"})
+        root = store.ensure_state_dir(sd)
+        env = {"action": "completion", "output": "RECOVERY_DONE", "artifact": ""}
+        lines = [json.dumps({"type": "thread.started", "thread_id": "thr"}),
+                 json.dumps({"type": "item.completed",
+                             "item": {"type": "agent_message",
+                                      "text": json.dumps(env)}}),
+                 json.dumps({"type": "turn.completed"})]
+        store.secure_write_text(root / "outputs" / "nrecok1.stdout",
+                                "\n".join(lines) + "\n")
+        store.secure_write_text(root / "outputs" / "nrecok1.stderr", "")
+        con = store.connect(sd)
+        try:
+            con.execute("INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
+                        "pid,pgid,stdout_path,stderr_path,started_at,state,rc) VALUES"
+                        "('nrecok1','nopr-rec-ok','codex_resume','[]',?,'old',999999,999999,?,?,?,?,?)",
+                        (str(ws), str(root / "outputs" / "nrecok1.stdout"),
+                         str(root / "outputs" / "nrecok1.stderr"), core._utcnow(),
+                         "completed", 0))
+        finally:
+            con.close()
+        applied = core.consume_finished_invocations(sd, "nopr-rec-ok")
+        self.assertTrue(any(a.get("action") == "completed" for a in applied), applied)
+        job = core.get_job(sd, "nopr-rec-ok")
+        self.assertEqual(job["status"], "succeeded", job)
+        outer = json.loads(job.get("result_json") or "null")
+        self.assertTrue(outer.get("ok"), outer)
+        inner = json.loads(outer.get("output") or "{}")
+        self.assertIn("pr_url", inner, outer)
+        self.assertIsNone(inner.get("pr_url"), outer)
+
 
 class TestSupplyLabels(unittest.TestCase):
     def test_runner_hook_none_labels(self):

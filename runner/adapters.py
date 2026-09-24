@@ -69,17 +69,20 @@ LUNA_ACTION_PROTOCOL = (
     "planner_question when a decision belongs to the planner. Request code "
     "changes with the implementation action; put complete worker "
     "instructions in payload.instructions. The runner sends them to the "
-    "implementation worker and returns its result to you. Inspect the "
-    "workspace and run the task's proof before reporting completion. Do not "
+    "implementation worker and returns its result to you. The worker "
+    "commits as it works, then pushes the branch and opens exactly one PR "
+    "without merging, and reports its URL. Inspect the workspace, confirm "
+    "the branch is pushed with one open PR, and run the task's proof "
+    "before reporting completion. Do not "
     "start other agents or models yourself.\n"
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
     '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"},"route":"muse-spark-xhigh-free"}\n'
-    '{"action":"completion","output":"<final result text>","artifact":"<path or empty>"}\n'
+    '{"action":"completion","output":"<final result text>","artifact":"<path or empty>","pr_url":"<opened PR URL>"}\n'
     "Rules: exactly one envelope; valid JSON; action must be one of "
     "planner_question, implementation, completion; use a new qid for each "
-    "new question; never invent a new planner or Codex session ID."
+    "new question; completion carries the opened PR URL; never invent a new planner or Codex session ID."
 )
 
 
@@ -215,33 +218,10 @@ def last_message_path_from_cmd(cmd) -> str | None:
     return None
 
 
-def _envelope_from_message_text(text: str) -> dict | None:
-    text = (text or "").strip()
-    if not text:
-        return None
-    candidates = [text] + [l.strip() for l in reversed(text.splitlines())]
-    if text.startswith("```"):
-        candidates.append(text.strip("`").partition("\n")[2])
-    for cand in candidates:
-        if not cand.startswith("{"):
-            continue
-        try:
-            obj = json.loads(cand)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
-            return obj
-    return None
-
-
-def parse_codex_agent_envelope(output_text: str,
-                               last_message_text: str | None = None) -> dict | None:
-    """Parse Luna's action from its own final agent message only.
-
-    Uses the last ``item.completed`` ``agent_message`` text in the JSONL
-    stream, else the ``--output-last-message`` file. Command output and
-    other items can contain arbitrary JSON and are never parsed.
-    """
+def _last_codex_agent_text(output_text: str) -> str | None:
+    """Text of the last ``item.completed`` ``agent_message`` in a Codex
+    JSONL stream, or None. Command output and other items are never
+    read: only the model's own final message counts."""
     last_text = None
     for line in (output_text or "").splitlines():
         line = line.strip()
@@ -257,11 +237,28 @@ def parse_codex_agent_envelope(output_text: str,
         if isinstance(item, dict) and item.get("type") == "agent_message" \
                 and isinstance(item.get("text"), str):
             last_text = item["text"]
+    return last_text
+
+
+def parse_codex_agent_envelope(output_text: str,
+                               last_message_text: str | None = None) -> dict | None:
+    """Parse Luna's action from its own final agent message only.
+
+    Uses the last ``item.completed`` ``agent_message`` text in the JSONL
+    stream, else the ``--output-last-message`` file. Command output and
+    other items can contain arbitrary JSON and are never parsed. The
+    final message text is extracted through the shared OpenCode
+    dispatcher-envelope parser, so a tail missing at most
+    ``DISPATCH_ENVELOPE_MAX_REPAIR_CLOSERS`` closers is completed the
+    same way on both dispatcher paths; a truncation inside a string
+    still fails closed and returns None.
+    """
+    last_text = _last_codex_agent_text(output_text)
     if last_text is not None:
-        found = _envelope_from_message_text(last_text)
+        found = parse_opencode_dispatcher_envelope(last_text)
         if found:
             return found
-    return _envelope_from_message_text(last_message_text or "")
+    return parse_opencode_dispatcher_envelope(last_message_text or "")
 
 
 def read_last_message_file(path: str | None) -> str | None:
@@ -335,6 +332,48 @@ def _balanced_object_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _string_aware_open_braces(text: str) -> list[int]:
+    """Indices of ``{`` outside double-quoted strings (escapes honored).
+
+    Braces inside JSON strings (an instruction carrying literal ``{...}``
+    text) never count as repair candidates, mirroring
+    :func:`_balanced_object_spans`.
+    """
+    opens: list[int] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            opens.append(i)
+    return opens
+
+
+def _ends_inside_string(text: str) -> bool:
+    """True when ``text`` ends inside an unterminated double-quoted string."""
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+    return in_string
+
+
 def _valid_dispatcher_envelope(obj) -> dict | None:
     """``obj`` when it is a dict carrying a valid dispatcher action."""
     if isinstance(obj, dict) and obj.get("action") in _policy.VALID_ACTIONS:
@@ -371,12 +410,17 @@ def parse_opencode_dispatcher_envelope(text: str | None) -> dict | None:
             continue
         if found is not None:
             return found
-    # Bounded repair for an unbalanced tail: try each late open,
+    # Bounded repair for an unbalanced tail: try each string-aware open,
     # last-first, with 1..N appended closers. The whole-text open
     # recovers the live shape (payload never closed); the payload open
     # alone parses but carries no action and is skipped by validation.
-    opens = [i for i, ch in enumerate(cleaned) if ch == "{"]
-    for pos in reversed(opens[-20:]):
+    # Braces inside JSON strings never count as opens, so an instruction
+    # string carrying many literal braces cannot shadow the envelope's
+    # real open; every valid open is examined, not just the last 20. A
+    # truncation inside a string still fails closed and returns None.
+    if _ends_inside_string(cleaned):
+        return None
+    for pos in reversed(_string_aware_open_braces(cleaned)):
         tail = cleaned[pos:].strip()
         if not tail:
             continue
@@ -521,6 +565,158 @@ def parse_claude_result(stdout: str) -> dict:
         return {"ok": False, "answer": None, "session_id": sid,
                 "error": "planner result is empty"}
     return {"ok": True, "answer": result.strip(), "session_id": sid, "error": None}
+
+
+def build_codex_planner_cmd(thread_id: str, prompt: str) -> list[str]:
+    """Resume the saved Codex planner thread for one question.
+
+    ``codex exec resume THREAD --json`` keeps the thread's own model and
+    never forks a new session; missing thread is a caller error. The
+    read-only sandbox keeps a decision-only callback from editing while
+    still allowing reads. The caller parses the final agent message as
+    the answer and validates the resumed thread identity.
+    """
+    if not thread_id:
+        raise ValueError("missing planner session ID: refusing to fork a new session")
+    if not prompt:
+        raise ValueError("missing prompt for codex planner callback")
+    return [CODEX_BIN, "exec", "resume", thread_id, "--json",
+            "-c", f'sandbox_mode="{CODEX_SANDBOX}"', prompt]
+
+
+def parse_codex_planner_answer(output_text: str) -> dict:
+    """Answer from a resumed Codex planner thread's JSONL stream.
+
+    Returns ``{ok, answer, session_id, error}``. The answer is the last
+    ``item.completed`` ``agent_message`` text; the session is the first
+    ``thread.started`` ID. Command output is never read.
+    """
+    thread_id = parse_codex_task_id(output_text)
+    answer = _last_codex_agent_text(output_text)
+    if not isinstance(thread_id, str) or not thread_id:
+        return {"ok": False, "answer": None, "session_id": None,
+                "error": "planner output carries no thread ID"}
+    if not isinstance(answer, str) or not answer.strip():
+        return {"ok": False, "answer": None, "session_id": thread_id,
+                "error": "planner answer is empty"}
+    return {"ok": True, "answer": answer.strip(), "session_id": thread_id,
+            "error": None}
+
+
+def build_opencode_planner_cmd(session_id: str, prompt: str,
+                               workspace: str) -> list[str]:
+    """Resume the saved OpenCode planner session for one question.
+
+    ``opencode run --session SID --dir WS --format json`` continues the
+    planner's own session with its own model and never forks a new one;
+    missing session is a caller error. JSON events let the caller parse
+    the final assistant text and validate the resumed session identity.
+    """
+    if not session_id:
+        raise ValueError("missing planner session ID: refusing to fork a new session")
+    if not prompt:
+        raise ValueError("missing prompt for opencode planner callback")
+    if not workspace:
+        raise ValueError("missing workspace for opencode planner callback")
+    return [OPENCODE_BIN, "run", "--session", session_id,
+            "--dir", workspace, "--format", "json", prompt]
+
+
+def _opencode_run_text_and_session(obj: object) -> tuple[str | None, str | None]:
+    """(text, session_id) from one ``opencode run --format json`` event."""
+    if not isinstance(obj, dict):
+        return None, None
+    if isinstance(obj.get("properties"), dict):
+        return _opencode_run_text_and_session(obj["properties"])
+    part = obj.get("part")
+    text = None
+    if isinstance(part, dict) and part.get("type") == "text" \
+            and isinstance(part.get("text"), str) and part["text"].strip():
+        text = part["text"].strip()
+    if text is None and obj.get("type") == "text" \
+            and isinstance(obj.get("text"), str) and obj["text"].strip():
+        text = obj["text"].strip()
+    if text is None:
+        info = obj.get("info")
+        if isinstance(info, dict) and info.get("role") == "assistant":
+            texts = [p["text"].strip() for p in (obj.get("parts") or [])
+                     if isinstance(p, dict) and p.get("type") == "text"
+                     and isinstance(p.get("text"), str) and p["text"].strip()]
+            if texts:
+                text = "\n".join(texts)
+    sid = None
+    for key in ("sessionID", "session_id", "sessionId"):
+        val = obj.get(key)
+        if isinstance(val, str) and val:
+            sid = val
+            break
+    if sid is None:
+        for key in ("info", "part"):
+            nested = obj.get(key)
+            if isinstance(nested, dict):
+                for skey in ("sessionID", "session_id", "sessionId"):
+                    val = nested.get(skey)
+                    if isinstance(val, str) and val:
+                        sid = val
+                        break
+            if sid is not None:
+                break
+    return text, sid
+
+
+def parse_opencode_run_planner_answer(stdout: str) -> dict:
+    """Answer from ``opencode run --session SID --format json`` stdout.
+
+    Returns ``{ok, answer, session_id, error}``. The answer is the last
+    non-empty assistant text event; the session is the last reported
+    session ID. Non-JSON lines are skipped; an empty stream, answerless
+    events, or a missing session ID fail closed.
+    """
+    answer = None
+    sid = None
+    found_json = False
+    lines = (stdout or "").strip().splitlines()
+    if len(lines) == 1 and lines[0].strip().startswith("{"):
+        try:
+            obj = json.loads(lines[0].strip())
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and "part" not in obj and "properties" not in obj \
+                and isinstance(obj.get("info"), dict):
+            text, got_sid = _opencode_run_text_and_session(obj)
+            if text:
+                answer = text
+            if got_sid:
+                sid = got_sid
+            found_json = True
+            lines = []
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        found_json = True
+        text, got_sid = _opencode_run_text_and_session(obj)
+        if text:
+            answer = text
+        if got_sid:
+            sid = got_sid
+    if not found_json:
+        return {"ok": False, "answer": None, "session_id": None,
+                "error": "planner output is not opencode JSON events"}
+    if not isinstance(sid, str) or not sid:
+        return {"ok": False, "answer": answer, "session_id": None,
+                "error": "planner output carries no session ID"}
+    if not isinstance(answer, str) or not answer.strip():
+        return {"ok": False, "answer": None, "session_id": sid,
+                "error": "planner answer is empty"}
+    return {"ok": True, "answer": answer.strip(), "session_id": sid,
+            "error": None}
 
 
 def planner_transcript_age(planner_session_id: str) -> float | None:

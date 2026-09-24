@@ -1289,9 +1289,19 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             if action_name == "completion":
                 # A job can never succeed while its last implementation
                 # turn's proof failed: refuse the envelope, record the
-                # refusal, and block with its reason.
+                # refusal, and block with its reason. An ordinary job in a
+                # workspace with an origin push remote also needs an opened
+                # PR URL (never mislabeled as a proof failure); without a
+                # remote it succeeds as before, experiment and replay jobs
+                # skip that gate. The remote capability is checked with git
+                # once per completion here.
                 _refusal = completion_refusal_reason(
                     latest_turn_report(state_dir, request_id))
+                if _refusal is None:
+                    _refusal = missing_pr_url_reason(
+                        job_row["job_kind"] if job_row is not None else None,
+                        envelope if isinstance(envelope, dict) else None,
+                        job_row["workspace"] if job_row is not None else None)
                 if _refusal is not None:
                     con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
                                 " AND status NOT IN ('succeeded','failed','cancelled')",
@@ -1302,8 +1312,11 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                     applied = "blocked"
                 else:
                     output = str(envelope.get("output") or "done")
+                    _pr = (envelope.get("pr_url") if isinstance(envelope, dict) else None)
+                    _pr_norm = _pr if isinstance(_pr, str) and _pr.strip() else None
                     result = {"ok": True, "output": json.dumps({"output": output,
-                                                                "artifact": envelope.get("artifact")},
+                                                                "artifact": envelope.get("artifact"),
+                                                                "pr_url": _pr_norm},
                                                                sort_keys=True)}
                     con.execute(
                         "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
@@ -1363,9 +1376,13 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
     if applied == "completed":
         try:
             root = store.ensure_state_dir(state_dir)
+            _mpr = (envelope or {}).get("pr_url") if isinstance(envelope, dict) else None
+            _mpr_norm = _mpr if isinstance(_mpr, str) and _mpr.strip() else None
             _mirror_result(state_dir, request_id,
                 json.dumps({"request_id": request_id, "status": "succeeded",
-                            "result": {"ok": True, "output": (envelope or {}).get("output")}}),
+                            "result": {"ok": True, "output": (envelope or {}).get("output"),
+                                       "artifact": (envelope or {}).get("artifact"),
+                                       "pr_url": _mpr_norm}}),
             )
         except OSError:
             pass
@@ -1582,9 +1599,11 @@ def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -
 # ---------------------------------------------------------------------------
 
 JOB_KINDS = ("ordinary", "experiment", "replay")
-# The planner callback runs Claude --resume on the exact saved session; no
-# other planner harness is implemented, so only claude is accepted.
-PLANNER_HARNESSES = ("claude",)
+# The planner callback resumes the saved planner session in its own
+# harness (Claude --resume, Codex exec resume, OpenCode run --session);
+# a harness without a usable resume path answers from a fresh session
+# seeded with the stored handoff summary.
+PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok")
 
 
 def _workspace_head(workspace: str | None) -> str | None:
@@ -1944,7 +1963,6 @@ def submit(state_dir, request_id: str, task, workspace: str,
            timeout_secs: int | None = None,
            planner_model: str | None = None,
            planner_effort: str | None = None,
-           planner_cwd: str | None = None,
            lane: str | None = None,
            job_kind: str = "ordinary", replay_of: str | None = None,
            planner_harness: str = "claude",
@@ -1953,10 +1971,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
 
     Built-in defaults mean no executor/callback commands are required:
     only the prepared task, workspace, stable request ID, and original
-    planner session ID are needed. Planner model/effort default to the
-    policy's planning route and may be overridden explicitly. The handoff
-    summary is stored on the job (explicit argument wins, else derived
-    from the task packet) so a callback prompt can carry it.
+    planner session ID are needed. The planner session may live in any
+    supported harness (claude, codex, opencode, grok); its harness and
+    session ID are recorded so dispatcher questions wake it there.
+    Planner model/effort default to the policy's planning route and may
+    be overridden explicitly. The handoff summary is stored on the job
+    (explicit argument wins, else derived from the task packet) so a
+    callback prompt can carry it. Planner callbacks run in the job
+    workspace.
     """
     _validate_request_id(request_id)
     if not planner_session_id:
@@ -2016,7 +2038,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
     task_json = _canonical_task(task)
     thash = _task_hash(task_json)
     summary = _derive_handoff_summary(task, request_id, handoff_summary)
-    pcwd = _canonical_workspace(planner_cwd, must_exist=False) if planner_cwd else ws
+    pcwd = ws
     root = store.ensure_state_dir(state_dir)
     out_path = str(store.output_path_for(root, request_id))
     now = _utcnow()
@@ -2061,8 +2083,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
                 same = False
             if _ee is not None and _ee != planner_effort:
                 same = False
-            if existing["planner_cwd"] is not None and existing["planner_cwd"] != pcwd:
-                same = False
+            # The planner_cwd column stays readable for old ledgers, but no
+            # longer participates: callbacks run in the job workspace.
             if not same_lane:
                 same = False
             if existing["job_kind"] is not None and (
@@ -2129,8 +2151,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
             route = route or policy.lane_default_route(policy.DEFAULT_LANE)
             policy.validate_implementation_route(route)
         try:
-            _canonical_workspace(ws)  # a new job needs existing directories
-            _canonical_workspace(pcwd)
+            _canonical_workspace(ws)  # a new job needs an existing workspace
         except ValueError:
             con.execute("ROLLBACK")
             raise
@@ -2223,7 +2244,6 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_model: str | None = None,
                      planner_effort: str | None = None,
                      launcher=None, spawn=None,
-                     planner_cwd: str | None = None,
                      lane: str | None = None,
                      job_kind: str = "ordinary", replay_of: str | None = None,
                      planner_harness: str = "claude",
@@ -2240,7 +2260,7 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
     job = submit(state_dir, request_id, task, workspace, planner_session_id,
                  route=route, policy_id=policy_id, max_attempts=max_attempts,
                  timeout_secs=timeout_secs, planner_model=planner_model,
-                 planner_effort=planner_effort, planner_cwd=planner_cwd,
+                 planner_effort=planner_effort,
                  lane=lane, job_kind=job_kind, replay_of=replay_of,
                  planner_harness=planner_harness, handoff_summary=handoff_summary)
     # Idempotent resubmit of the same payload must not fork a second
@@ -4341,6 +4361,53 @@ def completion_refusal_reason(report: dict | None) -> str | None:
         detail = " ".join(str(detail).split())
         return f"completion_refused: last turn failed ({detail[:160]})"
     return None
+
+
+def workspace_has_origin_push_remote(workspace: str | None) -> bool:
+    """True when the workspace can open a PR: a Git checkout with an origin push remote.
+
+    Checked with git exactly where the caller needs the decision (once per
+    completion in each path). Non-Git workspaces, Git without origin, or an
+    origin without a usable push URL return False so ordinary completion
+    succeeds as before.
+    """
+    if not workspace or not isinstance(workspace, str):
+        return False
+    try:
+        out = subprocess.run(["git", "-C", workspace, "remote", "get-url",
+                              "--push", "origin"],
+                             capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL)
+    except Exception:
+        return False
+    if out.returncode != 0:
+        return False
+    return bool((out.stdout or "").strip())
+
+
+def missing_pr_url_reason(job_kind: str | None, envelope: dict | None,
+                          workspace: str | None = None) -> str | None:
+    """Block reason when an ordinary completion carries no usable PR URL.
+
+    The PR-URL requirement applies exactly when the workspace is a Git
+    checkout with an origin push remote (checked with git once per call;
+    callers invoke this once per completion, so no duplicate checks). A
+    non-Git workspace, one without origin, or one without a usable push
+    remote completes successfully as before. Experiment and replay jobs
+    keep their current behavior (None: the gate does not apply). With a
+    remote, missing, None, non-string, empty, and whitespace-only values
+    refuse as ``completion_refused: ...`` naming the missing PR URL, never
+    as a proof failure; a valid nonblank URL succeeds and is preserved.
+    """
+    if job_kind in ("experiment", "replay"):
+        return None
+    if not workspace_has_origin_push_remote(workspace):
+        return None
+    pr_url = envelope.get("pr_url") if isinstance(envelope, dict) else None
+    if isinstance(pr_url, str) and pr_url.strip():
+        return None
+    return ("completion_refused: missing pr_url "
+            "(an ordinary job succeeds only with an opened PR URL)")
 
 
 def result_view(state_dir, request_id: str) -> dict:

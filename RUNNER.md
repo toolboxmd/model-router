@@ -1,6 +1,7 @@
 # Durable local runner
 
-A small local runner that accepts prepared work from a Claude planner, hands
+A small local runner that accepts prepared work from a planner in any
+supported harness (Claude Code, Codex, OpenCode, Grok Build), hands
 it to a persistent Codex Luna dispatcher, and returns questions and
 completion without depending on the planner process staying open. Python
 standard library only. No additional services, runtime dependencies, or network
@@ -16,7 +17,10 @@ Use Python 3.11 or newer, Git, and authenticated harness CLIs for the routes you
 intend to execute. Keep the full Model Router plugin together. Install AgentsMD
 and the Skills, plugins, and MCP integrations named by the selected role kit;
 missing dependencies block that dispatch. No credentials ship in this package.
-The current planner callback requires an existing Claude Code session.
+The planner callback wakes the saved planner session in its own harness
+(Claude resume, Codex `exec resume`, OpenCode `run --session`; a harness
+without resume answers from a fresh session seeded with the handoff
+summary).
 
 ## Public CLI
 
@@ -28,10 +32,10 @@ development.
 
 ```
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR submit --request-id ID (--task JSON | --task-file F) \
-  --workspace PATH --planner-session SID [--planner-cwd PATH] \
+  --workspace PATH --planner-session SID \
   [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
   [--timeout-secs S] [--job-kind ordinary|experiment|replay] [--replay-of ID] \
-  [--planner-harness claude] [--handoff-summary TEXT | --handoff-summary-file F] \
+  [--planner-harness claude|codex|opencode|grok] [--handoff-summary TEXT | --handoff-summary-file F] \
   [--start | --no-start]
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR start --request-id ID
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR status --request-id ID
@@ -43,11 +47,11 @@ development.
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR capacity [--clear ROUTE]
 ```
 
-`submit` commits the task, workspace claim, policy identity, planner session,
-planner model, effort, directory, route, attempt budget, and timeout before
+`submit` commits the task, workspace claim, policy identity, planner session
+and harness, planner model, effort, route, attempt budget, and timeout before
 it acknowledges. The same ID and payload return the existing job, also with
-`--start`. A changed payload conflicts. A new job's workspace and planner directory
-must be existing directories. A workspace that equals, contains,
+`--start`. A changed payload conflicts. A new job's workspace
+must be an existing directory. A workspace that equals, contains,
 or lies inside the workspace of an active or cancelling job, or of a job
 that still owns a child process, is rejected. Workspaces are compared by
 device and inode along their ancestor chain, so symlinks, case variants,
@@ -69,12 +73,14 @@ submitters cannot both take a capped route. `--route` names one implementation r
 Without either, the default lane's sticky home applies. The
 `critical` lane is planner-executed and `submit` rejects it: do that step in
 the planner session, then submit the remainder. `--start` launches a detached
-controller after the commit. `--planner-cwd` is the directory where the
-planner session was started, because Claude stores sessions per project
-directory; it defaults to the workspace.
+controller after the commit.
 `--job-kind` is `ordinary`, `experiment`, or `replay`; a replay names the
 request it repeats with `--replay-of`. `--planner-harness` names the harness
-hosting the planner session; only `claude` is implemented.
+hosting the planner session (`claude`, `codex`, `opencode`, or `grok`);
+`--planner-session` carries that harness's session id (a Claude session, a
+Codex thread, an OpenCode session, or any Grok session id for the record:
+the Grok fallback answers from a fresh session). Planner callbacks run in
+the job workspace.
 `--handoff-summary` (or `--handoff-summary-file`) stores the durable handoff
 summary on the job; without it the summary is derived from the task packet
 (`handoff_summary`, else Issue, decisions, proof command, and goal). The same
@@ -113,44 +119,57 @@ allowance; the runner never invents a reset time.
    with `route_reason` recorded. A dispatch that fails with no recognized
    signal still blocks, but with the last provider message in the block
    reason, never a bare "turn not completed".
-   The first `thread.started` ID is saved as the Luna task. Luna's action is
-   read only from its own final `item.completed` `agent_message` text, or
-   the last-message file. Command output is never parsed for actions. On
-   the OpenCode-hosted dispatcher the action is the last complete JSON
-   object of the turn's last assistant message (two messages arrive as
-   prose, then the envelope, optionally fenced; surrounding prose is
-   tolerated, and a tail missing at most three closers is completed),
-   validated as an action envelope; the raw text stays in the ledger.
+    The first `thread.started` ID is saved as the Luna task. Luna's action is
+    read only from its own final `item.completed` `agent_message` text, or
+    the last-message file. Command output is never parsed for actions. On
+    both dispatcher paths the action is the last complete JSON
+    object of the turn's last assistant message (two messages arrive as
+    prose, then the envelope, optionally fenced; surrounding prose is
+    tolerated, and a tail missing at most three closers is completed),
+    validated as an action envelope; the raw text stays in the ledger.
    A turn with no extractable envelope blocks quoting the first 200
    characters of the assistant text, never a bare "no structured envelope".
 2. Luna replies with one envelope: `planner_question`, `implementation`, or
    `completion`. The envelope is saved before its effect.
-3. `planner_question`: the question is saved, then the original planner is
-   resumed with `claude --resume SID --model M --effort E --output-format
-   json --tools "" -p PROMPT` in the planner directory. PROMPT carries the
-   stored handoff summary before the dispatcher's question, so a callback
-   hours later resumes the exact saved planner session and answers from
-   the ledger. The
-   answer counts only when the JSON result is a success from the same
-   session ID. The `claude_callback` invocation records the resumed
-   context (input, cache-read, and cache-creation tokens) with elapsed
-   time, so the resumed context is visible per job in the Observer mapping
-   (`status` and `result` measurements). A running `claude` process that
-   names the session in its arguments is a busy planner. Busy, failed, or
-   mismatched callbacks block the job with a reason; the question stays
-   pending for `answer` plus `recover`. The Astra fallback never resumes:
-   it answers from the handoff summary in a fresh session with no resume
-   (`controller.astra_fallback_prompt`), persisted the same way.
+3. `planner_question`: the question is saved, then the saved planner wakes
+    automatically in its own harness without human action: Claude resumes
+    with `claude --resume SID --model M --effort E --output-format
+    json --tools "" -p PROMPT` in the job workspace, Codex resumes with
+    `codex exec resume THREAD --json -c sandbox_mode="read-only" PROMPT`,
+    OpenCode resumes with `opencode run --session SID --dir WS --format
+    json PROMPT`, and a harness without a usable resume path (such as Grok
+    Build) answers from a fresh `grok -p PROMPT` session seeded with the
+    stored handoff summary. PROMPT carries the
+    stored handoff summary before the dispatcher's question, so a callback
+    hours later resumes the exact saved planner session and answers from
+    the ledger. The
+    answer counts only when the result is a success from the same
+    session ID (the fresh Grok fallback records its new session as the
+    answer's source instead). The planner callback invocation records the resumed
+    context with elapsed
+    time, so the resumed context is visible per job in the Observer mapping
+    (`status` and `result` measurements); the Claude invocation also carries
+    input, cache-read, and cache-creation tokens. A running `claude` process that
+    names the session in its arguments is a busy planner. Busy, failed, or
+    mismatched callbacks block the job with a reason; the question stays
+    pending for `answer` plus `recover`. The Astra fallback never resumes:
+    it answers from the handoff summary in a fresh session with no resume
+    (`controller.astra_fallback_prompt`), persisted the same way.
+    `questions` and `answer` stay as an optional human override.
 4. The answer is saved, then the same Luna task resumes with `codex exec
    resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
    sandbox_mode="read-only"`. A resume that reports another thread, or none,
    blocks.
 5. `implementation`: one Muse turn runs on an owned `opencode serve
-   --hostname 127.0.0.1 --port 0` on a runner-generated configuration
-   directory built from the route's kit (see below). The worker report
-   returns to the same Luna task.
+    --hostname 127.0.0.1 --port 0` on a runner-generated configuration
+    directory built from the route's kit (see below). The worker commits as
+    it works; at the end it pushes the branch and opens exactly one PR
+    without merging it, and reports the PR URL. The worker report
+    returns to the same Luna task.
 6. `completion`: the terminal result is saved before acknowledgment, but
-   never while the latest implementation turn's proof failed. A completion
+    never while the latest implementation turn's proof failed. The
+    completion envelope carries the opened PR URL (`pr_url`), and `result`
+    shows it; nothing merges the PR. A completion
    envelope arriving with a non-zero `proof_exit_code` or a `failed` report
    status is refused: the controller records `completion_refused: proof
    failed rc=<n>`, hands the failed report's evidence back to the dispatcher
@@ -196,7 +215,7 @@ another session after the question was answered publicly through `answer`,
 the stored public answer wins. A resume that fails before `thread.started`
 records `codex_resume_failed` with its exit code, as recovery does.
 
-Before resuming the planner, the runner also waits up to 30 seconds for the
+Before resuming a Claude planner, the runner also waits up to 30 seconds for the
 session transcript to be unchanged for 5 seconds; a planner still writing
 its transcript counts as busy.
 
@@ -350,8 +369,11 @@ python3 -c "from runner import kits; kits.materialize_grok_kit('recovery', '/tmp
 GROK_HOME=/tmp/grok-kit grok -p PROMPT --model grok-4.6
 ```
 
-The planner (`claude --resume`) keeps the user's own session and is never
-isolated; Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, and
+The planner keeps the user's own session and is never
+isolated: `claude --resume SID -p PROMPT`, `codex exec resume THREAD --json
+-c sandbox_mode="read-only" PROMPT`, or `opencode run --session SID --dir WS
+--format json PROMPT` in the job workspace; a Grok planner answers from a
+fresh `grok -p PROMPT` session seeded with the handoff summary. Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, and
 Grok Build uses `GROK_HOME` (or `~/.grok`) for their kit equivalents.
 
 The prompt goes through `POST /session/{id}/prompt_async` with the job
@@ -625,7 +647,8 @@ verbatim under a source label, the observed model and the observed variant as
 separate fields, and native identities (Codex thread and turn ids, Claude
 session and result ids with the callback's prompt digest, OpenCode session
 and message ids). Jobs record their kind (`ordinary`, `experiment`, `replay`
-with `--replay-of`), the planner harness (only `claude`), the workspace
+with `--replay-of`), the planner harness (`claude`, `codex`, `opencode`,
+or `grok`), the workspace
 commit at submit (`base_commit`) and completion (`head_commit`), and the
 optional task `links`. Events and invocations carry `schema_version` 2;
 Agent Observer reads this ledger directly. `status` and `result` show the

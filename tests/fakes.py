@@ -287,7 +287,10 @@ def run_turn(sid, model, directory, aborted, prompt_text=""):
             prose = "Routing to the worker with an implementation envelope."
         else:
             envelope = {"action": "completion", "output": "PLANNED_ON_OPENCODE",
-                        "artifact": ""}
+                        "artifact": "",
+                        "pr_url": os.environ.get(
+                            "FAKE_OC_PR_URL",
+                            "https://example.test/pr/fake-1")}
             prose = "Work is done, reporting completion."
         body = json.dumps(envelope)
         if os.environ.get("FAKE_OC_FENCE") == "1":

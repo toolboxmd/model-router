@@ -37,7 +37,7 @@ class DistributionTests(unittest.TestCase):
         (self.workspace / "packet.json").write_text(json.dumps({"goal": "offline package acceptance"}))
         result = json.loads(self.command("--state-dir", str(self.state), "submit", "--request-id", "package-test",
             "--task-file", "packet.json", "--workspace", ".", "--planner-session", "offline-fixture",
-            "--planner-cwd", ".", "--no-start"))
+            "--no-start"))
         self.assertTrue(result["acknowledged"])
         status = json.loads(self.command("--state-dir", str(self.state), "status", "--request-id", "package-test"))
         self.assertEqual(Path(status["job"]["workspace"]).resolve(), self.workspace.resolve())
