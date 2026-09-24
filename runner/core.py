@@ -1388,7 +1388,8 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                 "SELECT 1 FROM questions WHERE request_id=? AND qid=? AND status='pending'",
                 (request_id, cb_qid)).fetchone() is not None
             if still_open and not planner_answer:
-                planner_reason = harness.callback_failure_reason(kind, rc, stdout_text, dict(job_row))
+                planner_reason = harness.callback_failure_reason(
+                    kind, rc, stdout_text, dict(job_row), inv_meta)
         if planner_reason:
             con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
                         " AND status NOT IN ('succeeded','failed','cancelled')",
@@ -2095,9 +2096,10 @@ def exhaustion_context(state_dir, request_id: str) -> dict:
 
 JOB_KINDS = ("ordinary", "experiment", "replay")
 # The planner callback resumes the saved planner session in its own
-# harness (Claude --resume, Codex exec resume, OpenCode run --session);
-# a harness without a usable resume path answers from a fresh session
-# seeded with the stored handoff summary.
+# harness (Claude --resume, Codex exec resume, OpenCode run --session,
+# Grok Build --resume read-only in the user's own Grok home); only an
+# explicit recorded fallback for an unresumable Grok session answers
+# from a fresh read-only session seeded with the stored handoff summary.
 PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok")
 
 

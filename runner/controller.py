@@ -1152,6 +1152,34 @@ def _planner_meta(qid: str, question: str, route: str | None) -> dict:
     return meta
 
 
+def _record_grok_planner_fallback(state_dir, request_id: str, qid: str,
+                                    resume_error: str | None,
+                                    fallback_session: str | None) -> None:
+    """Explicit ledger event for a Grok planner fallback answer.
+
+    The fallback invocation's own metadata already carries
+    ``grok_resume=fallback`` with the resume error, and its child row
+    records the fresh session; this event keeps the same facts where
+    status and result readers look. Never raises past the caller.
+    """
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        core._event(con, request_id, "grok_planner_fallback",
+                    {"qid": qid,
+                     "resume_error": str(resume_error or "")[:300],
+                     "fallback_session": str(fallback_session or "")[:24]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
 def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
                              cmd, rc: int, err: str,
                              answer: str | None, ok: bool, error: str | None,
@@ -1206,13 +1234,13 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
     """Persist question before waking the planner; persist answer before resume.
 
     The planner wakes automatically in its own harness without human
-    action: Claude, Codex, and OpenCode resume the exact saved session,
-    while a harness without a usable resume path (such as Grok Build)
-    answers from a fresh session seeded with the stored handoff summary.
-    Never forks a new planner session except for that fresh fallback. A
-    busy planner, a failed callback, or a resumed result from another
-    session becomes a durable blocked state with a reason; the question
-    stays pending for ``answer`` + recover.
+    action: Claude, Codex, OpenCode, and Grok Build resume the exact
+    saved session (Grok read-only in the user's own Grok home). Only an
+    unresumable Grok session falls back once to a fresh read-only
+    session, recorded explicitly as a fallback. Never forks a new
+    planner session otherwise. A busy planner, a failed callback, or a
+    resumed result from another session becomes a durable blocked state
+    with a reason; the question stays pending for ``answer`` + recover.
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -1270,19 +1298,67 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
             parsed.get("error"), parsed.get("session_id"), planner_session,
             check_identity=True, meta=_planner_meta(qid, question, None))
     if harness_name == "grok":
-        # No usable resume path: a fresh Grok session answers from the
-        # handoff summary carried in the question above. Its new session
-        # ID is recorded as the answer's source, never as a resume.
-        cmd, _env = adapters.build_grok_cmd(question, workspace)
+        # The Grok planner callback resumes the saved planner session
+        # read-only in the user's own Grok home (never a runner kit),
+        # and the answer counts only from that same session. A resume
+        # the CLI cannot run falls back once to a fresh read-only
+        # session, recorded explicitly as a fallback; a result from
+        # another session never falls back and blocks as a mismatch.
+        try:
+            cmd = adapters.build_grok_planner_cmd(planner_session, question, workspace)
+        except ValueError as e:
+            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
+            return {"action": "blocked", "reason": "planner_resume_refused"}
         rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_GROK_CALLBACK,
                                meta=_planner_meta(qid, question, None))
         grok_h = harnesses.harness_named("grok")
         parsed = grok_h.parsed_planner_result(harnesses.KIND_GROK_CALLBACK, out)
-        return _finish_planner_callback(
-            state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
-            cmd, rc, err, parsed.get("text"), bool(parsed.get("ok")),
-            parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=False, meta=_planner_meta(qid, question, None))
+        if rc == 0 and parsed.get("ok"):
+            # Success or mismatch alike: the identity check decides, and a
+            # reported mismatch stays a mismatch (no fallback hides it).
+            return _finish_planner_callback(
+                state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
+                cmd, rc, err, parsed.get("text"), True,
+                parsed.get("error"), parsed.get("session_id"), planner_session,
+                check_identity=True, meta=_planner_meta(qid, question, None))
+        resume_error = parsed.get("error") or f"rc={rc}"
+        try:
+            fallback_cmd = adapters.build_grok_planner_fallback_cmd(question, workspace)
+        except ValueError as e:
+            _persist_error_evidence(state_dir, request_id,
+                                    {"source": harnesses.KIND_GROK_CALLBACK,
+                                     "resume_error": resume_error,
+                                     "fallback_error": str(e)[:300]})
+            _mark_blocked(state_dir, request_id,
+                          f"grok_planner_resume_failed: {resume_error}; fallback refused: {e}")
+            return {"action": "blocked", "reason": "grok_planner_resume_failed"}
+        fallback_meta = _planner_meta(qid, question, None)
+        fallback_meta["grok_resume"] = "fallback"
+        fallback_meta["resume_error"] = str(resume_error)[:300]
+        frc, fout, ferr = run_cmd(fallback_cmd, workspace, None,
+                                  kind=harnesses.KIND_GROK_CALLBACK,
+                                  meta=fallback_meta)
+        fparsed = grok_h.parsed_planner_result(harnesses.KIND_GROK_CALLBACK, fout)
+        ftext = fparsed.get("text")
+        if frc == 0 and fparsed.get("ok") and isinstance(ftext, str) and ftext.strip():
+            _record_grok_planner_fallback(state_dir, request_id, qid,
+                                          str(resume_error),
+                                          fparsed.get("session_id"))
+            return _finish_planner_callback(
+                state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
+                fallback_cmd, frc, ferr, ftext.strip(), True,
+                fparsed.get("error"), fparsed.get("session_id"), planner_session,
+                check_identity=False, meta=fallback_meta)
+        fallback_error = fparsed.get("error") or f"rc={frc}"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": harnesses.KIND_GROK_CALLBACK,
+                                 "resume_error": resume_error,
+                                 "resume_stderr": (err or "")[-500:],
+                                 "fallback_error": fallback_error,
+                                 "stderr": (ferr or "")[:1000]})
+        _mark_blocked(state_dir, request_id,
+                      f"grok_planner_resume_failed: {resume_error}; fallback failed: {fallback_error}")
+        return {"action": "blocked", "reason": "grok_planner_resume_failed"}
     busy = [] if asked else adapters.planner_session_in_use(
         planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
     if busy:
@@ -2955,7 +3031,8 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
                              run_cmd) -> dict:
     """Persist question -> wake the saved planner in its own harness ->
     persist answer -> resume exact Luna task. Never forks a session
-    (except the fresh fallback for a harness without resume).
+    (except the explicit recorded fallback for an unresumable Grok
+    session).
     An answer already persisted (public ``answer`` or earlier callback)
     is used without asking the planner again.
     """

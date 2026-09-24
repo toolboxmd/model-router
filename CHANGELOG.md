@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.32.0] - 2026-09-25
+
+### Added
+
+- Grok planner callbacks resume the saved planner session read-only (`grok --resume` with no tools, plan permission mode, no subagents, no web access) in the user's own Grok home, with the answer counting only from that same session; an unresumable session falls back once to a fresh read-only session recorded explicitly as a fallback, and a result from another session blocks as a mismatch (policy 2.8.0)
+
 ## [0.31.2] - 2026-09-25
 
 ### Changed
