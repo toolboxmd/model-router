@@ -90,6 +90,18 @@ carry an optional `links` array of `{"rel": "...", "href": "..."}` objects
 (references for the worker, kept verbatim in the stored task); it changes no
 routing and needs no runner flag.
 
+For Agent Observer, the task JSON may carry `observer_task_id`, a stable opaque
+task identifier such as `project:issue-42`. Related jobs use the same value,
+while their request IDs remain distinct. Use the existing Observer identity;
+do not infer it from a shared session or an Issue URL. The existing task envelope preserves
+this field with the job and its invocations; changing it under an existing
+request ID conflicts like any other payload change. No extra CLI flag or
+Observer runtime dependency is required. Observer consumes this explicit
+ownership, keeps missing identity visible through its legacy per-job task,
+and owns attribution and pricing. The field does not assign the planner's
+whole session or establish acceptance. The coordinator captures that session's
+genuine submissions and outcome evidence through Observer's CLI.
+
 `capacity` lists remembered route capacity with its original provider
 evidence, plus the latest usage-probe Reading per pool, model, and window.
 `--clear ROUTE` is an operator action after checking the provider

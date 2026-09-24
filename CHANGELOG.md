@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.29.1] - 2026-09-24
+
+### Changed
+
+- Carry Observer task identity across related Router jobs
+
 ## [0.29.0] - 2026-09-24
 
 ### Added
