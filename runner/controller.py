@@ -282,6 +282,29 @@ def _mark_blocked(state_dir, request_id: str, reason: str, extra: dict | None = 
     return core.get_job(state_dir, request_id)
 
 
+def _block_runtime_missing(state_dir, request_id: str, kind: str,
+                           cmd: list[str], meta: dict | None) -> dict | None:
+    """Recoverable block when a turn provably never started for a missing runtime.
+
+    Returns the blocked outcome when the action's latest row carries
+    explicit never-started runtime-missing evidence, else None. The reason
+    names the concrete cause and the next action (run recover on the
+    installed runtime); the planner is never asked to restore cache
+    directories. Rows without the explicit marker keep their existing
+    handling, however empty their output is.
+    """
+    detail = core.runtime_missing_for_action(state_dir, request_id, kind, cmd, meta)
+    if not detail:
+        return None
+    cause = detail.get("cause") or "old runtime path is gone; no supervisor or child started"
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": kind, "rc": 127, "error": cause})
+    reason = (f"runtime_missing: {cause}; run recover on the installed runtime "
+              "(do not restore cache directories)")
+    _mark_blocked(state_dir, request_id, reason)
+    return {"action": "blocked", "reason": "runtime_missing"}
+
+
 def _save_codex_task(state_dir, request_id: str, task_id: str,
                      model: str = adapters.CODEX_MODEL,
                      effort: str = adapters.CODEX_EFFORT,
@@ -913,6 +936,16 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
         if task_id:
             out_blocked["codex_task_id"] = task_id
         return out_blocked
+    # A turn that provably never started for a missing runtime blocks
+    # recoverably instead of falling through to signal classification,
+    # the OpenCode fallback, or a sticky dispatch failure.
+    runtime_blocked = _block_runtime_missing(
+        state_dir, request_id, "codex_dispatch", cmd,
+        {"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
+    if runtime_blocked is not None:
+        if task_id:
+            runtime_blocked["codex_task_id"] = task_id
+        return runtime_blocked
     if not task_id:
         stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
                                           prompt, run_cmd, out, err, cmd, rc)
@@ -1031,17 +1064,22 @@ def _dispatch_on_opencode(state_dir, request_id: str, route: str, prompt: str, r
     oc_h = harnesses.harness_named("opencode")
     model, variant, agent = policy.opencode_route_params(route)
     cmd = adapters.build_opencode_serve_cmd()
+    oc_meta = {"prompt": prompt, "allowance": policy.route_allowance(route),
+               "model": model, "variant": variant, "agent": agent,
+               "session_id": session_id, "seq": _load_controller_state(job).get("seq", 0),
+               "stage": "dispatch", "route": route, "reason": reason}
     rc, out, err = run_cmd(cmd, job["workspace"], None, kind="opencode_control",
-                           meta={"prompt": prompt, "allowance": policy.route_allowance(route),
-                                 "model": model, "variant": variant, "agent": agent,
-                                 "session_id": session_id, "seq": _load_controller_state(job).get("seq", 0),
-                                 "stage": "dispatch", "route": route, "reason": reason})
+                           meta=oc_meta)
     full = oc_h.parse_report("opencode_control", out, cmd) or {}
     got_session, _skind = oc_h.parse_session("opencode_control", out, err, job)
     got_session = got_session or full.get("opencode_session_id")
     _record_child(state_dir, request_id, "opencode_control", cmd, rc, session_id=got_session,
                   output_text=json.dumps({k: full.get(k) for k in ("ok", "rc", "finish", "actual_model")},
                                          sort_keys=True))
+    runtime_blocked = _block_runtime_missing(state_dir, request_id, "opencode_control",
+                                             cmd, oc_meta)
+    if runtime_blocked is not None:
+        return runtime_blocked
     if not got_session:
         _persist_error_evidence(state_dir, request_id, {"source": route, "rc": rc, "error": full.get("error")})
         _mark_blocked(state_dir, request_id, f"dispatch_failed rc={rc}: no dispatcher session on {route}")
@@ -1322,6 +1360,13 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     if _mm_reason is not None:
         _mark_blocked(state_dir, request_id, _mm_reason)
         return {"action": "blocked", "reason": _mm_reason}
+    # A resume that provably never started for a missing runtime blocks
+    # recoverably instead of the sticky turn-not-completed failure.
+    runtime_blocked = _block_runtime_missing(
+        state_dir, request_id, "codex_resume", cmd,
+        {"stage": "dispatch", "route": active, "reason": "resume"})
+    if runtime_blocked is not None:
+        return runtime_blocked
     if not codex_h.turn_ok("codex_resume", rc, out, cmd):
         # A stall the supervisor ended for stream silence stays stalled,
         # never auth: command output quoting auth-pattern text is not

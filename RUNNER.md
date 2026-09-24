@@ -618,6 +618,24 @@ result. File-backed output survives controller death.
 - `blocked` jobs never restart through `recover`, except for recover's own
   ownership blocks, which it re-evaluates. A planner-question block clears
   through `answer`. `cancel` works on any non-terminal job.
+- Runtime recovery: when the installed plugin runtime disappears between
+  turns (an update removes the old plugin-cache path), the next spawn
+  fails before any child exists. That failure is recorded with explicit
+  never-started evidence naming the missing path, and the dispatcher turn
+  blocks as `runtime_missing` with `recover` as the next action. `recover`
+  resolves the currently installed runtime, checks explicitly that it can
+  read the stored job and invocation state (controller state parses,
+  job policy matches, route known, no newer schema, invocation metas
+  parse), and records the actual runtime and policy before and after
+  (`runtime_assessed`, `runtime_recovered`, visible in `status` under
+  `runtime`). Compatible recovery preserves the job, task, session, and
+  route identities and restarts the controller to remake only the
+  never-started action; live children are adopted, never interrupted, and
+  ownership is established before any transfer. Unsupported state blocks
+  as `runtime_incompatible` with its specific reason and retains the
+  work: no migration, no route substitution, no replay of live,
+  successful, or uncertain actions. Other spawn failures (a missing job
+  workspace, a bad command) keep their sticky semantics.
 - `cancel` and timeouts signal every proven child and supervisor group and
   keep the workspace claimed until they are confirmed dead. If ownership
   stays unresolved, the job blocks and `recover` finalizes it once the

@@ -46,3 +46,5 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Completion refusal | A completion envelope refused while the latest implementation turn's proof failed (`completion_refused: proof failed rc=<n>`); the evidence returns to the dispatcher once, then the job blocks with that reason. | completion block |
 | Resumed context | A callback's measured input, cache-read, and cache-creation tokens on its `claude_callback` invocation, visible per job in the Observer mapping. | cached context |
 | Policy | The versioned data in `runner/policy.py` that defines pools, routes, stages, windows, and signal classes. The skill table is rendered from it. | config |
+| Installed runtime | The plugin directory holding `bin/model-router` and `runner/` that a controller or supervisor runs from, with its package version, policy, and schema. Recovery continues on the currently installed one. | plugin cache |
+| Never-started failure | A spawn error witnessed before any child existed, persisted with explicit evidence. Only the missing-runtime cause is recoverable; other causes keep sticky semantics. | spawn error |
