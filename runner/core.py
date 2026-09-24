@@ -1006,6 +1006,11 @@ def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
         kind = kind or _infer_invocation_kind(cmd)
         return _durable_run(state_dir, request_id, owner_token, kind,
                             cmd, cwd=cwd, timeout=timeout, meta=meta)
+    # Terminal-report delivery never rides this closure (see
+    # controller._send_report_turn): a read-only notification needs no
+    # supervised invocation, and a durable row on a blocked job would race
+    # recover's ownership reconciliation.
+    run_cmd.is_durable_runner = True  # type: ignore[attr-defined]
     return run_cmd
 
 
@@ -5601,7 +5606,8 @@ def status_view(state_dir, request_id: str) -> dict:
         st = json.loads(job_public.get("controller_state") or "{}") or {}
     except ValueError:
         st = {}
-    job_public["controller_state"] = {k: st.get(k) for k in ("phase", "last_action_name", "seq")}
+    job_public["controller_state"] = {k: st.get(k) for k in ("phase", "last_action_name", "seq",
+                                                          "terminal_report")}
     try:
         le = json.loads(job_public.get("last_error_json") or "null")
     except ValueError:

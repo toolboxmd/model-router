@@ -774,7 +774,10 @@ def wait_planner_quiet(planner_session_id: str, quiet: float = 5.0,
 def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int]:
     """PIDs of running ``claude`` processes naming this session in argv.
 
-    Detects a planner started with ``--session-id``/``--resume``. An
+    Detects a planner started with ``--session-id``/``--resume``. A live
+    T3 thread passes ``--session-id=<SID>`` as one token, so both the
+    separate-token form (``--resume SID``) and the joined form
+    (``--session-id=<SID>``, ``--resume=<SID>``) match. An
     interactive session opened without the ID in argv is not visible.
     """
     if not planner_session_id:
@@ -785,6 +788,7 @@ def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int
     except Exception:
         return []
     found = []
+    joined = (f"--session-id={planner_session_id}", f"--resume={planner_session_id}")
     for line in out.splitlines():
         line = line.strip()
         pid_s, _, command = line.partition(" ")
@@ -798,7 +802,7 @@ def planner_session_in_use(planner_session_id: str, exclude_pids=()) -> list[int
         # Native binary, or an interpreter/shell wrapper running it.
         if not any(os.path.basename(a) == CLAUDE_BIN for a in argv[:3]):
             continue
-        if planner_session_id in argv:
+        if planner_session_id in argv or any(t in joined for t in argv):
             found.append(pid)
     return found
 

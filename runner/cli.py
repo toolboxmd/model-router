@@ -30,7 +30,7 @@ import json
 import os
 import sys
 
-from . import core, policy
+from . import controller, core, policy
 
 
 def _state_dir(args) -> str:
@@ -197,12 +197,33 @@ def main(argv=None) -> int:
             return _out({"acknowledged": True, "qid": q["qid"], "status": q["status"]})
         if args.cmd == "cancel":
             job = core.cancel(sd, args.request_id)
+            # A cancelled job has no controller step left to report it:
+            # wake the saved planner once through the existing callback
+            # path. Best-effort: the cancellation already persisted above.
+            try:
+                controller.deliver_terminal_report(sd, args.request_id)
+            except Exception:
+                pass
+            job = core.get_job(sd, args.request_id)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"]})
         if args.cmd == "recover":
             if args.all:
-                return _out({"recovered": core.recover_all(sd)})
-            return _out(core.recover_one(sd, args.request_id))
+                recovered = core.recover_all(sd)
+                for entry in recovered:
+                    try:
+                        rid = (entry or {}).get("request_id")
+                        if rid:
+                            controller.deliver_terminal_report(sd, rid)
+                    except Exception:
+                        continue
+                return _out({"recovered": recovered})
+            out = core.recover_one(sd, args.request_id)
+            try:
+                controller.deliver_terminal_report(sd, args.request_id)
+            except Exception:
+                pass
+            return _out(out)
     except (core.NotFoundError, core.ConflictError, core.WorkspaceConflictError,
             core.TerminalError, core.BlockedError, core.OwnershipError,
             core.RunnerError, ValueError) as e:

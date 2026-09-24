@@ -234,6 +234,16 @@ allowance; the runner never invents a reset time.
     correction and recovery update that PR, never open a second, and the
     worker prompt carries it. Recovery refuses the same way when it
     consumes a completion.
+    Every terminal state (succeeded, blocked, failed, cancelled) then wakes
+    the saved planner once with an end-of-job report through the same
+    callback path (Claude resume, Codex `exec resume`, OpenCode
+    `run --session`, Grok fresh session from the handoff summary). The
+    report carries the request id, terminal status, PR URL or reason, and
+    handoff summary; a succeeded report says ready to merge with the PR
+    URL. Delivery runs after the terminal persist and never changes the
+    job's status or result. A busy planner retries within a bounded window;
+    the delivery outcome is recorded on the job and visible in `status`,
+    and recovery sends no duplicate.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
 but cannot edit. The controller runs at most 12 transitions per launch and

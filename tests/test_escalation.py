@@ -563,6 +563,12 @@ class TestPublicStepBudgetDrill(unittest.TestCase):
             core.get_job(sd, rid)), 90), core.get_job(sd, rid))
         job = core.get_job(sd, rid)
         self.assertEqual(controller._load_controller_state(job).get("steps_total"), 12)
+        # The controller delivers the Issue #94 terminal report before it
+        # releases the lease; recover only after release so it resumes the
+        # job instead of adopting the still-exiting controller.
+        self.assertTrue(wait_for(lambda: core.get_job(sd, rid).get("owner_token") is None,
+                                 90),
+                        core.get_job(sd, rid))
         rc, rec, err = cli(sd, "recover", "--request-id", rid, env=env)
         self.assertEqual(rc, 0, err)
         self.assertEqual(rec.get("action"), "resumed-controller", rec)

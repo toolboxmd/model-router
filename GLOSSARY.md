@@ -45,6 +45,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Tools called | Distinct tool part names observed in the turn's assistant messages (empty on text-only turns). | tool usage |
 | Experiment, replay | A job run to test a policy change, or to repeat an earlier job under a new policy; never counted as ordinary work. | benchmark |
 | Handoff summary | The durable summary stored on the job at submit (explicit or derived from the task packet) and carried before every callback question; the Astra fallback answers from it in a fresh session with no resume. | handoff note |
+| Terminal report | The once-per-terminal-state end-of-job notice to the saved planner (request id, status, PR URL or reason, handoff summary); recorded on the job, never changing its status or result. | notification |
 | Proof command | The task's own proof, run through `/bin/sh -c` in the workspace with the runner's environment; `proof.log` records the exact command and exit code. | proof script |
 | Completion refusal | A completion envelope refused while the latest implementation turn's proof failed (`completion_refused: proof failed rc=<n>`); the evidence returns to the dispatcher once, then the job blocks with that reason. | completion block |
 | Resumed context | A callback's measured input, cache-read, and cache-creation tokens on its `claude_callback` invocation, visible per job in the Observer mapping. | cached context |
