@@ -620,6 +620,37 @@ result. File-backed output survives controller death.
 - `blocked` jobs never restart through `recover`, except for recover's own
   ownership blocks, which it re-evaluates. A planner-question block clears
   through `answer`. `cancel` works on any non-terminal job.
+- Runtime recovery: when the installed plugin runtime disappears between
+  turns (an update removes the old plugin-cache path), the next spawn
+  fails before any child exists. That failure is recorded with explicit
+  never-started evidence naming the missing path, and the dispatcher,
+  worker, and planner-callback turns block as `runtime_missing` with
+  `recover` as the next action instead of an opaque sticky failure or a
+  ladder move: the cause names the missing path and the recovery action,
+  the explicit route is never substituted, and a never-started repairable
+  action is never counted as an ordinary provider failure. Only the
+  newest attempt for an action decides: an older missing-runtime row
+  never reblocks a newer completed or superseding attempt, so a repaired
+  retry stays repaired. `recover` resolves the currently installed
+  runtime, checks explicitly that it can read the stored job and
+  invocation state (controller state parses, job policy matches, route
+  known, no newer schema, invocation metas parse), and records the
+  actual runtime and policy before and after (`runtime_assessed`,
+  `runtime_recovered`, visible in `status` under `runtime`; terminal
+  jobs are not assessed). The compatibility decision gates only
+  execution handoffs (starting a replacement controller): live children
+  are adopted, never interrupted, and ownership is established before
+  any transfer. Compatible recovery preserves the job, task, session,
+  and route identities and restarts the controller to remake only the
+  never-started action. Unsupported state blocks as
+  `runtime_incompatible` with its specific reason and retains the
+  work: no migration, no route substitution, no replay of live,
+  successful, or uncertain actions. Policy compatibility is by policy
+  identity (`POLICY_ID`): the recorded `POLICY_VERSION` is provenance,
+  and a minor policy revision (such as 2.7.0 to 2.7.1) stays
+  recoverable by design; anything else keeps its specific
+  incompatibility. Other spawn failures (a missing job workspace, a bad
+  command) keep their sticky semantics.
 - `cancel` signals every proven child and supervisor group and
   keeps the workspace claimed until they are confirmed dead. If ownership
   stays unresolved, the job blocks and `recover` finalizes it once the

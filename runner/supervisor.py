@@ -226,8 +226,13 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
                     f.close()
             except Exception:
                 pass
+        # Popen raised before exec: the child provably never started. The
+        # marker records that truth; without a runtime cause it keeps the
+        # existing sticky semantics (only a missing runtime is repairable
+        # by recovery onto the installed runtime).
         _finish(state_dir, invocation_id, request_id, 127, "failed", None, None,
-                extra_result={"error": f"spawn failed: {type(e).__name__}: {str(e)[:200]}"})
+                extra_result={"never_started": True,
+                              "error": f"spawn failed: {type(e).__name__}: {str(e)[:200]}"})
         return 127
 
     pid = proc.pid

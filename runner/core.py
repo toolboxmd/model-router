@@ -31,6 +31,7 @@ from pathlib import Path
 from . import adapters
 from . import harnesses
 from . import policy
+from . import runtime
 from . import store
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -245,7 +246,7 @@ _PKG_ROOT = str(Path(__file__).resolve().parents[1])
 RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "unknown worker ownership", "live invocation",
                         "orphaned server", "timeout_pending", "cancellation_pending",
-                        "controller_step_budget_exhausted")
+                        "controller_step_budget_exhausted", "runtime_missing")
 # Steps across every launch of one job; a launch has MAX_LOOP_STEPS of them.
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
@@ -589,15 +590,21 @@ def _prior_action_result(state_dir, request_id: str, key: str):
 
     Raises OwnershipError while an attempt for the same action is live,
     orphaned, or unresolved: a second copy would be a duplicate writer.
+    Rows with explicit never-started runtime-missing evidence are skipped:
+    the installed runtime repairs exactly that cause, so the same action
+    is made fresh instead of memoized. Every other failed row keeps its
+    memoization; live, successful, and uncertain actions are never replayed.
     """
     prior = [i for i in _list_invocations(state_dir, request_id)
-             if i.get("action_key") == key and i.get("state") != "abandoned"]
+             if i.get("action_key") == key and i.get("state") != "abandoned"
+             and not runtime.is_runtime_missing_row(i)]
     if not prior:
         return None
     if any(_invocation_ownership(i) == "never_started" for i in prior):
         _abandon_never_started(state_dir, request_id, lock_holder=True)
         prior = [i for i in _list_invocations(state_dir, request_id)
-                 if i.get("action_key") == key and i.get("state") != "abandoned"]
+                 if i.get("action_key") == key and i.get("state") != "abandoned"
+                 and not runtime.is_runtime_missing_row(i)]
         if not prior:
             return None
     for inv in prior:
@@ -630,7 +637,8 @@ def _prior_action_result(state_dir, request_id: str, key: str):
     if any(i.get("state") in LIVE_INVOCATION_STATES for i in prior):
         consume_finished_invocations(state_dir, request_id)
         prior = [i for i in _list_invocations(state_dir, request_id)
-                 if i.get("action_key") == key and i.get("state") != "abandoned"]
+                 if i.get("action_key") == key and i.get("state") != "abandoned"
+                 and not runtime.is_runtime_missing_row(i)]
     done = [i for i in prior if i.get("state") == "completed" and i.get("rc") == 0]
     failed = [i for i in prior if i.get("state") != "completed" or i.get("rc") != 0]
     pick = done[-1] if done else (
@@ -782,6 +790,13 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
         _meta_store["kit_hash"] = _kit_hash
     if _dir_session_id:
         _meta_store["direction_session_id"] = _dir_session_id
+    # Runtime provenance travels on every invocation so recovery can name
+    # the runtime that actually ran before a transfer. It is added after
+    # the action key is computed, so retries keep one identity.
+    try:
+        _meta_store["runtime"] = runtime.installed_runtime()
+    except Exception:
+        pass
     # Key redaction cannot see inside free-text values (for example a
     # credential in the task prompt), so mask secret shapes as well. No
     # truncation: the supervisor re-reads this prompt from the ledger.
@@ -811,13 +826,22 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
         if other is not None:
             con.execute("ROLLBACK")
             raise OwnershipError(f"job {request_id}: invocation {other['invocation_id'][:8]} still owns the job")
-        if con.execute("SELECT 1 FROM invocations WHERE request_id=? AND action_key=?"
-                       " AND state != 'abandoned'", (request_id, key)).fetchone() is not None:
+        rows = con.execute("SELECT invocation_id, result_json FROM invocations"
+                           " WHERE request_id=? AND action_key=? AND state != 'abandoned'",
+                           (request_id, key)).fetchall()
+        live_rows = [r for r in rows
+                     if not runtime.is_runtime_missing_row({"result_json": r["result_json"]})]
+        if live_rows:
             con.execute("ROLLBACK")
             reused = _prior_action_result(state_dir, request_id, key)
             if reused is not None:
                 return reused
             raise OwnershipError(f"job {request_id}: action already has an attempt; run recover")
+        # Only never-started runtime-missing rows remain for this action:
+        # the installed runtime repairs exactly that cause, so this
+        # controller makes the action fresh under the write lock. The
+        # check and the insert below are one atomic transaction, so two
+        # controllers cannot both pass it.
         try:
             _skills_json = json.dumps(_kit_skills, sort_keys=True)
         except Exception:
@@ -868,17 +892,38 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             start_new_session=True, close_fds=True, cwd=_PKG_ROOT,
         )
     except OSError as e:
+        # Popen raised before any supervisor or child existed: this action
+        # provably never started. Only a missing runtime root is repairable
+        # (recovery continues on the installed runtime); every other spawn
+        # error keeps the existing sticky semantics. The evidence on the row
+        # decides, never empty output.
+        diag = runtime.diagnose_spawn_error(e)
+        now = _utcnow()
+        payload = {"never_started": True,
+                   "runtime_missing": bool(diag.get("runtime_missing")),
+                   "error": diag.get("cause"),
+                   "runtime": runtime.installed_runtime()}
+        detail = {"invocation_id": invocation_id[:16], "kind": kind,
+                  "never_started": True,
+                  "runtime_missing": bool(diag.get("runtime_missing")),
+                  "cause": diag.get("cause"),
+                  "next_action": "recover"}
         con = store.connect(state_dir)
         try:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
-                "UPDATE invocations SET state='failed', rc=127, ended_at=?, consumed_at=? WHERE invocation_id=?",
-                (_utcnow(), _utcnow(), invocation_id),
+                "UPDATE invocations SET state='failed', rc=127, ended_at=?, consumed_at=?,"
+                " result_json=? WHERE invocation_id=?",
+                (now, now, json.dumps(payload, sort_keys=True), invocation_id),
             )
+            _event(con, request_id, "supervisor_spawn_failed", detail)
             con.execute("COMMIT")
         finally:
             con.close()
         _measure_invocation(state_dir, request_id, invocation_id)
+        if diag.get("runtime_missing"):
+            return 127, "", (f"runtime_missing: {diag.get('cause')}; run recover "
+                             "on the installed runtime (do not restore cache directories)")
         return 127, "", f"supervisor spawn failed: {e}"
 
     # The supervisor records its own PID and start identity when it claims
@@ -961,6 +1006,43 @@ def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
         return _durable_run(state_dir, request_id, owner_token, kind,
                             cmd, cwd=cwd, timeout=timeout, meta=meta)
     return run_cmd
+
+
+def runtime_missing_for_action(state_dir, request_id: str, kind: str,
+                               cmd: list[str], meta: dict | None) -> dict | None:
+    """Never-started runtime-missing evidence for one action, if still current.
+
+    Recomputes the action key exactly as :func:`_durable_run` did and
+    returns the newest matching row's persisted ``{"cause": ...}`` detail,
+    but only when that newest non-abandoned row itself carries explicit
+    runtime-missing evidence. An older missing-runtime row never wins
+    after a newer attempt for the same action completed, failed
+    otherwise, or otherwise superseded it: the repaired retry must not
+    be reblocked by the stale row it already repaired. Callers use it
+    to trade an opaque sticky failure for a recoverable
+    ``runtime_missing`` block. Rows without the explicit marker never
+    count, however empty their output is.
+    """
+    try:
+        key = _action_key(kind, cmd, meta)
+    except Exception:
+        return None
+    matches = [i for i in _list_invocations(state_dir, request_id)
+               if i.get("action_key") == key and i.get("state") != "abandoned"]
+    if not matches:
+        return None
+    row = matches[-1]
+    if not runtime.is_runtime_missing_row(row):
+        return None
+    try:
+        obj = json.loads(row.get("result_json") or "null")
+    except ValueError:
+        obj = None
+    detail = dict(obj) if isinstance(obj, dict) else {}
+    if not detail.get("cause"):
+        detail["cause"] = detail.get("error") or \
+            "old runtime path is gone; no supervisor or child started"
+    return detail
 
 
 def _list_invocations(state_dir, request_id: str,
@@ -1281,11 +1363,15 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                         (planner_reason, now, request_id))
             _event(con, request_id, "blocked", {"reason": planner_reason[:120]})
             applied = "blocked"
-        elif not model_gate_applied and live_job and is_dispatch and (not turn_ok or not thread_ok):
+        elif not model_gate_applied and live_job and is_dispatch and (not turn_ok or not thread_ok) \
+                and not runtime.is_runtime_missing_row(inv):
             # The controller would have blocked on this result; recovery
             # records the same durable, sticky reason instead of leaving
             # the job running without an owner. Muse turns are left to the
             # restarted controller, which may switch routes on evidence.
+            # A row with explicit never-started runtime-missing evidence is
+            # exempt: the restarted controller remakes that action fresh on
+            # the installed runtime instead of inheriting a sticky block.
             reason = (f"luna_task_mismatch: consumed {kind} reported {str(sid or 'no thread')[:24]}"
                       if turn_ok and not thread_ok else f"{kind}_failed rc={rc} (consumed by recovery)")
             con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
@@ -2242,6 +2328,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
             "planner_session": planner_session_id, "task_hash": thash,
+            "runtime": runtime.installed_runtime(),
         })
         con.execute("COMMIT")
     except Exception:
@@ -2914,6 +3001,99 @@ def _known_tokens(con: sqlite3.Connection, request_id: str) -> set[str]:
     return {r["start_token"] for r in rows}
 
 
+def _assess_runtime(state_dir, request_id: str) -> tuple[bool, str, dict | None, dict]:
+    """Assess stored state against the currently installed runtime.
+
+    Returns (compatible, reason, old_runtime, new_runtime) and records a
+    ``runtime_assessed`` event with the actual runtime and policy used
+    before and after. ``old_runtime`` is the newest provenance recorded
+    by submit or an invocation, or None when nothing recorded one:
+    reported as unknown, never invented. Only NotFoundError propagates;
+    any other assessment failure is reported as incompatibility so the
+    work is retained instead of migrated.
+    """
+    new = runtime.installed_runtime()
+    job = get_job(state_dir, request_id)
+    invs = _list_invocations(state_dir, request_id)
+    con = store.connect(state_dir)
+    try:
+        events = [dict(r) for r in con.execute(
+            "SELECT kind, payload_json FROM events WHERE request_id=? AND kind IN "
+            "('submitted','runtime_assessed','runtime_recovered') ORDER BY id",
+            (request_id,)).fetchall()]
+    finally:
+        con.close()
+    old = runtime.latest_provenance(invs, events)
+    try:
+        ok, reason = runtime.check_compatible(dict(job), invs)
+    except Exception as e:  # noqa: BLE001 - retain work, never migrate blind
+        ok, reason = False, (f"compatibility_check_failed: {type(e).__name__}: {e}; "
+                             "retaining work, refusing to migrate")
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _event(con, request_id, "runtime_assessed",
+               {"compatible": ok, "reason": reason,
+                "old_runtime": old, "new_runtime": new})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+    return ok, reason, old, new
+
+
+def _record_runtime_recovered(state_dir, request_id: str, old, new, trigger: str) -> None:
+    """Record a runtime transfer: provenance before and after, identities kept."""
+    try:
+        job = get_job(state_dir, request_id)
+    except NotFoundError:
+        return
+    payload = {"trigger": trigger, "old_runtime": old, "new_runtime": new,
+               "preserved": {"route": job.get("route"), "policy_id": job.get("policy_id"),
+                             "task_hash": job.get("task_hash"),
+                             "codex_task_id": bool(job.get("codex_task_id")),
+                             "opencode_session_id": bool(job.get("opencode_session_id")),
+                             "grok_session_id": bool(job.get("grok_session_id"))}}
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _event(con, request_id, "runtime_recovered", payload)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
+def _has_runtime_missing_failure(state_dir, request_id: str) -> bool:
+    """A dispatch action whose newest attempt never started for a missing runtime.
+
+    Grouped per action key: only the newest non-abandoned row decides.
+    An older missing-runtime row never counts after a newer attempt for
+    the same action completed or otherwise superseded it, so a repaired
+    retry stops reporting recovery once it succeeds (no false
+    ``runtime_recovered`` events on later recoveries).
+    """
+    by_key: dict[str, list[dict]] = {}
+    for i in _list_invocations(state_dir, request_id):
+        if i.get("state") == "abandoned" or not i.get("action_key"):
+            continue
+        by_key.setdefault(i["action_key"], []).append(i)
+    for rows in by_key.values():
+        newest = rows[-1]
+        if (_is_dispatch_row(newest) and newest.get("state") == "failed"
+                and runtime.is_runtime_missing_row(newest)):
+            return True
+    return False
+
+
 def recover_one(state_dir, request_id: str) -> dict:
     """Reconcile durable records with live ownership; resume only when safe."""
     root = store.ensure_state_dir(state_dir)
@@ -2924,6 +3104,26 @@ def recover_one(state_dir, request_id: str) -> dict:
     _stop_orphaned_invocations(state_dir, request_id)
     _abandon_never_started(state_dir, request_id)
     _reconcile_dead_invocations(state_dir, request_id)
+    # Terminal jobs are never resurrected and never assessed: recover
+    # --all must not add runtime_assessed noise to finished jobs.
+    terminal_status = get_job(state_dir, request_id)["status"]
+    if terminal_status in store.TERMINAL:
+        return {"request_id": request_id, "action": "noop-terminal",
+                "status": terminal_status}
+    # Runtime recovery assessment for live jobs only: resolve the
+    # currently installed runtime, decide explicitly whether it can read
+    # the stored job and invocation state as is, and record the actual
+    # runtime and policy before and after. It runs before output is
+    # consumed because measurement during consume stamps current schema
+    # markers: the check must see the stored rows as they are. The
+    # compatibility decision itself only gates execution handoffs
+    # (starting a replacement controller) further down; healthy owned
+    # work adopted there is never interrupted merely because an update
+    # occurred.
+    compat_ok, compat_reason, old_runtime, new_runtime = _assess_runtime(
+        state_dir, request_id)
+    # Consume finished child output exactly once before considering the
+    # controller lease gone. A completed child must not be rerun.
     consumed = consume_finished_invocations(state_dir, request_id)
     if any(c.get("action") == "completed" for c in consumed):
         return {"request_id": request_id, "action": "consumed-completion",
@@ -2931,7 +3131,6 @@ def recover_one(state_dir, request_id: str) -> dict:
     live_invocations = _any_live_invocation(state_dir, request_id)
     if live_invocations:
         _capture_invocation_sessions(state_dir, request_id, live_invocations)
-    unresolved_invocations = _any_unresolved_invocation(state_dir, request_id)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -2981,18 +3180,26 @@ def recover_one(state_dir, request_id: str) -> dict:
                     "status": "blocked", "reason": job["block_reason"]}
         # A dispatch whose supervisor could not spawn was closed as failed by
         # the controller; if that controller died before blocking the job,
-        # the job would sit running without an owner. Block it here.
+        # the job would sit running without an owner. Block it here, unless
+        # every failed dispatch row carries explicit never-started
+        # runtime-missing evidence: the installed runtime repairs exactly
+        # that cause, so recovery falls through and restarts the controller
+        # to remake the action fresh. Any other failure keeps its sticky
+        # block; live, successful, and uncertain actions are never replayed.
         if status in ("pending", "running") and not job["codex_task_id"]:
             failed_dispatch = [inv for inv in _list_invocations(state_dir, request_id)
                                if _is_dispatch_row(inv) and inv.get("state") == "failed"]
             live_or_open = [inv for inv in _list_invocations(state_dir, request_id)
                             if inv.get("state") in LIVE_INVOCATION_STATES]
             if failed_dispatch and not live_or_open:
-                mark_blocked(f"codex_dispatch_failed rc={failed_dispatch[-1].get('rc')} "
-                             "(consumed by recovery): the dispatch never started")
-                con.execute("COMMIT")
-                return {"request_id": request_id, "action": "blocked-failed-dispatch",
-                        "status": "blocked"}
+                retryable = bool(failed_dispatch) and all(
+                    runtime.is_runtime_missing_row(i) for i in failed_dispatch)
+                if not retryable:
+                    mark_blocked(f"codex_dispatch_failed rc={failed_dispatch[-1].get('rc')} "
+                                 "(consumed by recovery): the dispatch never started")
+                    con.execute("COMMIT")
+                    return {"request_id": request_id, "action": "blocked-failed-dispatch",
+                            "status": "blocked"}
         orphans_left = [inv for inv in _list_invocations(state_dir, request_id)
                         if _invocation_ownership(inv) == "orphaned"]
         if orphans_left:
@@ -3192,7 +3399,15 @@ def recover_one(state_dir, request_id: str) -> dict:
             if pending_q > 0 and status == "question_pending" and job["codex_task_id"] \
                     and int(job["attempts"]) < int(job["max_attempts"]):
                 # The controller asks the saved planner again through the
-                # same action identity: a finished callback is reused.
+                # same action identity: a finished callback is reused. The
+                # compatibility check gates this handoff: an unsupported
+                # state blocks with its specific reason instead of starting
+                # execution on state this runtime cannot read.
+                if not compat_ok:
+                    mark_blocked(f"runtime_incompatible: {compat_reason}")
+                    con.execute("COMMIT")
+                    return {"request_id": request_id, "action": "blocked-incompatible-runtime",
+                            "status": "blocked", "reason": compat_reason}
                 con.execute(
                     "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL, updated_at=? WHERE request_id=?",
                     (_utcnow(), request_id))
@@ -3221,9 +3436,14 @@ def recover_one(state_dir, request_id: str) -> dict:
             # child output is reused by action identity, never rerun.
             # A finished dispatch whose action was not saved yet is resumed
             # too: the new controller reuses that result by action key.
+            # A dispatch that provably never started for a missing runtime
+            # is resumed as well: its rows prove no child ran, so the new
+            # controller remakes the action fresh without duplicating.
             should_resume = bool(job["codex_task_id"]) or any(
                 _is_dispatch_row(i) and i.get("state") == "completed"
                 for i in _list_invocations(state_dir, request_id))
+            runtime_recovery = _has_runtime_missing_failure(state_dir, request_id)
+            should_resume = should_resume or runtime_recovery
             # Same-session recovery within budget: clear lease, keep planner
             # and executor session IDs, keep partial log. When a public
             # answer is waiting on a saved Luna task, recover resumes a
@@ -3239,6 +3459,18 @@ def recover_one(state_dir, request_id: str) -> dict:
                 con.execute("COMMIT")
                 return {"request_id": request_id, "action": "budget-exhausted",
                         "status": "failed"}
+            # The installed runtime reads this state only when the
+            # recovery-boundary check says so. Healthy owned work was
+            # adopted above and is never interrupted; here no controller
+            # or child is alive, so an unsupported state or policy
+            # transition blocks with its specific reason and retains the
+            # work instead of starting execution on unreadable state: no
+            # migration, no route substitution, no replay.
+            if not compat_ok:
+                mark_blocked(f"runtime_incompatible: {compat_reason}")
+                con.execute("COMMIT")
+                return {"request_id": request_id, "action": "blocked-incompatible-runtime",
+                        "status": "blocked", "reason": compat_reason}
             con.execute(
                 "UPDATE jobs SET owner_token=NULL, owner_pid=NULL,"
                 " status=?, updated_at=? WHERE request_id=?",
@@ -3247,6 +3479,9 @@ def recover_one(state_dir, request_id: str) -> dict:
             _event(con, request_id, "recovered-worker-dead", {"partial_preserved": True})
             con.execute("COMMIT")
             if should_resume:
+                if runtime_recovery:
+                    _record_runtime_recovered(state_dir, request_id, old_runtime,
+                                              new_runtime, "worker-dead")
                 try:
                     info = start_controller(state_dir, request_id)
                     return {"request_id": request_id, "action": "resumed-controller",
@@ -4509,7 +4744,22 @@ def status_view(state_dir, request_id: str) -> dict:
     if job_public.get("owner_token"):
         job_public["owner_token"] = "<redacted>"
     job_public["measurements"] = invocation_measurements(state_dir, request_id)
+    try:
+        installed = runtime.installed_runtime()
+    except Exception:
+        installed = {"root": None, "version": "unknown", "policy_id": None,
+                     "policy_version": None, "schema_version": None}
+    assessment = None
+    for e in events:
+        if e.get("kind") in ("runtime_assessed", "runtime_recovered"):
+            try:
+                assessment = {"kind": e.get("kind"),
+                              **(json.loads(e.get("payload_json") or "{}") or {})}
+            except ValueError:
+                assessment = {"kind": e.get("kind")}
+            break
     return {"job": job_public, "launches": launches, "questions": questions,
             "recent_events": events, "output_tail": tail,
             "capacity": list_capacity(state_dir),
-            "readings": list_readings(state_dir)}
+            "readings": list_readings(state_dir),
+            "runtime": {"installed": installed, "assessment": assessment}}
