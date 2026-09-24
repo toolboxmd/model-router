@@ -312,5 +312,171 @@ class TestLegacyTimeoutRecordedButUnenforced(unittest.TestCase):
         self.assertIsNone(inv["timeout_secs"])
 
 
+class TestIdleIncompleteTurnEndsOnStall(unittest.TestCase):
+    """Review finding 1: an OpenCode turn that goes idle after showing
+    activity, without a terminal assistant result, must end through the
+    existing stream-silence stall machinery, never poll forever. No
+    elapsed deadline is restored: genuine silence past the policy window
+    is the only time-based end, and live activity keeps the turn alive."""
+
+    def _run_mode(self, mode):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        bindir = base / "bin"
+        bindir.mkdir()
+        fake_state = base / "fakestate"
+        fake_state.mkdir()
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_STATE", "FAKE_OC_MODE",
+                                                "FAKE_OC_DELAY", "RUNNER_STALL_SECS")}
+        try:
+            os.environ["PATH"] = str(bindir) + os.pathsep + (saved["PATH"] or "")
+            os.environ["FAKE_STATE"] = str(fake_state)
+            os.environ["FAKE_OC_MODE"] = mode
+            # Small deterministic window for the supervisor subprocess
+            # (production uses the 180s policy default); the old 1800s
+            # per-turn cap is never waited out.
+            os.environ["RUNNER_STALL_SECS"] = "2"
+            core.submit(sd, "oc-idle", {"goal": "idle drill"}, str(ws), "planner")
+            con = store.connect(sd)
+            try:
+                con.execute("UPDATE jobs SET owner_token='tok' WHERE request_id='oc-idle'")
+            finally:
+                con.close()
+            self.addCleanup(_kill_groups, sd, "oc-idle")
+            run = core.make_durable_run_cmd(sd, "oc-idle", "tok")
+            started = time.monotonic()
+            res = controller.run_implementation(sd, "oc-idle", run_cmd=run)
+            elapsed = time.monotonic() - started
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return sd, res, elapsed
+
+    def _assert_stalled(self, sd, res, elapsed):
+        # Terminates on the stall machinery, far short of any old budget.
+        self.assertLess(elapsed, 30.0, res)
+        self.assertGreaterEqual(elapsed, 2.0, res)
+        self.assertEqual(res["action"], "stalled_retry", res)
+        last = json.loads(core.get_job(sd, "oc-idle")["last_error_json"] or "{}")
+        self.assertEqual(last.get("signal"), "stalled", last)
+        ev = last.get("evidence") or {}
+        self.assertEqual(ev.get("source"), "stream_silence", ev)
+        self.assertTrue(ev.get("idle_without_terminal_result"), ev)
+        self.assertTrue(last.get("idle_confirmed"), last)
+        self.assertIsNotNone(last.get("longest_silence_secs"), last)
+        report = json.loads(Path(res["report"]["report_path"]).read_text())
+        self.assertEqual(report["status"], "stalled", report)
+        inv = [i for i in core._list_invocations(sd, "oc-idle")
+               if i["kind"] == "opencode_control"][-1]
+        self.assertEqual(inv["terminal_class"], "stalled", inv)
+        self.assertIsNotNone(inv["longest_silence_secs"], inv)
+
+    def test_idle_with_incomplete_message_stalls(self):
+        sd, res, elapsed = self._run_mode("idle_incomplete")
+        self._assert_stalled(sd, res, elapsed)
+
+    def test_idle_with_no_new_message_stalls(self):
+        sd, res, elapsed = self._run_mode("idle_empty")
+        self._assert_stalled(sd, res, elapsed)
+
+
+class TestGrokSupervisorLossIsOwnership(unittest.TestCase):
+    """Review finding 2: a Grok turn whose supervisor exits without a
+    durable terminal result while the CLI child is still alive
+    (``core._durable_run`` rc 125) stays in ownership handling like the
+    124/143 paths. The dispatcher blocks instead of escalating a new
+    attempt behind the unsupervised child; no duplicate writer spawns,
+    no unknown process is killed, explicit cancellation still works."""
+
+    def test_rc125_blocks_like_rc124_without_a_second_writer(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        core.submit(sd, "g125", {"goal": "supervisor loss drill"}, str(ws),
+                    "planner-1", route="grok-4.6-build", lane="hard")
+        calls = []
+
+        def run(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            calls.append((cmd, kind))
+            # Faithful supervisor-loss shape: no durable result, rc 125,
+            # empty output so the harness parses no report.
+            return 125, "", ""
+
+        # An unrelated live process stands in for every unknown process:
+        # the ownership block must not kill it.
+        other = None
+        try:
+            import subprocess as _sp
+            other = _sp.Popen(["sleep", "30"])
+            res = controller.run_implementation(sd, "g125", run_cmd=run)
+        finally:
+            other_alive = (other is not None and other.poll() is None)
+            if other is not None:
+                other.terminate()
+                try:
+                    other.wait(timeout=5)
+                except Exception:
+                    try:
+                        other.kill()
+                    except Exception:
+                        pass
+        self.assertTrue(other_alive, "ownership handling must not kill unknown processes")
+        self.assertEqual(len(calls), 1, "no duplicate writer may spawn")
+        self.assertEqual(res["action"], "blocked", res)
+        self.assertEqual(res["reason"], "implementation_failed", res)
+        self.assertEqual(res["report"]["status"], "failed", res)
+        self.assertTrue(Path(res["report"]["report_path"]).exists())
+        job = core.get_job(sd, "g125")
+        self.assertEqual(job["status"], "blocked", job)
+        # Explicit cancellation still works after the ownership block.
+        core.cancel(sd, "g125")
+        self.assertEqual(core.get_job(sd, "g125")["status"], "cancelled")
+
+    def test_rc125_matches_rc124_and_rc1_still_fails(self):
+        for rc, action in ((124, "blocked"), (125, "blocked")):
+            tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+            self.addCleanup(tmp.cleanup)
+            base = Path(tmp.name)
+            sd = str(base / "state")
+            ws = base / "ws"
+            ws.mkdir()
+            core.submit(sd, "g%d" % rc, {"goal": "rc drill"}, str(ws),
+                        "planner-1", route="grok-4.6-build", lane="hard")
+
+            def run(cmd, cwd=None, timeout=None, kind=None, meta=None, _rc=rc):
+                return _rc, "", ""
+
+            res = controller.run_implementation(sd, "g%d" % rc, run_cmd=run)
+            self.assertEqual(res["action"], action, (rc, res))
+        # A genuine worker failure (rc 1 with an error report) still ends
+        # the turn failed for the escalation ladder, never blocked.
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = base / "ws"
+        ws.mkdir()
+        core.submit(sd, "g1", {"goal": "rc drill"}, str(ws),
+                    "planner-1", route="grok-4.6-build", lane="hard")
+
+        def fail(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            return 1, json.dumps({"type": "error",
+                                  "message": "context_length_exceeded: blown"}) + "\n", ""
+
+        res = controller.run_implementation(sd, "g1", run_cmd=fail)
+        self.assertEqual(res["action"], "implementation_failed", res)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

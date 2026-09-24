@@ -1103,9 +1103,43 @@ def _drive_opencode_control(state_dir, request_id, invocation_id, proc,
                 result.update(rc=1, error="prompt was not accepted within 60 seconds")
                 abort_and_confirm()
                 break
+            # Idle without a terminal assistant result after the turn showed
+            # activity (#88 review): the session reports idle but the last
+            # new assistant message carries neither time.completed nor
+            # info.error, or no new assistant message exists at all. The
+            # prompt-accept bound above already covers a turn that never
+            # became active; any other non-terminal idle state reuses the
+            # same stream-silence stall machinery as the busy branch, so
+            # the loop always ends on genuine silence without restoring an
+            # elapsed deadline. Live activity reflected by the tracker (a
+            # fresh part, a reasoning/tool update, or a running tool) keeps
+            # the turn alive: only silence past the window stalls.
+            if seen_active or new:
+                _idle_age = tracker.silence(time.monotonic())
+                if _idle_age > window:
+                    probe = _probe_silent_route(client, model, variant, agent,
+                                                route)
+                    longest = round(max(tracker.longest, _idle_age), 3)
+                    result.update(
+                        rc=4, ok=False, signal="stalled",
+                        probe_signal=probe.get("signal", "unknown"),
+                        signal_evidence={
+                            "source": "stream_silence",
+                            "silence_secs": round(_idle_age, 1),
+                            "last_part_type": tracker.last_part_type or "none",
+                            "parts_observed": tracker.events,
+                            "probe": adapters.redact_nested(probe),
+                            "idle_without_terminal_result": True,
+                        },
+                        longest_silence_secs=longest,
+                        error=(f"worker turn stalled: no stream activity for "
+                               f"{_idle_age:.0f}s"))
+                    abort_and_confirm()
+                    break
         # No elapsed deadline (#88): the loop above ends the turn on
-        # completion, stall, overload/exhaustion/context/hard signals,
-        # serve exit, transport failure, or explicit cancellation. The
+        # completion, stall (busy or idle without a terminal result),
+        # overload/exhaustion/context/hard signals, serve exit,
+        # transport failure, or explicit cancellation. The
         # 60-second prompt-accept bound above stays as a purpose-specific
         # readiness limit.
         time.sleep(1.0)
