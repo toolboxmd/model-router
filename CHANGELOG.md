@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.2] - 2026-09-25
+
+### Changed
+
+- Project Direction: the delivery milestone now requires every job's end state, ready to merge or blocked, to reach the planner in its own thread
+
 ## [0.31.1] - 2026-09-25
 
 ### Changed
