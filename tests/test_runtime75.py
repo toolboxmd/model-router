@@ -23,12 +23,48 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, runtime, store  # noqa: E402
+from runner import controller, core, policy, runtime, store  # noqa: E402
 from runner.supervisor import process_start_identity  # noqa: E402
+from tests.fakes import FAKE_GROK, FAKE_OPENCODE, write_fake  # noqa: E402
 
 PY = sys.executable
 DISPATCH_META = {"stage": "dispatch", "route": "luna/max", "reason": "initial"}
 RESUME_META = {"stage": "dispatch", "route": "luna/max", "reason": "resume"}
+
+FIXED_THREAD = "thr-75-fixed"
+
+# A disposable `codex` shaped like the real CLI contract: thread.started,
+# one agent_message, turn.completed, plus the last-message file. Dispatch
+# answers an implementation envelope, resume the same thread with a
+# completion envelope. No model is called.
+FAKE_CODEX_75 = r'''
+import json, os, sys
+from pathlib import Path
+st = Path(os.environ.get("FAKE_STATE", ""))
+if str(st):
+    st.mkdir(parents=True, exist_ok=True)
+    argv = sys.argv[1:]
+    with open(st / "codex75.log", "a") as f:
+        f.write(json.dumps(argv) + "\n")
+else:
+    argv = sys.argv[1:]
+tid = "thr-75-fixed"
+if argv[:2] == ["exec", "resume"]:
+    env = {"action": "completion", "output": "RESUMED_75", "artifact": ""}
+    assert tid in argv, argv
+else:
+    env = {"action": "implementation", "artifact": "fix.txt",
+           "payload": {"instructions": "write fix.txt"}}
+if "--output-last-message" in argv:
+    lp = Path(argv[argv.index("--output-last-message") + 1])
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(json.dumps(env))
+for obj in ({"type": "thread.started", "thread_id": tid},
+            {"type": "item.completed",
+             "item": {"type": "agent_message", "text": json.dumps(env)}},
+            {"type": "turn.completed", "usage": {}}):
+    print(json.dumps(obj), flush=True)
+'''
 
 
 def sql(sd, q, args=()):
@@ -110,6 +146,37 @@ class Base(unittest.TestCase):
         saved = os.environ.get("PATH", "")
         os.environ["PATH"] = str(bindir) + os.pathsep + saved
         self.addCleanup(lambda: os.environ.__setitem__("PATH", saved))
+
+    def install_fake_harness_clis(self):
+        """Disposable `codex`/`opencode`/`grok` shaped like the real CLIs.
+
+        Used with the real durable run_cmd (real supervisors), so the
+        missing-then-repaired path runs through the public controller
+        turns with no real agent process.
+        """
+        bindir = self.base / "fakebin"
+        bindir.mkdir(exist_ok=True)
+        fake_state = self.base / "fakestate"
+        fake_state.mkdir(exist_ok=True)
+        write_fake(bindir, "codex", FAKE_CODEX_75, PY)
+        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
+        write_fake(bindir, "grok", FAKE_GROK, PY)
+        saved_path = os.environ.get("PATH", "")
+        saved_state = os.environ.get("FAKE_STATE")
+        os.environ["PATH"] = str(bindir) + os.pathsep + saved_path
+        os.environ["FAKE_STATE"] = str(fake_state)
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", saved_path))
+        if saved_state is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_STATE", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_STATE", saved_state))
+
+    def rows_for_key(self, rid, key):
+        return [i for i in core._list_invocations(self.sd, rid)
+                if i.get("action_key") == key and i.get("state") != "abandoned"]
+
+    def key_of(self, row, kind, meta):
+        return core._action_key(kind, json.loads(row["cmd_json"]), meta)
 
 
 class NeverStartedSpawnBranch(Base):
@@ -429,6 +496,383 @@ class IncompatibleReplacement(Base):
         self.assertEqual((job["route"], job["task_json"]), (before["route"], before["task_json"]))
         rows = core._list_invocations(self.sd, "r1")
         self.assertEqual(len(rows), 1)
+
+
+class DispatchTwiceMissingThenRepaired(Base):
+    """Finding 1: a repaired dispatch retry is not reblocked by its stale row.
+
+    Drives the real public ``controller.dispatch`` twice through real
+    supervisors: first with the disposable old runtime removed (the
+    spawn provably never starts), then on the installed runtime with a
+    working fake `codex`. Asserts preserved identities, one logical
+    action, no duplicate writer, no reblock after success, truthful
+    provenance, and no false recovery event.
+    """
+
+    def _stub_start(self, calls):
+        def fake_start(state_dir, request_id):
+            calls.append(request_id)
+            return {"request_id": request_id, "pid": 999999999}
+        return fake_start
+
+    def test_dispatch_twice_missing_then_repaired(self):
+        self.assertEqual(policy.stage_routes("dispatch")[0], "luna/max")
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
+        before = core.get_job(self.sd, "r1")
+        sql(self.sd, "UPDATE jobs SET owner_token='tok', status='running' WHERE request_id='r1'")
+        old = self.disposable_runtime_copy()
+        old_root = str(old)
+        self.point_runtimes_at(old)
+        self.remove_runtime(old)
+        run = core.make_durable_run_cmd(self.sd, "r1", "tok")
+        out = controller.dispatch(self.sd, "r1", run_cmd=run)
+        self.assertEqual(out, {"action": "blocked", "reason": "runtime_missing"})
+        job = core.get_job(self.sd, "r1")
+        self.assertTrue(job["block_reason"].startswith("runtime_missing:"))
+        self.assertIn("recover", job["block_reason"])
+        self.assertIn(old_root, job["block_reason"])
+        rows = core._list_invocations(self.sd, "r1")
+        self.assertEqual(len(rows), 1)
+        key = self.key_of(rows[0], "codex_dispatch", DISPATCH_META)
+        failed_payload = json.loads(rows[0]["result_json"])
+        self.assertTrue(failed_payload.get("never_started"))
+        self.assertTrue(failed_payload.get("runtime_missing"))
+        # Provenance names the real old version even though the old path
+        # is already gone: the version was read at import, not at call.
+        self.assertEqual(failed_payload["runtime"]["root"], old_root)
+        self.assertEqual(failed_payload["runtime"]["version"], runtime.IMPORT_VERSION)
+        self.assertNotEqual(failed_payload["runtime"]["version"], "unknown")
+        # Repair: the installed runtime with a working fake `codex`.
+        self._restore_pkg_roots()
+        self.install_fake_harness_clis()
+        sql(self.sd, "UPDATE jobs SET owner_token='tok2' WHERE request_id='r1'")
+        run2 = core.make_durable_run_cmd(self.sd, "r1", "tok2")
+        out2 = controller.dispatch(self.sd, "r1", run_cmd=run2)
+        self.assertEqual(out2["action"], "dispatched")
+        self.assertEqual(out2["codex_task_id"], FIXED_THREAD)
+        self.assertEqual(out2["luna_action"]["action"], "implementation")
+        same = self.rows_for_key("r1", key)
+        self.assertEqual(len(same), 2, "one logical action: failed row plus its remake")
+        self.assertEqual((same[0]["state"], same[1]["state"]), ("failed", "completed"))
+        self.assertTrue(runtime.is_runtime_missing_row(same[0]))
+        self.assertFalse(runtime.is_runtime_missing_row(same[1]))
+        after = core.get_job(self.sd, "r1")
+        for field in ("task_json", "task_hash", "workspace", "route", "policy_id",
+                      "planner_session_id"):
+            self.assertEqual(after[field], before[field])
+        # The stale row no longer decides: recovery sees no missing failure.
+        self.assertFalse(core._has_runtime_missing_failure(self.sd, "r1"))
+        self.assertIsNone(core.runtime_missing_for_action(
+            self.sd, "r1", "codex_dispatch",
+            json.loads(same[1]["cmd_json"]), DISPATCH_META))
+        # A third dispatch reuses the completed attempt: no duplicate
+        # writer, no reblock, no new row. (The controller reports
+        # already-dispatched once the task and its action are saved.)
+        out3 = controller.dispatch(self.sd, "r1", run_cmd=run2)
+        self.assertIn(out3["action"], ("dispatched", "already-dispatched"))
+        self.assertEqual(len(self.rows_for_key("r1", key)), 2)
+        # Recovery after the repaired success records no false recovery:
+        # the controller restarts without a runtime_recovered event.
+        calls = []
+        real_start = core.start_controller
+        core.start_controller = self._stub_start(calls)
+        try:
+            rec = core.recover_one(self.sd, "r1")
+        finally:
+            core.start_controller = real_start
+        self.assertEqual(rec["action"], "resumed-controller")
+        self.assertEqual(calls, ["r1"])
+        # The repaired job continues instead of reblocking: the stale
+        # row never wins again.
+        self.assertNotEqual(rec["status"], "blocked")
+        self.assertEqual(payloads(self.sd, "r1", "runtime_recovered"), [])
+
+
+class ResumeTwiceMissingThenRepaired(Base):
+    """Finding 1 on the resume path: ``resume_luna`` twice, then recover."""
+
+    def _stub_start(self, calls):
+        def fake_start(state_dir, request_id):
+            calls.append(request_id)
+            con = store.connect(state_dir)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute(
+                    "SELECT COALESCE(MAX(attempt_no), 0) AS n FROM launches WHERE request_id=?",
+                    (request_id,)).fetchone()
+                attempt = int(row["n"]) + 1
+                token = "tok-new-%d" % attempt
+                con.execute(
+                    "INSERT INTO launches(request_id,attempt_no,start_token,state,created_at)"
+                    " VALUES(?,?,?,'acknowledged',?)",
+                    (request_id, attempt, token, core._utcnow()))
+                con.execute(
+                    "UPDATE jobs SET owner_token=?, owner_pid=?, owner_start=?, updated_at=?"
+                    " WHERE request_id=?",
+                    (token, 999999999, "dead", core._utcnow(), request_id))
+                con.execute("COMMIT")
+            finally:
+                con.close()
+            return {"request_id": request_id, "pid": 999999999}
+        return fake_start
+
+    def test_resume_twice_missing_then_repaired(self):
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
+        before = core.get_job(self.sd, "r1")
+        sql(self.sd, "UPDATE jobs SET owner_token='tok', status='running',"
+                     " codex_task_id=%r WHERE request_id='r1'" % FIXED_THREAD)
+        old = self.disposable_runtime_copy()
+        old_root = str(old)
+        self.point_runtimes_at(old)
+        self.remove_runtime(old)
+        run = core.make_durable_run_cmd(self.sd, "r1", "tok")
+        out = controller.resume_luna(self.sd, "r1", "follow up", run_cmd=run)
+        self.assertEqual(out, {"action": "blocked", "reason": "runtime_missing"})
+        self.assertIn(old_root, core.get_job(self.sd, "r1")["block_reason"])
+        rows = core._list_invocations(self.sd, "r1")
+        self.assertEqual(len(rows), 1)
+        key = self.key_of(rows[0], "codex_resume", RESUME_META)
+        # Repair on the installed runtime with a working fake `codex`
+        # that resumes the same thread.
+        self._restore_pkg_roots()
+        self.install_fake_harness_clis()
+        sql(self.sd, "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL"
+                     " WHERE request_id='r1'")
+        calls = []
+        real_start = core.start_controller
+        core.start_controller = self._stub_start(calls)
+        try:
+            rec = core.recover_one(self.sd, "r1")
+        finally:
+            core.start_controller = real_start
+        self.assertEqual(rec["action"], "resumed-controller")
+        tok = core.get_job(self.sd, "r1")["owner_token"]
+        run2 = core.make_durable_run_cmd(self.sd, "r1", tok)
+        out2 = controller.resume_luna(self.sd, "r1", "follow up", run_cmd=run2)
+        self.assertEqual(out2["action"], "resumed")
+        self.assertEqual(out2["luna_action"]["action"], "completion")
+        same = self.rows_for_key("r1", key)
+        self.assertEqual(len(same), 2, "one logical action: failed row plus its remake")
+        self.assertEqual((same[0]["state"], same[1]["state"]), ("failed", "completed"))
+        after = core.get_job(self.sd, "r1")
+        for field in ("task_json", "task_hash", "workspace", "route", "policy_id",
+                      "planner_session_id", "codex_task_id"):
+            self.assertEqual(after[field], before[field] if field != "codex_task_id"
+                             else FIXED_THREAD)
+        recovered = payloads(self.sd, "r1", "runtime_recovered")
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["old_runtime"]["root"], old_root)
+        self.assertEqual(recovered[0]["old_runtime"]["version"], runtime.IMPORT_VERSION)
+        self.assertNotEqual(recovered[0]["old_runtime"]["version"], "unknown")
+        self.assertEqual(recovered[0]["new_runtime"]["root"], runtime.PKG_ROOT)
+        # A third resume reuses the completed attempt: no duplicate, no
+        # reblock, no new row.
+        out3 = controller.resume_luna(self.sd, "r1", "follow up", run_cmd=run2)
+        self.assertEqual(out3["action"], "resumed")
+        self.assertEqual(len(self.rows_for_key("r1", key)), 2)
+        self.assertFalse(core._has_runtime_missing_failure(self.sd, "r1"))
+        # A later recovery restarts without a second recovery event.
+        calls2 = []
+        core.start_controller = self._stub_start(calls2)
+        try:
+            rec2 = core.recover_one(self.sd, "r1")
+        finally:
+            core.start_controller = real_start
+        self.assertEqual(rec2["action"], "resumed-controller")
+        self.assertEqual(len(payloads(self.sd, "r1", "runtime_recovered")), 1)
+
+
+class WorkerTurnsGateMissingRuntime(Base):
+    """Finding 2: OpenCode and Grok worker turns gate the missing runtime.
+
+    A never-started spawn failure names its cause and blocks
+    recoverably before capacity handling, the escalation ladder, or a
+    sticky implementation failure. The explicit route is unchanged and
+    the unstarted turn leaves no turn report. After repair the same
+    public turn succeeds exactly once and is then reused.
+    """
+
+    def test_opencode_turn_missing_then_repaired(self):
+        route = "muse-spark-xhigh-free"
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
+        before = core.get_job(self.sd, "r1")
+        self.assertEqual(before["route"], route)
+        sql(self.sd, "UPDATE jobs SET owner_token='tok', status='running' WHERE request_id='r1'")
+        old = self.disposable_runtime_copy()
+        old_root = str(old)
+        self.point_runtimes_at(old)
+        self.remove_runtime(old)
+        run = core.make_durable_run_cmd(self.sd, "r1", "tok")
+        job = core.get_job(self.sd, "r1")
+        out = controller._run_opencode_turn(
+            self.sd, "r1", job, job["workspace"], route, "do work",
+            0, "initial", run)
+        self.assertEqual(out, {"action": "blocked", "reason": "runtime_missing"})
+        job = core.get_job(self.sd, "r1")
+        self.assertTrue(job["block_reason"].startswith("runtime_missing:"))
+        self.assertIn(old_root, job["block_reason"])
+        self.assertIn("recover", job["block_reason"])
+        # No silent route move, no capacity mark, no turn report for a
+        # turn that never started.
+        self.assertEqual(job["route"], route)
+        self.assertEqual(core.exhausted_routes(self.sd) | core.degraded_routes(self.sd), set())
+        self.assertIsNone(core.latest_turn_report(self.sd, "r1"))
+        rows = [i for i in core._list_invocations(self.sd, "r1")
+                if i.get("kind") == "opencode_control" and i.get("state") != "abandoned"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(runtime.is_runtime_missing_row(rows[0]))
+        # Repair on the installed runtime with a working fake server.
+        self._restore_pkg_roots()
+        self.install_fake_harness_clis()
+        sql(self.sd, "UPDATE jobs SET owner_token='tok2', status='running',"
+                     " block_reason=NULL WHERE request_id='r1'")
+        run2 = core.make_durable_run_cmd(self.sd, "r1", "tok2")
+        job2 = core.get_job(self.sd, "r1")
+        out2 = controller._run_opencode_turn(
+            self.sd, "r1", job2, job2["workspace"], route, "do work",
+            0, "initial", run2)
+        self.assertEqual(out2["action"], "implementation_ok")
+        key = self.key_of(rows[0], "opencode_control",
+                          json.loads(rows[0]["meta_json"]))
+        same = self.rows_for_key("r1", key)
+        self.assertEqual(len(same), 2)
+        self.assertEqual((same[0]["state"], same[1]["state"]), ("failed", "completed"))
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], route)
+        # The repaired turn is then reused: no duplicate, no reblock.
+        job3 = core.get_job(self.sd, "r1")
+        out3 = controller._run_opencode_turn(
+            self.sd, "r1", job3, job3["workspace"], route, "do work",
+            0, "initial", run2)
+        self.assertEqual(out3["action"], "implementation_ok")
+        self.assertEqual(len(self.rows_for_key("r1", key)), 2)
+
+    def test_grok_turn_missing_then_repaired(self):
+        route = "grok-4.6-build"
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p", route=route)
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], route)
+        sql(self.sd, "UPDATE jobs SET owner_token='tok', status='running' WHERE request_id='r1'")
+        old = self.disposable_runtime_copy()
+        old_root = str(old)
+        self.point_runtimes_at(old)
+        self.remove_runtime(old)
+        run = core.make_durable_run_cmd(self.sd, "r1", "tok")
+        job = core.get_job(self.sd, "r1")
+        out = controller._run_grok_turn(
+            self.sd, "r1", job, job["workspace"], route, "do work",
+            0, "initial", run)
+        self.assertEqual(out, {"action": "blocked", "reason": "runtime_missing"})
+        job = core.get_job(self.sd, "r1")
+        self.assertIn(old_root, job["block_reason"])
+        self.assertIn("recover", job["block_reason"])
+        self.assertEqual(job["route"], route)
+        self.assertEqual(core.exhausted_routes(self.sd) | core.degraded_routes(self.sd), set())
+        self.assertIsNone(core.latest_turn_report(self.sd, "r1"))
+        rows = [i for i in core._list_invocations(self.sd, "r1")
+                if i.get("kind") == "grok_control" and i.get("state") != "abandoned"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(runtime.is_runtime_missing_row(rows[0]))
+        self._restore_pkg_roots()
+        self.install_fake_harness_clis()
+        sql(self.sd, "UPDATE jobs SET owner_token='tok2', status='running',"
+                     " block_reason=NULL WHERE request_id='r1'")
+        run2 = core.make_durable_run_cmd(self.sd, "r1", "tok2")
+        job2 = core.get_job(self.sd, "r1")
+        out2 = controller._run_grok_turn(
+            self.sd, "r1", job2, job2["workspace"], route, "do work",
+            0, "initial", run2)
+        self.assertEqual(out2["action"], "implementation_ok")
+        key = self.key_of(rows[0], "grok_control",
+                          json.loads(rows[0]["meta_json"]))
+        same = self.rows_for_key("r1", key)
+        self.assertEqual(len(same), 2)
+        self.assertEqual((same[0]["state"], same[1]["state"]), ("failed", "completed"))
+        self.assertEqual(core.get_job(self.sd, "r1")["route"], route)
+        job3 = core.get_job(self.sd, "r1")
+        out3 = controller._run_grok_turn(
+            self.sd, "r1", job3, job3["workspace"], route, "do work",
+            0, "initial", run2)
+        self.assertEqual(out3["action"], "implementation_ok")
+        self.assertEqual(len(self.rows_for_key("r1", key)), 2)
+
+
+class PlannerCallbackGatesMissingRuntime(Base):
+    """Finding 2 on the callback path: the question stays pending."""
+
+    def test_codex_callback_missing_blocks_recoverably(self):
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p",
+                    planner_harness="codex")
+        sql(self.sd, "UPDATE jobs SET owner_token='tok', status='running' WHERE request_id='r1'")
+        old = self.disposable_runtime_copy()
+        old_root = str(old)
+        self.point_runtimes_at(old)
+        self.remove_runtime(old)
+        run = core.make_durable_run_cmd(self.sd, "r1", "tok")
+        out = controller.planner_callback(self.sd, "r1", "q1", "Proceed?", run_cmd=run)
+        self.assertEqual(out["action"], "blocked")
+        self.assertEqual(out["reason"], "runtime_missing")
+        job = core.get_job(self.sd, "r1")
+        self.assertTrue(job["block_reason"].startswith("runtime_missing:"))
+        self.assertIn(old_root, job["block_reason"])
+        self.assertIn("recover", job["block_reason"])
+        pending = core.list_questions(self.sd, "r1", only_pending=True)
+        self.assertEqual([q["qid"] for q in pending], ["q1"])
+        self._restore_pkg_roots()
+
+
+class CompatibilityAdoptsHealthyWork(Base):
+    """Finding 3: the compatibility check never stops healthy owned work.
+
+    An incompatible replacement still blocks with its specific reason
+    when no controller or child is alive, but a live child or an
+    advertised healthy controller is adopted first.
+    """
+
+    def _live_row(self, rid, kind, supervisor, child):
+        root = store.ensure_state_dir(self.sd)
+        out_p = root / "outputs" / "live2.stdout"
+        err_p = root / "outputs" / "live2.stderr"
+        store.secure_write_text(out_p, "")
+        store.secure_write_text(err_p, "")
+        meta = {"stage": "dispatch", "route": "luna/max"}
+        key = core._action_key(kind, ["codex", "exec", "live"], meta)
+        sql(self.sd,
+            "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
+            "pid,pgid,process_start,supervisor_pid,supervisor_start,stdout_path,stderr_path,"
+            "started_at,state,timeout_secs,meta_json,action_key,stage,requested_route,"
+            "policy_version,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("live2", rid, kind, json.dumps(["codex", "exec", "live"]), self.ws(), "tok",
+             child.pid, os.getpgid(child.pid), process_start_identity(child.pid),
+             supervisor.pid, process_start_identity(supervisor.pid),
+             str(out_p), str(err_p), core._utcnow(), "running", 600,
+             json.dumps(meta), key, "planning", None, "2.7.0", 2))
+
+    def test_incompatible_state_adopts_a_live_child(self):
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p",
+                    policy_id="other-policy-v9")
+        sql(self.sd, "UPDATE jobs SET status='running' WHERE request_id='r1'")
+        child, supervisor = self.sleeper(), self.sleeper()
+        self._live_row("r1", "codex_callback", supervisor, child)
+        real_start = core.start_controller
+        core.start_controller = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("a live child must be adopted, never replaced"))
+        try:
+            out = core.recover_one(self.sd, "r1")
+        finally:
+            core.start_controller = real_start
+        self.assertEqual(out["action"], "adopted-live-invocation")
+        self.assertIsNone(child.poll(), "the surviving child must not be signalled")
+        self.assertIsNone(supervisor.poll())
+
+    def test_terminal_jobs_are_not_assessed(self):
+        core.submit(self.sd, "r1", {"g": 1}, self.ws(), "p")
+        sql(self.sd, "UPDATE jobs SET status='succeeded' WHERE request_id='r1'")
+        before = [e["kind"] for e in events(self.sd, "r1")]
+        out = core.recover_one(self.sd, "r1")
+        self.assertEqual(out["action"], "noop-terminal")
+        after = [e["kind"] for e in events(self.sd, "r1")]
+        self.assertNotIn("runtime_assessed", after,
+                         "recover --all must not assess finished jobs")
+        self.assertNotIn("runtime_recovered", after)
 
 
 if __name__ == "__main__":
