@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.35.4] - 2026-09-25
+
+### Changed
+
+- An unparsable dispatcher reply gets one repair message on the same dispatcher thread; a second bad reply blocks, and recover retries the block (#105)
+
 ## [0.35.3] - 2026-09-25
 
 ### Added
