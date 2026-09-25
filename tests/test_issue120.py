@@ -125,6 +125,53 @@ class T3Persistence(unittest.TestCase):
         creates = [c for c in fake.commands if c.get("type") == "thread.create"]
         self.assertEqual(len(creates), 1)
 
+    def test_snapshot_error_after_post_never_posts_a_second_turn(self):
+        fake = FakeT3Client(planner=PLANNER)
+        original_post = fake.post_message
+        posted = [False]
+
+        def post_then_crash(*args, **kwargs):
+            result = original_post(*args, **kwargs)
+            if not posted[0]:
+                posted[0] = True
+                raise RuntimeError("controller crashed after post")
+            return result
+
+        fake.post_message = post_then_crash
+        with self.assertRaises(RuntimeError):
+            controller.run_implementation(self.sd, "r1", t3_client=fake)
+        child_id = controller._t3_thread_for(
+            core.get_job(self.sd, "r1"), "impl_0")["thread_id"]
+        fake.thread_snapshot = mock.Mock(side_effect=lambda tid: (
+            snap(PLANNER, state="completed") if tid == PLANNER
+            else (_ for _ in ()).throw(t3exec.T3Error("snapshot unavailable"))))
+        result = self._recover_into(
+            lambda sd, rid: controller.run_implementation(sd, rid, t3_client=fake))
+        self.assertEqual(result["action"], "resumed-controller")
+        self.assertEqual([p[0] for p in fake.posts].count(child_id), 1)
+
+    def test_adopted_running_turn_has_no_recovery_deadline(self):
+        state = {"t3_threads": {
+            "dispatch": {"thread_id": "sub.planner-t3.dispatch",
+                          "route": "luna/max", "created": True,
+                          "turn_started": True}}}
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='r1'",
+                        (json.dumps(state),))
+            con.commit()
+        finally:
+            con.close()
+        fake = FakeT3Client(planner=PLANNER)
+        fake.scripts["sub.planner-t3.dispatch"] = snap(
+            "sub.planner-t3.dispatch", state="running")
+        with mock.patch.object(t3exec, "watch_turn", return_value={
+                "state": "completed", "assistant_text": "done"}) as watch:
+            result = self._recover_into(
+                lambda sd, rid: controller.dispatch(sd, rid, t3_client=fake))
+        self.assertEqual(result["action"], "resumed-controller")
+        self.assertNotIn("timeout_secs", watch.call_args.kwargs)
+
 
 class T3Cancellation(unittest.TestCase):
     def setUp(self):
@@ -228,6 +275,58 @@ class T3Cancellation(unittest.TestCase):
             final = core.recover_one(self.sd, "r1")
         self.assertEqual(final["status"], "cancelled")
         self.assertEqual(core.get_job(self.sd, "r1")["status"], "cancelled")
+
+    def test_recover_fences_controller_before_reconciling_a_racing_turn(self):
+        state = {"t3_threads": {
+            "dispatch": {"thread_id": "sub.planner-t3.dispatch",
+                          "route": "luna/max", "created": True,
+                          "turn_started": False}}}
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=?, cancel_requested=1, "
+                        "status='cancelling' WHERE request_id='r1'",
+                        (json.dumps(state),))
+            con.commit()
+        finally:
+            con.close()
+        fake = FakeT3Client(planner=PLANNER)
+        fake.scripts["sub.planner-t3.dispatch"] = snap(
+            "sub.planner-t3.dispatch", state="running")
+        original_drain = core._drain_owned_children
+
+        def racing_drain(*args, **kwargs):
+            fake.scripts["sub.planner-t3.dispatch"] = snap(
+                "sub.planner-t3.dispatch", state="running")
+            return original_drain(*args, **kwargs)
+
+        with mock.patch.object(t3exec, "client_for_job", return_value=fake), \
+             mock.patch.object(core, "_drain_owned_children", side_effect=racing_drain):
+            result = core.recover_one(self.sd, "r1")
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(sum(c.get("type") == "thread.turn.interrupt"
+                             for c in fake.commands), 1)
+
+    def test_recover_confirms_never_created_child_absent(self):
+        state = {"t3_threads": {
+            "dispatch": {"thread_id": "sub.planner-t3.dispatch",
+                          "route": "luna/max", "created": False,
+                          "turn_started": False}}}
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='r1'",
+                        (json.dumps(state),))
+            con.commit()
+        finally:
+            con.close()
+        with mock.patch.object(t3exec, "client_for_job",
+                               side_effect=t3exec.T3Error("unreachable")):
+            self.assertEqual(core.cancel(self.sd, "r1")["status"], "cancelling")
+        fake = FakeT3Client(planner=PLANNER)
+        fake.thread_snapshot = mock.Mock(
+            side_effect=t3exec.T3Error("T3 GET failed: HTTP 404"))
+        with mock.patch.object(t3exec, "client_for_job", return_value=fake):
+            result = core.recover_one(self.sd, "r1")
+        self.assertEqual(result["status"], "cancelled")
 
 
 if __name__ == "__main__":

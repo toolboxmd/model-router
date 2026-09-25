@@ -973,7 +973,8 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                 watch_kwargs: dict | None = None,
                 planner_thread_id: str | None = None,
                 on_thread_created=None,
-                on_thread_state=None) -> dict:
+                on_thread_state=None,
+                before_thread_start=None) -> dict:
     """Run one job turn as a T3 child thread: create, start, watch.
 
     ``parent_thread_id`` is the thread the child is created under (the
@@ -1005,13 +1006,34 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
         if not turn_started:
             try:
                 snapshot = client.thread_snapshot(thread_id)
-                latest = snapshot_thread(snapshot).get("latestTurn")
-                turn_started = isinstance(latest, dict) and bool(latest.get("turnId"))
-            except T3Error:
-                turn_started = False
+                thread = snapshot_thread(snapshot)
+                if not thread or "latestTurn" not in thread:
+                    return {"state": "unknown",
+                            "reason": "T3 child snapshot has unknown turn state",
+                            "thread_id": thread_id, "adopted": adopted,
+                            "parent_thread_id": validate_thread_id(parent_thread_id),
+                            "planner_thread_id": planner, "route": route}
+                latest = thread.get("latestTurn")
+                if latest is None:
+                    turn_started = False
+                elif isinstance(latest, dict) and latest.get("turnId"):
+                    turn_started = True
+                else:
+                    return {"state": "unknown",
+                            "reason": "T3 child snapshot has unknown turn state",
+                            "thread_id": thread_id, "adopted": adopted,
+                            "parent_thread_id": validate_thread_id(parent_thread_id),
+                            "planner_thread_id": planner, "route": route}
+            except T3Error as e:
+                return {"state": "unknown", "reason": f"T3 child snapshot failed: {e}",
+                        "thread_id": thread_id, "adopted": adopted,
+                        "parent_thread_id": validate_thread_id(parent_thread_id),
+                        "planner_thread_id": planner, "route": route}
             if turn_started and on_thread_state is not None:
                 on_thread_state(thread_id, "started")
             if not turn_started:
+                if before_thread_start is not None:
+                    before_thread_start()
                 client.post_message(thread_id,
                                     child_first_message(request_id, kind_label,
                                                         planner, route, prompt),
@@ -1027,6 +1049,8 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                             title, route, role)
         if on_thread_state is not None:
             on_thread_state(thread_id, "created")
+        if before_thread_start is not None:
+            before_thread_start()
         client.post_message(thread_id,
                             child_first_message(request_id, kind_label,
                                                 planner, route, prompt),
@@ -1035,9 +1059,9 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
             on_thread_state(thread_id, "started")
         adopted = False
     kwargs = dict(watch_kwargs or {})
-    if adopted:
+    if adopted and not turn_started:
         kwargs.setdefault("timeout_secs", T3_RECOVERY_WATCH_SECS)
-    if not adopted or (existing_thread_state and not existing_thread_state.get("turn_started", True)):
+    if not adopted or not turn_started:
         kwargs.setdefault("await_new_turn", True)
     outcome = watch_turn(client, thread_id, **kwargs)
     outcome["thread_id"] = thread_id

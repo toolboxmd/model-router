@@ -384,6 +384,23 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
         con.close()
 
 
+def _check_t3_start_lease(state_dir, request_id: str) -> None:
+    """Fence a turn start against a cancellation committed after the step guard."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
 def _t3_client_for_job(job: dict, t3_client=None):
     if t3_client is not None:
         return t3_client
@@ -452,7 +469,9 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
                 lambda tid, state: _save_t3_thread(
                     state_dir, request_id, slot, tid, route,
                     created=state in ("created", "started"),
-                    turn_started=state == "started")))
+                    turn_started=state == "started")),
+            before_thread_start=lambda: _check_t3_start_lease(
+                state_dir, request_id))
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
         # block loudly with the reason.
