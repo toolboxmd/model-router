@@ -110,9 +110,10 @@ class DispatchWorkerReasonSeparation(unittest.TestCase):
                                            "dispatch_exhausted")
         st = controller._load_controller_state(core.get_job(sd, "sep"))
         self.assertEqual(st.get("dispatch_route_reason"), "dispatch_exhausted")
-        # Back-compat: the shared key still carries the dispatch reason until
-        # a worker move overwrites it.
-        self.assertEqual(st.get("route_reason"), "dispatch_exhausted")
+        # The shared key is left for worker moves: the dispatch cause
+        # never leaks into the first worker invocation, which keeps
+        # reason initial.
+        self.assertNotIn("route_reason", st)
         con = store.connect(sd)
         try:
             ev = con.execute("SELECT payload_json FROM events WHERE request_id='sep'"
@@ -120,7 +121,7 @@ class DispatchWorkerReasonSeparation(unittest.TestCase):
         finally:
             con.close()
         self.assertEqual(json.loads(ev["payload_json"])["scope"], "dispatch")
-        # A later worker move overwrites the worker key but preserves the
+        # A later worker move records the worker key but preserves the
         # dispatch key, so an Observer never reads a worker attempt as
         # dispatch_stalled again.
         controller._switch_route(sd, "sep", "muse-spark-xhigh-go", "pool_move",
@@ -135,6 +136,20 @@ class DispatchWorkerReasonSeparation(unittest.TestCase):
         finally:
             con.close()
         self.assertEqual(json.loads(ev["payload_json"])["scope"], "worker")
+
+    def test_first_worker_invocation_reason_is_initial_after_fallback(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "sep2", {"g": 1, "proof": "true"}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='sep2'")
+        set_controller_state(sd, "sep2", seq=1)
+        controller._record_dispatch_reason(sd, "sep2", "luna/max", "luna-go/max",
+                                           "dispatch_fallback rc=1")
+        job = core.get_job(sd, "sep2")
+        st = controller._load_controller_state(job)
+        meta_reason = st.get("route_reason") or "initial"
+        self.assertEqual(meta_reason, "initial")
+        self.assertEqual(st.get("dispatch_route_reason"), "dispatch_fallback rc=1")
 
 
 class ProofSeparation(unittest.TestCase):
@@ -219,6 +234,51 @@ class ProofSeparation(unittest.TestCase):
         self.assertTrue(reason.startswith("completion_refused:"))
         self.assertIn("timed out", reason)
         self.assertNotIn("not found", reason)
+
+    def test_executed_proof_records_verification_row(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "vrow", {"g": 1, "proof": "true"}, str(ws), "p")
+        job = core.get_job(sd, "vrow")
+        full = {"assistant_text": "t", "usage": None, "native_ids": {},
+                "finish": "stop", "actual_model": None}
+        report = controller._write_turn_report(
+            sd, "vrow", job, 1, "muse-spark-xhigh-free", full, "ses")
+        self.assertEqual(report["proof_class"], "pass")
+        con = store.connect(sd)
+        try:
+            rows = con.execute("SELECT kind, stage, rc, reason, started_at,"
+                               " ended_at, elapsed_secs, terminal_class"
+                               " FROM invocations WHERE request_id='vrow'"
+                               " AND kind='proof'").fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(rows), 1)
+        row = dict(rows[0])
+        self.assertEqual(row["stage"], "verification")
+        self.assertEqual((row["rc"], row["reason"]), (0, "pass"))
+        self.assertTrue(row["started_at"] and row["ended_at"])
+        self.assertEqual(row["terminal_class"], "completed")
+
+    def test_skipped_proof_records_no_attempt_row(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "vskip", {"g": 1, "proof": "true"}, str(ws), "p")
+        job = core.get_job(sd, "vskip")
+        full = {"assistant_text": "t", "usage": None, "native_ids": {},
+                "finish": "stop", "actual_model": None,
+                "signal": "exhausted", "signal_evidence": {"source": "test"}}
+        controller._write_turn_report(
+            sd, "vskip", job, 1, "muse-spark-xhigh-free", full, "ses",
+            status="exhausted", run_proof=False,
+            proof_skipped_reason="exhausted turn: proof deferred")
+        con = store.connect(sd)
+        try:
+            rows = con.execute("SELECT * FROM invocations WHERE request_id='vskip'"
+                               " AND kind='proof'").fetchall()
+        finally:
+            con.close()
+        self.assertEqual(rows, [])
 
 
 class CompletionBinding(unittest.TestCase):
@@ -415,7 +475,7 @@ class CompletionBinding(unittest.TestCase):
         finally:
             core.PR_VERIFIER = saved
 
-    def test_step_completion_preserves_pr_identity_through_refusal(self):
+    def test_step_completion_refuses_unverified_pr_without_poisoning(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
@@ -429,8 +489,8 @@ class CompletionBinding(unittest.TestCase):
             {"ok": True, "state": "CLOSED", "is_draft": False,
              "head_sha": core._workspace_head(str(ws)), "repo": "example/repo"})
         try:
-            # The PR is closed, so completion refuses; the claimed identity
-            # is still preserved for the correction path to update.
+            # The PR is closed, so completion refuses; the unverified URL
+            # is never preserved as the job's identity.
             set_controller_state(
                 sd, "gate-b", seq=1,
                 last_action={"action": "completion", "output": "DONE",
@@ -440,17 +500,58 @@ class CompletionBinding(unittest.TestCase):
             self.assertEqual(first["action"], "completion-refused-resumed")
             st = controller._load_controller_state(core.get_job(sd, "gate-b"))
             self.assertIn("pr_not_open", st.get("completion_refused_reason") or "")
+            self.assertIsNone(core.known_pr_url(sd, "gate-b"))
+        finally:
+            core.PR_VERIFIER = saved
+        # A corrected URL verifies and completes: the invalid first URL
+        # never poisons the job into a false duplicate.
+        core.PR_VERIFIER = stub_pr_verifier(
+            {"ok": True, "state": "OPEN", "is_draft": False,
+             "head_sha": core._workspace_head(str(ws)), "repo": "example/repo"})
+        try:
+            set_controller_state(
+                sd, "gate-b", seq=2,
+                last_action={"action": "completion", "output": "DONE",
+                             "pr_url": "https://github.com/example/repo/pull/8"},
+                last_action_name="completion")
+            done = controller.step(sd, "gate-b", run_cmd=self._refusing_resume())
+            self.assertEqual(done["action"], "completed")
             self.assertEqual(core.known_pr_url(sd, "gate-b"),
-                             "https://github.com/example/repo/pull/7")
+                             "https://github.com/example/repo/pull/8")
         finally:
             core.PR_VERIFIER = saved
 
+    def test_completion_result_carries_acceptance_and_candidate(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        sd = str(base / "state")
+        ws = self._git_ws(base, "ws")
+        core.submit(sd, "gate-c", {"goal": "x", "proof": "true",
+                                   "acceptance": "real interaction"},
+                    str(ws), "p")
+        self._passing_report(sd, "gate-c", ws)
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='gate-c'")
+        set_controller_state(
+            sd, "gate-c", seq=1,
+            last_action={"action": "completion", "output": "DONE",
+                         "acceptance_evidence": "drove the real interaction"},
+            last_action_name="completion")
+        done = controller.step(sd, "gate-c", run_cmd=self._refusing_resume())
+        self.assertEqual(done["action"], "completed")
+        job = core.get_job(sd, "gate-c")
+        result = json.loads(job["result_json"])
+        self.assertEqual(result["acceptance_evidence"],
+                         "drove the real interaction")
+        self.assertEqual(result["head_commit"], core._workspace_head(str(ws)))
+
 
 class ExhaustionContent(unittest.TestCase):
-    def test_recovery_exhausted_carries_concrete_decision(self):
+    def test_recovery_exhausted_asks_the_planner_not_blocks(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "exh", {"g": 1}, str(ws), "p")
+        core.submit(sd, "exh", {"g": 1, "observer_task_id": "model-router-87"},
+                    str(ws), "p")
         sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh'")
         # Every recovery rung already ran once in this job.
         con = store.connect(sd)
@@ -471,15 +572,136 @@ class ExhaustionContent(unittest.TestCase):
         set_controller_state(sd, "exh", ladder={"failures": 3, "rung": "recovery",
                                                 "escalated": True})
         ended = controller._apply_ladder(sd, "exh")
-        self.assertEqual(ended["action"], "blocked")
+        self.assertEqual(ended["action"], "recovery-exhausted-question")
+        self.assertEqual(ended["qid"], "recovery-decision")
+        # The job and Observer identities are preserved: the logical job
+        # continues through the planner's answer, never cancel/resubmit.
         job = core.get_job(sd, "exh")
-        reason = job["block_reason"] or ""
-        self.assertTrue(reason.startswith("recovery_exhausted:"))
-        self.assertIn("decision required", reason)
-        self.assertIn("evidence", reason)
-        self.assertIn("attempted", reason)
-        self.assertIn("recommendation", reason)
-        self.assertNotIn("implement it yourself", reason)
+        self.assertEqual(job["status"], "question_pending")
+        self.assertEqual(json.loads(job["task_json"]).get("observer_task_id"),
+                         "model-router-87")
+        pending = core.list_questions(sd, "exh")
+        self.assertEqual([q["qid"] for q in pending], ["recovery-decision"])
+        prompt = pending[0]["prompt"]
+        for needle in ("decision required", "evidence", "attempted",
+                       "eligible dispatcher routes", "recommendation"):
+            self.assertIn(needle, prompt)
+        self.assertNotIn("implement it yourself", prompt)
+        st = controller._load_controller_state(job)
+        self.assertEqual(st.get("recovery_question_qid"), "recovery-decision")
+        self.assertEqual(st.get("last_action", {}).get("action"),
+                         "planner_question")
+
+    def test_exhaustion_answer_permits_exactly_one_directed_attempt(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "exh2", {"g": 1}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh2'")
+        # Every recovery rung already ran once in this job.
+        con = store.connect(sd)
+        try:
+            for i, route in enumerate(("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai")):
+                con.execute(
+                    "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+                    "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
+                    "action_key,started_at,stdout_path,stderr_path) VALUES"
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"x2used{i}", "exh2", "grok_control", "[]", str(ws), "tok",
+                     "completed", 0, "implementation", route, "x",
+                     json.dumps({"route": route}), f"x2key{i}", core._utcnow(),
+                     "/dev/null", "/dev/null"))
+            con.commit()
+        finally:
+            con.close()
+        set_controller_state(sd, "exh2", ladder={"failures": 3, "rung": "recovery",
+                                                 "escalated": True})
+        ended = controller._apply_ladder(sd, "exh2")
+        self.assertEqual(ended["action"], "recovery-exhausted-question")
+        # The planner answers with direction (an eligible route), never
+        # with implementation.
+        core.answer(sd, "exh2", "recovery-decision",
+                    "use glm-5.3-flash-go with a narrower scope")
+        set_controller_state(sd, "exh2", seq=7,
+                             last_action={"action": "planner_question",
+                                          "qid": "recovery-decision",
+                                          "prompt": core.list_questions(
+                                              sd, "exh2", only_pending=False)[0]["prompt"]},
+                             last_action_name="planner_question")
+
+        def fake_resume(state_dir, request_id, prompt, run_cmd=None, label=""):
+            env = {"action": "implementation", "artifact": "",
+                   "directed_route": "glm-5.3-flash-go"}
+            return {"action": "resumed", "luna_action": env}
+
+        real_resume = controller.resume_luna
+        controller.resume_luna = fake_resume
+        try:
+            answered = controller._handle_question_action(
+                sd, "exh2",
+                {"action": "planner_question", "qid": "recovery-decision",
+                 "prompt": core.list_questions(
+                     sd, "exh2", only_pending=False)[0]["prompt"]},
+                run_cmd=lambda *a, **k: (0, "", ""))
+        finally:
+            controller.resume_luna = real_resume
+        self.assertEqual(answered["action"], "question-answered-resumed")
+        st = controller._load_controller_state(core.get_job(sd, "exh2"))
+        self.assertTrue(st.get("planner_recovery_authorized"))
+        # The authorized directed attempt runs once on the directed route.
+        set_controller_state(sd, "exh2", seq=8,
+                             last_action={"action": "implementation"},
+                             last_action_name="implementation")
+        controller._handle_implementation_action(
+            sd, "exh2",
+            {"action": "implementation",
+             "directed_route": "glm-5.3-flash-go"},
+            run_cmd=lambda *a, **k: (0, "", ""))
+        st = controller._load_controller_state(core.get_job(sd, "exh2"))
+        self.assertTrue(st.get("planner_recovery_used"))
+        self.assertEqual(core.get_job(sd, "exh2")["route"],
+                         "glm-5.3-flash-go")
+        con = store.connect(sd)
+        try:
+            ev = con.execute("SELECT payload_json FROM events WHERE request_id='exh2'"
+                             " AND kind='route_switched' ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+        self.assertEqual(json.loads(ev["payload_json"])["reason"],
+                         "planner_directed")
+        # No implicit loop: the authorization is single-use.
+        self.assertFalse(controller._consume_planner_authorized_attempt(
+            sd, "exh2", {"action": "implementation",
+                         "directed_route": "glm-5.3-flash-go"}))
+
+    def test_used_authorization_ends_terminally_without_another_question(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "exh3", {"g": 1}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh3'")
+        con = store.connect(sd)
+        try:
+            for i, route in enumerate(("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai")):
+                con.execute(
+                    "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+                    "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
+                    "action_key,started_at,stdout_path,stderr_path) VALUES"
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"u{i}", "exh3", "grok_control", "[]", str(ws), "tok",
+                     "completed", 0, "implementation", route, "x",
+                     json.dumps({"route": route}), f"k{i}", core._utcnow(),
+                     "/dev/null", "/dev/null"))
+            con.commit()
+        finally:
+            con.close()
+        set_controller_state(sd, "exh3", ladder={"failures": 3, "rung": "recovery",
+                                                 "escalated": True},
+                             planner_recovery_authorized=True,
+                             planner_recovery_used=True)
+        ended = controller._apply_ladder(sd, "exh3")
+        self.assertEqual((ended["action"], ended["reason"]),
+                         ("failed", "escalation_exhausted"))
+        self.assertEqual(core.list_questions(sd, "exh3"), [],
+                         "no second planner question after the used attempt")
 
     def test_escalation_exhausted_error_carries_decision(self):
         tmp, sd, ws = new_dirs()
@@ -516,8 +738,34 @@ class ExhaustionContent(unittest.TestCase):
         payload = json.loads(rows[0]["payload_json"])
         self.assertEqual(payload["rung"], "correction")
         self.assertEqual(payload["failed_seq"], 3)
-        self.assertEqual(payload["next_attempt_seq"], 4)
+        # The next seq is unknown at decision time: questions, refusals,
+        # and completions may consume seq numbers first, never a guess.
+        self.assertIsNone(payload["next_attempt_seq"])
         self.assertTrue(payload.get("decided_at"))
+        # The actual next attempt links when it starts.
+        set_controller_state(sd, "dec", seq=5)
+        controller._link_recovery_attempt(sd, "dec", 5, "muse-spark-xhigh-free")
+        con = store.connect(sd)
+        try:
+            link = con.execute("SELECT payload_json FROM events WHERE request_id='dec'"
+                               " AND kind='recovery_next_attempt' ORDER BY id").fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(link), 1)
+        linked = json.loads(link[0]["payload_json"])
+        self.assertEqual((linked["failed_seq"], linked["next_seq"]), (3, 5))
+        # And its outcome is preserved when recorded.
+        controller._record_turn_outcome(
+            sd, "dec", {"action": "implementation_ok",
+                        "report": {"seq": 5, "proof_exit_code": 0}})
+        con = store.connect(sd)
+        try:
+            res = con.execute("SELECT payload_json FROM events WHERE request_id='dec'"
+                              " AND kind='recovery_attempt_result' ORDER BY id").fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(res), 1)
+        self.assertEqual(json.loads(res[0]["payload_json"])["outcome"], "ok")
 
 
 class PlannerDirectedRoute(unittest.TestCase):
@@ -531,12 +779,11 @@ class PlannerDirectedRoute(unittest.TestCase):
     def test_eligible_planner_route_is_assigned(self):
         _tmp, sd, _ws = self._impl_job("pdr-ok")
         set_controller_state(sd, "pdr-ok", seq=1,
-                             last_action={"action": "implementation",
-                                          "route": "muse-spark-xhigh-go"},
+                             last_action={"action": "implementation"},
                              last_action_name="implementation")
         out = controller._handle_implementation_action(
             sd, "pdr-ok",
-            {"action": "implementation", "route": "muse-spark-xhigh-go"},
+            {"action": "implementation", "directed_route": "muse-spark-xhigh-go"},
             run_cmd=lambda *a, **k: (0, "", ""))
         self.assertEqual(core.get_job(sd, "pdr-ok")["route"], "muse-spark-xhigh-go")
         con = store.connect(sd)
@@ -547,16 +794,54 @@ class PlannerDirectedRoute(unittest.TestCase):
             con.close()
         self.assertEqual(json.loads(ev["payload_json"])["reason"], "planner_directed")
 
+    def test_ordinary_envelope_route_never_undoes_the_ladder(self):
+        # At two failures the ladder owns the move to the correction
+        # route even when the envelope repeats the old default: the
+        # ordinary route field is inert and no planner_directed event
+        # credits the planner with a direction it never gave.
+        _tmp, sd, _ws = self._impl_job("pdr-ladder")
+        set_controller_state(sd, "pdr-ladder", seq=2,
+                             ladder={"failures": 2, "rung": "correction"},
+                             last_action={"action": "implementation"},
+                             last_action_name="implementation")
+        controller._handle_implementation_action(
+            sd, "pdr-ladder",
+            {"action": "implementation", "route": "muse-spark-xhigh-free"},
+            run_cmd=lambda *a, **k: (0, "", ""))
+        self.assertEqual(core.get_job(sd, "pdr-ladder")["route"],
+                         "kimi-k2.7-code-go")
+        con = store.connect(sd)
+        try:
+            rows = con.execute("SELECT payload_json FROM events WHERE request_id='pdr-ladder'"
+                               " AND kind='route_switched' ORDER BY id").fetchall()
+        finally:
+            con.close()
+        reasons = [json.loads(r["payload_json"])["reason"] for r in rows]
+        self.assertIn("correction", reasons)
+        self.assertNotIn("planner_directed", reasons)
+
+    def test_correction_stage_route_assignable_from_any_lane(self):
+        _tmp, sd, _ws = self._impl_job("pdr-corr")
+        set_controller_state(sd, "pdr-corr", seq=1,
+                             last_action={"action": "implementation"},
+                             last_action_name="implementation")
+        controller._handle_implementation_action(
+            sd, "pdr-corr",
+            {"action": "implementation",
+             "directed_route": "kimi-k2.7-code-go"},
+            run_cmd=lambda *a, **k: (0, "", ""))
+        self.assertEqual(core.get_job(sd, "pdr-corr")["route"],
+                         "kimi-k2.7-code-go")
+
     def test_ineligible_planner_route_is_rejected_without_substitution(self):
         _tmp, sd, _ws = self._impl_job("pdr-no")
         before = core.get_job(sd, "pdr-no")["route"]
         set_controller_state(sd, "pdr-no", seq=1,
-                             last_action={"action": "implementation",
-                                          "route": "no-such-route"},
+                             last_action={"action": "implementation"},
                              last_action_name="implementation")
         out = controller._handle_implementation_action(
             sd, "pdr-no",
-            {"action": "implementation", "route": "no-such-route"},
+            {"action": "implementation", "directed_route": "no-such-route"},
             run_cmd=lambda *a, **k: (0, "", ""))
         self.assertEqual(core.get_job(sd, "pdr-no")["route"], before)
         con = store.connect(sd)
@@ -575,14 +860,21 @@ class PlannerDirectedRoute(unittest.TestCase):
         _tmp, sd, _ws = self._impl_job("pdr-rung")
         before = core.get_job(sd, "pdr-rung")["route"]
         set_controller_state(sd, "pdr-rung", seq=1,
-                             last_action={"action": "implementation",
-                                          "route": "astra/max"},
+                             last_action={"action": "implementation"},
                              last_action_name="implementation")
         controller._handle_implementation_action(
             sd, "pdr-rung",
-            {"action": "implementation", "route": "astra/max"},
+            {"action": "implementation", "directed_route": "astra/medium"},
             run_cmd=lambda *a, **k: (0, "", ""))
         self.assertEqual(core.get_job(sd, "pdr-rung")["route"], before)
+        con = store.connect(sd)
+        try:
+            ev = con.execute("SELECT payload_json FROM events WHERE request_id='pdr-rung'"
+                             " AND kind='planner_route_rejected' ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+        self.assertIsNotNone(ev)
+        self.assertIn("astra/medium", json.loads(ev["payload_json"])["requested"])
 
 
 class Runtime75Caveats(unittest.TestCase):
@@ -682,6 +974,207 @@ class Runtime75Caveats(unittest.TestCase):
         self.assertTrue(invs[0]["consumed_at"], "late evidence is recorded, never resurrected")
         self.assertTrue(invs[0]["terminal_class"], "late rows carry a classified outcome")
         self.assertEqual(core.get_job(sd, "late")["status"], "succeeded")
+
+
+def _finished_worker_row(sd, rid, ws, kind="opencode_control", rc=1):
+    con = store.connect(sd)
+    try:
+        con.execute(
+            "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+            "owner_token,stdout_path,stderr_path,started_at,ended_at,state,rc,"
+            "consumed_at,stage,requested_route,policy_version,meta_json,action_key)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"fin-{rid}-{kind}", rid, kind, "[]", str(ws), "",
+             "/dev/null", "/dev/null", core._utcnow(), core._utcnow(),
+             "failed", rc, core._utcnow(), "implementation",
+             "muse-spark-xhigh-free", "x",
+             json.dumps({"route": "muse-spark-xhigh-free", "seq": 1}), "k1"))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _supervisor_run(rc, result):
+    def run(cmd, cwd=None, timeout=None, kind=None, meta=None):
+        return rc, "RUNNER_RESULT " + json.dumps(result) + "\n", ""
+    return run
+
+
+class ConfirmedStopRecovery(unittest.TestCase):
+    def _running_job(self, rid):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, rid, {"g": 1, "proof": "true"}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
+                " WHERE request_id=?", (rid,))
+        return tmp, sd, ws
+
+    def _turn(self, sd, rid, ws, run):
+        job = core.get_job(sd, rid)
+        return controller._run_opencode_turn(
+            sd, rid, job, str(ws), "muse-spark-xhigh-free", "prompt",
+            1, "initial", run, artifact=None, attempt=0)
+
+    def test_rc124_startup_failure_returns_evidence(self):
+        _tmp, sd, ws = self._running_job("stop124")
+        _finished_worker_row(sd, "stop124", ws)
+        res = self._turn(sd, "stop124", ws, _supervisor_run(
+            124, {"ok": False, "rc": 124,
+                  "error": "opencode serve did not emit a localhost URL"}))
+        self.assertEqual(res["action"], "implementation_failed")
+        self.assertEqual(res["report"]["failure_class"], "infrastructure")
+        self.assertNotEqual(res["report"]["failure_class"], "timeout")
+        self.assertEqual(core.get_job(sd, "stop124")["status"], "running")
+
+    def test_rc143_confirmed_stop_returns_evidence(self):
+        _tmp, sd, ws = self._running_job("stop143")
+        _finished_worker_row(sd, "stop143", ws)
+        res = self._turn(sd, "stop143", ws, _supervisor_run(
+            143, {"ok": False, "rc": 143,
+                  "error": "terminated by cancellation"}))
+        self.assertEqual(res["action"], "implementation_failed")
+        self.assertEqual(res["report"]["failure_class"], "infrastructure")
+        self.assertEqual(core.get_job(sd, "stop143")["status"], "running")
+
+    def test_rc143_grok_confirmed_stop_returns_evidence(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "stopg", {"g": 1, "proof": "true"}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
+                " WHERE request_id='stopg'")
+        _finished_worker_row(sd, "stopg", ws, kind="grok_control", rc=143)
+        job = core.get_job(sd, "stopg")
+        res = controller._run_grok_turn(
+            sd, "stopg", job, str(ws), "grok-4.6-build", "prompt",
+            1, "initial",
+            _supervisor_run(143, {"ok": False, "rc": 143,
+                                  "error": "terminated by cancellation"}),
+            artifact=None, attempt=0)
+        self.assertEqual(res["action"], "implementation_failed")
+        self.assertEqual(core.get_job(sd, "stopg")["status"], "running")
+
+    def test_missing_result_stays_blocked(self):
+        _tmp, sd, ws = self._running_job("stop-missing")
+        _finished_worker_row(sd, "stop-missing", ws)
+        res = self._turn(sd, "stop-missing", ws,
+                         lambda *a, **k: (1, "", ""))
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(core.get_job(sd, "stop-missing")["status"], "blocked")
+
+    def test_rc125_supervisor_loss_stays_blocked(self):
+        _tmp, sd, ws = self._running_job("stop125")
+        _finished_worker_row(sd, "stop125", ws)
+        res = self._turn(sd, "stop125", ws, _supervisor_run(
+            125, {"ok": False, "rc": 125, "error": "supervisor gone"}))
+        self.assertEqual(res["action"], "blocked")
+
+    def test_unresolved_ownership_stays_blocked(self):
+        _tmp, sd, ws = self._running_job("stop-unres")
+        con = store.connect(sd)
+        try:
+            con.execute(
+                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+                "owner_token,stdout_path,stderr_path,started_at,state,stage,"
+                "requested_route,policy_version,meta_json,action_key)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("unres1", "stop-unres", "opencode_control", "[]", str(ws), "",
+                 "/dev/null", "/dev/null", core._utcnow(), "running",
+                 "implementation", "muse-spark-xhigh-free", "x", "{}", "k9"))
+            con.commit()
+        finally:
+            con.close()
+        res = self._turn(sd, "stop-unres", ws, _supervisor_run(
+            143, {"ok": False, "rc": 143, "error": "terminated"}))
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(core.get_job(sd, "stop-unres")["status"], "blocked")
+
+
+class HardErrorSkipsProof(unittest.TestCase):
+    def test_failed_turn_skips_suite_truthfully(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "hard", {"g": 1, "proof": "true"}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
+                " WHERE request_id='hard'")
+        job = core.get_job(sd, "hard")
+        res = controller._run_opencode_turn(
+            sd, "hard", job, str(ws), "muse-spark-xhigh-free", "prompt",
+            1, "initial",
+            _supervisor_run(1, {"ok": False, "rc": 1, "signal": "hard",
+                                "signal_evidence": {"name": "DataPolicyError"},
+                                "error": "consent denied"}),
+            artifact=None, attempt=0)
+        self.assertEqual(res["action"], "implementation_failed")
+        report = res["report"]
+        self.assertEqual(report["proof_class"], "skipped")
+        self.assertIsNone(report["proof_exit_code"])
+        self.assertEqual(report["failure_class"], "infrastructure")
+        # A skipped proof is not a passed proof: completion refuses it.
+        self.assertIsNotNone(core.incomplete_proof_reason(
+            job["task_json"], report, str(ws)))
+
+
+class ProofTreeOwnership(unittest.TestCase):
+    def test_normal_exit_reaps_leftover_group(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        pidfile = ws / "survivor.pid"
+        rc, _out, cls, _s, _e = controller._run_proof_command(
+            str(ws), "sleep 30 >/dev/null 2>&1 & echo $! > survivor.pid; exit 0",
+            timeout=10, state_dir=sd, request_id="proof-left")
+        self.assertEqual((rc, cls), (0, "pass"))
+        survivor = int(pidfile.read_text().strip())
+        time.sleep(0.5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(survivor, 0)
+
+    def test_pipe_held_child_is_not_a_timeout(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        pidfile = ws / "survivor.pid"
+        rc, _out, cls, _s, _e = controller._run_proof_command(
+            str(ws), "sleep 30 & echo $! > survivor.pid; exit 0",
+            timeout=5, state_dir=sd, request_id="proof-pipe")
+        # The main shell exited 0 while a background child held the
+        # pipe: the attempt classifies by its actual exit, never 124.
+        self.assertEqual((rc, cls), (0, "pass"))
+        survivor = int(pidfile.read_text().strip())
+        time.sleep(0.5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(survivor, 0)
+
+    def test_recover_blocks_on_live_proof_group(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "proofown", {"g": 1}, str(ws), "p")
+        proc = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        core.record_proof_owner(sd, "proofown", proc.pid,
+                                os.getpgid(proc.pid))
+        try:
+            rec = core.recover_one(sd, "proofown")
+        finally:
+            pass
+        self.assertEqual(rec["action"], "blocked-unresolved-proof")
+        self.assertTrue(core.proof_owner_alive(sd, "proofown"))
+        proc.kill()
+        proc.wait()
+        core.clear_proof_owner(sd, "proofown")
+        self.assertFalse(core.proof_owner_alive(sd, "proofown"))
+
+
+class EligibleDirectedRoutes(unittest.TestCase):
+    def test_lists_assignable_routes_and_rejects_rungs(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "elig", {"g": 1}, str(ws), "p")
+        eligible = controller.eligible_directed_routes(sd, "elig")
+        self.assertIn("muse-spark-xhigh-go", eligible)
+        self.assertIn("kimi-k2.7-code-go", eligible)
+        self.assertIn("grok-4.6-go", eligible)
+        self.assertNotIn("astra/medium", eligible)
+        self.assertNotIn("opus-5.5/high", eligible)
+        self.assertNotIn("no-such-route", eligible)
 
 
 class FailedCallbackWakeup(unittest.TestCase):
@@ -809,12 +1302,41 @@ class RoutedTrace(unittest.TestCase):
             decisions = [json.loads(r["payload_json"]) for r in con.execute(
                 "SELECT payload_json FROM events WHERE request_id='trace87'"
                 " AND kind='recovery_decision' ORDER BY id").fetchall()]
+            links = [json.loads(r["payload_json"]) for r in con.execute(
+                "SELECT payload_json FROM events WHERE request_id='trace87'"
+                " AND kind='recovery_next_attempt' ORDER BY id").fetchall()]
+            results = [json.loads(r["payload_json"]) for r in con.execute(
+                "SELECT payload_json FROM events WHERE request_id='trace87'"
+                " AND kind='recovery_attempt_result' ORDER BY id").fetchall()]
         finally:
             con.close()
         self.assertTrue(decisions, "recovery decision links the failed attempt")
         self.assertEqual(decisions[0]["failed_seq"], rep1["seq"])
-        self.assertEqual(decisions[0]["next_attempt_seq"], rep2["seq"])
+        self.assertIsNone(decisions[0]["next_attempt_seq"],
+                          "the decision never guesses the next seq")
         self.assertTrue(decisions[0].get("failed_at") and decisions[0].get("decided_at"))
+        self.assertTrue(links, "the actual next attempt links when it starts")
+        self.assertEqual((links[0]["failed_seq"], links[0]["next_seq"]),
+                         (rep1["seq"], rep2["seq"]))
+        self.assertTrue(results, "the attempt outcome is preserved")
+        self.assertEqual(results[0]["outcome"], "ok")
+        # Every executed proof is an observable verification row with
+        # stage, timestamps, and class for the Observer importer.
+        con = store.connect(sd)
+        try:
+            proofs = con.execute(
+                "SELECT kind, stage, rc, reason, started_at, ended_at, elapsed_secs,"
+                " terminal_class FROM invocations WHERE request_id='trace87'"
+                " AND kind='proof' ORDER BY id").fetchall()
+        finally:
+            con.close()
+        self.assertEqual([(dict(p)["rc"], dict(p)["reason"]) for p in proofs],
+                         [(1, "failed"), (0, "pass")])
+        for p in proofs:
+            row = dict(p)
+            self.assertEqual((row["kind"], row["stage"]), ("proof", "verification"))
+            self.assertTrue(row["started_at"] and row["ended_at"])
+            self.assertIn(row["terminal_class"], ("failed", "completed"))
 
 
 if __name__ == "__main__":

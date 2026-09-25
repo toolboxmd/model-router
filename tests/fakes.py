@@ -336,13 +336,11 @@ def run_turn(sid, model, directory, aborted, prompt_text=""):
             n_prompts = 1
         if os.environ.get("FAKE_OC_PLAN") == "implement_then_complete" and n_prompts <= 1:
             envelope = {"action": "implementation", "artifact": "fix.txt",
-                        "payload": {"instructions": "write fix.txt",
-                                    "route": "muse-spark-xhigh-free"}}
+                        "payload": {"instructions": "write fix.txt"}}
             prose = "Routing to the worker with an implementation envelope."
         elif os.environ.get("FAKE_OC_PLAN") == "implement_twice_then_complete" and n_prompts <= 2:
             envelope = {"action": "implementation", "artifact": "fix.txt",
-                        "payload": {"instructions": "write fix.txt",
-                                    "route": "muse-spark-xhigh-free"}}
+                        "payload": {"instructions": "write fix.txt"}}
             prose = "Routing to the worker with an implementation envelope."
         else:
             envelope = {"action": "completion", "output": "PLANNED_ON_OPENCODE",

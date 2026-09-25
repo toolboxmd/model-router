@@ -561,12 +561,14 @@ class TestWorkerDispatcherResumeWithCacheLoader(unittest.TestCase):
         self.assertTrue(texts, "fake server must have received prompts")
         for text in texts:
             self.assertNotIn(direction.BLOCK_START, text)
-        # The loader ran exactly once per durable invocation with unique
-        # session ids.
+        # The loader ran exactly once per durable harness invocation with
+        # unique session ids (proof rows are verification evidence, not
+        # harness turns, so they carry no loader call).
         calls = loader_calls(loader_state)
         invs = core._list_invocations(sd, rid)
         loader_invs = [i for i in invs
-                       if i.get("state") != "abandoned"]
+                       if i.get("state") != "abandoned"
+                       and i.get("kind") != "proof"]
         self.assertEqual(len(calls), len(loader_invs), (calls, len(loader_invs)))
         sids = [c["session_id"] for c in calls]
         self.assertEqual(len(set(sids)), len(sids))

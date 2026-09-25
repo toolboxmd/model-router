@@ -569,7 +569,8 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(inv["report_path"], report["report_path"])
         self.assertEqual(inv["schema_version"], store.SCHEMA_VERSION)
         view = core.status_view(self.sd, "oc1")
-        m = view["job"]["measurements"][-1]
+        m = [x for x in view["job"]["measurements"]
+             if x["stage"] == "implementation"][-1]
         self.assertEqual((m["stage"], m["terminal_class"], m["observed_model"], m["observed_variant"]),
                          ("implementation", "completed", inv["observed_model"], "xhigh"))
         self.assertTrue(m["native_ids"]["assistant_message_ids"])
@@ -631,7 +632,8 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
             self.assertEqual(job["adapter"], "opencode")
             st = controller._load_controller_state(job)
             self.assertEqual(st["dispatch_route"], "luna-go/max")
-            self.assertEqual(st.get("route_reason"), "preflight_exhausted")
+            self.assertEqual(st.get("dispatch_route_reason"), "preflight_exhausted")
+            self.assertNotIn("route_reason", st)
             prompts = [r["body"] for r in self._requests() if r["path"].endswith("/prompt_async")]
             self.assertEqual(prompts[-1]["model"], {"providerID": "opencode-go", "modelID": "gpt-5.6-luna"})
             self.assertEqual(prompts[-1]["agent"], "plan")

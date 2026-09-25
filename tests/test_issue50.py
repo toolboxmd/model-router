@@ -848,7 +848,7 @@ class TestPublicFallbackDrill(unittest.TestCase):
         # server: the dispatcher ran on luna-go/max, not luna/max.
         st = controller._load_controller_state(job)
         self.assertEqual(st.get("dispatch_route"), "luna-go/max", st)
-        self.assertEqual(st.get("route_reason"), "preflight_exhausted", st)
+        self.assertEqual(st.get("dispatch_route_reason"), "preflight_exhausted", st)
         con = store.connect(sd)
         try:
             rows = con.execute(
