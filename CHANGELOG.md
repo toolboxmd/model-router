@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.1] - 2026-09-25
+
+### Changed
+
+- Project Direction: planners are hosted in the T3 Code workspace and jobs run as T3 threads
+
 ## [0.31.0] - 2026-09-25
 
 ### Added

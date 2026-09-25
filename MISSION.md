@@ -1,8 +1,10 @@
 # Mission
 
-Model Router makes delegation practical for software work. A planner, in
-whatever harness the human works in, hands an authorized task to Model
-Router, and from then on a dispatcher owns the job. One versioned policy and
+Model Router makes delegation practical for software work. A planner in any
+harness, hosted in the human's T3 Code workspace, hands an authorized task
+to Model Router, and from then on a dispatcher owns the job. Jobs run as T3
+threads, so every agent a job starts is visible and reachable from the
+thread that started it. One versioned policy and
 one durable runner route each step to the most suitable eligible model
 within subscription allowances, move it when capacity fails, and carry the
 work through commits, the target project's own proof and review to one PR
