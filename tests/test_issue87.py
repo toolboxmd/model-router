@@ -703,13 +703,67 @@ class ExhaustionContent(unittest.TestCase):
         self.assertEqual(core.list_questions(sd, "exh3"), [],
                          "no second planner question after the used attempt")
 
+    def test_approach_only_answer_consumes_one_attempt_without_repeat_question(self):
+        # A planner answer with only an approach (no directed_route) runs
+        # exactly one dispatcher-owned attempt on the current route and
+        # never re-posts the recovery question or loops.
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "approach", {"g": 1}, str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='approach'")
+        before_route = core.get_job(sd, "approach")["route"]
+        set_controller_state(sd, "approach",
+                             ladder={"failures": 3, "rung": "recovery", "escalated": True},
+                             planner_recovery_authorized=True,
+                             seq=9,
+                             last_action={"action": "implementation"},
+                             last_action_name="implementation")
+        consumed = controller._consume_planner_authorized_attempt(
+            sd, "approach", {"action": "implementation"})
+        self.assertTrue(consumed, "approach-only answer consumes the authorization")
+        self.assertEqual(core.get_job(sd, "approach")["route"], before_route)
+        st = controller._load_controller_state(core.get_job(sd, "approach"))
+        self.assertTrue(st.get("planner_recovery_used"))
+        con = store.connect(sd)
+        try:
+            dec = con.execute("SELECT payload_json FROM events WHERE request_id='approach'"
+                              " AND kind='recovery_decision' ORDER BY id DESC LIMIT 1").fetchone()
+            qs = con.execute("SELECT COUNT(*) AS n FROM questions WHERE request_id='approach'"
+                             " AND qid='recovery-decision'").fetchone()["n"]
+        finally:
+            con.close()
+        self.assertIsNotNone(dec)
+        payload = json.loads(dec["payload_json"])
+        self.assertEqual(payload["rung"], "recovery_directed")
+        self.assertEqual(payload["target"], before_route)
+        self.assertEqual(payload["reason"], "planner_directed")
+        self.assertEqual(qs, 0, "no repeated planner question for an approach answer")
+        self.assertFalse(controller._consume_planner_authorized_attempt(
+            sd, "approach", {"action": "implementation"}),
+            "single use only, no implicit loop")
+
     def test_escalation_exhausted_error_carries_decision(self):
+        # Normal failures at 4 reach the planner before any authorized
+        # directed attempt is used; only after that one attempt is used
+        # does the job end terminally with the same concrete decision.
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
         core.submit(sd, "esc", {"g": 1}, str(ws), "p")
         sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='esc'")
         set_controller_state(sd, "esc", ladder={"failures": 4, "rung": "recovery",
                                                 "escalated": True})
+        first = controller._apply_ladder(sd, "esc")
+        self.assertEqual((first["action"], first["reason"]),
+                         ("recovery-exhausted-question", "recovery_exhausted"))
+        self.assertEqual(core.get_job(sd, "esc")["status"], "question_pending")
+        # After the single authorized attempt is used, the same failures
+        # end terminally with the decision payload for the planner.
+        set_controller_state(sd, "esc", ladder={"failures": 4, "rung": "recovery_directed",
+                                                "escalated": True},
+                             planner_recovery_authorized=True,
+                             planner_recovery_used=True,
+                             recovery_question_qid="recovery-decision")
+        sql(sd, "UPDATE jobs SET status='running' WHERE request_id='esc'")
         ended = controller._apply_ladder(sd, "esc")
         self.assertEqual((ended["action"], ended["reason"]), ("failed", "escalation_exhausted"))
         err = json.loads(core.get_job(sd, "esc")["result_json"])["error"]
@@ -718,6 +772,26 @@ class ExhaustionContent(unittest.TestCase):
         self.assertIn("evidence", err)
         self.assertIn("attempted", err)
         self.assertIn("recommendation", err)
+
+    def test_normal_failures_four_questions_planner_before_authorized_used(self):
+        # The usual path is one Grok escalation that fails: failures reach
+        # 4 with no authorized attempt used yet. The planner must be woken
+        # through the existing question path, preserving the job.
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "norm4", {"g": 1, "observer_task_id": "model-router-87"},
+                    str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='norm4'")
+        set_controller_state(sd, "norm4", ladder={"failures": 4, "rung": "recovery",
+                                                  "escalated": True})
+        ended = controller._apply_ladder(sd, "norm4")
+        self.assertEqual(ended["action"], "recovery-exhausted-question")
+        self.assertEqual(ended["qid"], "recovery-decision")
+        job = core.get_job(sd, "norm4")
+        self.assertEqual(job["status"], "question_pending")
+        pending = core.list_questions(sd, "norm4")
+        self.assertEqual([q["qid"] for q in pending], ["recovery-decision"])
+        self.assertIn("decision required", pending[0]["prompt"])
 
     def test_recovery_decision_events_link_attempts(self):
         tmp, sd, ws = new_dirs()
@@ -1088,6 +1162,54 @@ class ConfirmedStopRecovery(unittest.TestCase):
         self.assertEqual(res["action"], "blocked")
         self.assertEqual(core.get_job(sd, "stop-unres")["status"], "blocked")
 
+    def test_finished_row_with_live_group_stays_blocked(self):
+        # A finished database row alone never proves the group died:
+        # members that ignore SIGTERM can survive the supervisor's
+        # leader-only wait, and the next writer must not start beside
+        # them.
+        import subprocess as _sp
+        _tmp, sd, ws = self._running_job("stop-live")
+        proc = _sp.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        pgid = os.getpgid(proc.pid)
+        con = store.connect(sd)
+        try:
+            con.execute(
+                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+                "owner_token,pid,pgid,stdout_path,stderr_path,started_at,ended_at,"
+                "state,rc,stage,requested_route,policy_version,meta_json,action_key)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("livefin1", "stop-live", "opencode_control", "[]", str(ws), "",
+                 proc.pid, pgid, "/dev/null", "/dev/null",
+                 core._utcnow(), core._utcnow(), "failed", 143,
+                 "implementation", "muse-spark-xhigh-free", "x", "{}", "kLive"))
+            con.commit()
+        finally:
+            con.close()
+        res = self._turn(sd, "stop-live", ws, _supervisor_run(
+            143, {"ok": False, "rc": 143, "error": "terminated by cancellation"}))
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(core.get_job(sd, "stop-live")["status"], "blocked")
+
+    def test_startup_rc124_invocation_row_matches_infrastructure_report(self):
+        # The same startup rc124 attempt must read infrastructure in both
+        # the turn report and the durable invocation row Observer reads.
+        self.assertEqual(
+            core.terminal_class_for(
+                124, {"ok": False, "rc": 124,
+                      "error": "opencode serve did not emit a localhost URL"}),
+            "infrastructure")
+        self.assertEqual(
+            core.terminal_class_for(124, {}), "timeout",
+            "an actual proof timeout without a startup marker stays timeout")
+        _tmp, sd, ws = self._running_job("stop124row")
+        _finished_worker_row(sd, "stop124row", ws)
+        res = self._turn(sd, "stop124row", ws, _supervisor_run(
+            124, {"ok": False, "rc": 124,
+                  "error": "opencode serve did not emit a localhost URL"}))
+        self.assertEqual(res["action"], "implementation_failed")
+        self.assertEqual(res["report"]["failure_class"], "infrastructure")
+
 
 class HardErrorSkipsProof(unittest.TestCase):
     def test_failed_turn_skips_suite_truthfully(self):
@@ -1144,23 +1266,70 @@ class ProofTreeOwnership(unittest.TestCase):
             os.kill(survivor, 0)
 
     def test_recover_blocks_on_live_proof_group(self):
+        # An isolated proof group blocks recovery while alive and clears
+        # once the group is dead: the block is real ownership, not a
+        # row in the test's own group.
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
         core.submit(sd, "proofown", {"g": 1}, str(ws), "p")
-        proc = subprocess.Popen(["sleep", "60"])
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         core.record_proof_owner(sd, "proofown", proc.pid,
                                 os.getpgid(proc.pid))
-        try:
-            rec = core.recover_one(sd, "proofown")
-        finally:
-            pass
+        rec = core.recover_one(sd, "proofown")
         self.assertEqual(rec["action"], "blocked-unresolved-proof")
         self.assertTrue(core.proof_owner_alive(sd, "proofown"))
         proc.kill()
         proc.wait()
-        core.clear_proof_owner(sd, "proofown")
+        time.sleep(0.3)
         self.assertFalse(core.proof_owner_alive(sd, "proofown"))
+        rec2 = core.recover_one(sd, "proofown")
+        self.assertNotEqual(rec2["action"], "blocked-unresolved-proof")
+
+    def test_proof_owner_records_start_identity(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "proofid", {"g": 1}, str(ws), "p")
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        core.record_proof_owner(sd, "proofid", proc.pid,
+                                os.getpgid(proc.pid))
+        raw = core.proof_owner_path(sd, "proofid").read_text()
+        rec = json.loads(raw)
+        self.assertEqual(rec["pid"], proc.pid)
+        self.assertTrue(rec.get("pid_start"), "start identity guards PID reuse")
+        self.assertTrue(core.proof_owner_alive(sd, "proofid"))
+        proc.kill()
+        proc.wait()
+        time.sleep(0.3)
+        self.assertFalse(core.proof_owner_alive(sd, "proofid"))
+
+    def test_public_cancel_drains_owned_proof_group(self):
+        # Public cancel drains the actual owned proof group (with start
+        # identity and PID reuse protection) and retains the workspace
+        # claim only until ownership is confirmed dead.
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "cancelproof", {"g": 1}, str(ws), "p")
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        pgid = os.getpgid(proc.pid)
+        pid = proc.pid
+        self.addCleanup(lambda: (proc.poll() is None and (proc.kill(), proc.wait())))
+        core.record_proof_owner(sd, "cancelproof", pid, pgid)
+        self.assertTrue(core.proof_owner_alive(sd, "cancelproof"))
+        job = core.cancel(sd, "cancelproof")
+        self.assertEqual(job["status"], "cancelled")
+        self.assertFalse(core.proof_owner_alive(sd, "cancelproof"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        try:
+            os.killpg(pgid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        self.assertFalse(alive, "owned proof group is confirmed dead")
 
 
 class EligibleDirectedRoutes(unittest.TestCase):

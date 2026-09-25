@@ -256,11 +256,15 @@ the next attempt seq stays unknown there) so Observer can measure failure-to-res
 success; `recovery_next_attempt` links the decision to the actual next
 attempt seq when that worker invocation starts, and
 `recovery_attempt_result` preserves its outcome, so the next attempt's report and invocation rows join on that seq.
-When every rung was used, the evidence returns to the planner as a concrete
+When every rung was used, and normal failures reach 4 or more before any
+authorized directed attempt is used (the usual path is one recovery
+escalation that fails), the evidence returns to the planner as a concrete
 decision through a planner question (the decision required, the evidence,
 attempted remedies, the genuinely eligible dispatcher routes, and the
 dispatcher's recommendation), never a request for the planner to
-implement; the job and Observer identities are preserved. Routine mechanical
+implement; the job and Observer identities are preserved. An approach-only
+answer consumes exactly one dispatcher-owned attempt on the current route
+without re-posting the question. Routine mechanical
 recovery stays inside the dispatch subsystem
 (the runner's bounded ladder and capacity moves); missing authority or a
 consequential scope or approach decision reaches the planner, which answers
@@ -287,11 +291,13 @@ the single authorized directed attempt ends the job as `failed` with
 decision content in its error payload, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
 decides; the runner enforces the ceiling. A stopped turn with a supervisor
-result and every owned process group confirmed dead (an OpenCode rc124
-startup failure or an rc143 confirmed stop) returns its evidence to the
-dispatcher as a failed turn instead of a sticky block; missing results,
-rc125, and ambiguous ownership keep the sticky block so no second writer
-starts behind a possible owner.
+result and every owned process group proven dead (an OpenCode rc124
+startup failure or an rc143 confirmed stop, with both child and supervisor
+groups confirmed dead and no live invocation) returns its evidence to the
+dispatcher as a failed turn instead of a sticky block; a finished database
+row alone never proves death, and missing results, live groups, rc125, and
+ambiguous ownership keep the sticky block so no second writer starts
+behind a possible owner.
 
 A stored answer is reused only when the stored prompt matches the
 dispatcher's prompt; a reused `qid` with a different prompt blocks with
@@ -792,9 +798,11 @@ already exited while a background child holds the output pipe is reaped and
 classifies by its actual exit, never as a false timeout; leftover group
 members are stopped after a normal exit too, so no proof child races a later
 writer. The proof group is recorded durably while it runs
-(`proof-owner.json`): cancel and `recover` block on unresolved proof
-ownership instead of treating the job as stopped while the proof tree keeps
-running. Every executed proof is also a durable invocation row with
+(`proof-owner.json` with PID, PGID, and leader start identity): public
+cancel drains that actual owned group with PID reuse protection, and
+cancel and `recover` block on unresolved proof ownership instead of
+treating the job as stopped while the proof tree keeps running. The
+workspace claim is retained until ownership is confirmed dead. Every executed proof is also a durable invocation row with
 `stage='verification'` (kind `proof`), its start/end timestamps, exit code,
 proof class, and elapsed time, so verification outcomes are observable from
 the existing invocation records. A supervisor-level rc124 with no proof run
@@ -819,7 +827,8 @@ reason (worker moves record `route_reason` with `scope: worker`; dispatch
 moves record `dispatch_route_reason` with `scope: dispatch` and leave the
 worker's reason alone, so the first worker invocation keeps `initial`),
 harness version, elapsed time, terminal class (completed, failed,
-crashed, cancelled, timeout, quota, overloaded, stalled, context, hard_error),
+crashed, cancelled, timeout, quota, overloaded, stalled, context,
+hard_error, infrastructure for a startup rc124 with no proof run),
 longest observed stream silence (`longest_silence_secs`), usage counters
 verbatim under a source label, the observed model and the observed variant as
 separate fields, and native identities (Codex thread and turn ids, Claude
@@ -843,16 +852,23 @@ starts; `recovery_attempt_result` preserves that attempt's outcome.
 Verification attempts are invocation rows with `stage='verification'`
 (kind `proof`) carrying started/ended timestamps, exit code, proof class,
 and elapsed time; cancellation intent lives on the job
-(`cancel_requested`) with `cancelled`/`timeout` events. Combined
+(`cancel_requested`) with `cancelled`/`timeout` events. A startup rc124
+carries `infrastructure` in both the turn report and its invocation row;
+an actual proof rc124 timeout carries `timeout` in both. Combined
 acceptance with Agent Observer still needs its importer to read these
 fields (it currently discards Router events and never reads `report.json`):
 the remaining adapter additions are importing `recovery_decision`,
 `recovery_next_attempt`, `recovery_attempt_result`, and
-`verification_attempt` events, `stage='verification'` invocation rows,
-`dispatch_route_reason` versus worker `route_reason` (event scope
-`dispatch` versus `worker`), and the job cancel intent; no new Router
-fields are planned for this. Unknown timestamps, causes, and ownership
-stay unknown throughout and are never fabricated.
+`verification_attempt` events (with sanitized failure and proof classes,
+seq linkage, and timestamps), `stage='verification'` invocation rows with
+kind `proof`, sequence metadata from `meta_json`, `dispatch_route_reason`
+versus worker `route_reason` (event scope `dispatch` versus `worker`),
+the job cancel intent (`cancel_requested`), and the class mapping
+(context pressure is Router `provider`, rc143 unconfirmed stop is Router
+`infrastructure`, startup rc124 is `infrastructure`, proof timeout is
+`timeout`); no new Router fields are planned for this. Unknown
+timestamps, causes, and ownership stay unknown throughout and are never
+fabricated.
 
 `--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is made absolute and is
 `0700`. Detached controllers and supervisors start from the package

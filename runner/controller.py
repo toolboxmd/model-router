@@ -1969,11 +1969,16 @@ def _confirmed_stop_recoverable(state_dir, request_id: str,
 
     A supervisor result (an OpenCode rc124 startup failure or an rc143
     confirmed stop) is recoverable only when every owned process group
-    is confirmed dead: the newest worker control invocation must read
-    ``dead`` or ``finished``, never live, orphaned, unresolved, or
-    unknown. Missing results, rc125 supervisor loss, and any ambiguous
-    ownership stay sticky-blocked so no second writer starts behind a
-    possible owner. Read-only: never kills anything.
+    is proven dead, not merely because a database row reads finished:
+    the newest worker control invocation must read ``dead`` or
+    ``finished``, never live, orphaned, unresolved, or unknown, and
+    both its recorded process groups (child and supervisor) must not be
+    alive. A finished row alone proves the record was written, never
+    that the group died: members that ignore SIGTERM can survive the
+    supervisor's leader-only wait. Missing results, rc125 supervisor
+    loss, live groups, and any ambiguous ownership stay sticky-blocked
+    so no second writer starts behind a possible owner. Read-only:
+    never kills anything.
     """
     if rc == 125:
         return False
@@ -1990,7 +1995,19 @@ def _confirmed_stop_recoverable(state_dir, request_id: str,
         own = core._invocation_ownership(invs[-1])
     except Exception:
         return False
-    return own in ("dead", "finished")
+    if own not in ("dead", "finished"):
+        return False
+    try:
+        newest = invs[-1]
+        for pgid_key in ("pgid", "supervisor_pgid"):
+            pgid = newest.get(pgid_key)
+            if pgid is not None and core._is_pgid_alive(pgid):
+                return False
+        if core._any_live_invocation(state_dir, request_id):
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
@@ -3174,8 +3191,11 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
 
     0 failures: the initial route. 1: a correction in the same worker
     session. 2: a fresh correction on the correction stage's route. 3: the
-    single escalation to the recovery stage. 4 or more: the job ends failed
-    with its evidence, which is the planner's to act on. A pool move inside
+    single escalation to the recovery stage. 4 or more: the evidence
+    returns to the planner through the existing planner-question path
+    before any authorized directed attempt is used; only after that one
+    explicitly authorized attempt is used does the job end failed with
+    its evidence, which is the planner's to act on. A pool move inside
     the recovery stage is not a second escalation."""
     job = core.get_job(state_dir, request_id)
     ladder = _ladder(job)
@@ -3219,6 +3239,17 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
                 return {"action": "failed", "reason": "escalation_exhausted", "reports": reports}
             return _escalate_recovery_to_planner(state_dir, request_id, token)
     else:
+        # Normal failures at 4 or more still owe the planner a concrete
+        # decision before any authorized directed attempt is used: the
+        # usual path is one recovery escalation that fails, not three
+        # exhausted rungs. Only after the planner's one explicitly
+        # authorized attempt is used does exhaustion end terminally.
+        try:
+            st_used = _load_controller_state(job).get("planner_recovery_used")
+        except Exception:
+            st_used = False
+        if not st_used:
+            return _escalate_recovery_to_planner(state_dir, request_id, token)
         reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
                                           .glob("turn-*/report.json")))
         error = _escalation_exhausted_error(state_dir, request_id, failures, reports)
@@ -3459,17 +3490,20 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     """Run one explicitly authorized planner-directed recovery attempt.
 
     After recovery exhaustion the planner's answer permits exactly one
-    additional bounded attempt on an eligible directed route. Consumes
-    the authorization (single use, never reset by the ladder), switches
-    to the directed route with reason ``planner_directed``, and records
+    additional bounded dispatcher-owned attempt: an approach-only answer
+    runs once on the current route, while an eligible ``directed_route``
+    switches there with reason ``planner_directed``. Consumes the
+    authorization (single use, never reset by the ladder) and records
     the recovery decision linking the failed attempt onward. Returns
     True when the caller should run the turn directly instead of the
-    ordinary ladder path. A missing authorization, a missing
-    ``directed_route``, or a rejected route returns False so the ladder
-    path applies unchanged: no implicit loop and no unlimited retries.
+    ordinary ladder path, so the question is never re-posted and no
+    implicit loop forms. A missing authorization or a rejected route
+    returns False so the ladder path applies unchanged: no unlimited
+    retries.
     """
     try:
-        st = _load_controller_state(core.get_job(state_dir, request_id))
+        job_now = core.get_job(state_dir, request_id)
+        st = _load_controller_state(job_now)
     except Exception:
         return False
     if not st.get("planner_recovery_authorized") or st.get("planner_recovery_used"):
@@ -3477,11 +3511,20 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     if not isinstance(envelope, dict):
         return False
     directed = envelope.get("directed_route")
+    current_route = job_now.get("route")
     if not isinstance(directed, str) or not directed.strip():
-        return False
-    assigned = _apply_planner_directed_route(state_dir, request_id, envelope)
-    if not assigned:
-        return False
+        # Approach-only direction: one authorized attempt on the current
+        # route, without re-posting the recovery question.
+        target = current_route
+    elif directed.strip() == current_route:
+        # An explicit direction naming the current route needs no switch
+        # but still consumes the single authorization.
+        target = current_route
+    else:
+        assigned = _apply_planner_directed_route(state_dir, request_id, envelope)
+        if not assigned:
+            return False
+        target = directed.strip()
     try:
         ladder = _ladder(core.get_job(state_dir, request_id))
     except Exception:
@@ -3497,7 +3540,7 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     try:
         core.record_recovery_decision(
             state_dir, request_id, int(ladder.get("failures") or 0),
-            "recovery_directed", directed.strip(),
+            "recovery_directed", target,
             ladder.get("counted_seq"), "planner_directed",
             lease_token=token)
     except core.LeaseLostError:

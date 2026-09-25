@@ -1767,14 +1767,21 @@ def record_proof_owner(state_dir, request_id: str,
 
     Lets cancel and recover block on unresolved proof ownership when
     the controller dies mid-proof instead of treating the job as
-    stopped while the proof tree keeps running. Never raises past the
-    caller: an unrecorded proof still runs, it just reads as unknown.
+    stopped while the proof tree keeps running. Records the leader
+    start identity with the PID and PGID so a reused group ID never
+    reads as alive. Never raises past the caller: an unrecorded proof
+    still runs, it just reads as unknown.
     """
+    try:
+        pid_start = _process_start_identity(pid) if pid is not None else None
+    except Exception:
+        pid_start = None
     try:
         path = proof_owner_path(state_dir, request_id)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         store.secure_write_text(path, json.dumps(
-            {"pid": pid, "pgid": pgid, "started_at": _utcnow()},
+            {"pid": pid, "pgid": pgid, "pid_start": pid_start,
+             "started_at": _utcnow()},
             sort_keys=True))
     except Exception:
         pass
@@ -1793,7 +1800,12 @@ def proof_owner_alive(state_dir, request_id: str) -> bool:
 
     A missing or unreadable file reads as not alive (unknown ownership
     is handled by the invocation ledger, never invented here). A live
-    group blocks cancel and recover until it is reaped.
+    group blocks cancel and recover until it is reaped. PID reuse
+    protection: the leader start identity is verified, so a reused
+    group ID never reads as alive. A dead leader with a live group
+    still reads alive (leftover members need draining); a mismatched
+    leader proven to sit in the same recorded group proves reuse and
+    reads dead.
     """
     try:
         raw = proof_owner_path(state_dir, request_id).read_text(
@@ -1806,7 +1818,65 @@ def proof_owner_alive(state_dir, request_id: str) -> bool:
         return False
     if not isinstance(rec, dict):
         return False
-    return bool(_is_pgid_alive(rec.get("pgid")))
+    pgid = rec.get("pgid")
+    if not _is_pgid_alive(pgid):
+        return False
+    pid = rec.get("pid")
+    pid_start = rec.get("pid_start")
+    if pid is None:
+        return True
+    try:
+        state = _identity_state(pid, pid_start)
+    except Exception:
+        return True
+    if state == "match":
+        return True
+    if state == "dead":
+        return True
+    if state == "mismatch":
+        try:
+            if _pgid_for_pid(pid) == int(pgid):
+                return False
+        except (TypeError, ValueError):
+            pass
+        return True
+    return True
+
+
+def _drain_proof_group(state_dir, request_id: str) -> bool:
+    """Signal and wait for the recorded proof process group to stop.
+
+    Uses the stored start identity so a reused PID or PGID is never
+    signalled. Returns True only after the proof owner reads dead.
+    """
+    try:
+        raw = proof_owner_path(state_dir, request_id).read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    try:
+        rec = json.loads(raw or "null")
+    except ValueError:
+        return True
+    if not isinstance(rec, dict):
+        return True
+    if not proof_owner_alive(state_dir, request_id):
+        return True
+    _signal_group(rec.get("pgid"), rec.get("pid"), rec.get("pid_start"),
+                  signal.SIGTERM)
+    end = time.monotonic() + 5.0
+    while time.monotonic() < end:
+        if not proof_owner_alive(state_dir, request_id):
+            return True
+        time.sleep(0.1)
+    _signal_group(rec.get("pgid"), rec.get("pid"), rec.get("pid_start"),
+                  signal.SIGKILL)
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end:
+        if not proof_owner_alive(state_dir, request_id):
+            return True
+        time.sleep(0.1)
+    return not proof_owner_alive(state_dir, request_id)
 
 
 def record_verification_attempt(state_dir, request_id: str, seq,
@@ -2042,10 +2112,19 @@ def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
     if crashed:
         return "crashed"
     signal_name = None
+    startup_error = ""
     if isinstance(result_obj, dict):
         signal_name = result_obj.get("signal")
         if signal_name is None and isinstance(result_obj.get("envelope"), dict):
             signal_name = result_obj["envelope"].get("signal")
+        for container in (result_obj,
+                          result_obj.get("envelope")
+                          if isinstance(result_obj.get("envelope"), dict) else {}):
+            if not isinstance(container, dict):
+                continue
+            err = container.get("error")
+            if isinstance(err, str) and err:
+                startup_error += " " + err
     if signal_name == "exhausted":
         return "quota"
     if signal_name == "overloaded":
@@ -2059,6 +2138,16 @@ def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
     if rc == 0:
         return "completed"
     if rc == 124:
+        # A supervisor-level rc124 with no proof run (an OpenCode startup
+        # failure) is infrastructure, never a proof timeout: the suite
+        # never ran, so nothing timed out. A proof that ran past its
+        # budget carries no such marker and stays timeout. This keeps the
+        # invocation row class aligned with the turn report's
+        # failure_class for the same attempt.
+        if ("did not emit a localhost URL" in startup_error
+                or "exited before emitting" in startup_error
+                or "terminated during server startup" in startup_error):
+            return "infrastructure"
         return "timeout"
     if rc in (143, -15):
         return "cancelled"
@@ -3214,9 +3303,13 @@ def cancel(state_dir, request_id: str) -> dict:
     finally:
         con.close()
 
-    # Stop every owned child process group, not just the controller PID.
-    # The workspace claim is retained until all owned children confirm dead.
-    all_dead = _drain_owned_children(state_dir, request_id, owner)
+    # Stop every owned child process group, not just the controller PID,
+    # including the actual owned proof process group recorded durably
+    # while it runs. The workspace claim is retained until all owned
+    # children confirm dead.
+    children_dead = _drain_owned_children(state_dir, request_id, owner)
+    proof_dead = _drain_proof_group(state_dir, request_id)
+    all_dead = bool(children_dead and proof_dead)
 
     # Best-effort stop of the legacy owned worker PID when ownership proven.
     try:
@@ -3518,8 +3611,9 @@ def recover_one(state_dir, request_id: str) -> dict:
         if job["cancel_requested"]:
             con.execute("COMMIT")
             con.close()
-            all_dead = _drain_owned_children(state_dir, request_id, dict(job)) \
-                and not proof_owner_alive(state_dir, request_id)
+            children_dead = _drain_owned_children(state_dir, request_id, dict(job))
+            proof_dead = _drain_proof_group(state_dir, request_id)
+            all_dead = bool(children_dead and proof_dead)
             _finalize_stopped(state_dir, request_id, all_dead)
             fin = get_job(state_dir, request_id)
             return {"request_id": request_id,
