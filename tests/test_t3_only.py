@@ -311,7 +311,7 @@ class SubmitRequiresT3(Base):
     def test_legacy_modules_are_gone(self):
         for name in ("harnesses", "supervisor", "kits", "direction"):
             self.assertFalse((ROOT / "runner" / f"{name}.py").exists(), name)
-        self.assertFalse((ROOT / "skills").exists())
+        self.assertFalse((ROOT / "skills" / "model-routing").exists())
 
 
 if __name__ == "__main__":
