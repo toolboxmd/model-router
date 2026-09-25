@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.35.3] - 2026-09-25
+
+### Added
+
+- A small fixed `model-router` Skill (how to submit and follow a job through the bundled CLI), so the marketplace can build the Cursor plugin; promotion of 0.35.2 was rejected with `released Project declares no Cursor Skills`
+
 ## [0.35.2] - 2026-09-25
 
 ### Fixed
