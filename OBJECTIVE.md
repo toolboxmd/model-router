@@ -18,8 +18,9 @@ The Objective is complete when:
   that thread is open: ready to merge with the PR URL, or blocked, failed
   or cancelled with the reason.
 - A dispatcher reply missing its closing braces no longer blocks a job.
-- One real task submitted from a planner outside Claude Code reaches an open
-  PR through the installed release.
+- One real task handed over from a planner in a T3 thread (any harness)
+  runs its dispatcher and workers as T3 threads of that planner thread and
+  reaches an open PR.
 
 Merging, releases, installations and other Human Gates stay with people.
 Stacked PR trains, multi-machine operation and a learned routing policy

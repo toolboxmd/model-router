@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.33.1] - 2026-09-25
+
+### Changed
+
+- Project Direction: the milestone is proven from a planner in a T3 thread whose agents run as T3 threads
+
 ## [0.33.0] - 2026-09-25
 
 ### Added
