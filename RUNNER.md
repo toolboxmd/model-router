@@ -94,8 +94,10 @@ operator checked the provider allowance.
 `runner/policy.py` names each route as a T3 model selection (provider
 instance, model, effort) with its family, pool, caps, and context window,
 and orders them per stage: `dispatch`, the three implementation lanes,
-`correction`, `recovery`, and `review`. These orders are the default role
-preferences.
+`correction` (Retry), `recovery` (Escalation), and `review`. These orders are
+the default role preferences. The internal keys `correction` and `recovery`
+stay in the policy and the snapshot contract; user-facing text says Retry
+and Escalation, and recovery alone means controller recovery.
 
 Before each controller step the runner reads the Prism provider snapshot,
 `GET /api/prism/snapshot?projectId=<planner project>` with the same bearer
@@ -104,10 +106,12 @@ token (toolboxmd/t3code#19; `runner/t3snapshot.py`, cached for 30 seconds):
 - **Eligibility.** A route is eligible when its T3 instance is present and
   enabled and offers the route's model. Turning a model off in T3 Providers
   removes it from routing.
-- **Role preferences.** A non-empty Prism list for a role and lane replaces
-  the policy order for that stage: `worker` easy, medium and hard for the
-  small, default and hard lanes; `dispatcher`, `reviewer`, `correction` and
-  `recovery` for the job's lane. The first entry is the primary, the rest are
+- **Role preferences.** A non-empty Prism list replaces the policy order
+  for that stage: `worker` easy, medium and hard for the small, default and
+  hard lanes; `dispatcher`, `reviewer`, `correction` (Retry) and `recovery`
+  (Escalation) each read one list, `models` (toolboxmd/model-router#127). A
+  snapshot without `models` (older fork) falls back to the role's entry for
+  the job's lane. The first entry is the primary, the rest are
   fallbacks. An entry that matches a policy route keeps its caps; any other
   runs as `t3:<instance>:<model>@<effort>`.
 - **Limits.** A pool's meter is one T3 driver's usage windows (`go` is
@@ -135,7 +139,7 @@ Signal classes: `exhausted` moves the same model to the next pool
 moves to a larger-context route in the lane; `hard` ends the turn as failed.
 Moves stay inside the job's lane and skip exhausted, degraded, one-turn
 routes already used, and full capped routes; with nothing eligible the job
-blocks as `capacity_exhausted` with the route and signal. The correction
+blocks as `capacity_exhausted` with the route and signal. The Retry
 route sits in no lane: a capacity signal on it moves into the job's lane
 (another family first). A preflight before every worker turn and dispatch
 applies the same rules before any thread starts.
@@ -143,7 +147,7 @@ applies the same rules before any thread starts.
 ## T3 threads
 
 A job's threads form a tree (#113). The dispatcher thread is a child of the
-planner thread; worker, correction and recovery threads are children of the
+planner thread; worker, Retry and Escalation threads are children of the
 dispatcher thread (the planner thread when no dispatcher thread was saved).
 A child id follows the fork convention `sub.<parent>.<suffix>` and the
 `thread.create` payload also carries `parentThreadId`. Every child's first
@@ -223,7 +227,7 @@ thread; Grok turns are re-sent by the router.
    refusal hands the evidence back to the dispatcher once and blocks if it
    insists. The PR check reads the PR live with `gh pr view` once per
    completion; an unavailable check refuses as unverified. A verified PR URL
-   becomes the job's single PR identity: correction and recovery update
+   becomes the job's single PR identity: Retry and Escalation update
    that PR, never open a second. An ordinary job in a workspace without an
    origin push remote completes without a PR; experiment and replay jobs
    need none. Nothing merges the PR.
@@ -274,12 +278,18 @@ budget is 5 launches.
 
 **Escalation ladder.** A turn fails when the worker or provider errors (not
 a capacity signal, which moves routes instead), when the task's own proof
-exits non-zero, or when the reviewer requests changes. The first failure leads to a correction in the same worker
-thread on the same route. The second leads to a fresh correction on the
-correction route. The third is the single escalation to the recovery stage;
-its pool moves are not second escalations, and recovery never reuses a
+exits non-zero, or when the reviewer requests changes. The first failure leads to a retry in the same worker
+thread on the same route. The second leads to a fresh retry on the
+Retry route. The third is the single escalation to the Escalation stage;
+its pool moves are not second escalations, and Escalation never reuses a
 rung the job already ran. An ordinary implementation envelope never moves
-the job, so a repeated default cannot undo a correction or recovery move.
+the job, so a repeated default cannot undo a Retry or Escalation move.
+Prism can switch Retry or Escalation off (`enabled: false` on the
+`correction` or `recovery` role); its rungs then drop out and later rungs
+and the planner question move up. With both off, the first failed worker
+turn goes straight to the planner question. Each failure takes the next
+enabled rung after the last one used, so a switch flipped mid-job never
+repeats a rung or escalates twice.
 Every rung move records a `recovery_decision` event; `recovery_next_attempt`
 links it to the next attempt's seq and `recovery_attempt_result` keeps that
 attempt's outcome. When every rung was used, the evidence returns to the
@@ -293,7 +303,7 @@ after it ends the job as `failed` with `ESCALATION_EXHAUSTED` and the same
 decision content. The candidate stays dispatcher-owned: a failure never
 authorizes the planner to take over implementation, debugging, test
 execution, or verification. A dispatcher-directed route is assigned only
-when it is assignable (an implementation-lane, correction, or recovery
+when it is assignable (an implementation-lane, Retry, or Escalation
 route) and has capacity; anything else is rejected with a
 `planner_route_rejected` event, never silently substituted.
 

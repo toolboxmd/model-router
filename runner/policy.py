@@ -166,11 +166,11 @@ STAGES = {
                  "note": "a load-bearing step is done by the planner itself before "
                          "submission; the runner never dispatches it"},
     "correction": {"executor": "runner", "role": "correction", "routes": ["kimi-k2.7-code-go"],
-                   "note": "once per job; the same worker thread is tried first; a capacity "
+                   "note": "Retry: once per job; the same worker thread is tried first; a capacity "
                            "signal moves on into the job's lane"},
     "recovery": {"executor": "runner", "role": "recovery",
                  "routes": ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"],
-                 "note": "one escalation per job; pool moves are not second escalations; "
+                 "note": "Escalation: one per job; pool moves are not second escalations; "
                          "then the planner decides through a planner question"},
     "review": {"executor": "runner", "role": "reviewer",
                "routes": ["luna/max", "luna-go/max"],

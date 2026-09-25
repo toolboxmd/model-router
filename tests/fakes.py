@@ -198,14 +198,17 @@ def prism_provider(instance, models, driver=None, enabled=True, windows=None):
     return entry
 
 
-def prism_snapshot(providers, lanes=None):
-    """A Prism snapshot: providers plus role kits with ``lanes`` per role."""
+def prism_snapshot(providers, lanes=None, kits=None):
+    """A Prism snapshot: providers plus role kits with ``lanes`` per role;
+    ``kits`` adds fields per role (``models``, ``enabled``)."""
     roles = {role: {"instructions": "", "skills": [], "threadTools": "none",
                     "lanes": {"easy": [], "medium": [], "hard": []}}
              for role in ("planner", "dispatcher", "reviewer", "worker",
                           "correction", "recovery")}
     for role, per_lane in (lanes or {}).items():
         roles[role]["lanes"].update(per_lane)
+    for role, fields in (kits or {}).items():
+        roles[role].update(fields)
     return {"generatedAt": iso(NOW), "projectId": PROJECT, "providers": providers,
             "roles": roles}
 
