@@ -292,12 +292,13 @@ decision content in its error payload, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
 decides; the runner enforces the ceiling. A stopped turn with a supervisor
 result and every owned process group proven dead (an OpenCode rc124
-startup failure or an rc143 confirmed stop, with both child and supervisor
-groups confirmed dead and no live invocation) returns its evidence to the
-dispatcher as a failed turn instead of a sticky block; a finished database
-row alone never proves death, and missing results, live groups, rc125, and
-ambiguous ownership keep the sticky block so no second writer starts
-behind a possible owner.
+startup failure or an rc143 confirmed stop, with every recorded child and
+supervisor group present and confirmed dead and no live or unresolved
+invocation) returns its evidence to the dispatcher as a failed turn
+instead of a sticky block; a finished database row alone never proves
+death, absent group identities prove nothing, and missing results, live
+groups, rc125, and ambiguous ownership keep the sticky block so no second
+writer starts behind a possible owner.
 
 A stored answer is reused only when the stored prompt matches the
 dispatcher's prompt; a reused `qid` with a different prompt blocks with
@@ -801,8 +802,11 @@ writer. The proof group is recorded durably while it runs
 (`proof-owner.json` with PID, PGID, and leader start identity): public
 cancel drains that actual owned group with PID reuse protection, and
 cancel and `recover` block on unresolved proof ownership instead of
-treating the job as stopped while the proof tree keeps running. The
-workspace claim is retained until ownership is confirmed dead. Every executed proof is also a durable invocation row with
+treating the job as stopped while the proof tree keeps running. An
+unreadable record or one without group identities is ambiguous
+ownership, never safe death: the workspace claim is retained until
+ownership resolves. The workspace claim is otherwise retained until
+ownership is confirmed dead. Every executed proof is also a durable invocation row with
 `stage='verification'` (kind `proof`), its start/end timestamps, exit code,
 proof class, and elapsed time, so verification outcomes are observable from
 the existing invocation records. A supervisor-level rc124 with no proof run
@@ -827,8 +831,9 @@ reason (worker moves record `route_reason` with `scope: worker`; dispatch
 moves record `dispatch_route_reason` with `scope: dispatch` and leave the
 worker's reason alone, so the first worker invocation keeps `initial`),
 harness version, elapsed time, terminal class (completed, failed,
-crashed, cancelled, timeout, quota, overloaded, stalled, context,
-hard_error, infrastructure for a startup rc124 with no proof run),
+crashed, cancelled only with explicit job cancellation intent, timeout,
+quota, overloaded, stalled, context, hard_error, infrastructure for a
+startup rc124 with no proof run or a stop without cancel intent),
 longest observed stream silence (`longest_silence_secs`), usage counters
 verbatim under a source label, the observed model and the observed variant as
 separate fields, and native identities (Codex thread and turn ids, Claude
@@ -852,9 +857,13 @@ starts; `recovery_attempt_result` preserves that attempt's outcome.
 Verification attempts are invocation rows with `stage='verification'`
 (kind `proof`) carrying started/ended timestamps, exit code, proof class,
 and elapsed time; cancellation intent lives on the job
-(`cancel_requested`) with `cancelled`/`timeout` events. A startup rc124
-carries `infrastructure` in both the turn report and its invocation row;
-an actual proof rc124 timeout carries `timeout` in both. Combined
+(`cancel_requested`) with `cancelled`/`timeout` events. A stop (rc143)
+reads `cancelled` on the invocation row only with explicit job
+cancellation intent; without intent it reads `infrastructure` when stop
+evidence is present and `unknown` when none is, never cancelled by exit
+code alone. A startup rc124 carries `infrastructure` in both the turn
+report and its invocation row; an actual proof rc124 timeout carries
+`timeout` in both. Combined
 acceptance with Agent Observer still needs its importer to read these
 fields (it currently discards Router events and never reads `report.json`):
 the remaining adapter additions are importing `recovery_decision`,

@@ -1969,16 +1969,17 @@ def _confirmed_stop_recoverable(state_dir, request_id: str,
 
     A supervisor result (an OpenCode rc124 startup failure or an rc143
     confirmed stop) is recoverable only when every owned process group
-    is proven dead, not merely because a database row reads finished:
-    the newest worker control invocation must read ``dead`` or
-    ``finished``, never live, orphaned, unresolved, or unknown, and
-    both its recorded process groups (child and supervisor) must not be
-    alive. A finished row alone proves the record was written, never
-    that the group died: members that ignore SIGTERM can survive the
-    supervisor's leader-only wait. Missing results, rc125 supervisor
-    loss, live groups, and any ambiguous ownership stay sticky-blocked
-    so no second writer starts behind a possible owner. Read-only:
-    never kills anything.
+    is proven dead: each recorded worker control invocation (abandoned
+    never-started rows excepted) must read ``dead`` or ``finished``,
+    never live, orphaned, unresolved, or unknown, and every recorded
+    child and supervisor process group must be present and proven dead.
+    A finished row alone proves the record
+    was written, never that the group died: members that ignore SIGTERM
+    can survive the supervisor's leader-only wait, and absent group
+    identities prove nothing at all. Missing results, missing or
+    unknown group identities, live groups, rc125 supervisor loss, and
+    any ambiguous ownership stay sticky-blocked so no second writer
+    starts behind a possible owner. Read-only: never kills anything.
     """
     if rc == 125:
         return False
@@ -1992,18 +1993,24 @@ def _confirmed_stop_recoverable(state_dir, request_id: str,
     if not invs:
         return False
     try:
-        own = core._invocation_ownership(invs[-1])
-    except Exception:
-        return False
-    if own not in ("dead", "finished"):
-        return False
-    try:
-        newest = invs[-1]
-        for pgid_key in ("pgid", "supervisor_pgid"):
-            pgid = newest.get(pgid_key)
-            if pgid is not None and core._is_pgid_alive(pgid):
+        for inv in invs:
+            if inv.get("state") == "abandoned":
+                continue
+            try:
+                own = core._invocation_ownership(inv)
+            except Exception:
                 return False
+            if own not in ("dead", "finished"):
+                return False
+            for pgid_key in ("pgid", "supervisor_pgid"):
+                pgid = inv.get(pgid_key)
+                if pgid is None:
+                    return False
+                if core._is_pgid_alive(pgid):
+                    return False
         if core._any_live_invocation(state_dir, request_id):
+            return False
+        if core._any_unresolved_invocation(state_dir, request_id):
             return False
     except Exception:
         return False

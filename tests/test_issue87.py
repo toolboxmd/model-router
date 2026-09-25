@@ -1050,19 +1050,39 @@ class Runtime75Caveats(unittest.TestCase):
         self.assertEqual(core.get_job(sd, "late")["status"], "succeeded")
 
 
-def _finished_worker_row(sd, rid, ws, kind="opencode_control", rc=1):
+def _dead_group():
+    """A real process group proven dead: spawn detached, reap, verify."""
+    proc = subprocess.Popen(["sleep", "0.05"], start_new_session=True)
+    pgid = os.getpgid(proc.pid)
+    proc.wait()
+    time.sleep(0.2)
+    assert not core._is_pgid_alive(pgid), "fixture group must be dead"
+    return proc.pid, pgid
+
+
+def _finished_worker_row(sd, rid, ws, kind="opencode_control", rc=1,
+                         with_groups=True):
+    # Recoverable stops carry explicit known-dead group evidence: real
+    # child and supervisor process groups that have exited and verified
+    # dead. A row without group identities proves nothing and must stay
+    # blocked (with_groups=False covers that regression).
+    pid, pgid = _dead_group() if with_groups else (None, None)
+    spid, spgid = _dead_group() if with_groups else (None, None)
     con = store.connect(sd)
     try:
         con.execute(
             "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-            "owner_token,stdout_path,stderr_path,started_at,ended_at,state,rc,"
-            "consumed_at,stage,requested_route,policy_version,meta_json,action_key)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "owner_token,pid,pgid,stdout_path,stderr_path,started_at,ended_at,state,rc,"
+            "consumed_at,stage,requested_route,policy_version,meta_json,action_key,"
+            "supervisor_pid,supervisor_pgid)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (f"fin-{rid}-{kind}", rid, kind, "[]", str(ws), "",
-             "/dev/null", "/dev/null", core._utcnow(), core._utcnow(),
+             pid, pgid, "/dev/null", "/dev/null",
+             core._utcnow(), core._utcnow(),
              "failed", rc, core._utcnow(), "implementation",
              "muse-spark-xhigh-free", "x",
-             json.dumps({"route": "muse-spark-xhigh-free", "seq": 1}), "k1"))
+             json.dumps({"route": "muse-spark-xhigh-free", "seq": 1}), "k1",
+             spid, spgid))
         con.commit()
     finally:
         con.close()
@@ -1162,6 +1182,18 @@ class ConfirmedStopRecovery(unittest.TestCase):
         self.assertEqual(res["action"], "blocked")
         self.assertEqual(core.get_job(sd, "stop-unres")["status"], "blocked")
 
+    def test_finished_row_with_absent_group_ownership_stays_blocked(self):
+        # A finished database row without recorded child and supervisor
+        # group identities proves nothing about the processes: the stop
+        # stays sticky-blocked instead of returning evidence.
+        _tmp, sd, ws = self._running_job("stop-absent")
+        _finished_worker_row(sd, "stop-absent", ws, with_groups=False)
+        res = self._turn(sd, "stop-absent", ws, _supervisor_run(
+            143, {"ok": False, "rc": 143,
+                  "error": "terminated by cancellation"}))
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(core.get_job(sd, "stop-absent")["status"], "blocked")
+
     def test_finished_row_with_live_group_stays_blocked(self):
         # A finished database row alone never proves the group died:
         # members that ignore SIGTERM can survive the supervisor's
@@ -1209,6 +1241,47 @@ class ConfirmedStopRecovery(unittest.TestCase):
                   "error": "opencode serve did not emit a localhost URL"}))
         self.assertEqual(res["action"], "implementation_failed")
         self.assertEqual(res["report"]["failure_class"], "infrastructure")
+
+
+class TerminalClassCancelIntent(unittest.TestCase):
+    def test_rc143_cancelled_only_with_explicit_job_intent(self):
+        stop = {"ok": False, "rc": 143, "error": "terminated by cancellation"}
+        self.assertEqual(
+            core.terminal_class_for(143, stop, cancel_requested=True),
+            "cancelled")
+        self.assertEqual(
+            core.terminal_class_for(143, stop), "infrastructure",
+            "a stop returned to the dispatcher without job cancellation "
+            "intent is infrastructure, never cancelled by exit code alone")
+        self.assertEqual(
+            core.terminal_class_for(143, None), "unknown",
+            "a stop with no evidence and no intent stays unknown")
+
+    def test_measurement_threads_job_cancel_intent(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "intent", {"g": 1}, str(ws), "p")
+        stop = {"ok": False, "rc": 143, "error": "terminated by cancellation"}
+        m = core._compute_invocation_measurement(
+            sd, "intent", "inv1", "opencode_control", "", "",
+            {"seq": 1}, core._utcnow(), core._utcnow(), 143, stop)
+        self.assertEqual(m["terminal_class"], "infrastructure")
+        sql(sd, "UPDATE jobs SET cancel_requested=1 WHERE request_id='intent'")
+        m = core._compute_invocation_measurement(
+            sd, "intent", "inv1", "opencode_control", "", "",
+            {"seq": 1}, core._utcnow(), core._utcnow(), 143, stop)
+        self.assertEqual(m["terminal_class"], "cancelled")
+
+    def test_class_boundaries_preserved(self):
+        self.assertEqual(
+            core.terminal_class_for(
+                124, {"error": "opencode serve did not emit a localhost URL"}),
+            "infrastructure",
+            "startup rc124 needs its supervisor marker")
+        self.assertEqual(core.terminal_class_for(124, None), "timeout",
+                         "an actual proof rc124 stays timeout")
+        self.assertEqual(core.failure_class_for(signal="context"), "provider",
+                         "context pressure classifies provider")
 
 
 class HardErrorSkipsProof(unittest.TestCase):
@@ -1330,6 +1403,39 @@ class ProofTreeOwnership(unittest.TestCase):
         except PermissionError:
             alive = True
         self.assertFalse(alive, "owned proof group is confirmed dead")
+
+    def test_ambiguous_proof_owner_retains_workspace_claim(self):
+        # A proof record without group identities is unproven ownership,
+        # never safe death: public cancel retains the workspace claim
+        # instead of finalizing cancellation behind a possible owner.
+        from runner import store as _store
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "ambigproof", {"g": 1}, str(ws), "p")
+        path = core.proof_owner_path(sd, "ambigproof")
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _store.secure_write_text(path, json.dumps(
+            {"pid": None, "pgid": None, "pid_start": None,
+             "started_at": core._utcnow()}, sort_keys=True))
+        self.assertTrue(core.proof_owner_alive(sd, "ambigproof"))
+        job = core.cancel(sd, "ambigproof")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("pending", job["block_reason"])
+
+    def test_unreadable_proof_owner_retains_workspace_claim(self):
+        # A proof record that cannot be parsed proves nothing either:
+        # cancel blocks with the claim retained until ownership resolves.
+        from runner import store as _store
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        core.submit(sd, "badproof", {"g": 1}, str(ws), "p")
+        path = core.proof_owner_path(sd, "badproof")
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _store.secure_write_text(path, "{not json")
+        self.assertTrue(core.proof_owner_alive(sd, "badproof"))
+        job = core.cancel(sd, "badproof")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("pending", job["block_reason"])
 
 
 class EligibleDirectedRoutes(unittest.TestCase):

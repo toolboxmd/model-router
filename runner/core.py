@@ -1798,9 +1798,12 @@ def clear_proof_owner(state_dir, request_id: str) -> None:
 def proof_owner_alive(state_dir, request_id: str) -> bool:
     """True when a recorded proof process group may still be running.
 
-    A missing or unreadable file reads as not alive (unknown ownership
-    is handled by the invocation ledger, never invented here). A live
-    group blocks cancel and recover until it is reaped. PID reuse
+    No proof-owner file means no proof owner is recorded, which reads
+    as not alive. A present but unreadable record, or a record without
+    group identities, is ambiguous ownership and reads alive: an
+    unproven owner is never treated as safely dead, and cancel and
+    recover retain the workspace claim until ownership resolves. A
+    live group blocks cancel and recover until it is reaped. PID reuse
     protection: the leader start identity is verified, so a reused
     group ID never reads as alive. A dead leader with a live group
     still reads alive (leftover members need draining); a mismatched
@@ -1815,10 +1818,12 @@ def proof_owner_alive(state_dir, request_id: str) -> bool:
     try:
         rec = json.loads(raw or "null")
     except ValueError:
-        return False
+        return True
     if not isinstance(rec, dict):
-        return False
+        return True
     pgid = rec.get("pgid")
+    if pgid is None:
+        return True
     if not _is_pgid_alive(pgid):
         return False
     pid = rec.get("pid")
@@ -1847,7 +1852,10 @@ def _drain_proof_group(state_dir, request_id: str) -> bool:
     """Signal and wait for the recorded proof process group to stop.
 
     Uses the stored start identity so a reused PID or PGID is never
-    signalled. Returns True only after the proof owner reads dead.
+    signalled. Returns True only after the proof owner reads dead. A
+    missing file means nothing to drain. An unreadable record or one
+    without group identities cannot be drained and returns False, so
+    the workspace claim is retained until ownership resolves.
     """
     try:
         raw = proof_owner_path(state_dir, request_id).read_text(
@@ -1857,9 +1865,9 @@ def _drain_proof_group(state_dir, request_id: str) -> bool:
     try:
         rec = json.loads(raw or "null")
     except ValueError:
-        return True
-    if not isinstance(rec, dict):
-        return True
+        return False
+    if not isinstance(rec, dict) or rec.get("pgid") is None:
+        return False
     if not proof_owner_alive(state_dir, request_id):
         return True
     _signal_group(rec.get("pgid"), rec.get("pid"), rec.get("pid_start"),
@@ -1907,18 +1915,20 @@ def record_verification_attempt(state_dir, request_id: str, seq,
         ended = None
     elapsed = round(max(0.0, ended - started), 3) \
         if started is not None and ended is not None else None
-    try:
-        tclass = terminal_class_for(proof_rc, None)
-    except Exception:
-        tclass = "failed" if proof_rc else "completed"
     now = _utcnow()
     invocation_id = secrets.token_hex(8)
     try:
         job = get_job(state_dir, request_id)
         owner_token = job.get("owner_token") or ""
         workspace = job.get("workspace") or ""
+        _proof_cancel_intent = bool(job.get("cancel_requested"))
     except Exception:
-        owner_token, workspace = "", ""
+        owner_token, workspace, _proof_cancel_intent = "", "", False
+    try:
+        tclass = terminal_class_for(proof_rc, None,
+                                    cancel_requested=_proof_cancel_intent)
+    except Exception:
+        tclass = "failed" if proof_rc else "completed"
     try:
         seq_i = int(seq) if seq is not None else None
     except (TypeError, ValueError):
@@ -2108,7 +2118,17 @@ def harness_version_for(kind: str) -> str | None:
     """``<binary> --version`` once per process for the harness behind a kind."""
     return harnesses.harness_for(kind).version()
 
-def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
+def terminal_class_for(rc, result_obj, crashed: bool = False,
+                       cancel_requested: bool = False) -> str:
+    """Terminal class for one finished invocation, for Observer measurement.
+
+    An rc143 (or -15) stop reads ``cancelled`` only when the owning job
+    carries explicit cancellation intent (``cancel_requested``). Without
+    that intent a stop is ``infrastructure`` when the result carries stop
+    evidence and ``unknown`` when it carries none: the exit code alone
+    never invents a cancellation. Intentional cancellation stays a job
+    property, separate from ordinary failure reporting.
+    """
     if crashed:
         return "crashed"
     signal_name = None
@@ -2150,7 +2170,11 @@ def terminal_class_for(rc, result_obj, crashed: bool = False) -> str:
             return "infrastructure"
         return "timeout"
     if rc in (143, -15):
-        return "cancelled"
+        if cancel_requested:
+            return "cancelled"
+        if isinstance(result_obj, dict) and result_obj:
+            return "infrastructure"
+        return "unknown"
     return "failed"
 
 
@@ -2257,7 +2281,12 @@ def _compute_invocation_measurement(state_dir, request_id: str, invocation_id: s
     started = _parse_ts(started_at)
     ended = _parse_ts(ended_at) or time.time()
     elapsed = round(max(0.0, ended - started), 3) if started is not None else None
-    tclass = terminal_class_for(rc, result_obj, crashed=crashed)
+    try:
+        _cancel_intent = bool(get_job(state_dir, request_id).get("cancel_requested"))
+    except Exception:
+        _cancel_intent = False
+    tclass = terminal_class_for(rc, result_obj, crashed=crashed,
+                                cancel_requested=_cancel_intent)
     longest = None
     if isinstance(result_obj, dict):
         # Owned-server turns nest the drive result under ``envelope``; CLI
