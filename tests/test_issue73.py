@@ -281,7 +281,8 @@ class TestDispatchStallPath(unittest.TestCase):
         self.assertNotIn("codex_auth_failed", job["block_reason"] or "")
         self.assertEqual(_last_error(sd, "i73-d1").get("signal"), "stalled")
         st = json.loads(job["controller_state"] or "{}")
-        self.assertEqual(st.get("route_reason"), "dispatch_stalled")
+        self.assertEqual(st.get("dispatch_route_reason"), "dispatch_stalled")
+        self.assertNotIn("route_reason", st)
 
     def test_stalled_dispatch_without_thread_moves_laterally(self):
         sd, _base = _submit(self, "i73-d2")

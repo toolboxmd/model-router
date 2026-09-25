@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shlex
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -559,13 +560,15 @@ def _codex_auth_block(state_dir, request_id: str, rc, out, err) -> dict | None:
 
 def _record_dispatch_reason(state_dir, request_id: str, prev: str,
                             target: str, reason: str) -> None:
-    """Record why the dispatch moved routes, with the route reason.
+    """Record why the dispatch moved routes, apart from the worker reason.
 
-    Merges ``route_reason`` into the controller state and emits a
-    ``route_switched`` event (from the Codex dispatch route to the
-    OpenCode fallback), so the move is visible the same way an
-    implementation capacity move is. Never raises past the caller: a lost
-    lease still yields to the owner.
+    The dispatch reason lands only on ``dispatch_route_reason``; the
+    shared ``route_reason`` key stays untouched so the first worker
+    invocation keeps its own reason (``initial`` until a worker move
+    sets one). The ``route_switched`` event carries ``scope: dispatch``,
+    so a later worker move overwriting ``route_reason`` never disguises
+    a worker attempt with the dispatch cause. Never raises past the
+    caller: a lost lease still yields to the owner.
     """
     con = store.connect(state_dir)
     try:
@@ -579,12 +582,13 @@ def _record_dispatch_reason(state_dir, request_id: str, prev: str,
             st = {}
         if not isinstance(st, dict):
             st = {}
-        st["route_reason"] = reason
+        st["dispatch_route_reason"] = reason
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
         core._event(con, request_id, "route_switched",
                     {"from": prev, "to": target, "reason": reason,
-                     "evidence": "codex_dispatch"})
+                      "scope": "dispatch",
+                      "evidence": "codex_dispatch"})
         con.execute("COMMIT")
     except Exception:
         try:
@@ -964,6 +968,8 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
         # dispatch route once, the same model on OpenCode in plan mode.
         fallback = _dispatch_fallback_routes(dispatch_route)
         if fallback:
+            _record_dispatch_reason(state_dir, request_id, dispatch_route,
+                                    fallback[0], f"dispatch_fallback rc={rc}")
             return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
                                          reason=f"dispatch_fallback rc={rc}")
         _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted: {message}")
@@ -1423,10 +1429,14 @@ WORKER_RULES = (
 )
 
 
-def _implementation_prompt(task_json: str, artifact, payload) -> str:
+def _implementation_prompt(task_json: str, artifact, payload,
+                           known_pr_url: str | None = None) -> str:
     prompt = f"TASK (complete):\n{_task_summary(task_json)}\n"
     if isinstance(payload, dict) and isinstance(payload.get("instructions"), str):
         prompt += f"\nDISPATCHER INSTRUCTIONS:\n{payload['instructions']}\n"
+    if isinstance(known_pr_url, str) and known_pr_url.strip():
+        prompt += (f"\nExisting PR for this job: {known_pr_url.strip()}\n"
+                   "Update that PR; do not open another.\n")
     if artifact:
         prompt += f"\nartifact: {artifact}\n"
     if payload:
@@ -1520,8 +1530,9 @@ def _switch_route(state_dir, request_id: str, target: str, reason: str,
                      core._utcnow(), request_id))
         core._event(con, request_id, "route_switched",
                     {"from": prev, "to": target, "reason": reason,
-                     "evidence": str(evidence.get("source") or evidence.get("class")
-                                     or evidence.get("name") or "provider")[:64]})
+                      "scope": "worker",
+                      "evidence": str(evidence.get("source") or evidence.get("class")
+                                      or evidence.get("name") or "provider")[:64]})
         if mark is not None:
             state, marked_route, mark_evidence, reset_at, reset_source = mark
             core._record_capacity_locked(con, marked_route, state,
@@ -1687,7 +1698,11 @@ def _handle_stalled(state_dir, request_id: str, job: dict, seq: int, route: str,
     probe = evidence.get("probe") if isinstance(evidence.get("probe"), dict) else {}
     probe_signal = full.get("probe_signal") or probe.get("signal")
     stall_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                      status="stalled", error=full.get("error"))
+                                      status="stalled", error=full.get("error"),
+                                      run_proof=False,
+                                      proof_skipped_reason="stalled turn: the suite is not run "
+                                      "automatically for a silent turn; the dispatcher requests "
+                                      "useful proof of a coherent candidate")
     _set_phase(state_dir, request_id, phase="stalled_moved",
                opencode_session_id=session_id, report_path=stall_report.get("report_path"))
     if not full.get("idle_confirmed"):
@@ -1763,6 +1778,106 @@ def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
 
 
 
+def _record_planner_route_rejection(state_dir, request_id: str,
+                                      requested: str, reason: str) -> None:
+    """Persist why a dispatcher-requested route was not assigned.
+
+    The job keeps its route; the rejection travels in the ledger so the
+    dispatcher can direct an eligible route instead. Never raises past
+    the caller: a lost lease still yields to the owner.
+    """
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        core._event(con, request_id, "planner_route_rejected",
+                    {"requested": requested, "reason": reason})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _apply_planner_directed_route(state_dir, request_id: str,
+                                   envelope: dict) -> None:
+    """Assign an explicit planner direction under the routing policy.
+
+    A planner decision may direct a different approach or a stronger
+    eligible agent through the dispatcher: when the implementation
+    envelope carries ``directed_route`` naming a dispatcher-assignable
+    route, the job moves there with reason ``planner_directed``. The
+    ordinary envelope ``route`` field (and any legacy concrete route in
+    an older example) is inert: the escalation ladder stays authoritative
+    and a repeated default never undoes a correction or recovery move.
+    Anything else (an unknown route, a planner-harness rung that runs in
+    the planner session, or a route with no capacity left) is rejected
+    with a ``planner_route_rejected`` event and the job keeps its route:
+    explicit choices are never silently substituted and models never
+    silently swapped. Correction and recovery stage routes are valid
+    from any implementation lane; other routes must sit in the job lane.
+    Returns True when the direction was assigned, False otherwise.
+    """
+    if not isinstance(envelope, dict):
+        return False
+    requested = envelope.get("directed_route")
+    if not isinstance(requested, str) or not requested.strip():
+        return False
+    requested = requested.strip()
+    job = core.get_job(state_dir, request_id)
+    if requested == job.get("route"):
+        return False
+    if not policy.is_dispatcher_assignable(requested):
+        _record_planner_route_rejection(
+            state_dir, request_id, requested,
+            f"route {requested!r} is not dispatcher-assignable: "
+            "planner-harness rungs run in the planner session, and unknown "
+            "routes never substitute a model")
+        return False
+    lane = job.get("lane")
+    try:
+        stage = policy.lane_of_route(requested, lane)
+    except ValueError:
+        stage = None
+    if stage is None and requested not in policy.STAGES.get(
+            "correction", {}).get("routes", ()) \
+            and requested not in policy.STAGES.get(
+                "recovery", {}).get("routes", ()):
+        _record_planner_route_rejection(
+            state_dir, request_id, requested,
+            f"route {requested!r} is not in lane {lane!r}; keeping the job route")
+        return False
+    try:
+        exhausted = core.exhausted_routes(state_dir)
+        degraded = core.degraded_routes(state_dir)
+    except Exception:
+        exhausted, degraded = set(), set()
+    if requested in exhausted or requested in degraded:
+        _record_planner_route_rejection(
+            state_dir, request_id, requested,
+            f"route {requested!r} has no capacity left; keeping the job route")
+        return False
+    turns = _turns_by_route(state_dir, request_id)
+    if policy.one_turn_routes_used(requested, turns):
+        _record_planner_route_rejection(
+            state_dir, request_id, requested,
+            f"route {requested!r} already ran its one turn in this job; "
+            "keeping the job route")
+        return False
+    if core.route_concurrency_full(state_dir, requested, exclude=request_id):
+        _record_planner_route_rejection(
+            state_dir, request_id, requested,
+            f"route {requested!r} is at max_concurrent; keeping the job route")
+        return False
+    _switch_route(state_dir, request_id, requested, "planner_directed",
+                  {"source": "dispatcher", "requested_route": requested})
+    return True
+
+
 def _turns_by_route(state_dir, request_id: str) -> dict:
     """Implementation turns already run per route, for the one-turn rule."""
     counts: dict = {}
@@ -1796,7 +1911,12 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     state = _load_controller_state(job)
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
-    prompt = _implementation_prompt(job["task_json"], artifact, payload)
+    try:
+        known_pr = core.known_pr_url(state_dir, request_id)
+    except Exception:
+        known_pr = None
+    prompt = _implementation_prompt(job["task_json"], artifact, payload,
+                                    known_pr_url=known_pr)
     def _turn_seq(inv):
         try:
             return (json.loads(inv.get("meta_json") or "{}") or {}).get("seq")
@@ -1810,6 +1930,17 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         move = _preflight_move(state_dir, request_id, route)
         if move is not None:
             return move
+    # Bind a pending recovery decision to this actual attempt start, after
+    # any preflight route move: a preflight move starts no worker
+    # invocation, so it must not consume the pending link or emit a
+    # recovery_next_attempt for a seq that never ran. The link carries the
+    # post-move route, while the decision keeps its pre-move target.
+    try:
+        _post_move_job = core.get_job(state_dir, request_id)
+        _post_move_route = _post_move_job.get("route") or route
+    except Exception:
+        _post_move_route = route
+    _link_recovery_attempt(state_dir, request_id, seq, _post_move_route)
     # ``try`` numbers repeated worker turns for one dispatcher turn, so a
     # bounded same-route retry after a stall spawns a new attempt with its
     # own action identity instead of reusing the stalled turn's record.
@@ -1837,6 +1968,60 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         return _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
                               seq, route_reason, run_cmd, artifact, attempt)
     raise core.RunnerError(f"route {route} runs on {harness.name}, which has no worker turn")
+
+
+def _confirmed_stop_recoverable(state_dir, request_id: str,
+                                  full: dict | None, rc: int | None) -> bool:
+    """True when a stopped turn may return evidence to the dispatcher.
+
+    A supervisor result (an OpenCode rc124 startup failure or an rc143
+    confirmed stop) is recoverable only when every owned process group
+    is proven dead: each recorded worker control invocation (abandoned
+    never-started rows excepted) must read ``dead`` or ``finished``,
+    never live, orphaned, unresolved, or unknown, and every recorded
+    child and supervisor process group must be present and proven dead.
+    A finished row alone proves the record
+    was written, never that the group died: members that ignore SIGTERM
+    can survive the supervisor's leader-only wait, and absent group
+    identities prove nothing at all. Missing results, missing or
+    unknown group identities, live groups, rc125 supervisor loss, and
+    any ambiguous ownership stay sticky-blocked so no second writer
+    starts behind a possible owner. Read-only: never kills anything.
+    """
+    if rc == 125:
+        return False
+    if not isinstance(full, dict) or not full:
+        return False
+    try:
+        invs = [i for i in core._list_invocations(state_dir, request_id)
+                if i.get("kind") in ("opencode_control", "grok_control")]
+    except Exception:
+        return False
+    if not invs:
+        return False
+    try:
+        for inv in invs:
+            if inv.get("state") == "abandoned":
+                continue
+            try:
+                own = core._invocation_ownership(inv)
+            except Exception:
+                return False
+            if own not in ("dead", "finished"):
+                return False
+            for pgid_key in ("pgid", "supervisor_pgid"):
+                pgid = inv.get(pgid_key)
+                if pgid is None:
+                    return False
+                if core._is_pgid_alive(pgid):
+                    return False
+        if core._any_live_invocation(state_dir, request_id):
+            return False
+        if core._any_unresolved_invocation(state_dir, request_id):
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
@@ -1903,7 +2088,11 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
         if moved is not None:
             ctx_report = _write_turn_report(state_dir, request_id, job, seq, route, full,
                                             session_id, status="context",
-                                            error=full.get("error"))
+                                            error=full.get("error"),
+                                            run_proof=False,
+                                            proof_skipped_reason="context move: the suite is not run "
+                                            "automatically for an incomplete turn; the dispatcher "
+                                            "requests useful proof of a coherent candidate")
             _set_phase(state_dir, request_id, phase="context_moved",
                        opencode_session_id=session_id,
                        report_path=ctx_report.get("report_path"))
@@ -1914,9 +2103,16 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
                                session_id, evidence)
     if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
         # Every worker turn leaves a report, including capacity moves, so
-        # the dispatcher and the ledger keep the evidence.
+        # the dispatcher and the ledger keep the evidence. The suite is
+        # not run automatically for a capacity turn: the candidate is
+        # unfinished by definition, and the dispatcher requests useful
+        # proof of a coherent candidate instead.
         move_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                         status=signal, error=full.get("error"))
+                                         status=signal, error=full.get("error"),
+                                         run_proof=False,
+                                         proof_skipped_reason=f"{signal} turn: the suite is not run "
+                                         "automatically for a capacity turn; the dispatcher requests "
+                                         "useful proof of a coherent candidate")
         _set_phase(state_dir, request_id, phase=f"{signal}_moved",
                    opencode_session_id=session_id, report_path=move_report.get("report_path"))
         if not full.get("idle_confirmed"):
@@ -1932,12 +2128,37 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
         moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
         moved["report"] = move_report
         return moved
-    if not full or rc in (124, 143) or full.get("rc") in (124, 143):
+    if not full or rc in (124, 143, 125) or full.get("rc") in (124, 143, 125):
         # No control result means the supervisor never finished its loop
-        # (a crash or a stop); that is an ownership matter, not a worker
-        # failure, and it blocks as before, but the turn still leaves a report.
+        # (a crash, a stop, or supervisor loss); that is an ownership
+        # matter, not a worker failure, and it blocks as before, but the
+        # turn still leaves a report.
+        # The suite is not run for the unfinished turn.
+        # A supervisor result with every owned process group confirmed
+        # dead (an OpenCode rc124 startup failure or an rc143 confirmed
+        # stop) returns its evidence to the dispatcher instead: the turn
+        # counts as failed on the ladder and stays recoverable. Missing
+        # results, rc125, and ambiguous ownership keep the sticky block
+        # so no second writer starts behind a possible owner.
+        if _confirmed_stop_recoverable(state_dir, request_id, full, rc):
+            stop_report = _write_turn_report(
+                state_dir, request_id, job, seq, route, full, session_id,
+                status="failed", error=full.get("error") or f"rc={rc}",
+                run_proof=False, turn_rc=rc, harness_crash=True,
+                proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
+                "not run automatically for a stopped turn; the dispatcher "
+                "requests useful proof of a coherent candidate")
+            _set_phase(state_dir, request_id, phase="implementation_failed",
+                       opencode_session_id=session_id, report_path=stop_report.get("report_path"))
+            return {"action": "implementation_failed", "session": session_id, "rc": rc,
+                    "error": full.get("error"), "report": stop_report,
+                    "output": str(full.get("assistant_text") or "")}
         crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                          status="failed", error=full.get("error") or f"rc={rc}")
+                                          status="failed", error=full.get("error") or f"rc={rc}",
+                                          run_proof=False, turn_rc=rc, harness_crash=True,
+                                          proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
+                                          "not run automatically for a crashed turn; the dispatcher "
+                                          "requests useful proof of a coherent candidate")
         _set_phase(state_dir, request_id, phase="implementation_failed",
                    opencode_session_id=session_id, report_path=crash_report.get("report_path"))
         _mark_blocked(state_dir, request_id,
@@ -1945,9 +2166,15 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
         return {"action": "blocked", "reason": "implementation_failed", "report": crash_report}
     # A hard provider or worker error ends the turn as failed. The
     # dispatcher hears about it and the escalation ladder decides the
-    # next route; nothing is retried here.
+    # next route; nothing is retried here. The full suite is not run
+    # automatically for the failed turn: the dispatcher requests useful
+    # proof of a coherent candidate instead.
     report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                status="failed", error=full.get("error"))
+                                status="failed", error=full.get("error"),
+                                run_proof=False,
+                                proof_skipped_reason="failed turn: the suite is not run "
+                                "automatically for a failed turn; the dispatcher requests "
+                                "useful proof of a coherent candidate")
     _set_phase(state_dir, request_id, phase="implementation_failed",
                opencode_session_id=session_id, report_path=report.get("report_path"))
     return {"action": "implementation_failed", "session": session_id, "rc": rc,
@@ -2027,9 +2254,14 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
                              "stderr": (err or "")[:1000]})
     if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
         # Every worker turn leaves a report, including capacity moves, so
-        # the dispatcher and the ledger keep the evidence.
+        # the dispatcher and the ledger keep the evidence. The suite is
+        # not run automatically for a capacity turn.
         move_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                         status=signal, error=full.get("error"))
+                                         status=signal, error=full.get("error"),
+                                         run_proof=False,
+                                         proof_skipped_reason=f"{signal} turn: the suite is not run "
+                                         "automatically for a capacity turn; the dispatcher requests "
+                                         "useful proof of a coherent candidate")
         _set_phase(state_dir, request_id, phase=f"{signal}_moved",
                    grok_session_id=session_id, report_path=move_report.get("report_path"))
         moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
@@ -2042,8 +2274,30 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
         # That is an ownership matter, not a worker failure, and it blocks
         # as before so no new attempt queues behind the unsupervised child;
         # the turn still leaves a report. No elapsed deadline is restored.
+        # The suite is not run for the unfinished turn. A supervisor result
+        # with every owned process group confirmed dead (rc124 startup
+        # failure or rc143 confirmed stop) returns its evidence to the
+        # dispatcher instead and stays recoverable; rc125 and ambiguous
+        # ownership keep the sticky block.
+        if _confirmed_stop_recoverable(state_dir, request_id, full, rc):
+            stop_report = _write_turn_report(
+                state_dir, request_id, job, seq, route, full, session_id,
+                status="failed", error=full.get("error") or f"rc={rc}",
+                run_proof=False, turn_rc=rc, harness_crash=True,
+                proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
+                "not run automatically for a stopped turn; the dispatcher "
+                "requests useful proof of a coherent candidate")
+            _set_phase(state_dir, request_id, phase="implementation_failed",
+                       grok_session_id=session_id, report_path=stop_report.get("report_path"))
+            return {"action": "implementation_failed", "session": session_id, "rc": rc,
+                    "error": full.get("error"), "report": stop_report,
+                    "output": str(full.get("assistant_text") or "")}
         crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                          status="failed", error=full.get("error") or f"rc={rc}")
+                                          status="failed", error=full.get("error") or f"rc={rc}",
+                                          run_proof=False, turn_rc=rc, harness_crash=True,
+                                          proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
+                                          "not run automatically for a crashed turn; the dispatcher "
+                                          "requests useful proof of a coherent candidate")
         _set_phase(state_dir, request_id, phase="implementation_failed",
                    grok_session_id=session_id, report_path=crash_report.get("report_path"))
         _mark_blocked(state_dir, request_id,
@@ -2051,9 +2305,15 @@ def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
         return {"action": "blocked", "reason": "implementation_failed", "report": crash_report}
     # A hard provider or worker error ends the turn as failed. The
     # dispatcher hears about it and the escalation ladder decides the
-    # next route; nothing is retried here.
+    # next route; nothing is retried here. The full suite is not run
+    # automatically for the failed turn: the dispatcher requests useful
+    # proof of a coherent candidate instead.
     report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                status="failed", error=full.get("error"))
+                                status="failed", error=full.get("error"),
+                                run_proof=False,
+                                proof_skipped_reason="failed turn: the suite is not run "
+                                "automatically for a failed turn; the dispatcher requests "
+                                "useful proof of a coherent candidate")
     _set_phase(state_dir, request_id, phase="implementation_failed",
                grok_session_id=session_id, report_path=report.get("report_path"))
     return {"action": "implementation_failed", "session": session_id, "rc": rc,
@@ -2183,9 +2443,113 @@ def _git_changes(workspace: str) -> tuple[list[str], str, str | None]:
     return files, diff, None
 
 
+def _run_proof_command(workspace: str, proof_cmd: str, timeout: int = 600,
+                       state_dir: str | None = None,
+                       request_id: str | None = None
+                       ) -> tuple[int, str, str, str | None, str | None]:
+    """Run one verification attempt in its own process group.
+
+    Returns ``(rc, output, proof_class, started_at, ended_at)`` with the
+    output redacted. A proof that runs past ``timeout`` has its whole
+    process tree stopped (SIGKILL to the group, so no orphaned proof
+    child can race a later writer) and classifies ``timeout`` (rc 124),
+    apart from an executable-not-found ``not_found`` (rc 127). A main
+    process that already exited while a background child holds the
+    output pipe open is not a timeout: the group is reaped and the
+    actual exit code classifies the attempt. After a normal exit any
+    leftover group members are stopped as well. Other spawn failures
+    classify ``error`` (rc 127); a zero exit is ``pass`` and any other
+    exit is ``failed``. Timestamps are UTC ISO strings; unavailable
+    values stay None, never invented. The proof group is recorded
+    durably while it runs so cancel and recover block on unresolved
+    proof ownership instead of treating the job as stopped.
+    """
+    started_at = core._utcnow()
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", proof_cmd], cwd=workspace,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, env=dict(os.environ),
+            start_new_session=True, text=True)
+    except FileNotFoundError as e:
+        ended_at = core._utcnow()
+        return (127, adapters.redact_text(
+            f"proof command failed to run: {type(e).__name__}: {e}\n"),
+            "not_found", started_at, ended_at)
+    except OSError as e:
+        ended_at = core._utcnow()
+        return (127, adapters.redact_text(
+            f"proof command failed to run: {type(e).__name__}: {e}\n"),
+            "error", started_at, ended_at)
+    if state_dir is not None and request_id is not None:
+        try:
+            proc_pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            proc_pgid = None
+        core.record_proof_owner(state_dir, request_id, proc.pid, proc_pgid)
+    try:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            rc = proc.returncode
+            # The main process exited: reap any leftover group members
+            # so no proof child races a later writer.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError, OSError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        except subprocess.TimeoutExpired:
+            if proc.poll() is not None:
+                # The main process already exited but a background child
+                # holds the output pipe: reap the group and classify the
+                # actual exit instead of reporting a false timeout.
+                out = ""
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, ValueError, OSError):
+                    pass
+                try:
+                    out, _ = proc.communicate(timeout=10)
+                except Exception:  # noqa: BLE001 - the tree is dead; keep what we have
+                    pass
+                rc = proc.returncode if proc.returncode is not None else 124
+            else:
+                out = ""
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, ValueError, OSError):
+                    pass
+                try:
+                    out, _ = proc.communicate(timeout=10)
+                except Exception:  # noqa: BLE001 - the tree is dead; keep what we have
+                    pass
+                rc = 124
+    finally:
+        if state_dir is not None and request_id is not None:
+            core.clear_proof_owner(state_dir, request_id)
+    ended_at = core._utcnow()
+    out = out or ""
+    if rc == 0:
+        proof_class = "pass"
+    elif rc == 124:
+        proof_class = "timeout"
+    elif rc == 127:
+        proof_class = "not_found"
+    else:
+        proof_class = "failed"
+    return rc, out, proof_class, started_at, ended_at
+
+
 def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: str,
                        full: dict, session_id: str | None, status: str = "ok",
-                       error=None) -> dict:
+                       error=None, *, run_proof: bool = True,
+                       proof_skipped_reason: str | None = None,
+                       proof_timeout: int = 600,
+                       turn_rc: int | None = None,
+                       harness_crash: bool = False) -> dict:
     """Write report.json, proof.log, diff.patch, and worker.txt for one turn.
 
     The runner runs the task's own proof command and records the exit code;
@@ -2194,7 +2558,19 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     in the report's blockers (redacted), never as live questions; the
     implementation harness denies question permission today, so blockers are
     typically empty. Retries on the same seq use a suffixed
-    directory so no turn's evidence is overwritten."""
+    directory so no turn's evidence is overwritten.
+
+    Writing the failure report is separate from executing proof: pass
+    ``run_proof=False`` for exhausted, stalled, crashed, or otherwise
+    incomplete turns, where the full suite would run against an
+    unfinished candidate. The skipped proof is recorded truthfully
+    (``proof_class skipped`` with its reason); required final
+    verification still refuses completion without a bound passing proof.
+    Every report carries the turn's failure class, the proof attempt
+    class with its timestamps, the harness signal where one exists, and
+    the workspace HEAD the evidence was taken against, so Observer can
+    measure failure-to-restart and recovery success.
+    """
     root = store.ensure_state_dir(state_dir)
     base = store.job_dir_for(root, request_id) / f"turn-{seq}"
     turn_dir = base
@@ -2210,25 +2586,26 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     store.secure_write_text(turn_dir / "diff.patch", diff if not note else f"# {note}\n")
     proof_cmd = _proof_command(job.get("task_json") or "")
     proof_rc = None
+    proof_class = "none"
+    proof_skipped = None
+    proof_started_at = None
+    proof_ended_at = None
     proof_log = turn_dir / "proof.log"
-    if proof_cmd:
-        try:
-            # The task's proof runs exactly as written: through the shell in
-            # the workspace with the runner's environment, so `&&`, pipes,
-            # and quoting behave as in the project's own docs.
-            run = subprocess.run(["/bin/sh", "-c", proof_cmd], cwd=workspace,
-                                 capture_output=True, text=True,
-                                 timeout=600, stdin=subprocess.DEVNULL,
-                                 env=dict(os.environ))
-            proof_rc = run.returncode
-            header = f"$ {proof_cmd}\nexit {proof_rc}\n"
-            store.secure_write_text(proof_log, adapters.redact_text(
-                header + (run.stdout or "") + (run.stderr or "")))
-        except Exception as e:  # noqa: BLE001
-            proof_rc = 127
-            header = f"$ {proof_cmd}\nexit {proof_rc}\n"
-            store.secure_write_text(proof_log, adapters.redact_text(
-                header + f"proof command failed to run: {type(e).__name__}: {e}\n"))
+    if proof_cmd and run_proof:
+        # The task's proof runs exactly as written: through the shell in
+        # the workspace with the runner's environment, so `&&`, pipes,
+        # and quoting behave as in the project's own docs.
+        proof_rc, proof_out, proof_class, proof_started_at, proof_ended_at = \
+            _run_proof_command(workspace, proof_cmd, timeout=proof_timeout,
+                               state_dir=state_dir, request_id=request_id)
+        header = f"$ {proof_cmd}\nexit {proof_rc}\n"
+        store.secure_write_text(proof_log, adapters.redact_text(header + proof_out))
+    elif proof_cmd:
+        proof_class = "skipped"
+        proof_skipped = proof_skipped_reason or \
+            "proof deferred: the turn did not produce a verifiable candidate"
+        store.secure_write_text(proof_log, adapters.redact_text(
+            f"$ {proof_cmd}\nskipped: {proof_skipped}\n"))
     else:
         store.secure_write_text(proof_log, "# no proof command in the task\n")
     if proof_rc is not None and proof_rc != 0 and status == "ok":
@@ -2238,6 +2615,25 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         status = "failed"
         if error is None:
             error = f"proof_failed rc={proof_rc}"
+    signal_name = full.get("signal") if isinstance(full, dict) else None
+    if not isinstance(signal_name, str):
+        signal_name = None
+    failure_class = None
+    if status != "ok":
+        failure_class = core.failure_class_for(
+            signal=signal_name, proof_class=proof_class, rc=turn_rc)
+        if failure_class == "timeout" and harness_crash and turn_rc == 124:
+            # A supervisor-level rc124 with no proof outcome (an OpenCode
+            # startup failure, a legacy 124 record) is infrastructure,
+            # never a proof timeout: the suite never ran, so nothing
+            # timed out. A proof that ran past its budget carries
+            # proof_class timeout instead and stays timeout.
+            failure_class = "infrastructure"
+        if failure_class == "unknown" and (error or turn_rc not in (None, 0)):
+            # The worker or harness errored without a capacity signal:
+            # a vanished supervisor is infrastructure, a finished worker
+            # that errored is implementation.
+            failure_class = "infrastructure" if harness_crash else "implementation"
     am = full.get("actual_model") if isinstance(full.get("actual_model"), dict) else {}
     observed = (f"{am.get('providerID')}/{am.get('modelID')}" if am.get("providerID") and am.get("modelID") else None)
     observed_variant = am.get("variant") if isinstance(am.get("variant"), str) else None
@@ -2250,8 +2646,12 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         "observed_variant": observed_variant, "session_id": session_id,
         "finish": full.get("finish"), "status": status,
         "error": adapters.redact_nested(error) if error else None,
+        "failure_class": failure_class, "signal": signal_name,
         "changed_files": files, "workspace_note": note,
+        "head_commit": core._workspace_head(workspace),
         "proof_command": proof_cmd, "proof_exit_code": proof_rc,
+        "proof_class": proof_class, "proof_skipped": proof_skipped,
+        "proof_started_at": proof_started_at, "proof_ended_at": proof_ended_at,
         "proof_log": str(proof_log), "diff": str(turn_dir / "diff.patch"),
         "worker_text": str(turn_dir / "worker.txt"), "worker_summary": worker_text[:1500],
         "blockers": adapters.redact_nested(blockers_raw),
@@ -2261,6 +2661,18 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     report_path = turn_dir / "report.json"
     store.secure_write_text(report_path, json.dumps(report, sort_keys=True, indent=1))
     report["report_path"] = str(report_path)
+    # An executed proof is also a durable verification attempt row
+    # (stage verification with its timestamps and class), so Observer
+    # measures it from the existing invocation records. Skipped proofs
+    # record no attempt: nothing ran, and the report says so truthfully.
+    if proof_rc is not None:
+        try:
+            core.record_verification_attempt(
+                state_dir, request_id, seq, route, proof_cmd, proof_rc,
+                proof_class, proof_started_at, proof_ended_at,
+                str(report_path), str(proof_log))
+        except Exception:
+            pass
     # Link the report to the invocation that produced it.
     kinds = harnesses.worker_control_kinds()
     placeholders = ",".join("?" for _ in kinds)
@@ -2286,14 +2698,29 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
     """The dispatcher's resume message: paths and structured fields, not prose.
 
     Carries the turn's paths plus the structured measurements Luna needs
-    (route, policy, models, variants, status, tokens, native identities).
-    Worker prose and proof output stay in the files; only redacted summaries
-    travel here, never raw tails.
+    (route, policy, models, variants, status, failure and proof classes,
+    tokens, native identities). Worker prose and proof output stay in the
+    files; only redacted summaries travel here, never raw tails. The
+    guidance consumes the runner's exact-candidate evidence instead of
+    requiring the read-only dispatcher to blindly repeat valid proof,
+    and it preserves the single PR identity across correction and
+    recovery.
     """
     report = impl.get("report") if isinstance(impl.get("report"), dict) else {}
+    known_pr = None
+    try:
+        st = json.loads(job.get("controller_state") or "{}") or {}
+        known_pr = st.get("pr_url") if isinstance(st, dict) else None
+    except ValueError:
+        known_pr = None
     fields = {
         "turn_status": report.get("status") or ("failed" if impl.get("action") == "implementation_failed" else "ok"),
         "turn_error": report.get("error"),
+        "failure_class": report.get("failure_class"),
+        "proof_class": report.get("proof_class"),
+        "proof_skipped": report.get("proof_skipped"),
+        "head_commit": report.get("head_commit"),
+        "known_pr_url": known_pr,
         "route": report.get("route") or job.get("route"),
         "model": report.get("model") or job.get("model"),
         "variant": report.get("variant"),
@@ -2313,13 +2740,19 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
         "diff": report.get("diff"), "worker_text": report.get("worker_text"),
     }
     return (json.dumps(fields, sort_keys=True) + "\n"
-            "Read the report, proof log, and diff at the paths above. Run the proof "
-            "yourself and inspect the workspace before completion.")
+            "Consume this exact-candidate evidence (report, proof log, diff) for the "
+            "candidate commit above; do not rerun the full suite against it when its "
+            "proof already passed. Request implementation again when the turn failed, "
+            "when proof was skipped or is stale, or when the candidate changed; the "
+            "worker updates the existing PR, never opens a second. Completion needs "
+            "bound proof, an open PR on the current candidate, and required acceptance "
+            "evidence.")
 
 
 def _complete_job(state_dir, request_id: str, token: str | None,
-                  output: str, artifact: str | None = None,
-                  pr_url: str | None = None) -> dict:
+                   output: str, artifact: str | None = None,
+                   pr_url: str | None = None,
+                   acceptance_evidence: str | None = None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
     job = core.get_job(state_dir, request_id)
     use_token = token or job.get("owner_token")
@@ -2333,6 +2766,15 @@ def _complete_job(state_dir, request_id: str, token: str | None,
         result_payload["pr_url"] = pr_url
     else:
         result_payload["pr_url"] = None
+    # Acceptance evidence is durable in the result record as well as the
+    # envelope, bound to the candidate commit the proof ran against:
+    # worker exit zero, helper tests, and an open PR alone never
+    # establish acceptance when the task names required evidence.
+    if isinstance(acceptance_evidence, str) and acceptance_evidence.strip():
+        result_payload["acceptance_evidence"] = acceptance_evidence.strip()
+    else:
+        result_payload["acceptance_evidence"] = None
+    result_payload["head_commit"] = core._workspace_head(job.get("workspace"))
     if token:
         # Public path: only the lease holder may complete; a stale
         # controller never writes success.
@@ -2462,8 +2904,14 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
         return {"action": "blocked", "reason": "completion_refused"}
     _record_completion_refusal(state_dir, request_id, report, reason)
     job = core.get_job(state_dir, request_id)
+    try:
+        _reqs = core.task_completion_requirements(job.get("task_json"))
+    except Exception:
+        _reqs = {}
     fields = {
         "completion_refused": reason,
+        "required_acceptance": _reqs.get("acceptance"),
+        "known_pr_url": core.known_pr_url(state_dir, request_id),
         "turn_status": report.get("status"),
         "turn_error": report.get("error"),
         "route": report.get("route") or job.get("route"),
@@ -2480,6 +2928,18 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
         "opened PR URL. Push the branch, open the PR, and complete again "
         "with its pr_url; do not complete without one."
         if "missing pr_url" in reason else
+        "Completion is refused: keep the job's single PR identity. Update the existing "
+        "open PR to the candidate commit and complete again with its URL; do not open "
+        "another."
+        if ("duplicate PR" in reason or "completion_refused: pr_" in reason
+                or "draft PR" in reason) else
+        "Completion is refused: carry the required acceptance evidence in "
+        "acceptance_evidence and complete again."
+        if "acceptance" in reason else
+        "Completion is refused: no bound proof covers the current candidate. Request "
+        "implementation again for a coherent candidate; do not complete until the proof "
+        "passes."
+        if ("incomplete proof" in reason or "stale proof" in reason) else
         "Completion is refused: "
         "the last implementation turn's proof failed. Fix the work and "
         "request implementation again; do not complete until the proof passes."))
@@ -2518,6 +2978,23 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
         for q in core.list_questions(state_dir, request_id, only_pending=False):
             if q["qid"] == qid:
                 answer_text = q.get("answer") or ""
+    # A planner answer to the exhaustion decision permits exactly one
+    # explicitly authorized directed recovery attempt (an approach or an
+    # eligible route relayed as directed_route). The answer directs; the
+    # dispatcher assigns that work under the routing policy. The planner
+    # never implements.
+    try:
+        st_now = _load_controller_state(core.get_job(state_dir, request_id))
+    except Exception:
+        st_now = {}
+    if qid and qid == st_now.get("recovery_question_qid") \
+            and isinstance(answer_text, str) and answer_text.strip() \
+            and not st_now.get("planner_recovery_used"):
+        try:
+            _set_phase(state_dir, request_id,
+                       planner_recovery_authorized=True)
+        except Exception:
+            pass
     r = resume_luna(state_dir, request_id, f"question {qid}: {prompt_q}\nanswer: {answer_text}",
                     run_cmd=run_cmd, label="PLANNER ANSWER")
     if r.get("action") == "blocked":
@@ -2527,6 +3004,165 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
 
 
 LADDER_RUNGS = ("initial", "correction", "correction_fresh", "recovery")
+
+
+def eligible_directed_routes(state_dir, request_id: str) -> list[str]:
+    """Genuinely eligible dispatcher routes for a planner direction.
+
+    A route qualifies when the dispatcher may assign it (owned-server
+    or headless-worker harness, never a planner-harness rung), it sits
+    in the job lane or on the correction/recovery stage, and it has
+    capacity (not exhausted or degraded, one-turn routes unused,
+    concurrency cap free). The escalation evidence lists these so a
+    planner direction names a route that can actually run; anything
+    else is rejected with evidence, never substituted silently.
+    """
+    try:
+        job = core.get_job(state_dir, request_id)
+    except Exception:
+        return []
+    lane = job.get("lane")
+    try:
+        exhausted = core.exhausted_routes(state_dir)
+        degraded = core.degraded_routes(state_dir)
+    except Exception:
+        exhausted, degraded = set(), set()
+    try:
+        turns = _turns_by_route(state_dir, request_id)
+    except Exception:
+        turns = {}
+    ordered: list[str] = []
+    for stage in ("implementation_default", "implementation_small",
+                  "implementation_hard", "correction", "recovery"):
+        try:
+            routes = policy.stage_routes(stage)
+        except ValueError:
+            continue
+        for route in routes:
+            if route not in ordered:
+                ordered.append(route)
+    out: list[str] = []
+    for route in ordered:
+        if not policy.is_dispatcher_assignable(route):
+            continue
+        try:
+            stage = policy.lane_of_route(route, lane)
+        except ValueError:
+            stage = None
+        if stage is None and route not in policy.STAGES.get(
+                "correction", {}).get("routes", ()) \
+                and route not in policy.STAGES.get(
+                    "recovery", {}).get("routes", ()):
+            continue
+        if route in exhausted or route in degraded:
+            continue
+        try:
+            if policy.one_turn_routes_used(route, turns):
+                continue
+        except Exception:
+            continue
+        try:
+            if core.route_concurrency_full(state_dir, route,
+                                           exclude=request_id):
+                continue
+        except Exception:
+            continue
+        out.append(route)
+    return out
+
+
+def _escalate_recovery_to_planner(state_dir, request_id: str,
+                                  token: str | None = None) -> dict:
+    """Persist an exhaustion decision request and wake the planner.
+
+    Posts the concrete decision (required choice, evidence, attempted
+    remedies, eligible routes, recommendation) as a planner question
+    through the existing planner-question path, preserving the job and
+    Observer identities. The planner answers with direction (an approach
+    or an eligible route relayed as ``directed_route``), which permits
+    exactly one explicitly authorized recovery attempt; the planner
+    never implements. Returns the step action for this transition.
+    """
+    reason = _recovery_exhausted_reason(state_dir, request_id)
+    qid = "recovery-decision"
+    try:
+        core.post_question(state_dir, request_id, qid, reason,
+                           lease_token=token)
+    except core.ConflictError:
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "recovery_exhausted"}
+    except (core.TerminalError, core.NotFoundError, ValueError) as e:
+        _mark_blocked(state_dir, request_id,
+                      f"recovery_exhausted: planner question unavailable "
+                      f"({type(e).__name__}); {reason}"[:1500])
+        return {"action": "blocked", "reason": "recovery_exhausted"}
+    try:
+        _persist_envelope(state_dir, request_id,
+                          {"action": "planner_question", "qid": qid,
+                           "prompt": reason},
+                          "recovery-exhausted")
+        _set_phase(state_dir, request_id, recovery_question_qid=qid)
+    except core.LeaseLostError:
+        raise
+    except Exception:
+        pass
+    return {"action": "recovery-exhausted-question", "qid": qid,
+            "reason": "recovery_exhausted"}
+
+
+def _recovery_exhausted_reason(state_dir, request_id: str) -> str:
+    """Concrete planner decision for an exhausted escalation.
+
+    Retry exhaustion prompts a decision, never a request for the planner
+    to implement: the reason carries the decision required, the evidence,
+    the attempted remedies, and the dispatcher's recommendation. Routine
+    mechanical recovery stays with the dispatcher; missing authority or
+    a consequential scope or approach decision reaches the planner
+    through this reason.
+    """
+    ctx = core.exhaustion_context(state_dir, request_id)
+    tried = ", ".join(f"{route}x{n}" for route, n in ctx["routes_tried"]) \
+        or "no turns recorded"
+    ev = "; ".join(
+        f"seq={r.get('seq')} {r.get('route')} {r.get('status')}/"
+        f"{r.get('failure_class')} proof={r.get('proof_exit_code')} "
+        f"{r.get('report')}" for r in ctx["reports"][-4:]) or "no turn reports"
+    try:
+        eligible = eligible_directed_routes(state_dir, request_id)
+    except Exception:
+        eligible = []
+    eligible_txt = ", ".join(eligible) if eligible else \
+        "none currently eligible (all dispatcher routes exhausted, degraded, or capped)"
+    return ("recovery_exhausted: every recovery rung was already used; "
+            "decision required: choose the next approach (an eligible route or a scope "
+            "change) for the original objective; "
+            f"evidence: {ev}; attempted: {tried}; "
+            f"eligible dispatcher routes: {eligible_txt}; "
+            "recommendation: answer with the direction (an approach or one eligible "
+            "route the dispatcher relays as directed_route and assigns under the "
+            "routing policy for exactly one authorized attempt); the planner does not implement")
+
+
+def _escalation_exhausted_error(state_dir, request_id: str, failures: int,
+                                reports: list) -> dict:
+    """Terminal evidence for an exhausted escalation, for the planner to act on."""
+    ctx = core.exhaustion_context(state_dir, request_id)
+    tried = ", ".join(f"{route}x{n}" for route, n in ctx["routes_tried"]) \
+        or "no turns recorded"
+    return {
+        "code": "ESCALATION_EXHAUSTED", "failures": failures, "reports": reports,
+        "message": "initial turn, one correction, one fresh correction, and one escalation failed",
+        "decision_required": "choose the next approach (an eligible route or a scope "
+                             "change) for the original objective",
+        "evidence": [f"seq={r.get('seq')} {r.get('route')} {r.get('status')}/"
+                     f"{r.get('failure_class')} proof={r.get('proof_exit_code')} "
+                     f"{r.get('report')}" for r in ctx["reports"][-6:]],
+        "attempted": ("initial turn, one correction, one fresh correction, and one "
+                      f"escalation; routes tried: {tried}"),
+        "recommendation": "the planner returns its direction through the dispatcher "
+                          "and the dispatcher assigns that work under the routing policy; "
+                          "the planner does not implement",
+    }
 
 
 def _ladder(job: dict) -> dict:
@@ -2569,8 +3205,11 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
 
     0 failures: the initial route. 1: a correction in the same worker
     session. 2: a fresh correction on the correction stage's route. 3: the
-    single escalation to the recovery stage. 4 or more: the job ends failed
-    with its evidence, which is the planner's to act on. A pool move inside
+    single escalation to the recovery stage. 4 or more: the evidence
+    returns to the planner through the existing planner-question path
+    before any authorized directed attempt is used; only after that one
+    explicitly authorized attempt is used does the job end failed with
+    its evidence, which is the planner's to act on. A pool move inside
     the recovery stage is not a second escalation."""
     job = core.get_job(state_dir, request_id)
     ladder = _ladder(job)
@@ -2587,16 +3226,63 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
         rung = "recovery"
         target = policy.next_recovery_route(None, _turns_by_route(state_dir, request_id))
         if target is None:
-            # Every recovery rung was already used by this job: the planner
-            # gets the evidence instead of a second automatic rung.
-            _mark_blocked(state_dir, request_id,
-                          "recovery_exhausted: every recovery rung was already used")
-            return {"action": "blocked", "reason": "recovery_exhausted"}
+            # Every recovery rung was already used by this job: the
+            # planner gets a concrete decision (evidence, attempted
+            # remedies, eligible routes, recommendation) through the
+            # existing planner-question path instead of a second
+            # automatic rung, never a request for the planner to
+            # implement. After the planner answers, exactly one
+            # explicitly authorized directed attempt may run; a failure
+            # after that attempt used ends the job terminally below.
+            try:
+                st_used = _load_controller_state(job).get(
+                    "planner_recovery_used")
+                st_flight = _load_controller_state(job).get(
+                    "planner_recovery_in_flight")
+            except Exception:
+                st_used = False
+                st_flight = False
+            if st_flight and not st_used:
+                # The planner already answered and its one authorized
+                # attempt is still in flight through a capacity move:
+                # never re-post the question nor fail before it runs.
+                return None
+            if st_used:
+                reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
+                                                  .glob("turn-*/report.json")))
+                error = _escalation_exhausted_error(state_dir, request_id, failures, reports)
+                if token:
+                    try:
+                        core.fail(state_dir, request_id, token, error)
+                    except core.OwnershipError as e:
+                        raise core.LeaseLostError(str(e))
+                else:
+                    _fail_offline(state_dir, request_id, error)
+                return {"action": "failed", "reason": "escalation_exhausted", "reports": reports}
+            return _escalate_recovery_to_planner(state_dir, request_id, token)
     else:
+        # Normal failures at 4 or more still owe the planner a concrete
+        # decision before any authorized directed attempt is used: the
+        # usual path is one recovery escalation that fails, not three
+        # exhausted rungs. Only after the planner's one explicitly
+        # authorized attempt is used does exhaustion end terminally.
+        try:
+            st_used = _load_controller_state(job).get("planner_recovery_used")
+            st_flight = _load_controller_state(job).get("planner_recovery_in_flight")
+        except Exception:
+            st_used = False
+            st_flight = False
+        if st_flight and not st_used:
+            # The planner already answered and its one authorized attempt
+            # is still in flight through a preflight or capacity move:
+            # never re-post the question nor fail before the actual
+            # directed worker attempt runs.
+            return None
+        if not st_used:
+            return _escalate_recovery_to_planner(state_dir, request_id, token)
         reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
                                           .glob("turn-*/report.json")))
-        error = {"code": "ESCALATION_EXHAUSTED", "failures": failures, "reports": reports,
-                 "message": "initial turn, one correction, one fresh correction, and one escalation failed"}
+        error = _escalation_exhausted_error(state_dir, request_id, failures, reports)
         if token:
             try:
                 core.fail(state_dir, request_id, token, error)
@@ -2616,7 +3302,87 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
                                               "escalated": ladder["escalated"] or rung == "recovery",
                                               **({"counted_seq": ladder["counted_seq"]}
                                                  if ladder.get("counted_seq") is not None else {})})
+    # Link the failed attempt onward: Observer joins this decision to the
+    # next attempt's report and invocation rows by seq, and measures
+    # failure-to-restart from failed_at to the next attempt start. The
+    # actual next seq is linked when the next worker invocation starts
+    # (see _link_recovery_attempt): planner questions, refusals, and
+    # completion envelopes may consume seq numbers first, so the decision
+    # itself never guesses it.
+    core.record_recovery_decision(
+        state_dir, request_id, failures, rung, target,
+        ladder.get("counted_seq"),
+        "escalation" if rung == "recovery" else "correction",
+        lease_token=token)
+    try:
+        _set_phase(state_dir, request_id,
+                   pending_recovery={"failed_seq": ladder.get("counted_seq")})
+    except core.LeaseLostError:
+        raise
+    except Exception:
+        pass
     return None
+
+
+def _link_recovery_attempt(state_dir, request_id: str, seq: int | None,
+                           route: str | None = None) -> None:
+    """Bind a pending recovery decision to the worker attempt now starting.
+
+    Emits ``recovery_next_attempt`` with the failed seq and the actual
+    next seq, then clears the pending link. Never raises past the
+    caller: a missed link leaves the decision event itself, never a
+    fabricated seq.
+    """
+    try:
+        job = core.get_job(state_dir, request_id)
+    except Exception:
+        return
+    st = _load_controller_state(job)
+    pending = st.get("pending_recovery")
+    if not isinstance(pending, dict):
+        return
+    try:
+        failed_seq = pending.get("failed_seq")
+        failed_i = int(failed_seq) if failed_seq is not None else None
+    except (TypeError, ValueError):
+        failed_i = None
+    try:
+        next_i = int(seq) if seq is not None else None
+    except (TypeError, ValueError):
+        next_i = None
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            cur = json.loads(row["controller_state"] or "{}") if row is not None else {}
+        except ValueError:
+            cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+        if not isinstance(cur.get("pending_recovery"), dict):
+            con.execute("ROLLBACK")
+            return
+        cur.pop("pending_recovery", None)
+        cur["last_recovery_link"] = {"failed_seq": failed_i,
+                                     "next_seq": next_i,
+                                     "route": route,
+                                     "linked_at": core._utcnow()}
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(cur, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "recovery_next_attempt",
+                    {"failed_seq": failed_i, "next_seq": next_i,
+                     "route": route})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
 
 
 def _fail_offline(state_dir, request_id: str, error: dict) -> None:
@@ -2657,6 +3423,12 @@ def _record_turn_outcome(state_dir, request_id: str, impl: dict) -> None:
     report = impl.get("report") if isinstance(impl.get("report"), dict) else {}
     proof_rc = report.get("proof_exit_code")
     failed = impl.get("action") == "implementation_failed" or (proof_rc is not None and proof_rc != 0)
+    # Preserve the eventual result link for a bound recovery attempt:
+    # Observer joins recovery_next_attempt to this outcome by seq.
+    try:
+        _record_recovery_result(state_dir, request_id, report, failed)
+    except Exception:
+        pass
     if not failed:
         return
     job = core.get_job(state_dir, request_id)
@@ -2672,6 +3444,53 @@ def _record_turn_outcome(state_dir, request_id: str, impl: dict) -> None:
     if seq is not None:
         ladder["counted_seq"] = seq
     _set_phase(state_dir, request_id, ladder=ladder)
+
+
+def _record_recovery_result(state_dir, request_id: str, report: dict,
+                              failed: bool) -> None:
+    """Emit ``recovery_attempt_result`` for a bound recovery attempt.
+
+    Joins the earlier ``recovery_next_attempt`` link to this attempt's
+    outcome (ok or failed) by seq, so the eventual result is preserved
+    on the ledger instead of inferred. No-op without a stored link for
+    this report's seq. Never raises past the caller.
+    """
+    try:
+        rep_seq = report.get("seq")
+        next_i = int(rep_seq) if rep_seq is not None else None
+    except (TypeError, ValueError):
+        return
+    if next_i is None:
+        return
+    try:
+        job = core.get_job(state_dir, request_id)
+    except Exception:
+        return
+    link = _load_controller_state(job).get("last_recovery_link")
+    if not isinstance(link, dict):
+        return
+    try:
+        linked = int(link.get("next_seq")) if link.get("next_seq") is not None else None
+    except (TypeError, ValueError):
+        return
+    if linked != next_i:
+        return
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        core._event(con, request_id, "recovery_attempt_result",
+                    {"failed_seq": link.get("failed_seq"),
+                     "next_seq": next_i,
+                     "outcome": "failed" if failed else "ok"})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
 
 
 def _latest_invocation_seq(state_dir, request_id: str) -> int | None:
@@ -2695,14 +3514,155 @@ def _latest_invocation_seq(state_dir, request_id: str) -> int | None:
     return None
 
 
+def _consume_planner_authorized_attempt(state_dir, request_id: str,
+                                          envelope: dict,
+                                          token: str | None = None) -> bool:
+    """Run one explicitly authorized planner-directed recovery attempt.
+
+    After recovery exhaustion the planner's answer permits exactly one
+    additional bounded dispatcher-owned attempt: an approach-only answer
+    runs once on the current route, while an eligible ``directed_route``
+    switches there with reason ``planner_directed``. The authorization
+    stays reserved (``planner_recovery_in_flight``) through preflight,
+    pool, and other non-terminal capacity or routing transitions, and is
+    consumed (``planner_recovery_used``) only when the authorized
+    dispatcher-owned attempt reaches a genuine ``implementation_ok`` or
+    ``implementation_failed`` outcome, including a real verification
+    failure after the worker turn. A preflight move, pool transfer,
+    stalled retry, or other non-result transition never consumes it.
+    Records the recovery decision once, linking the failed attempt
+    onward; continuing the same authorized attempt after a capacity move
+    never re-posts the planner question nor records a second decision.
+    Returns True when the caller should run the turn directly instead of
+    the ordinary ladder path. A missing authorization, a used
+    authorization, or a rejected route returns False so the ladder path
+    applies unchanged: no unlimited retries.
+    """
+    try:
+        job_now = core.get_job(state_dir, request_id)
+        st = _load_controller_state(job_now)
+    except Exception:
+        return False
+    if not st.get("planner_recovery_authorized") or st.get("planner_recovery_used"):
+        return False
+    if not isinstance(envelope, dict):
+        return False
+    if st.get("planner_recovery_in_flight"):
+        # Continuing the same authorized attempt after a preflight or
+        # capacity move: the decision is already recorded and the pending
+        # link is still reserved for the actual worker invocation. Run
+        # directly without a second decision or question.
+        return True
+    directed = envelope.get("directed_route")
+    current_route = job_now.get("route")
+    if not isinstance(directed, str) or not directed.strip():
+        # Approach-only direction: one authorized attempt on the current
+        # route, without re-posting the recovery question.
+        target = current_route
+    elif directed.strip() == current_route:
+        # An explicit direction naming the current route needs no switch
+        # but still consumes the single authorization.
+        target = current_route
+    else:
+        assigned = _apply_planner_directed_route(state_dir, request_id, envelope)
+        if not assigned:
+            return False
+        target = directed.strip()
+    try:
+        ladder = _ladder(core.get_job(state_dir, request_id))
+    except Exception:
+        ladder = {"failures": 0, "rung": "initial", "escalated": False}
+    try:
+        _set_phase(state_dir, request_id, planner_recovery_in_flight=True,
+                   ladder={**ladder, "rung": "recovery_directed",
+                           "escalated": True})
+    except core.LeaseLostError:
+        raise
+    except Exception:
+        pass
+    try:
+        core.record_recovery_decision(
+            state_dir, request_id, int(ladder.get("failures") or 0),
+            "recovery_directed", target,
+            ladder.get("counted_seq"), "planner_directed",
+            lease_token=token)
+    except core.LeaseLostError:
+        raise
+    except Exception:
+        pass
+    try:
+        _set_phase(state_dir, request_id,
+                   pending_recovery={"failed_seq": ladder.get("counted_seq")})
+    except Exception:
+        pass
+    return True
+
+
 def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
                                   run_cmd, token: str | None = None) -> dict:
-    """One bounded implementation transition: worker turn then Luna resume."""
+    """One bounded implementation transition: worker turn then Luna resume.
+
+    The escalation ladder chooses the rung first and stays authoritative:
+    an ordinary envelope route never moves the job. An explicit planner
+    direction relayed as ``directed_route`` is assigned under the routing
+    policy (or rejected with evidence) before the turn runs. After
+    recovery exhaustion the planner's answer permits exactly one
+    explicitly authorized directed attempt; the submitted candidate stays
+    dispatcher-owned throughout.
+    """
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
+    if _consume_planner_authorized_attempt(state_dir, request_id, envelope,
+                                           token):
+        impl = run_implementation(state_dir, request_id, artifact=artifact,
+                                   payload=payload, run_cmd=run_cmd)
+        if impl.get("action") not in ("implementation_ok", "implementation_failed"):
+            # A preflight route move, pool transfer, stalled retry, or
+            # other non-result transition: the authorization stays in
+            # flight for the actual directed attempt, with the same job
+            # and Observer identities and no second planner question or
+            # recovery decision. The next step continues the same attempt.
+            return impl
+        # The authorized dispatcher-owned attempt reached a genuine
+        # result (including a real verification failure after the worker
+        # turn): consume the single use now, never before.
+        try:
+            _set_phase(state_dir, request_id, planner_recovery_used=True,
+                       planner_recovery_in_flight=False)
+        except core.LeaseLostError:
+            raise
+        except Exception:
+            pass
+        _record_turn_outcome(state_dir, request_id, impl)
+        rep = impl.get("report") if isinstance(impl.get("report"), dict) else {}
+        proof_rc = rep.get("proof_exit_code")
+        failed = impl.get("action") == "implementation_failed" or (
+            proof_rc is not None and proof_rc != 0)
+        if not failed:
+            # A successful directed attempt continues to Luna with its
+            # exact-candidate evidence; only a failure after the one
+            # authorized attempt ends terminally with evidence.
+            job = core.get_job(state_dir, request_id)
+            evidence = _implementation_evidence(job, impl)
+            r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                            label="IMPLEMENTATION RESULT")
+            if r.get("action") == "blocked":
+                return r
+            return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
+        exhausted = _apply_ladder(state_dir, request_id, token)
+        if exhausted is not None:
+            return exhausted
+        job = core.get_job(state_dir, request_id)
+        evidence = _implementation_evidence(job, impl)
+        r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                        label="IMPLEMENTATION RESULT")
+        if r.get("action") == "blocked":
+            return r
+        return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
     ended = _apply_ladder(state_dir, request_id, token)
     if ended is not None:
         return ended
+    _apply_planner_directed_route(state_dir, request_id, envelope)
     impl = run_implementation(state_dir, request_id, artifact=artifact,
                                payload=payload, run_cmd=run_cmd)
     if impl.get("action") not in ("implementation_ok", "implementation_failed"):
@@ -2750,25 +3710,52 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> 
     if action_name == "completion":
         # A job can never succeed while its last implementation turn's
         # proof failed: refuse the envelope, hand the evidence back once,
-        # and block if the dispatcher insists. An ordinary completion in a
-        # workspace with an origin push remote also needs an opened PR URL
-        # (never as a proof failure); without a remote it succeeds as
-        # before, experiment and replay jobs keep their behavior. The
-        # remote capability is checked with git once per completion here.
+        # and block if the dispatcher insists. The bound proof must cover
+        # the current candidate (no skipped or stale proof), named
+        # acceptance evidence must travel in the envelope, and an ordinary
+        # completion in a workspace with an origin push remote needs an
+        # opened PR URL that exists, is open, and points at the candidate
+        # commit (a draft only when the task explicitly allows it).
+        # Without a remote it succeeds as before, experiment and replay
+        # jobs keep their behavior. One job owns one PR: a different URL
+        # than the preserved identity refuses as a duplicate.
         _latest = core.latest_turn_report(state_dir, request_id)
         _refusal = core.completion_refusal_reason(_latest)
-        if _refusal is not None and isinstance(_latest, dict):
-            return _handle_completion_refusal(state_dir, request_id, last,
-                                              _latest, _refusal, run_cmd)
-        _pr_refusal = core.missing_pr_url_reason(
-            job.get("job_kind"), last, job.get("workspace"))
-        if _pr_refusal is not None:
+        if _refusal is None:
+            _refusal = core.incomplete_proof_reason(
+                job.get("task_json"), _latest, job.get("workspace"))
+        if _refusal is None:
+            _refusal = core.incomplete_acceptance_reason(
+                job.get("task_json"), last)
+        if _refusal is None:
+            _refusal = core.missing_pr_url_reason(
+                job.get("job_kind"), last, job.get("workspace"))
+        if _refusal is None and core.pr_gate_applies(job.get("job_kind"),
+                                                     job.get("workspace")):
+            _pr = last.get("pr_url") if isinstance(last, dict) else None
+            if isinstance(_pr, str) and _pr.strip():
+                _refusal = core.duplicate_pr_reason(
+                    core.known_pr_url(state_dir, request_id), last)
+                if _refusal is None:
+                    # Verify live before preserving: an invalid first URL
+                    # never becomes the job's identity, so a corrected URL
+                    # is accepted instead of refused as a duplicate.
+                    _head = _latest.get("head_commit") \
+                        if isinstance(_latest, dict) else None
+                    _refusal = core.verify_pr_for_completion(
+                        job.get("workspace"), _pr.strip(), _head,
+                        job.get("task_json"))
+                    if _refusal is None:
+                        core.record_known_pr(state_dir, request_id, _pr.strip(),
+                                             lease_token=_LEASE["token"])
+        if _refusal is not None:
             return _handle_completion_refusal(state_dir, request_id, last,
                                               _latest if isinstance(_latest, dict) else {},
-                                              _pr_refusal, run_cmd)
+                                              _refusal, run_cmd)
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
-                             last.get("artifact"), last.get("pr_url"))
+                             last.get("artifact"), last.get("pr_url"),
+                             last.get("acceptance_evidence"))
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}

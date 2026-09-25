@@ -253,7 +253,10 @@ class TestDispatchExhaustionFallback(unittest.TestCase):
         job = core.get_job(sd, "e46-d1")
         st = json.loads(job["controller_state"] or "{}")
         self.assertEqual(st.get("dispatch_route"), "luna-go/max")
-        self.assertEqual(st.get("route_reason"), "dispatch_exhausted")
+        self.assertEqual(st.get("dispatch_route_reason"), "dispatch_exhausted")
+        # The shared worker key is left alone: the first worker turn keeps
+        # reason initial instead of inheriting the dispatch cause.
+        self.assertNotIn("route_reason", st)
         self.assertIn("luna/max", core.exhausted_routes(sd))
         marks = [r for r in core.list_capacity(sd)
                  if r["route"] == "luna/max" and r["state"] == "exhausted"]
@@ -280,7 +283,8 @@ class TestDispatchExhaustionFallback(unittest.TestCase):
         self.assertIn("luna/max", core.exhausted_routes(sd))
         job = core.get_job(sd, "e46-d2")
         st = json.loads(job["controller_state"] or "{}")
-        self.assertEqual(st.get("route_reason"), "dispatch_exhausted")
+        self.assertEqual(st.get("dispatch_route_reason"), "dispatch_exhausted")
+        self.assertNotIn("route_reason", st)
 
     def test_preflight_skips_codex_on_shared_ledger(self):
         isolate_homes(self)
@@ -310,7 +314,7 @@ class TestDispatchExhaustionFallback(unittest.TestCase):
         self.assertNotIn("codex_dispatch", seen)
         job = core.get_job(sd, "e46-d6")
         st = json.loads(job["controller_state"] or "{}")
-        self.assertEqual(st.get("route_reason"), "preflight_exhausted")
+        self.assertEqual(st.get("dispatch_route_reason"), "preflight_exhausted")
 
     def test_unrecognized_failure_keeps_provider_message(self):
         isolate_homes(self)

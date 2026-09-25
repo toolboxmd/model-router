@@ -116,7 +116,22 @@ class Ladder(unittest.TestCase):
         self.assertTrue(controller._ladder(j)["escalated"])
         events = [json.loads(r["payload_json"]) for r in self._events("route_switched")]
         self.assertEqual([e["reason"] for e in events], ["correction", "escalation"])
+        # Normal failures at 4 reach the planner through the existing
+        # question path before any authorized directed attempt is used.
         _set_state(self.sd, "j", ladder={"failures": 4, "rung": "recovery", "escalated": True})
+        asked = controller._apply_ladder(self.sd, "j")
+        self.assertEqual((asked["action"], asked["reason"]),
+                         ("recovery-exhausted-question", "recovery_exhausted"))
+        j = self.job()
+        self.assertEqual(j["status"], "question_pending")
+        self.assertEqual([q["qid"] for q in core.list_questions(self.sd, "j")],
+                         ["recovery-decision"])
+        # Only after the single authorized attempt is used does the same
+        # exhaustion end terminally with its evidence for the planner.
+        _set_state(self.sd, "j", ladder={"failures": 4, "rung": "recovery_directed",
+                                         "escalated": True},
+                   planner_recovery_authorized=True, planner_recovery_used=True,
+                   recovery_question_qid="recovery-decision")
         ended = controller._apply_ladder(self.sd, "j")
         self.assertEqual((ended["action"], ended["reason"]), ("failed", "escalation_exhausted"))
         j = self.job()
@@ -255,7 +270,10 @@ class LadderIdempotency(unittest.TestCase):
         controller._record_turn_outcome(self.sd, "j", {"action": "implementation_failed", "report": {}})
         self.assertEqual(controller._ladder(core.get_job(self.sd, "j"))["failures"], 2)
 
-    def test_recovery_failure_ends_exhausted_without_resuming_luna(self):
+    def test_recovery_failure_asks_planner_without_resuming_luna(self):
+        # The recovery turn just failed (failures 3 -> 4): the evidence
+        # returns to the planner through the question path, never a Luna
+        # resume and never a terminal fail before the authorized attempt.
         _set_state(self.sd, "j", seq=3,
                    ladder={"failures": 3, "rung": "recovery", "escalated": True, "counted_seq": 2},
                    last_action={"action": "implementation", "artifact": None, "payload": {}},
@@ -277,9 +295,12 @@ class LadderIdempotency(unittest.TestCase):
         res = controller._handle_implementation_action(
             self.sd, "j", {"action": "implementation", "artifact": None, "payload": {}},
             run_cmd=lambda *a, **k: (0, "", ""))
-        self.assertEqual((res["action"], res["reason"]), ("failed", "escalation_exhausted"))
+        self.assertEqual((res["action"], res["reason"]),
+                         ("recovery-exhausted-question", "recovery_exhausted"))
         job = core.get_job(self.sd, "j")
-        self.assertEqual((job["status"], job["error_class"]), ("failed", "escalation_exhausted"))
+        self.assertEqual(job["status"], "question_pending")
+        self.assertEqual([q["qid"] for q in core.list_questions(self.sd, "j")],
+                         ["recovery-decision"])
 
 
 class ResumeOrdering(unittest.TestCase):
@@ -460,7 +481,11 @@ def _cli_env(base, codex_body, oc_mode="ok", extra_env=None):
 class TestPublicEscalationDrill(unittest.TestCase):
     """Escalation through the public CLI: one escalation, then evidence to the planner."""
 
-    def test_cli_escalation_exhausts_once_with_evidence(self):
+    def test_cli_escalation_asks_planner_once_with_evidence(self):
+        # Four hard failures through the public CLI: one escalation, then
+        # the evidence returns to the planner as a concrete decision
+        # through the question path (never a terminal fail before the
+        # single authorized directed attempt is used).
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
@@ -476,19 +501,19 @@ class TestPublicEscalationDrill(unittest.TestCase):
                            "--start", env=env)
         self.assertEqual(rc, 0, err)
         self.addCleanup(lambda: _cleanup_job(sd, rid))
-        self.assertTrue(wait_for(lambda: core.get_job(sd, rid)["status"] == "failed", 120),
+        self.assertTrue(wait_for(lambda: core.get_job(sd, rid)["status"] == "question_pending", 120),
                         core.get_job(sd, rid))
         job = core.get_job(sd, rid)
-        # The live controller fails through core.fail, whose error class
-        # carries the error code; the offline helper records it lowercase.
-        self.assertEqual(job["error_class"], "ESCALATION_EXHAUSTED")
         self.assertEqual(job["route"], "grok-4.6-go")
-        result = json.loads(job["result_json"])
-        self.assertEqual(result["error"]["code"], "ESCALATION_EXHAUSTED")
-        self.assertEqual(result["error"]["failures"], 4)
-        self.assertEqual(len(result["error"]["reports"]), 4)
+        pending = core.list_questions(sd, rid)
+        self.assertEqual([q["qid"] for q in pending], ["recovery-decision"])
+        prompt = pending[0]["prompt"]
+        for needle in ("decision required", "evidence", "attempted",
+                       "eligible dispatcher routes", "recommendation"):
+            self.assertIn(needle, prompt)
         ladder = controller._ladder(job)
         self.assertTrue(ladder["escalated"])
+        self.assertEqual(ladder["failures"], 4)
         con = store.connect(sd)
         try:
             reasons = [json.loads(r["payload_json"])["reason"] for r in con.execute(

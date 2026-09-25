@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0] - 2026-09-25
+
+### Added
+
+- dispatcher-owned recovery evidence and truthful acceptance
+
 ## [0.30.0] - 2026-09-24
 
 ### Added

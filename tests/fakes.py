@@ -26,7 +26,10 @@ messages, proving tool-part recording; unset keeps text-only turns).
 ``FAKE_OC_PLAN`` (plan-agent envelope sequence: ``completion`` (default)
 answers every prompt with a completion envelope; ``implement_then_complete``
 answers the session's first prompt with an implementation envelope and later
-prompts with completion, so a drill runs dispatch, worker, resume, done).
+prompts with completion, so a drill runs dispatch, worker, resume, done;
+``implement_twice_then_complete`` answers the first two prompts with
+implementation envelopes and later prompts with completion, so a drill runs
+dispatch, worker, correction, resume, done).
 ``FAKE_OC_FENCE`` (``1`` wraps the plan envelope in a ```json fence).
 """
 
@@ -333,8 +336,11 @@ def run_turn(sid, model, directory, aborted, prompt_text=""):
             n_prompts = 1
         if os.environ.get("FAKE_OC_PLAN") == "implement_then_complete" and n_prompts <= 1:
             envelope = {"action": "implementation", "artifact": "fix.txt",
-                        "payload": {"instructions": "write fix.txt",
-                                    "route": "muse-spark-xhigh-free"}}
+                        "payload": {"instructions": "write fix.txt"}}
+            prose = "Routing to the worker with an implementation envelope."
+        elif os.environ.get("FAKE_OC_PLAN") == "implement_twice_then_complete" and n_prompts <= 2:
+            envelope = {"action": "implementation", "artifact": "fix.txt",
+                        "payload": {"instructions": "write fix.txt"}}
             prose = "Routing to the worker with an implementation envelope."
         else:
             envelope = {"action": "completion", "output": "PLANNED_ON_OPENCODE",

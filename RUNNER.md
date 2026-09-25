@@ -104,6 +104,14 @@ and owns attribution and pricing. The field does not assign the planner's
 whole session or establish acceptance. The coordinator captures that session's
 genuine submissions and outcome evidence through Observer's CLI.
 
+The task JSON may also carry `acceptance` (required acceptance evidence the
+completion envelope must then carry as `acceptance_evidence`, so worker exit
+zero, passing helper tests, and an open PR cannot establish completion when
+the required real product interaction or independent review is missing) and
+`draft_pr_allowed` (explicit authorization to complete with a draft PR;
+draft status itself is not a defect). Both are preserved verbatim with the
+job like any other payload field.
+
 `capacity` lists remembered route capacity with its original provider
 evidence, plus the latest usage-probe Reading per pool, model, and window.
 `--clear ROUTE` is an operator action after checking the provider
@@ -129,10 +137,16 @@ allowance; the runner never invents a reset time.
    classifies `exhausted` with the carried reset time (the message's human
    date reads as UTC): the Codex pool is marked exhausted until that reset
    in the capacity ledger with the verbatim message as evidence, and the
-   job dispatches on `luna-go/max` in the same step without retrying Codex,
-   with `route_reason` recorded. A dispatch that fails with no recognized
-   signal still blocks, but with the last provider message in the block
-   reason, never a bare "turn not completed".
+    job dispatches on `luna-go/max` in the same step without retrying Codex,
+    with the dispatch reason recorded separately from any worker route
+    reason: `dispatch_route_reason` in the controller state (the shared
+    `route_reason` key is left for worker moves, so the first worker
+    invocation keeps reason `initial`) and
+    `scope: dispatch` on the `route_switched` event (worker moves carry
+    `scope: worker`), so a worker attempt is never misread with the
+    dispatch cause. A dispatch that fails with no recognized
+    signal still blocks, but with the last provider message in the block
+    reason, never a bare "turn not completed".
     The first `thread.started` ID is saved as the Luna task. Luna's action is
     read only from its own final `item.completed` `agent_message` text, or
     the last-message file. Command output is never parsed for actions. On
@@ -181,16 +195,38 @@ allowance; the runner never invents a reset time.
     without merging it, and reports the PR URL. The worker report
     returns to the same Luna task.
 6. `completion`: the terminal result is saved before acknowledgment, but
-    never while the latest implementation turn's proof failed. The
-    completion envelope carries the opened PR URL (`pr_url`), and `result`
-    shows it; nothing merges the PR. A completion
-   envelope arriving with a non-zero `proof_exit_code` or a `failed` report
-   status is refused: the controller records `completion_refused: proof
-   failed rc=<n>`, hands the failed report's evidence back to the dispatcher
-   once (a resume carrying the report, proof log, and diff paths), and blocks
-   with that reason if the dispatcher insists on completion for the same
-   failed turn; `status` shows the refusal and the block reason. Recovery
-   refuses the same way when it consumes a completion.
+    never while the latest implementation turn's proof failed, while the
+    bound proof is missing, skipped, or stale, while named acceptance
+    evidence is missing, or while the PR check fails. The
+    completion envelope carries the opened PR URL (`pr_url`) and, when the
+    task names required acceptance evidence, its `acceptance_evidence`;
+    `result` shows the PR URL, the acceptance evidence, and the candidate
+    head commit it was bound to; nothing merges the PR. A completion
+    envelope arriving with a non-zero `proof_exit_code` or a `failed` report
+    status is refused: the controller records `completion_refused: proof
+    failed rc=<n>` (or `proof timed out rc=124` for a proof that ran past
+    its budget, apart from an executable-not-found rc127), hands the failed
+    report's evidence back to the dispatcher once (a resume carrying the
+    report, proof log, and diff paths), and blocks with that reason if the
+    dispatcher insists on completion for the same failed turn; `status`
+    shows the refusal and the block reason. A completion whose bound proof
+    is skipped (`completion_refused: incomplete proof`), ran against an
+    older workspace HEAD (`completion_refused: stale proof`), lacks the
+    task's required acceptance evidence, names a second PR identity
+    (`completion_refused: duplicate PR`), or whose PR does not verify live
+    (missing, closed, wrong repository, or pointing at another commit; a
+    draft only when the task explicitly sets `draft_pr_allowed`) refuses
+    through the same once-then-block pattern, with evidence naming the
+    exact gap instead of a proof failure. The PR check reads the PR live
+    with `gh pr view` once per completion (stubbed in deterministic tests);
+    an unavailable check refuses as unverified, never as verified. A PR URL
+    is preserved as the job's single PR identity (`pr_url` in the
+    controller state, `pr_identity_preserved` event) only after the live
+    check passes, so an invalid first URL never poisons the job and a
+    corrected URL is accepted instead of refused as a duplicate:
+    correction and recovery update that PR, never open a second, and the
+    worker prompt carries it. Recovery refuses the same way when it
+    consumes a completion.
 
 The dispatcher's Codex sandbox is read-only, so Luna coordinates and verifies
 but cannot edit. The controller runs at most 12 transitions per launch and
@@ -204,22 +240,65 @@ launches cover the 48-step job budget before launch-budget exhaustion.
 
 Escalation ladder. A turn fails when the worker or provider errors (not a
 capacity signal, which moves routes instead; hard errors end the turn as
-`implementation_failed` for this ladder) or when the task's own proof
+`implementation_failed` for this ladder without running the suite) or when the task's own proof
 command exits non-zero. The first failure leads to a correction in the same
 worker session on the same route. The second leads to a fresh correction on
 the correction stage's route (Kimi K2.7 Code). The third is the single
 escalation to the recovery stage (Grok 4.6 on Go, then native Grok Build on
 the xAI subscription, then OpenCode's xAI provider; those pool moves are not
-second escalations; recovery never reuses a rung the job already ran, and
-when every rung was used the job blocks with `recovery_exhausted`). After
-the escalation the evidence returns to the planner, which may itself choose
-a rung from the policy's planner-chosen rungs (Astra medium on Codex, Opus 5.5
-high on the Claude harness) and run it in its own session; the runner never
-selects those automatically. A fourth failure ends the job as `failed` with
-`ESCALATION_EXHAUSTED` and
-the turn reports listed in `result`, which is the planner's to act on. A
+second escalations; recovery never reuses a rung the job already ran).
+The ladder stays authoritative: an ordinary implementation envelope carries
+no route and never moves the job, so a repeated default can never undo a
+correction or recovery move. Every
+rung move records a `recovery_decision` event (failures, rung, route
+target, the failed attempt's seq and proof timestamps where known, reason;
+the next attempt seq stays unknown there) so Observer can measure failure-to-restart and recovery
+success; `recovery_next_attempt` links the decision to the actual next
+attempt seq when that worker invocation starts, and
+`recovery_attempt_result` preserves its outcome, so the next attempt's report and invocation rows join on that seq.
+When every rung was used, and normal failures reach 4 or more before any
+authorized directed attempt is used (the usual path is one recovery
+escalation that fails), the evidence returns to the planner as a concrete
+decision through a planner question (the decision required, the evidence,
+attempted remedies, the genuinely eligible dispatcher routes, and the
+dispatcher's recommendation), never a request for the planner to
+implement; the job and Observer identities are preserved. An approach-only
+answer consumes exactly one dispatcher-owned attempt on the current route
+without re-posting the question. Routine mechanical
+recovery stays inside the dispatch subsystem
+(the runner's bounded ladder and capacity moves); missing authority or a
+consequential scope or approach decision reaches the planner, which answers
+with direction (an approach or an eligible route the dispatcher relays as
+`directed_route`). That answer permits exactly one explicitly authorized
+attempt assigned under the routing policy, never an implicit loop or
+unlimited retries. The submitted candidate stays
+dispatcher-owned throughout: a failure never authorizes the planner to take
+over implementation, debugging, test execution, or verification. The planner
+may direct a different approach or a stronger eligible agent through the
+dispatcher by naming it (an implementation envelope `directed_route` or a planner
+answer): the dispatcher assigns that work under the routing policy when the
+route is dispatcher-assignable and has capacity (correction and recovery
+stage routes are valid from any lane; other routes must sit in the job
+lane), and rejects anything else
+with a `planner_route_rejected` event, never a silent substitution. Two
+routes stay explicitly planner-executed and are never auto-selected or
+dispatcher-assigned: the planner-chosen rungs (Astra medium on Codex, Opus
+5.5 high on the Claude harness), which the planner itself chooses and runs
+in its own session before submission, and `critical` work, which the planner does in its own
+session before submitting and never inside a submitted job. A failure after
+the single authorized directed attempt ends the job as `failed` with
+`ESCALATION_EXHAUSTED` and the same concrete
+decision content in its error payload, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
-decides; the runner enforces the ceiling.
+decides; the runner enforces the ceiling. A stopped turn with a supervisor
+result and every owned process group proven dead (an OpenCode rc124
+startup failure or an rc143 confirmed stop, with every recorded child and
+supervisor group present and confirmed dead and no live or unresolved
+invocation) returns its evidence to the dispatcher as a failed turn
+instead of a sticky block; a finished database row alone never proves
+death, absent group identities prove nothing, and missing results, live
+groups, rc125, and ambiguous ownership keep the sticky block so no second
+writer starts behind a possible owner.
 
 A stored answer is reused only when the stored prompt matches the
 dispatcher's prompt; a reused `qid` with a different prompt blocks with
@@ -598,7 +677,9 @@ result. File-backed output survives controller death.
 - `recover` stops orphaned servers, consumes uncollected results once
   (including a finished planner answer), and restarts the controller for a
   dispatched job whose controller is gone (including a finished dispatch
-  whose action was not saved yet). While the controller lock is
+  whose action was not saved yet). A job blocked only by `runtime_missing`
+  that still owes a planner answer restarts its callback in the same single
+  call, like a question-pending job. While the controller lock is
   held, or within 60 seconds of a launch (acknowledged or not), recover
   never replaces the controller and never blocks it for a missing
   handshake. It still blocks for orphaned servers, and for unresolved
@@ -606,11 +687,19 @@ result. File-backed output survives controller death.
   applied only when it reports the saved thread, and a consumed failed or
   mismatched Luna turn blocks the job with its reason. A consumed failed or
   mismatched planner turn blocks only while its question is still pending;
-  if the question was answered meanwhile, the stored answer wins. A failed Muse turn is left to the restarted controller,
+  if the question was answered meanwhile, the stored answer wins. A failed
+  planner callback stays pending for `answer` plus `recover`: the answer
+  unblocks the job and a following recover restarts its controller. A failed Muse turn is left to the restarted controller,
   which may switch routes on provider evidence. After that, a free lock proves no controller has
   started; one that starts later fails the lock or its acknowledgment,
   because its token no longer holds the lease, and exits without changing
-  the job.
+  the job. Adopting a live child never interrupts it, but the compatibility
+  decision gates starting its replacement controller: on an unsupported
+  state no controller starts and the next recovery blocks with the specific
+  incompatibility instead of executing on unreadable rows. Terminal jobs
+  are never resurrected and never assessed, but rows that finished after
+  the job ended are still consumed once so their measurements land on the
+  ledger.
   Never-started rows are not closed while another process holds the lock. A row a live controller has just
   inserted, not yet claimed by its supervisor, is normal startup. A controller that advertised the current
   lease token with a proven identity is adopted even with an old heartbeat,
@@ -618,7 +707,13 @@ result. File-backed output survives controller death.
   turns, and any result after cancellation was requested, are recorded but
   never applied.
 - `blocked` jobs never restart through `recover`, except for recover's own
-  ownership blocks, which it re-evaluates. A planner-question block clears
+  ownership blocks, which it re-evaluates. Genuine unknown-ownership,
+  identity-mismatch, orphaned-server, unresolved-child, failed-resume, and
+  insisted-completion blocks stay sticky by design: no automatic wakeup can
+  safely start another writer there, and their reasons name no `recover`
+  action. Every block reason that does name `run recover` as its next
+  action (`runtime_missing`, the step-budget restart, answered planner
+  questions) is recoverable through exactly that call. A planner-question block clears
   through `answer`. `cancel` works on any non-terminal job.
 - Runtime recovery: when the installed plugin runtime disappears between
   turns (an update removes the old plugin-cache path), the next spawn
@@ -680,23 +775,65 @@ finalize with their timeout origin. A timeout finalizes as `failed` with
 Each worker turn writes `outputs/<request_id>/turn-<seq>/` (retries on the
 same seq use `turn-<seq>-1`, ... so no turn overwrites another):
 `report.json` (route, policy version, observed model and variant as separate
-fields, session, changed files, proof command and exit code, tokens verbatim
+fields, session, changed files, the workspace HEAD the evidence was taken
+against, proof command, exit code, proof class and attempt timestamps,
+failure class and harness signal where one exists, tokens verbatim
 with a source label including reasoning and cache read and write, native
 message identities, blockers, a redacted worker summary), `proof.log` (the
 task's own `proof` command run through `/bin/sh -c` in the workspace with the
 runner's environment, so `&&`, pipes, and quoting behave as in the project's
 own docs; the log records the exact command and its exit code plus the
-redacted output), `diff.patch` (`git diff HEAD` plus untracked files, or a note
+redacted output, or truthfully records that the suite was skipped and why),
+`diff.patch` (`git diff HEAD` plus untracked files, or a note
 when the workspace is not a checkout), and `worker.txt` (the worker's full
-text, redacted). Harness-reported worker questions travel in the report's
+text, redacted). Writing the failure report is separate from executing
+proof: exhausted, stalled, crashed, hard-error, or otherwise incomplete
+turns skip the
+suite (`proof_class skipped` with its reason) instead of running the full
+suite automatically against an unfinished candidate; the dispatcher requests
+useful proof of a coherent candidate, and required final verification still
+refuses completion without a bound passing proof. A proof that runs past its
+budget has its whole process group stopped and classifies `timeout` (rc 124),
+apart from an executable-not-found `not_found` (rc 127); a main process that
+already exited while a background child holds the output pipe is reaped and
+classifies by its actual exit, never as a false timeout; leftover group
+members are stopped after a normal exit too, so no proof child races a later
+writer. The proof group is recorded durably while it runs
+(`proof-owner.json` with PID, PGID, and leader start identity): public
+cancel drains that actual owned group with PID reuse protection, and
+cancel and `recover` block on unresolved proof ownership instead of
+treating the job as stopped while the proof tree keeps running. An
+unreadable record or one without group identities is ambiguous
+ownership, never safe death: the workspace claim is retained until
+ownership resolves. The workspace claim is otherwise retained until
+ownership is confirmed dead. Every executed proof is also a durable invocation row with
+`stage='verification'` (kind `proof`), its start/end timestamps, exit code,
+proof class, and elapsed time, so verification outcomes are observable from
+the existing invocation records. A supervisor-level rc124 with no proof run
+(a startup failure) classifies `infrastructure`, never `timeout`. Turn failure classes
+are timeout, stall, provider (exhausted, overloaded, context), infrastructure
+(hard errors, missing runtime, lost supervisor, unconfirmed stop),
+implementation (the worker ran and errored without a capacity signal), and
+verification (the task's own proof ran and failed); intentional cancellation
+lives on the job's cancel intent, never on a turn report; missing causes and
+timestamps stay unknown. Harness-reported worker questions travel in the report's
 blockers (redacted), never as live questions; the implementation harness
 denies question permission, so blockers are typically empty. The dispatcher's resume message carries these paths and the
-structured fields (route, policy version, models, variants, status, tokens,
-native identities) instead of the worker's prose.
+structured fields (route, policy version, models, variants, status, failure and
+proof classes, tokens, native identities, the candidate commit, and the
+preserved PR identity) instead of the worker's prose. The dispatcher consumes
+that exact-candidate evidence; it requests new proof only when the evidence is
+missing, skipped, stale, or for a different candidate, and never reruns the
+full suite automatically against an unfinished candidate.
 
 Every invocation records its stage, requested route, policy version, route
-reason, harness version, elapsed time, terminal class (completed, failed,
-crashed, cancelled, timeout, quota, overloaded, stalled, context, hard_error),
+reason (worker moves record `route_reason` with `scope: worker`; dispatch
+moves record `dispatch_route_reason` with `scope: dispatch` and leave the
+worker's reason alone, so the first worker invocation keeps `initial`),
+harness version, elapsed time, terminal class (completed, failed,
+crashed, cancelled only with explicit job cancellation intent, timeout,
+quota, overloaded, stalled, context, hard_error, infrastructure for a
+startup rc124 with no proof run or a stop without cancel intent),
 longest observed stream silence (`longest_silence_secs`), usage counters
 verbatim under a source label, the observed model and the observed variant as
 separate fields, and native identities (Codex thread and turn ids, Claude
@@ -711,7 +848,36 @@ measurements including native identities, variants, and schema versions,
 plus the `capacity` marks and usage-probe `readings`;
 `status` keeps the redacted error evidence (signal, evidence, retry counts
 and caps) so CLI readers need not query the database directly;
-`result` also lists the turn reports.
+`result` also lists the turn reports. Recovery links are observable from
+existing records: each `recovery_decision` event carries the failed seq,
+rung, route target, reason, and proof timestamps where known (its
+`next_attempt_seq` stays unknown until linked); `recovery_next_attempt`
+binds the decision to the actual next worker seq when that invocation
+starts; `recovery_attempt_result` preserves that attempt's outcome.
+Verification attempts are invocation rows with `stage='verification'`
+(kind `proof`) carrying started/ended timestamps, exit code, proof class,
+and elapsed time; cancellation intent lives on the job
+(`cancel_requested`) with `cancelled`/`timeout` events. A stop (rc143)
+reads `cancelled` on the invocation row only with explicit job
+cancellation intent; without intent it reads `infrastructure` when stop
+evidence is present and `unknown` when none is, never cancelled by exit
+code alone. A startup rc124 carries `infrastructure` in both the turn
+report and its invocation row; an actual proof rc124 timeout carries
+`timeout` in both. Combined
+acceptance with Agent Observer still needs its importer to read these
+fields (it currently discards Router events and never reads `report.json`):
+the remaining adapter additions are importing `recovery_decision`,
+`recovery_next_attempt`, `recovery_attempt_result`, and
+`verification_attempt` events (with sanitized failure and proof classes,
+seq linkage, and timestamps), `stage='verification'` invocation rows with
+kind `proof`, sequence metadata from `meta_json`, `dispatch_route_reason`
+versus worker `route_reason` (event scope `dispatch` versus `worker`),
+the job cancel intent (`cancel_requested`), and the class mapping
+(context pressure is Router `provider`, rc143 unconfirmed stop is Router
+`infrastructure`, startup rc124 is `infrastructure`, proof timeout is
+`timeout`); no new Router fields are planned for this. Unknown
+timestamps, causes, and ownership stay unknown throughout and are never
+fabricated.
 
 `--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is made absolute and is
 `0700`. Detached controllers and supervisors start from the package

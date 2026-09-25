@@ -136,7 +136,12 @@ class Measures(unittest.TestCase):
         self.assertEqual(core.terminal_class_for(4, {"signal": "overloaded"}), "overloaded")
         self.assertEqual(core.terminal_class_for(1, {"signal": "hard"}), "hard_error")
         self.assertEqual(core.terminal_class_for(124, {}), "timeout")
-        self.assertEqual(core.terminal_class_for(143, {}), "cancelled")
+        self.assertEqual(core.terminal_class_for(143, {"error": "x"},
+                                                         cancel_requested=True),
+                         "cancelled")
+        self.assertEqual(core.terminal_class_for(143, {"error": "x"}),
+                         "infrastructure")
+        self.assertEqual(core.terminal_class_for(143, None), "unknown")
         self.assertEqual(core.terminal_class_for(None, None, crashed=True), "crashed")
         self.assertEqual(core.terminal_class_for(2, None), "failed")
 

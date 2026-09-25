@@ -396,7 +396,7 @@ class TestExhaustedCodexToLunaGoStubDrill(unittest.TestCase):
         self.assertEqual(res["luna_action"]["output"], "PREFLIGHT_DONE")
         job = core.get_job(sd, "i48-stub-1")
         st = json.loads(job["controller_state"] or "{}")
-        self.assertEqual(st.get("route_reason"), "preflight_exhausted")
+        self.assertEqual(st.get("dispatch_route_reason"), "preflight_exhausted")
         done = controller.step(sd, "i48-stub-1", run_cmd=run)
         self.assertEqual(done["action"], "completed")
         self.assertEqual(core.get_job(sd, "i48-stub-1")["status"], "succeeded")
@@ -472,7 +472,7 @@ class TestPublicCliFallbackDrill(unittest.TestCase):
         self.assertTrue((ws / "fix.txt").exists(), "worker turn completed")
         st = json.loads(job["controller_state"] or "{}")
         self.assertEqual(st.get("dispatch_route"), "luna-go/max")
-        self.assertEqual(st.get("route_reason"), "preflight_exhausted")
+        self.assertEqual(st.get("dispatch_route_reason"), "preflight_exhausted")
         self.assertIn("PLANNED_ON_OPENCODE", job.get("result_json") or "")
         # The ordinary completion carries its opened PR URL into the result.
         self.assertIn("https://example.test/pr/fake-1",
