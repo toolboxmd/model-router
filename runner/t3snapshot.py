@@ -8,8 +8,13 @@ the project. The router reads it before choosing a route:
 - Eligible route = its role preference whose T3 instance is enabled and
   whose model the instance offers. Turning a model off in T3 removes it
   from routing.
-- A non-empty Prism list for a (role, lane) replaces the policy's order
-  for that stage; entries without a policy route run as ``t3:`` routes.
+- A non-empty Prism list replaces the policy's order for that stage;
+  entries without a policy route run as ``t3:`` routes. The worker has
+  one list per lane; every other role has one ``models`` list
+  (toolboxmd/model-router#127). Older snapshots without ``models`` still
+  work through the role's entry for the job's lane.
+- ``enabled: false`` on Retry (``correction``) or Escalation
+  (``recovery``) switches that ladder step off (``ladder_enabled``).
 - A usage window at 100 percent with ``resetsAt`` in the future makes
   every route on that meter exhausted until then; at 100 percent with no
   ``resetsAt`` it stays exhausted until a later read says otherwise; at
@@ -33,7 +38,9 @@ CACHE_SECS = 30.0
 EXHAUSTED_PERCENT = 100.0
 DEGRADED_PERCENT = 80.0
 
-# Prism role -> router stage, for the roles the router dispatches.
+# Prism role -> router stage, for the roles the router dispatches. The
+# Retry and Escalation roles keep their internal keys ``correction`` and
+# ``recovery`` so the snapshot contract stays stable.
 ROLE_STAGES = {"dispatcher": "dispatch", "correction": "correction",
                "recovery": "recovery", "reviewer": "review"}
 
@@ -59,19 +66,24 @@ def _providers(snapshot: dict) -> list[dict]:
 
 
 def stage_preferences(snapshot: dict, lane_stage: str | None) -> dict[str, list[str]]:
-    """Stage orders from the snapshot's role lanes (non-empty lists only).
+    """Stage orders from the snapshot's role lists (non-empty lists only).
 
-    Worker lanes map onto the three implementation stages; the
-    dispatcher, reviewer, correction and recovery lists follow the job's lane.
+    Worker lanes map onto the three implementation stages. The
+    dispatcher, reviewer, Retry and Escalation roles read their single
+    ``models`` list; a snapshot without it (older fork) falls back to the
+    role's entry for the job's lane.
     """
     roles = snapshot.get("roles") if isinstance(snapshot, dict) else None
     if not isinstance(roles, dict):
         return {}
 
-    def routes(role: str, prism_lane: str) -> list[str]:
+    def routes(role: str, prism_lane: str, single: bool = False) -> list[str]:
         kit = roles.get(role)
-        lanes = kit.get("lanes") if isinstance(kit, dict) else None
-        entries = lanes.get(prism_lane) if isinstance(lanes, dict) else None
+        if single and isinstance(kit, dict) and isinstance(kit.get("models"), list):
+            entries = kit["models"]
+        else:
+            lanes = kit.get("lanes") if isinstance(kit, dict) else None
+            entries = lanes.get(prism_lane) if isinstance(lanes, dict) else None
         out: list[str] = []
         for e in entries or []:
             if not isinstance(e, dict):
@@ -91,10 +103,26 @@ def stage_preferences(snapshot: dict, lane_stage: str | None) -> dict[str, list[
             overrides[stage] = worker
     job_lane = policy.PRISM_LANE_OF.get(lane_stage or policy.DEFAULT_LANE, "medium")
     for role, stage in ROLE_STAGES.items():
-        found = routes(role, job_lane)
+        found = routes(role, job_lane, single=True)
         if found:
             overrides[stage] = found
     return overrides
+
+
+def ladder_enabled(snapshot: dict | None = None) -> dict[str, bool]:
+    """Whether Retry (``correction``) and Escalation (``recovery``) are on.
+
+    Reads the role's ``enabled`` flag from the given snapshot, or the last
+    applied one; only an explicit ``false`` switches a step off, so an
+    unknown or older snapshot keeps both on.
+    """
+    snap = snapshot if snapshot is not None else _CACHE.get("applied")
+    roles = snap.get("roles") if isinstance(snap, dict) else None
+    out = {}
+    for role in ("correction", "recovery"):
+        kit = roles.get(role) if isinstance(roles, dict) else None
+        out[role] = not (isinstance(kit, dict) and kit.get("enabled") is False)
+    return out
 
 
 def _window_state(windows, now: float) -> tuple[str | None, str | None]:
@@ -243,6 +271,7 @@ def view() -> dict:
     return {"snapshot": "read", "generated_at": snap.get("generatedAt"),
             "project_id": snap.get("projectId"),
             "stage_overrides": dict(policy.STAGE_OVERRIDES),
+            "ladder_enabled": ladder_enabled(snap),
             "routes": {r: {"state": s, "reason": why}
                        for r, (s, why) in sorted(current_states().items())}}
 

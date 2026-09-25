@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.37.0] - 2026-09-26
+
+### Added
+
+- Prism roles: single model lists outside the worker; Retry and Escalation names and switches (#127)
+
 ## [0.36.0] - 2026-09-26
 
 ### Added

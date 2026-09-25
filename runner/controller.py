@@ -3272,6 +3272,51 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict) -> dict:
 
 
 LADDER_RUNGS = ("initial", "correction", "correction_fresh", "recovery")
+_RUNG_NAMES = {"correction": "one retry", "correction_fresh": "one fresh retry",
+               "recovery": "one escalation"}
+
+
+_AUTO_RUNGS = LADDER_RUNGS[1:]
+
+
+def _next_rung(ladder: dict) -> str | None:
+    """The next enabled automatic rung after the last one this job used.
+
+    Retry (``correction``, two rungs) and Escalation (``recovery``, one
+    rung) can each be switched off in Prism, also mid-job; their rungs
+    are then skipped and later failures reach the planner question
+    sooner. The ladder never moves backwards and never escalates twice.
+    None means the planner decides.
+    """
+    on = t3snapshot.ladder_enabled()
+    last = ladder.get("rung")
+    after = _AUTO_RUNGS.index(last) + 1 if last in _AUTO_RUNGS else \
+        (0 if last in (None, "initial") else len(_AUTO_RUNGS))
+    for rung in _AUTO_RUNGS[after:]:
+        if rung == "recovery" and (ladder.get("escalated") or not on["recovery"]):
+            continue
+        if rung != "recovery" and not on["correction"]:
+            continue
+        return rung
+    return None
+
+
+def _rungs_ran(ladder: dict) -> list[str]:
+    """The automatic rungs this job actually used, in order.
+
+    Jobs laddered before the switches existed ran every rung up to the
+    last one.
+    """
+    if isinstance(ladder.get("ran"), list):
+        return [r for r in ladder["ran"] if r in _AUTO_RUNGS]
+    last = ladder.get("rung")
+    if last in _AUTO_RUNGS:
+        return list(_AUTO_RUNGS[:_AUTO_RUNGS.index(last) + 1])
+    return list(_AUTO_RUNGS) if last == "recovery_directed" else []
+
+
+def _ladder_attempted(ladder: dict) -> str:
+    return ", ".join(["initial turn"] + [_RUNG_NAMES[r] for r in _rungs_ran(ladder)])
 
 
 def eligible_directed_routes(state_dir, request_id: str) -> list[str]:
@@ -3401,7 +3446,7 @@ def _recovery_exhausted_reason(state_dir, request_id: str) -> str:
         eligible = []
     eligible_txt = ", ".join(eligible) if eligible else \
         "none currently eligible (all dispatcher routes exhausted, degraded, or capped)"
-    return ("recovery_exhausted: every recovery rung was already used; "
+    return ("recovery_exhausted: every enabled Retry and Escalation rung was already used; "
             "decision required: choose the next approach (an eligible route or a scope "
             "change) for the original objective; "
             f"evidence: {ev}; attempted: {tried}; "
@@ -3417,16 +3462,16 @@ def _escalation_exhausted_error(state_dir, request_id: str, failures: int,
     ctx = core.exhaustion_context(state_dir, request_id)
     tried = ", ".join(f"{route}x{n}" for route, n in ctx["routes_tried"]) \
         or "no turns recorded"
+    attempted = _ladder_attempted(_ladder(core.get_job(state_dir, request_id)))
     return {
         "code": "ESCALATION_EXHAUSTED", "failures": failures, "reports": reports,
-        "message": "initial turn, one correction, one fresh correction, and one escalation failed",
+        "message": f"{attempted} failed",
         "decision_required": "choose the next approach (an eligible route or a scope "
                              "change) for the original objective",
         "evidence": [f"seq={r.get('seq')} {r.get('route')} {r.get('status')}/"
                      f"{r.get('failure_class')} proof={r.get('proof_exit_code')} "
                      f"{r.get('report')}" for r in ctx["reports"][-6:]],
-        "attempted": ("initial turn, one correction, one fresh correction, and one "
-                      f"escalation; routes tried: {tried}"),
+        "attempted": f"{attempted}; routes tried: {tried}",
         "recommendation": "the planner returns its direction through the dispatcher "
                           "and the dispatcher assigns that work under the routing policy; "
                           "the planner does not implement",
@@ -3439,8 +3484,9 @@ def _ladder(job: dict) -> dict:
     out = {"failures": int(ladder.get("failures") or 0),
            "rung": ladder.get("rung") or "initial",
            "escalated": bool(ladder.get("escalated"))}
-    if ladder.get("counted_seq") is not None:
-        out["counted_seq"] = ladder.get("counted_seq")
+    for key in ("counted_seq", "rung_at", "ran"):
+        if ladder.get(key) is not None:
+            out[key] = ladder.get(key)
     return out
 
 
@@ -3471,9 +3517,12 @@ def _clear_session(state_dir, request_id: str) -> None:
 def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict | None:
     """Choose the rung for the next implementation turn from the failures so far.
 
-    0 failures: the initial route. 1: a correction in the same worker
-    session. 2: a fresh correction on the correction stage's route. 3: the
-    single escalation to the recovery stage. 4 or more: the evidence
+    Each new failure takes the next enabled rung after the last one used:
+    a retry in the same worker session, a fresh retry on the correction
+    stage's route, then the single escalation to the recovery stage.
+    Retry or Escalation switched off in Prism skips its rungs, so the
+    later rungs and the planner question move up (both off: the first
+    failure asks the planner). After the last rung: the evidence
     returns to the planner through the existing planner-question path
     before any authorized directed attempt is used; only after that one
     explicitly authorized attempt is used does the job end failed with
@@ -3484,14 +3533,23 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
     failures = ladder["failures"]
     if failures <= 0:
         return None
-    if failures == 1:
-        rung = "correction"
-        target = None
-    elif failures == 2:
-        rung = "correction_fresh"
-        target = policy.stage_routes("correction")[0]
-    elif failures == 3:
+    # A rung is taken once per counted failure. Jobs laddered before
+    # ``rung_at`` existed took rung n at failure n.
+    rung_at = ladder.get("rung_at",
+                         {"correction": 1, "correction_fresh": 2, "recovery": 3}.get(ladder["rung"]))
+    if rung_at != failures:
+        rung = _next_rung(ladder)
+    elif ladder["rung"] == "recovery":
+        # Same failure, escalation already taken: only re-check whether
+        # every recovery route is now used, which asks the planner.
         rung = "recovery"
+    else:
+        return None
+    if rung == "correction":
+        target = None
+    elif rung == "correction_fresh":
+        target = policy.stage_routes("correction")[0]
+    elif rung == "recovery":
         target = policy.next_recovery_route(None, _turns_by_route(state_dir, request_id))
         if target is None:
             # Every recovery rung was already used by this job: the
@@ -3529,7 +3587,7 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
                 return {"action": "failed", "reason": "escalation_exhausted", "reports": reports}
             return _escalate_recovery_to_planner(state_dir, request_id, token)
     else:
-        # Normal failures at 4 or more still owe the planner a concrete
+        # Normal failures past the last rung still owe the planner a concrete
         # decision before any authorized directed attempt is used: the
         # usual path is one recovery escalation that fails, not three
         # exhausted rungs. Only after the planner's one explicitly
@@ -3567,6 +3625,8 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
                       "escalation" if rung == "recovery" else "correction",
                       {"source": "ladder", "failures": failures})
     _set_phase(state_dir, request_id, ladder={"failures": failures, "rung": rung,
+                                              "rung_at": failures,
+                                              "ran": _rungs_ran(ladder) + [rung],
                                               "escalated": ladder["escalated"] or rung == "recovery",
                                               **({"counted_seq": ladder["counted_seq"]}
                                                  if ladder.get("counted_seq") is not None else {})})
@@ -3820,7 +3880,7 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     try:
         _set_phase(state_dir, request_id, planner_recovery_in_flight=True,
                    ladder={**ladder, "rung": "recovery_directed",
-                           "escalated": True})
+                           "ran": _rungs_ran(ladder), "escalated": True})
     except core.LeaseLostError:
         raise
     except Exception:
