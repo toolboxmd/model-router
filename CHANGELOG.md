@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.35.1] - 2026-09-25
+
+### Fixed
+
+- A T3 child thread's ID is saved before its create request and its turn-start state before posting, so a controller crash never loses a running thread; recovery adopts the saved child on its saved route (including fallback routes) instead of starting a second writer, and an unreadable T3 state never posts and stays recoverable (#120)
+- `cancel` confirms the controller process has exited (TERM, bounded wait, KILL, PID identity check), then interrupts every active T3 child and confirms it settled; until then the job stays `cancelling` and keeps its workspace claim. Only a real HTTP 404 counts as a missing child (#120)
+- The recovery deadline applies only to confirming a turn started, not to healthy adopted turns (#120)
+
 ## [0.35.0] - 2026-09-25
 
 ### Changed
