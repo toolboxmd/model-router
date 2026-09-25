@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.32.0] - 2026-09-25
+
+### Added
+
+- native Codex dispatcher transport with attachable loopback endpoint
+
 ## [0.31.0] - 2026-09-25
 
 ### Added

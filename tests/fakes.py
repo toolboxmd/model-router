@@ -551,6 +551,293 @@ VERSION_GUARD = (
 )
 
 
+# Fake ``codex app-server --listen ws://127.0.0.1:PORT`` branch, composed at
+# the top of fake codex bodies that serve dispatcher flows. Speaks the
+# proven native protocol over real WebSocket framing (stdlib only):
+# initialize (experimentalApi asserted), thread/start, turn/start,
+# thread/loaded/list, thread/resume (metadata-only asserted), turn/steer,
+# thread/read, turn/interrupt. Scripted per-turn dispatcher envelopes come
+# from FAKE_NATIVE_PLAN with a per-server turn counter, so public-path
+# drills keep their envelope sequences on the new transport.
+#
+# Environment: FAKE_STATE (log directory), FAKE_NATIVE_THREAD (thread id),
+# FAKE_NATIVE_PLAN (completion | implementation | implement_then_complete |
+# planner_first | question_conflict), FAKE_NATIVE_IMPL_TURNS (first N turns
+# answer implementation regardless of plan), FAKE_NATIVE_QID (planner
+# question id), FAKE_NATIVE_OUTPUT (completion text),
+# FAKE_NATIVE_RELEASE (when set, a turn waits for this path to exist
+# before answering, so a test can kill the controller mid-turn and then
+# release the finished child),
+# FAKE_NATIVE_MODE (ok | fail | hang | auth | limit | busy | steer_fail).
+# Received RPC methods and params land in native-requests.jsonl for
+# transport assertions. Compose after argv/st are defined; dispatcher
+# exec branches below stay for the planner callback only.
+FAKE_CODEX_NATIVE_APP = r'''
+if argv[:2] == ["app-server", "--listen"]:
+    import base64 as _b64, hashlib as _hl, socket as _sock, struct as _st
+    import threading as _th, time as _tm
+    from urllib.parse import urlparse as _up
+    _mode = os.environ.get("FAKE_NATIVE_MODE", "ok")
+    if _mode == "fail":
+        sys.stderr.write("fake native server refused to start\n")
+        sys.exit(1)
+    _port = _up(argv[2]).port
+    _lsock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    _lsock.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    _lsock.bind(("127.0.0.1", _port))
+    _lsock.listen(16)
+    _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    _TID = os.environ.get("FAKE_NATIVE_THREAD", "native-thread-001")
+    _PLAN = os.environ.get("FAKE_NATIVE_PLAN", "completion")
+    _QID = os.environ.get("FAKE_NATIVE_QID", "q-native-1")
+    _OUT = os.environ.get("FAKE_NATIVE_OUTPUT", "NATIVE_DONE")
+    _lock = _th.Lock()
+    _turns = [0]
+    _interrupted = set()
+    _foreign_busy = [_mode == "busy"]
+
+    def _log_rpc(method, params):
+        with open(st / "native-requests.jsonl", "a") as _f:
+            _f.write(json.dumps({"method": method, "params": params}) + "\n")
+
+    def _envelope(n):
+        try:
+            _impl_turns = int(os.environ.get("FAKE_NATIVE_IMPL_TURNS", "0"))
+        except ValueError:
+            _impl_turns = 0
+        if _impl_turns and n <= _impl_turns:
+            return {"action": "implementation", "artifact": "fix.txt",
+                    "payload": {"instructions": "write fix.txt"}}
+        if _PLAN == "implementation":
+            return {"action": "implementation", "artifact": "fix.txt",
+                    "payload": {"instructions": "write fix.txt"}}
+        if _PLAN == "question_conflict":
+            if n == 1:
+                return {"action": "planner_question", "qid": _QID,
+                        "prompt": "First?"}
+            if n == 2:
+                return {"action": "planner_question", "qid": _QID,
+                        "prompt": "Second?"}
+            return {"action": "completion", "output": "QUESTION_DRILL_DONE",
+                    "artifact": ""}
+        if _PLAN == "implement_then_complete" and n <= 1:
+            return {"action": "implementation", "artifact": "fix.txt",
+                    "payload": {"instructions": "write fix.txt"}}
+        if _PLAN == "planner_first":
+            if n == 1:
+                return {"action": "planner_question", "qid": _QID,
+                        "prompt": "Confirm the fix?"}
+            if n == 2:
+                return {"action": "implementation", "artifact": "fix.txt",
+                        "payload": {"instructions": "write fix.txt"}}
+        return {"action": "completion", "output": _OUT, "artifact": "",
+                "pr_url": "https://example.test/pr/native-1"}
+
+    def _send(conn, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytes([0x81])
+        if len(data) < 126:
+            hdr += bytes([len(data)])
+        elif len(data) < 65536:
+            hdr += bytes([126]) + _st.pack(">H", len(data))
+        else:
+            hdr += bytes([127]) + _st.pack(">Q", len(data))
+        conn.sendall(hdr + data)
+
+    def _recv_frame(conn):
+        hdr = conn.recv(2)
+        if len(hdr) < 2:
+            raise ConnectionError("closed")
+        b1, b2 = hdr[0], hdr[1]
+        opcode, ln = b1 & 0x0F, b2 & 0x7F
+        if ln == 126:
+            ln = _st.unpack(">H", conn.recv(2))[0]
+        elif ln == 127:
+            ln = _st.unpack(">Q", conn.recv(8))[0]
+        mask = conn.recv(4) if b2 & 0x80 else None
+        payload = b""
+        while len(payload) < ln:
+            chunk = conn.recv(ln - len(payload))
+            if not chunk:
+                raise ConnectionError("closed")
+            payload += chunk
+        if mask:
+            payload = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+        return opcode, payload
+
+    def _answer_turn(conn, turn_id, n):
+        _rel = os.environ.get("FAKE_NATIVE_RELEASE", "")
+        if _rel:
+            _end = _tm.monotonic() + 120
+            while _tm.monotonic() < _end and not os.path.exists(_rel):
+                _tm.sleep(0.05)
+        if _mode == "hang":
+            while True:
+                _tm.sleep(0.5)
+        env = _envelope(n)
+        _tm.sleep(0.2)
+        mid = "msg-native-%06d" % n
+        _send(conn, {"method": "item/completed",
+                     "params": {"item": {"type": "agentMessage", "id": mid,
+                                         "text": json.dumps(env)},
+                                "threadId": _TID, "turnId": turn_id}})
+        _send(conn, {"method": "thread/tokenUsage/updated",
+                     "params": {"threadId": _TID, "turnId": turn_id,
+                                "tokenUsage": {"total": {"totalTokens": 100 + n,
+                                                         "inputTokens": 90 + n,
+                                                         "outputTokens": 10},
+                                               "last": {"totalTokens": 100 + n,
+                                                        "inputTokens": 90 + n,
+                                                        "outputTokens": 10}}}})
+        _send(conn, {"method": "turn/completed",
+                     "params": {"threadId": _TID,
+                                "turn": {"id": turn_id, "status": "completed",
+                                         "items": [{"type": "agentMessage",
+                                                    "id": mid,
+                                                    "text": json.dumps(env)}]}}})
+
+    def _serve(conn):
+        try:
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    conn.close()
+                    return
+                raw += chunk
+            head = raw.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+            key = ""
+            for line in head.split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    key = line.split(":", 1)[1].strip()
+            accept = _b64.b64encode(
+                _hl.sha1((key + _GUID).encode()).digest()).decode()
+            conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                          "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept +
+                          "\r\n\r\n").encode())
+            while True:
+                try:
+                    opcode, payload = _recv_frame(conn)
+                except ConnectionError:
+                    return
+                if opcode == 0x9:
+                    conn.sendall(bytes([0x8A, len(payload)]) + payload)
+                    continue
+                if opcode == 0x8:
+                    try:
+                        conn.sendall(b"\x88\x00")
+                    except OSError:
+                        pass
+                    return
+                if opcode != 0x1:
+                    continue
+                try:
+                    msg = json.loads(payload.decode())
+                except ValueError:
+                    continue
+                rid, method = msg.get("id"), msg.get("method")
+                params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                if rid is not None:
+                    _log_rpc(method, params)
+                if method == "initialize":
+                    caps = (params.get("capabilities") or {})
+                    assert caps.get("experimentalApi") is True, caps
+                    _send(conn, {"id": rid, "result": {"userAgent": "fake-codex/0.0.0"}})
+                elif method == "thread/start":
+                    assert params.get("model"), params
+                    assert params.get("sandbox") == "read-only", params
+                    assert params.get("approvalPolicy") == "never", params
+                    if _mode == "auth":
+                        _send(conn, {"id": rid, "error": {
+                            "code": 401, "message": "failed to connect to websocket: "
+                                                   "HTTP error: 401 Unauthorized"}})
+                    else:
+                        _send(conn, {"id": rid, "result": {"thread": {"id": _TID}}})
+                elif method == "turn/start":
+                    assert params.get("threadId") == _TID, params
+                    assert isinstance(params.get("effort"), str) and params["effort"], params
+                    assert isinstance(params.get("input"), list) and params["input"], params
+                    if _mode == "auth":
+                        _send(conn, {"id": rid, "error": {
+                            "code": 401, "message": "Missing bearer or basic "
+                                                   "authentication in header"}})
+                    elif _mode == "limit":
+                        _send(conn, {"id": rid, "error": {
+                            "code": "UsageLimitExceeded",
+                            "message": "You have hit your usage limit. Try again later.",
+                            "resets_at": "2026-09-22T09:51:00+00:00"}})
+                    else:
+                        with _lock:
+                            _turns[0] += 1
+                            n, turn_id = _turns[0], "%s-turn-%d" % (_TID, _turns[0])
+                        _send(conn, {"id": rid, "result": {"turn": {"id": turn_id}}})
+                        _th.Thread(target=_answer_turn,
+                                   args=(conn, turn_id, n), daemon=True).start()
+                elif method == "thread/loaded/list":
+                    _send(conn, {"id": rid, "result": {"data": [_TID], "nextCursor": None}})
+                elif method == "thread/resume":
+                    assert params.get("threadId") == _TID, params
+                    assert params.get("excludeTurns") is True, params
+                    for banned in ("model", "sandbox", "approvalPolicy", "permissions"):
+                        assert banned not in params, params
+                    if _mode == "busy":
+                        _send(conn, {"id": rid, "result": {"thread": {
+                            "id": _TID, "status": {"type": "active"},
+                            "turns": [{"id": "foreign-turn-1",
+                                       "status": "inProgress"}]}}})
+                    else:
+                        _send(conn, {"id": rid, "result": {"thread": {
+                            "id": _TID, "status": {"type": "idle"}, "turns": []}}})
+                elif method == "turn/steer":
+                    assert params.get("threadId") == _TID, params
+                    assert params.get("expectedTurnId"), params
+                    assert isinstance(params.get("input"), list) and params["input"], params
+                    if _mode == "steer_fail":
+                        _send(conn, {"id": rid, "error": {
+                            "code": -32000, "message": "turn is no longer active"}})
+                    else:
+                        _send(conn, {"id": rid, "result": {"turnId": params["expectedTurnId"]}})
+                elif method == "thread/read":
+                    if not _turns[0] and _mode != "busy" and params.get("includeTurns"):
+                        _send(conn, {"id": rid, "error": {"code": -32600,
+                            "message": "list_turns is not supported yet"}})
+                    elif _foreign_busy[0]:
+                        _send(conn, {"id": rid, "result": {"thread": {
+                            "id": _TID, "status": {"type": "active"}, "turns": [
+                                {"id": "foreign-turn-1", "status": "inProgress"}]}}})
+                        _send(conn, {"method": "item/completed", "params": {
+                            "threadId": _TID, "turnId": "foreign-turn-1", "item": {
+                                "type": "agentMessage", "text": "FOREIGN_REPLY"}}})
+                        _foreign_busy[0] = False
+                        _send(conn, {"method": "turn/completed", "params": {
+                            "threadId": _TID, "turn": {
+                                "id": "foreign-turn-1", "status": "completed"}}})
+                    else:
+                        _send(conn, {"id": rid, "result": {"thread": {
+                            "id": _TID, "status": {"type": "idle"}, "turns": []}}})
+                elif method == "turn/interrupt":
+                    with _lock:
+                        _interrupted.add(params.get("turnId"))
+                    with open(st / "native-interrupts.jsonl", "a") as _f:
+                        _f.write(json.dumps(params) + "\n")
+                    _send(conn, {"id": rid, "result": {}})
+                elif rid is not None:
+                    _send(conn, {"id": rid, "error": {"code": -32601,
+                                                      "message": "unknown method " + str(method)}})
+        except (ConnectionError, OSError):
+            return
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    while True:
+        _conn, _ = _lsock.accept()
+        _th.Thread(target=_serve, args=(_conn,), daemon=True).start()
+'''
+
+
 def write_fake(bindir, name, body, python):
     path = bindir / name
     path.write_text("#!" + python + "\n" + VERSION_GUARD + body, encoding="utf-8")

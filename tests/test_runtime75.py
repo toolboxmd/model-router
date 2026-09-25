@@ -23,9 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, policy, runtime, store  # noqa: E402
+from runner import codex_native, controller, core, policy, runtime, store  # noqa: E402
 from runner.supervisor import process_start_identity  # noqa: E402
-from tests.fakes import FAKE_GROK, FAKE_OPENCODE, write_fake  # noqa: E402
+from tests.fakes import FAKE_CODEX_NATIVE_APP, FAKE_GROK, FAKE_OPENCODE, write_fake  # noqa: E402
 
 PY = sys.executable
 DISPATCH_META = {"stage": "dispatch", "route": "luna/max", "reason": "initial"}
@@ -33,11 +33,11 @@ RESUME_META = {"stage": "dispatch", "route": "luna/max", "reason": "resume"}
 
 FIXED_THREAD = "thr-75-fixed"
 
-# A disposable `codex` shaped like the real CLI contract: thread.started,
-# one agent_message, turn.completed, plus the last-message file. Dispatch
-# answers an implementation envelope, resume the same thread with a
-# completion envelope. No model is called.
-FAKE_CODEX_75 = r'''
+# Dispatcher turns run on the native app-server branch (#86); the exec
+# body below stays for the planner-callback path. Native turns answer
+# from FAKE_NATIVE_PLAN (implement_then_complete: first turn
+# implementation, later turns completion).
+_FAKE_CODEX_HEAD = r'''
 import json, os, sys
 from pathlib import Path
 st = Path(os.environ.get("FAKE_STATE", ""))
@@ -48,6 +48,15 @@ if str(st):
         f.write(json.dumps(argv) + "\n")
 else:
     argv = sys.argv[1:]
+'''
+
+# A disposable `codex` shaped like the real CLI contract: thread.started,
+# one agent_message, turn.completed, plus the last-message file. Dispatch
+# answers an implementation envelope, resume the same thread with a
+# completion envelope. No model is called.
+FAKE_CODEX_75 = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r'''
+import json, os, sys
+from pathlib import Path
 tid = "thr-75-fixed"
 if argv[:2] == ["exec", "resume"]:
     env = {"action": "completion", "output": "RESUMED_75", "artifact": ""}
@@ -107,6 +116,12 @@ class Base(unittest.TestCase):
                 os.killpg(p.pid, signal.SIGKILL)
             except Exception:
                 pass
+        # Stop only the job-owned native server recorded in durable
+        # state; ownership-checked, never a pattern kill.
+        try:
+            codex_native.stop_server(self.sd, "r1", "test-cleanup")
+        except Exception:
+            pass
 
     def _restore_pkg_roots(self):
         core._PKG_ROOT, runtime.PKG_ROOT = self._saved_pkg_roots
@@ -152,7 +167,9 @@ class Base(unittest.TestCase):
 
         Used with the real durable run_cmd (real supervisors), so the
         missing-then-repaired path runs through the public controller
-        turns with no real agent process.
+        turns with no real agent process. Dispatcher turns run on the
+        native app-server branch (#86): the fake server answers from
+        FAKE_NATIVE_PLAN on the fixed thread.
         """
         bindir = self.base / "fakebin"
         bindir.mkdir(exist_ok=True)
@@ -163,13 +180,31 @@ class Base(unittest.TestCase):
         write_fake(bindir, "grok", FAKE_GROK, PY)
         saved_path = os.environ.get("PATH", "")
         saved_state = os.environ.get("FAKE_STATE")
+        saved_thread = os.environ.get("FAKE_NATIVE_THREAD")
+        saved_plan = os.environ.get("FAKE_NATIVE_PLAN")
+        saved_output = os.environ.get("FAKE_NATIVE_OUTPUT")
         os.environ["PATH"] = str(bindir) + os.pathsep + saved_path
         os.environ["FAKE_STATE"] = str(fake_state)
+        os.environ["FAKE_NATIVE_THREAD"] = FIXED_THREAD
+        os.environ["FAKE_NATIVE_PLAN"] = "implement_then_complete"
+        os.environ["FAKE_NATIVE_OUTPUT"] = "RESUMED_75"
         self.addCleanup(lambda: os.environ.__setitem__("PATH", saved_path))
         if saved_state is None:
             self.addCleanup(lambda: os.environ.pop("FAKE_STATE", None))
         else:
             self.addCleanup(lambda: os.environ.__setitem__("FAKE_STATE", saved_state))
+        if saved_thread is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_NATIVE_THREAD", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_NATIVE_THREAD", saved_thread))
+        if saved_plan is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_NATIVE_PLAN", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_NATIVE_PLAN", saved_plan))
+        if saved_output is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_NATIVE_OUTPUT", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_NATIVE_OUTPUT", saved_output))
 
     def rows_for_key(self, rid, key):
         return [i for i in core._list_invocations(self.sd, rid)
@@ -327,13 +362,19 @@ class ResumeRecoveryLoop(Base):
         self.assertEqual(len(resume_rows), 1)
         self.assertTrue(runtime.is_runtime_missing_row(resume_rows[0]))
         # The restarted controller remakes the same action exactly once, and
-        # the successful result is then memoized instead of rerun.
-        self.install_fake_codex()
+        # the successful result is then memoized instead of rerun. The
+        # remake uses the stored native turn meta (prompt/model travel in
+        # meta on the native seam) against the fake app-server.
+        self.install_fake_harness_clis()
+        os.environ["FAKE_NATIVE_THREAD"] = "thr-old"
+        os.environ["FAKE_NATIVE_PLAN"] = "completion"
+        os.environ["FAKE_NATIVE_OUTPUT"] = "RESUMED_75"
         run2 = core.make_durable_run_cmd(self.sd, "r1", "tok-new")
         resume_cmd = json.loads(resume_rows[0]["cmd_json"])
-        key = core._action_key("codex_resume", resume_cmd, RESUME_META)
+        resume_meta = json.loads(resume_rows[0]["meta_json"])
+        key = core._action_key("codex_resume", resume_cmd, resume_meta)
         rc, _, _ = run2(resume_cmd, self.ws(), 60,
-                         kind="codex_resume", meta=dict(RESUME_META))
+                         kind="codex_resume", meta=dict(resume_meta))
         self.assertEqual(rc, 0)
         same = [i for i in core._list_invocations(self.sd, "r1")
                 if i.get("action_key") == key]
@@ -341,7 +382,7 @@ class ResumeRecoveryLoop(Base):
         self.assertEqual((same[0]["state"], same[1]["state"]), ("failed", "completed"))
         self.assertEqual(same[1]["rc"], 0)
         again = run2(resume_cmd, self.ws(), 60,
-                     kind="codex_resume", meta=dict(RESUME_META))
+                     kind="codex_resume", meta=dict(resume_meta))
         self.assertEqual(again[0], 0)
         self.assertEqual(len([i for i in core._list_invocations(self.sd, "r1")
                               if i.get("action_key") == key]), 2)
@@ -533,7 +574,10 @@ class DispatchTwiceMissingThenRepaired(Base):
         self.assertIn(old_root, job["block_reason"])
         rows = core._list_invocations(self.sd, "r1")
         self.assertEqual(len(rows), 1)
-        key = self.key_of(rows[0], "codex_dispatch", DISPATCH_META)
+        # Native seam (#86): prompt/model travel in invocation meta, so
+        # the logical action key is recomputed from the stored meta.
+        key = self.key_of(rows[0], "codex_dispatch",
+                          json.loads(rows[0]["meta_json"]))
         failed_payload = json.loads(rows[0]["result_json"])
         self.assertTrue(failed_payload.get("never_started"))
         self.assertTrue(failed_payload.get("runtime_missing"))
@@ -564,7 +608,8 @@ class DispatchTwiceMissingThenRepaired(Base):
         self.assertFalse(core._has_runtime_missing_failure(self.sd, "r1"))
         self.assertIsNone(core.runtime_missing_for_action(
             self.sd, "r1", "codex_dispatch",
-            json.loads(same[1]["cmd_json"]), DISPATCH_META))
+            json.loads(same[1]["cmd_json"]),
+            json.loads(same[1]["meta_json"])))
         # A third dispatch reuses the completed attempt: no duplicate
         # writer, no reblock, no new row. (The controller reports
         # already-dispatched once the task and its action are saved.)
@@ -631,11 +676,16 @@ class ResumeTwiceMissingThenRepaired(Base):
         self.assertIn(old_root, core.get_job(self.sd, "r1")["block_reason"])
         rows = core._list_invocations(self.sd, "r1")
         self.assertEqual(len(rows), 1)
-        key = self.key_of(rows[0], "codex_resume", RESUME_META)
+        # Native seam (#86): the logical action key carries the stored
+        # prompt/model meta.
+        key = self.key_of(rows[0], "codex_resume",
+                          json.loads(rows[0]["meta_json"]))
         # Repair on the installed runtime with a working fake `codex`
-        # that resumes the same thread.
+        # that resumes the same thread. The repaired resume answers the
+        # completion envelope on its first native turn.
         self._restore_pkg_roots()
         self.install_fake_harness_clis()
+        os.environ["FAKE_NATIVE_PLAN"] = "completion"
         sql(self.sd, "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL"
                      " WHERE request_id='r1'")
         calls = []

@@ -23,13 +23,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import adapters, controller, core, policy, store  # noqa: E402
+from runner import adapters, codex_native, controller, core, policy, store  # noqa: E402
 
 PY = sys.executable
 
 
 def codex_out(thread, env):
-    """Realistic ``codex exec --json`` stream carrying Luna's envelope."""
+    """Dispatcher-turn JSONL carrying Luna's envelope.
+
+    The native driver converts its WebSocket events to these CLI-shaped
+    lines (``thread.started``, ``agent_message``, ``turn.completed``),
+    so the harness parses both the same way."""
     lines = [{"type": "thread.started", "thread_id": thread},
              {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message",
                                                  "text": json.dumps(env)}},
@@ -213,8 +217,11 @@ class TestAdapterSessions(Base):
         seen = []
 
         def fake_run(cmd, cwd=None, timeout=120, **kw):
-            seen.append(list(cmd))
-            self.assertIn("codex", cmd[0])
+            seen.append((list(cmd), dict(kw)))
+            # Native seam (#86): stable driver argv, op/model/effort in meta.
+            self.assertEqual(list(cmd), codex_native.python_driver_cmd())
+            meta = kw.get("meta") or {}
+            self.assertEqual((meta.get("native") or {}).get("op"), "dispatch")
             out = codex_out("codex-task-123", {"action": "planner_question",
                                                "qid": "q1", "prompt": "Confirm?"})
             return 0, out, ""
@@ -250,15 +257,26 @@ class TestAdapterSessions(Base):
 
         def fake_resume(cmd, cwd=None, timeout=120, **kw):
             captured["cmd"] = list(cmd)
+            captured["meta"] = dict(kw.get("meta") or {})
+            captured["kind"] = kw.get("kind")
+            # The saved thread travels in durable state, never in argv:
+            # the resume must read exactly the persisted ID.
+            saved = core.get_job(self.sd, "r1")["codex_task_id"]
+            self.assertEqual(saved, "codex-saved-9")
             return 0, codex_out("codex-saved-9", {"action": "completion", "output": "done"}), ""
 
         controller.resume_luna(self.sd, "r1", "planner answer text", run_cmd=fake_resume)
         cmd = captured["cmd"]
-        self.assertIn("resume", cmd)
-        self.assertIn("codex-saved-9", cmd)
-        self.assertIn("--json", cmd)
+        meta = captured["meta"]
+        # Native seam (#86): one stable driver argv for every turn; the
+        # resume names its op in meta and carries no thread ID in argv.
+        self.assertEqual(cmd, codex_native.python_driver_cmd())
+        self.assertEqual(captured["kind"], "codex_resume")
+        self.assertEqual((meta.get("native") or {}).get("op"), "resume")
+        self.assertNotIn("codex-saved-9", " ".join(cmd))
         # Never contains a different task ID.
-        self.assertNotIn("codex-other", " ".join(cmd))
+        self.assertNotIn("codex-other", " ".join(cmd) + json.dumps(meta))
+        self.assertEqual(core.get_job(self.sd, "r1")["codex_task_id"], "codex-saved-9")
 
     def test_dispatch_persists_its_codex_route_and_resume_uses_it(self):
         # A second Codex dispatch route listed first: dispatch must persist
@@ -270,6 +288,7 @@ class TestAdapterSessions(Base):
 
         def fake_dispatch(cmd, cwd=None, timeout=120, **kw):
             captured["dispatch_cmd"] = list(cmd)
+            captured["dispatch_meta"] = dict(kw.get("meta") or {})
             return 0, codex_out("codex-active-1", {"action": "planner_question",
                                                    "qid": "q1", "prompt": "Confirm?"}), ""
 
@@ -292,9 +311,16 @@ class TestAdapterSessions(Base):
             self.assertEqual(policy.stage_routes("dispatch")[0], "luna/max")
             controller.resume_luna(self.sd, "r1", "follow up", run_cmd=fake_resume)
         dispatch_cmd = captured["dispatch_cmd"]
-        self.assertEqual(dispatch_cmd[dispatch_cmd.index("--model") + 1], "gpt-5.6-luna-alt")
-        self.assertEqual(captured["cmd"][captured["cmd"].index("-m") + 1], "gpt-5.6-luna-alt")
-        self.assertIn('model_reasoning_effort="max"', captured["cmd"])
+        dispatch_meta = captured["dispatch_meta"]
+        # Native seam (#86): the policy model/effort/route travel in
+        # invocation meta; the driver argv stays stable across routes.
+        self.assertEqual(dispatch_cmd, codex_native.python_driver_cmd())
+        self.assertEqual(dispatch_meta["model"], "gpt-5.6-luna-alt")
+        self.assertEqual(dispatch_meta["effort"], "max")
+        self.assertEqual(dispatch_meta["route"], "luna-alt/max")
+        self.assertEqual(captured["cmd"], codex_native.python_driver_cmd())
+        self.assertEqual(captured["meta"]["model"], "gpt-5.6-luna-alt")
+        self.assertEqual(captured["meta"]["effort"], "max")
         self.assertEqual(captured["meta"]["route"], "luna-alt/max")
 
     def test_planner_resume_never_forks_new_session(self):
@@ -453,7 +479,11 @@ class TestPlannerBusyAndCallback(Base):
             answered = [q for q in qs if q["qid"] == "q-live-1" and q["status"] == "answered"]
             calls.append("resume-after-answer")
             self.assertEqual(len(answered), 1)
-            self.assertIn("codex-q-1", " ".join(cmd))
+            # Native seam (#86): the saved thread travels in durable
+            # state, never in argv.
+            self.assertEqual(core.get_job(self.sd, "r1")["codex_task_id"], "codex-q-1")
+            self.assertEqual(list(cmd), codex_native.python_driver_cmd())
+            self.assertEqual(((kw.get("meta") or {}).get("native") or {}).get("op"), "resume")
             return 0, codex_out("codex-q-1", {"action": "completion", "output": "done"}), ""
 
         r = controller.resume_luna(self.sd, "r1", "Approved as written.", run_cmd=fake_resume)

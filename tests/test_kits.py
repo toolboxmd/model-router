@@ -20,13 +20,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import adapters, core, harnesses, policy, store  # noqa: E402
+from runner import adapters, codex_native, core, harnesses, policy, store  # noqa: E402
 from runner import kits as kitmod  # noqa: E402
-from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
+from tests.fakes import FAKE_CLAUDE, FAKE_CODEX_NATIVE_APP, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
 
 PY = sys.executable
 
-FAKE_CODEX_OK = r"""
+# Dispatcher turns run on the native app-server branch (#86); the exec
+# body below stays for the planner-callback path. First turn answers
+# implementation, later turns complete.
+_FAKE_CODEX_HEAD = r"""
 import json, os, sys
 from pathlib import Path
 st = Path(os.environ["FAKE_STATE"])
@@ -34,6 +37,11 @@ st.mkdir(parents=True, exist_ok=True)
 argv = sys.argv[1:]
 with open(st / "codex.log", "a") as f:
     f.write(json.dumps(argv) + "\n")
+"""
+
+FAKE_CODEX_OK = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
+import json, os, sys
+from pathlib import Path
 tid = "kit-thread-001"
 n_f = st / "codex_n"
 n = int(n_f.read_text()) + 1 if n_f.exists() else 1
@@ -623,7 +631,10 @@ class TestKitPublicCLI(unittest.TestCase):
         env["XDG_CONFIG_HOME"] = str(user_config)
         env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
                    FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
-                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1",
+                   FAKE_NATIVE_THREAD="kit-thread-001",
+                   FAKE_NATIVE_PLAN="implement_then_complete",
+                   FAKE_NATIVE_OUTPUT="KIT_DONE")
         rc, out, err = cli(sd, "submit", "--request-id", request_id,
                            "--task", '{"goal":"kit proof"}',
                            "--workspace", str(ws), "--planner-session", "p-kit",
@@ -646,6 +657,12 @@ class TestKitPublicCLI(unittest.TestCase):
                         os.killpg(int(pg), signal.SIGKILL)
                     except Exception:
                         pass
+        # Stop only the job-owned native server recorded in durable
+        # state; ownership-checked, never a pattern kill.
+        try:
+            codex_native.stop_server(sd, rid, "test-cleanup")
+        except Exception:
+            pass
 
     def _kit_dirs(self, sd):
         root = Path(sd) / "kits"

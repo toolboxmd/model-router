@@ -21,12 +21,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import adapters, core, direction, policy, store  # noqa: E402
-from tests.fakes import FAKE_CLAUDE, FAKE_GROK, FAKE_OPENCODE, write_fake  # noqa: E402
+from runner import adapters, codex_native, core, direction, policy, store  # noqa: E402
+from tests.fakes import FAKE_CLAUDE, FAKE_CODEX_NATIVE_APP, FAKE_GROK, FAKE_OPENCODE, write_fake  # noqa: E402
 
 PY = sys.executable
 
-FAKE_CODEX_OK = r"""
+# Dispatcher turns run on the native app-server branch (#86); the exec
+# body below stays for the planner-callback path. First turn answers
+# implementation, later turns complete.
+_FAKE_CODEX_HEAD = r"""
 import json, os, sys
 from pathlib import Path
 st = Path(os.environ["FAKE_STATE"])
@@ -34,6 +37,11 @@ st.mkdir(parents=True, exist_ok=True)
 argv = sys.argv[1:]
 with open(st / "codex.log", "a") as f:
     f.write(json.dumps(argv) + "\n")
+"""
+
+FAKE_CODEX_OK = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
+import json, os, sys
+from pathlib import Path
 tid = "supply-thread-001"
 if argv[:2] != ["exec", "resume"]:
     env = {"action": "implementation", "artifact": "fix.txt",
@@ -142,6 +150,12 @@ def kill_job(sd, rid):
                     os.killpg(int(pg), signal.SIGKILL)
                 except Exception:
                     pass
+    # Stop only the job-owned native server recorded in durable state;
+    # ownership-checked, never a pattern kill.
+    try:
+        codex_native.stop_server(sd, rid, "test-cleanup")
+    except Exception:
+        pass
 
 
 def make_fake_homes(base: Path):
@@ -326,7 +340,10 @@ class TestSupplyPublicCLI(unittest.TestCase):
         env = dict(os.environ)
         env.update(homes)
         env.update(PATH=path_val, FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
-                    FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1",
+                   FAKE_NATIVE_THREAD="supply-thread-001",
+                   FAKE_NATIVE_PLAN="implement_then_complete",
+                   FAKE_NATIVE_OUTPUT="SUPPLY_DONE")
         if tools:
             # Fake server appends one tool part to text assistant messages.
             env["FAKE_OC_TOOLS"] = "1"
@@ -449,7 +466,10 @@ class TestSupplyPublicCLI(unittest.TestCase):
         env = dict(os.environ)
         env.update(homes)
         env.update(PATH=path_val, FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
-                   PYTHONDONTWRITEBYTECODE="1")
+                   PYTHONDONTWRITEBYTECODE="1",
+                   FAKE_NATIVE_THREAD="supply-thread-001",
+                   FAKE_NATIVE_PLAN="implement_then_complete",
+                   FAKE_NATIVE_OUTPUT="SUPPLY_DONE")
         env.pop("MODEL_ROUTER_PROJECT_DIRECTION_BIN", None)
         rid = "supply-review-001"
         rc, out, err = cli(sd, "submit", "--request-id", rid,

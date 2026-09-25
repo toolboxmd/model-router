@@ -5,7 +5,8 @@ supported harness (Claude Code, Codex, OpenCode, Grok Build), hands
 it to a persistent Codex Luna dispatcher, and returns questions and
 completion without depending on the planner process staying open. Python
 standard library only. No additional services, runtime dependencies, or network
-listeners beyond one owned loopback OpenCode server per implementation turn.
+listeners beyond one owned loopback Codex app-server per job and one owned
+loopback OpenCode server per implementation turn.
 
 AgentsMD and the target project own workflow, authority, proof, and review.
 The runner persists the handoff, owns child processes, and follows one
@@ -119,9 +120,18 @@ allowance; the runner never invents a reset time.
 
 ## Flow
 
-1. Dispatch: `codex exec --json --output-last-message PATH --model
-   gpt-5.6-luna -c model_reasoning_effort="max" --sandbox read-only --cd WS`.
-   Before the dispatch the runner runs the Codex rate-limit probe when due
+1. Dispatch: one job-owned `codex app-server` on a loopback WebSocket
+   endpoint (`ws://127.0.0.1:PORT`, never credentials in `status`), driven
+   through the native thread/turn protocol: `initialize` (experimental
+   API), `thread/start` (policy model, read-only sandbox, never ask),
+   `turn/start` (policy effort plus the Luna prompt). The driver argv is
+   stable across restarts; op, model, effort, and prompt travel in the
+   invocation record, never on the command line. The server stays up
+   while the controller waits on workers, so an idle dispatcher can
+   still take a direct user turn, and its native thread ID is stable
+   across dispatch and resume. Only the tracked control turn converts
+   to dispatcher output; unrelated user turns wait without interrupting
+   it. Before the dispatch the runner runs the Codex rate-limit probe when due
    (`account/rateLimits/read` through the app-server first, the newest
    rollout record as fallback; unknown with its reason when nothing
    reads, never blocking the dispatch). A dispatch route the capacity
@@ -184,10 +194,11 @@ allowance; the runner never invents a reset time.
     it answers from the handoff summary in a fresh session with no resume
     (`controller.astra_fallback_prompt`), persisted the same way.
     `questions` and `answer` stay as an optional human override.
-4. The answer is saved, then the same Luna task resumes with `codex exec
-   resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
-   sandbox_mode="read-only"`. A resume that reports another thread, or none,
-   blocks.
+4. The answer is saved, then the same Luna thread resumes with a
+   metadata-only `thread/resume` (no settings change) plus a new control
+   turn carrying the followup. A resume that reports another thread, or none,
+   blocks. The owned server is reused across turns and stopped (only when
+   provably ours) on terminal states and cancel.
 5. `implementation`: one Muse turn runs on an owned `opencode serve
     --hostname 127.0.0.1 --port 0` on a runner-generated configuration
     directory built from the route's kit (see below). The worker commits as
@@ -373,7 +384,7 @@ table lists each role's kit. The Codex kit links the user's `auth.json`
 by symlink from the Codex home (honoring `MODEL_ROUTER_CODEX_HOME` and
 `CODEX_HOME` overrides), and its `sessions/` links to one directory per job
 (`<state-dir>/codex-sessions/<request-id>`) shared by every Codex
-invocation of the job, so `codex exec resume` finds the thread its
+invocation of the job, so a resume reattaches to the thread its
 dispatch wrote; a rollout left in an earlier kit of the same job is copied
 there before a resume. The Grok kit links `auth.json` the same way
 when the Grok home keeps its login under that filename (recorded as
@@ -450,9 +461,11 @@ OPENCODE_CONFIG_DIR=/tmp/manual-kit \
   OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
   opencode serve --hostname 127.0.0.1 --port 0
 # Codex dispatcher on the dispatcher kit (nothing inherited except the
-# auth.json login link, so the dispatch authenticates).
+# auth.json login link, so the dispatch authenticates). Dispatcher turns
+# go through the job-owned loopback app-server (Flow step 1), never the
+# CLI directly.
 python3 -c "from runner import kits; kits.materialize_codex_kit('dispatcher', '/tmp/codex-kit')"
-CODEX_HOME=/tmp/codex-kit codex exec --json --model gpt-5.6-luna --sandbox read-only --cd WS PROMPT
+CODEX_HOME=/tmp/codex-kit codex app-server --listen ws://127.0.0.1:PORT
 # Claude review equivalent (isolated); the planner keeps the user's session.
 python3 -c "from runner import kits; kits.materialize_claude_kit('reviewer', '/tmp/claude-kit')"
 CLAUDE_CONFIG_DIR=/tmp/claude-kit claude --resume SID -p PROMPT

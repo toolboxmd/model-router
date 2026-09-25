@@ -33,6 +33,7 @@ from . import harnesses
 from . import policy
 from . import runtime
 from . import store
+from . import codex_native
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 HEARTBEAT_FRESH_SECS = 15.0
@@ -1707,14 +1708,15 @@ def _drain_owned_children(state_dir, request_id: str, owner=None) -> bool:
     _mark_invocations_cancelling(state_dir, request_id)
     _terminate_invocations(state_dir, request_id, owner, signal.SIGTERM)
     if _wait_invocations_dead(state_dir, request_id, timeout=10.0):
-        return True
+        return codex_native.stop_for_job(state_dir, request_id, "drain")
     _terminate_invocations(state_dir, request_id, owner, signal.SIGKILL)
     if _wait_invocations_dead(state_dir, request_id, timeout=5.0):
-        return True
+        return codex_native.stop_for_job(state_dir, request_id, "drain")
     _reconcile_dead_invocations(state_dir, request_id)
     consume_finished_invocations(state_dir, request_id)
     return (not _any_live_invocation(state_dir, request_id)
-            and not _any_unresolved_invocation(state_dir, request_id))
+            and not _any_unresolved_invocation(state_dir, request_id)
+            and codex_native.stop_for_job(state_dir, request_id, "drain"))
 
 
 def get_job(state_dir, request_id: str) -> dict:
@@ -3340,6 +3342,11 @@ def cancel(state_dir, request_id: str) -> dict:
     proof_dead = _drain_proof_group(state_dir, request_id)
     all_dead = bool(children_dead and proof_dead)
 
+    # The job-owned native app-server is not an invocation child: stop it
+    # here too (owner-checked, best effort), so a cancelled job leaves no
+    # dispatcher process behind for anyone to attach to.
+    codex_native.stop_for_job(state_dir, request_id, "cancel")
+
     # Best-effort stop of the legacy owned worker PID when ownership proven.
     try:
         root = store.ensure_state_dir(state_dir)
@@ -3403,12 +3410,20 @@ def _finalize_stopped(state_dir, request_id: str, all_dead: bool) -> None:
         result = None
     _mirror_result(state_dir, request_id,
                    json.dumps({"request_id": request_id, "status": row["status"], "result": result}))
+    # Terminal either way: a finished job keeps no attachable dispatcher.
+    codex_native.stop_for_job(state_dir, request_id, "terminal")
 
 
 def _complete_with_token(state_dir, request_id: str, token: str, ok: bool,
                          output: str | None, error, route: str | None = None) -> dict:
     if not token:
         raise ValueError("missing start token")
+    current = get_job(state_dir, request_id)
+    if current.get("owner_token") != token:
+        raise OwnershipError("start token does not hold the lease")
+    if current["status"] not in store.TERMINAL and not codex_native.stop_for_job(
+            state_dir, request_id, "completion"):
+        raise BlockedError("native server cleanup is unconfirmed; workspace remains claimed")
     head_commit = _workspace_head(get_job(state_dir, request_id).get("workspace"))
     con = store.connect(state_dir)
     try:
@@ -3463,6 +3478,8 @@ def _complete_with_token(state_dir, request_id: str, token: str, ok: bool,
         store.append_text(store.output_path_for(root, request_id), f"[{status}]\n")
     except OSError:
         pass
+    # A completed job keeps no attachable dispatcher behind.
+    codex_native.stop_for_job(state_dir, request_id, "completed")
     return get_job(state_dir, request_id)
 
 
@@ -3618,6 +3635,13 @@ def recover_one(state_dir, request_id: str) -> dict:
     if any(c.get("action") == "completed" for c in consumed):
         return {"request_id": request_id, "action": "consumed-completion",
                 "status": get_job(state_dir, request_id)["status"]}
+    # Native dispatcher reconcile: reuse a live job-owned server, drop a
+    # dead record (the thread id stays for resume-from-disk), stop the
+    # server of a terminal job. Never raises, never blocks recovery.
+    try:
+        codex_native.recover_server(state_dir, request_id)
+    except Exception:
+        pass
     live_invocations = _any_live_invocation(state_dir, request_id)
     if live_invocations:
         _capture_invocation_sessions(state_dir, request_id, live_invocations)
@@ -5620,6 +5644,16 @@ def status_view(state_dir, request_id: str) -> dict:
     if job_public.get("owner_token"):
         job_public["owner_token"] = "<redacted>"
     job_public["measurements"] = invocation_measurements(state_dir, request_id)
+    # Native dispatcher runtime metadata (attachable loopback endpoint,
+    # thread and control turn ids). Endpoint only, never credentials:
+    # this transport has no password by construction. Kept on the job
+    # record for T3 discovery; the top-level runtime keeps the installed
+    # runtime assessment from main alongside it.
+    try:
+        native = codex_native.status_runtime(job).get("native")
+    except Exception:
+        native = {"server": "unknown"}
+    job_public["runtime"] = {"native": native}
     try:
         installed = runtime.installed_runtime()
     except Exception:
@@ -5638,4 +5672,5 @@ def status_view(state_dir, request_id: str) -> dict:
             "recent_events": events, "output_tail": tail,
             "capacity": list_capacity(state_dir),
             "readings": list_readings(state_dir),
-            "runtime": {"installed": installed, "assessment": assessment}}
+            "runtime": {"installed": installed, "assessment": assessment,
+                        "native": native}}

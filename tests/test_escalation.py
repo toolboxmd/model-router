@@ -11,8 +11,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from runner import controller, core, policy, store  # noqa: E402
-from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
+from runner import codex_native, controller, core, policy, store  # noqa: E402
+from tests.fakes import (FAKE_CLAUDE, FAKE_CODEX_NATIVE_APP, FAKE_OPENCODE, VERSION_GUARD, write_fake)  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
@@ -63,6 +63,12 @@ def _cleanup_job(sd, request_id):
                     os.killpg(int(pg), signal.SIGKILL)
                 except Exception:
                     pass
+    # Stop only the job-owned native server recorded in durable state;
+    # ownership-checked, never a pattern kill.
+    try:
+        codex_native.stop_server(sd, request_id, "test-cleanup")
+    except Exception:
+        pass
 
 
 def _set_state(sd, request_id, **fields):
@@ -394,13 +400,23 @@ class StepBudgetDefaults(unittest.TestCase):
         self.assertGreater(int(job["max_attempts"]) * controller.MAX_LOOP_STEPS, core.MAX_JOB_STEPS)
 
 
-FAKE_LUNA_ALWAYS_IMPL = r"""
+# Dispatcher turns run on the native app-server branch (#86); the exec
+# body below stays for the planner-callback path. Plan modes mirror the
+# old exec envelopes exactly: always implementation, N implementations
+# then completion, and the q1 First?/Second? conflict.
+_FAKE_CODEX_HEAD = r"""
 import json, os, sys
 from pathlib import Path
 st = Path(os.environ["FAKE_STATE"])
+st.mkdir(parents=True, exist_ok=True)
 argv = sys.argv[1:]
 with open(st / "codex.log", "a") as f:
     f.write(json.dumps(argv) + "\n")
+"""
+
+FAKE_LUNA_ALWAYS_IMPL = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
+import json, os, sys
+from pathlib import Path
 tid = "escalation-thread-001"
 env = {"thread_id": tid, "action": "implementation", "artifact": "fix.txt",
        "payload": {"instructions": "write fix.txt"}}
@@ -412,13 +428,9 @@ for obj in ({"type": "thread.started", "thread_id": tid},
     print(json.dumps(obj), flush=True)
 """
 
-FAKE_LUNA_COUNT_IMPL = r"""
+FAKE_LUNA_COUNT_IMPL = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
 import json, os, sys
 from pathlib import Path
-st = Path(os.environ["FAKE_STATE"])
-argv = sys.argv[1:]
-with open(st / "codex.log", "a") as f:
-    f.write(json.dumps(argv) + "\n")
 n_f = st / "codex_n"
 n = int(n_f.read_text()) + 1 if n_f.exists() else 1
 n_f.write_text(str(n))
@@ -436,13 +448,9 @@ for obj in ({"type": "thread.started", "thread_id": tid},
     print(json.dumps(obj), flush=True)
 """
 
-FAKE_LUNA_CONFLICT = r"""
+FAKE_LUNA_CONFLICT = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
 import json, os, sys
 from pathlib import Path
-st = Path(os.environ["FAKE_STATE"])
-argv = sys.argv[1:]
-with open(st / "codex.log", "a") as f:
-    f.write(json.dumps(argv) + "\n")
 n_f = st / "codex_n"
 n = int(n_f.read_text()) + 1 if n_f.exists() else 1
 n_f.write_text(str(n))
@@ -462,7 +470,7 @@ for obj in ({"type": "thread.started", "thread_id": tid},
 """
 
 
-def _cli_env(base, codex_body, oc_mode="ok", extra_env=None):
+def _cli_env(base, codex_body, oc_mode="ok", extra_env=None, native_env=None):
     bindir = base / "bin"
     bindir.mkdir()
     fs = base / "fakestate"
@@ -474,8 +482,16 @@ def _cli_env(base, codex_body, oc_mode="ok", extra_env=None):
     env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
                FAKE_STATE=str(fs), FAKE_OC_MODE=oc_mode, FAKE_OC_DELAY="0.1",
                FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+    env.update(native_env or {})
     env.update(extra_env or {})
     return env, fs
+
+
+def _native_rpcs(fs):
+    path = fs / "native-requests.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 class TestPublicEscalationDrill(unittest.TestCase):
@@ -493,7 +509,9 @@ class TestPublicEscalationDrill(unittest.TestCase):
         ws = base / "ws"
         ws.mkdir()
         env, fs = _cli_env(base, FAKE_LUNA_ALWAYS_IMPL, oc_mode="hard_error",
-                           extra_env={"FAKE_OC_MODE_GO": "hard_error"})
+                            extra_env={"FAKE_OC_MODE_GO": "hard_error"},
+                            native_env={"FAKE_NATIVE_THREAD": "escalation-thread-001",
+                                        "FAKE_NATIVE_PLAN": "implementation"})
         rid = "esc-cli-001"
         rc, out, err = cli(sd, "submit", "--request-id", rid,
                            "--task", '{"goal":"escalation drill"}',
@@ -523,10 +541,24 @@ class TestPublicEscalationDrill(unittest.TestCase):
             con.close()
         self.assertEqual(reasons, ["correction", "escalation"])
         codex_calls = [json.loads(line) for line in (fs / "codex.log").read_text().splitlines()]
-        dispatches = [c for c in codex_calls if len(c) > 1 and c[0] == "exec" and c[1] != "resume"]
-        resumes = [c for c in codex_calls if len(c) > 1 and c[0] == "exec" and c[1] == "resume"]
-        self.assertEqual(len(dispatches), 1)
-        self.assertEqual(len(resumes), 3, "no resume after the exhausted recovery turn")
+        # Native seam (#86): one job-owned app-server; one thread/start
+        # plus one turn/start per dispatcher turn on the exact saved
+        # thread; resumes attach metadata-only before the new turn.
+        servers = [c for c in codex_calls
+                   if len(c) > 1 and c[:2] == ["app-server", "--listen"]]
+        self.assertEqual(len(servers), 1, codex_calls)
+        rpcs = _native_rpcs(fs)
+        starts = [r for r in rpcs if r["method"] == "thread/start"]
+        self.assertEqual(len(starts), 1, rpcs)
+        self.assertEqual(starts[0]["params"]["model"], "gpt-5.6-luna")
+        self.assertEqual(starts[0]["params"]["sandbox"], "read-only")
+        attaches = [r for r in rpcs if r["method"] == "thread/resume"]
+        self.assertEqual(len(attaches), 3, "no resume after the exhausted recovery turn")
+        for r in attaches:
+            self.assertEqual(r["params"], {"threadId": "escalation-thread-001",
+                                           "excludeTurns": True})
+        turns = [r for r in rpcs if r["method"] == "turn/start"]
+        self.assertEqual(len(turns), 4, rpcs)
         prompts = [json.loads(line) for line in (fs / "opencode-requests.jsonl").read_text().splitlines()
                    if "prompt_async" in line]
         self.assertEqual(len(prompts), 4)
@@ -549,7 +581,11 @@ class TestPublicStepBudgetDrill(unittest.TestCase):
         sd = str(base / "state")
         ws = base / "ws"
         ws.mkdir()
-        env, fs = _cli_env(base, FAKE_LUNA_COUNT_IMPL)
+        env, fs = _cli_env(base, FAKE_LUNA_COUNT_IMPL,
+                            native_env={"FAKE_NATIVE_THREAD": "budget-thread-001",
+                                        "FAKE_NATIVE_PLAN": "completion",
+                                        "FAKE_NATIVE_IMPL_TURNS": "20",
+                                        "FAKE_NATIVE_OUTPUT": "BUDGET_DRILL_DONE"})
         rid = "budget-cli-001"
         rc, out, err = cli(sd, "submit", "--request-id", rid,
                            "--task", '{"goal":"step budget drill"}',
@@ -583,7 +619,11 @@ class TestPublicQuestionDrill(unittest.TestCase):
         sd = str(base / "state")
         ws = base / "ws"
         ws.mkdir()
-        env, fs = _cli_env(base, FAKE_LUNA_CONFLICT)
+        env, fs = _cli_env(base, FAKE_LUNA_CONFLICT,
+                            native_env={"FAKE_NATIVE_THREAD": "conflict-thread-001",
+                                        "FAKE_NATIVE_PLAN": "question_conflict",
+                                        "FAKE_NATIVE_QID": "q1",
+                                        "FAKE_NATIVE_OUTPUT": "QUESTION_DRILL_DONE"})
         rid = "conflict-cli-001"
         rc, out, err = cli(sd, "submit", "--request-id", rid,
                            "--task", '{"goal":"question conflict drill"}',

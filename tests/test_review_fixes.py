@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, store  # noqa: E402
+from runner import codex_native, controller, core, policy, store  # noqa: E402
 from tests.fakes import FAKE_OPENCODE, write_fake  # noqa: E402
 
 PY = sys.executable
@@ -721,10 +721,17 @@ class TestRoundEight(Base):
         ws = self.ws()
         core.submit(self.sd, "r1", {"g": 1}, ws, "p")
         job = core.get_job(self.sd, "r1")
-        from runner import adapters
         last = controller._last_message_path(self.sd, "r1", "codex-dispatch-last")
-        cmd = adapters.build_codex_dispatch_cmd(job["workspace"], controller._full_luna_prompt(job["task_json"]),
-                                                last_message_path=last)
+        # The collected row carries the production native dispatch
+        # identity: stable driver argv plus op/model/effort/prompt meta,
+        # so the action key matches what step() recomputes.
+        route = policy.stage_routes("dispatch")[0]
+        prompt = controller._full_luna_prompt(job["task_json"])
+        model = policy.ROUTES[route]["model"]
+        effort = policy.ROUTES[route]["variant"]
+        cmd = codex_native.python_driver_cmd()
+        meta = controller.native_turn_meta(codex_native.OP_DISPATCH, prompt,
+                                           model, effort, route, "initial")
         env = {"action": "completion", "output": "DONE"}
         root = store.ensure_state_dir(self.sd)
         out = root / "outputs" / "d1.stdout"
@@ -736,10 +743,11 @@ class TestRoundEight(Base):
         # Finished and collected by a controller that died before saving
         # the action; the supervisor had already saved the thread ID.
         sql(self.sd, "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
-                     "pid,pgid,stdout_path,stderr_path,started_at,state,rc,consumed_at,action_key) VALUES"
-                     "('d1','r1','codex_dispatch',?,?,'old',999999,999999,?,?,?,'completed',0,?,?)",
+                     "pid,pgid,stdout_path,stderr_path,started_at,state,rc,consumed_at,action_key,meta_json) VALUES"
+                     "('d1','r1','codex_dispatch',?,?,'old',999999,999999,?,?,?,'completed',0,?,?,?)",
             (json.dumps(cmd), job["workspace"], str(out), str(root / "outputs" / "d1.stderr"),
-             core._utcnow(), core._utcnow(), core._action_key("codex_dispatch", cmd, None)))
+             core._utcnow(), core._utcnow(),
+             core._action_key("codex_dispatch", cmd, meta), json.dumps(meta)))
         sql(self.sd, "UPDATE jobs SET codex_task_id='th-1', owner_token='tok', status='running' WHERE request_id='r1'")
         res = controller.step(self.sd, "r1", run_cmd=core.make_durable_run_cmd(self.sd, "r1", "tok"))
         self.assertEqual(res["action"], "dispatched")

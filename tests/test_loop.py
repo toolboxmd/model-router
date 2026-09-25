@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests.fakes import VERSION_GUARD  # noqa: E402
+from tests.fakes import VERSION_GUARD, FAKE_CODEX_NATIVE_APP  # noqa: E402
 
 from runner import core, harnesses, store  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
@@ -31,7 +31,7 @@ THREAD_ID = "thread-loop-001"
 PLANNER_SID = "claude-planner-loop-001"
 QID = "q-loop-1"
 
-FAKE_CODEX = """#!/usr/bin/env python3
+_FAKE_CODEX_HEAD = """#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 state = Path(os.environ["DURABLE_FAKE_STATE"])
@@ -41,6 +41,12 @@ count_f = state / "codex_resume_count"
 argv = sys.argv[1:]
 with open(log, "a", encoding="utf-8") as f:
     f.write(json.dumps(argv) + "\\n")
+st = state
+"""
+
+_FAKE_CODEX_EXEC = r"""
+# Dispatcher turns run on the native app-server above; only the planner
+# callback (not exercised here) would use exec.
 def last_msg_path(args):
     if "--output-last-message" in args:
         i = args.index("--output-last-message")
@@ -101,6 +107,8 @@ else:
     print(json.dumps({"type": "turn.completed"}))
 """ % (THREAD_ID, THREAD_ID, "gpt-5.6-luna", THREAD_ID, QID)
 
+FAKE_CODEX = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + _FAKE_CODEX_EXEC
+
 from tests.fakes import FAKE_CLAUDE as _FC, FAKE_OPENCODE as _FO  # noqa: E402
 
 FAKE_CLAUDE = "#!" + PY + "\n" + _FC
@@ -146,6 +154,9 @@ class TestPublicLoopProof(unittest.TestCase):
         env["DURABLE_FAKE_STATE"] = str(fake_state)
         env["FAKE_STATE"] = str(fake_state)
         env["FAKE_OC_WRITE"] = "fix.txt"
+        env["FAKE_NATIVE_THREAD"] = THREAD_ID
+        env["FAKE_NATIVE_PLAN"] = "planner_first"
+        env["FAKE_NATIVE_QID"] = QID
 
         req = "loop-proof-001"
         task = json.dumps({"goal": "Loop proof fix", "scope": "one file"})
@@ -188,16 +199,48 @@ class TestPublicLoopProof(unittest.TestCase):
         claude_calls = [c["argv"] for c in read_log("claude.log")]
         oc_calls = read_log("opencode.log")
 
-        # One Luna fresh dispatch (exec without resume) + exact-ID resumes.
-        dispatches = [c for c in codex_calls
-                      if len(c) > 1 and c[0] == "exec" and c[1] != "resume"]
-        resumes = [c for c in codex_calls
-                   if len(c) > 1 and c[0] == "exec" and c[1] == "resume"]
-        self.assertEqual(len(dispatches), 1, codex_calls)
-        self.assertEqual(len(resumes), 2, codex_calls)
-        for r in resumes:
-            self.assertIn(THREAD_ID, r)
-        self.assertEqual(len(codex_calls), len(dispatches) + len(resumes))
+        # One job-owned native app-server; one thread/start plus one
+        # turn/start per dispatcher turn on the exact saved thread.
+        servers = [c for c in codex_calls
+                   if len(c) > 1 and c[:2] == ["app-server", "--listen"]]
+        self.assertEqual(len(servers), 1, codex_calls)
+        self.assertTrue(str(servers[0][2]).startswith("ws://127.0.0.1:"),
+                        servers)
+        rpcs = read_log("native-requests.jsonl")
+        starts = [r for r in rpcs if r["method"] == "thread/start"]
+        self.assertEqual(len(starts), 1, rpcs)
+        self.assertEqual(starts[0]["params"]["model"], "gpt-5.6-luna")
+        self.assertEqual(starts[0]["params"]["sandbox"], "read-only")
+        self.assertEqual(starts[0]["params"]["approvalPolicy"], "never")
+        turns = [r for r in rpcs if r["method"] == "turn/start"]
+        self.assertEqual(len(turns), 3, rpcs)
+        for t in turns:
+            self.assertEqual(t["params"]["threadId"], THREAD_ID)
+            self.assertEqual(t["params"]["effort"], "max")
+        attaches = [r for r in rpcs if r["method"] == "thread/resume"]
+        self.assertEqual(len(attaches), 2, rpcs)
+        for r in attaches:
+            self.assertEqual(r["params"], {"threadId": THREAD_ID,
+                                           "excludeTurns": True})
+        # The published endpoint carries the live dispatcher while the
+        # job runs; terminal jobs keep no server behind.
+        view = core.status_view(sd, req)
+        rt = view["job"]["runtime"]["native"]
+        self.assertEqual(rt["thread_id"], THREAD_ID)
+        self.assertEqual(rt["server"], "absent")
+        started = [json.loads(e["payload_json"]) for e in view["recent_events"]
+                   if e["kind"] == "native_server_started"]
+        if not started:
+            con = store.connect(sd)
+            try:
+                rows = con.execute(
+                    "SELECT payload_json FROM events WHERE request_id=? AND kind=?",
+                    (req, "native_server_started")).fetchall()
+            finally:
+                con.close()
+            started = [json.loads(r["payload_json"]) for r in rows]
+        self.assertTrue(started, "server start is on the ledger")
+        self.assertTrue(str(started[0]["endpoint"]).startswith("ws://127.0.0.1:"))
 
         # One Claude --resume of the exact original planner ID, run in
         # the planner's directory (default: the workspace). Submit never
@@ -309,25 +352,30 @@ class TestPublicLoopProof(unittest.TestCase):
         calls = fake_state / "codex-calls.jsonl"
         thread_id = "crash-repro-thread-001"
 
-        fake_codex = '''#!/usr/bin/env python3
-import sys as _vs
-if _vs.argv[1:2] == ['--version']:
-    print('fake-harness 0.0.0'); raise SystemExit(0)
-import json, os, time
-from pathlib import Path
-p = Path(os.environ["CRASH_REPRO_CALLS"])
-with p.open("a") as f:
-    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),
-                        "args": __import__("sys").argv[1:]}) + "\\n")
-print(json.dumps({"type": "thread.started", "thread_id": "%s"}), flush=True)
-time.sleep(60)
-''' % thread_id
+        fake_codex = ('#!/usr/bin/env python3\n'
+                      "import sys as _vs\n"
+                      "if _vs.argv[1:2] == ['--version']:\n"
+                      "    print('fake-harness 0.0.0'); raise SystemExit(0)\n"
+                      'import json, os, sys\n'
+                      'from pathlib import Path\n'
+                      'p = Path(os.environ["CRASH_REPRO_CALLS"])\n'
+                      'argv = sys.argv[1:]\n'
+                      'with p.open("a") as f:\n'
+                      '    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),\n'
+                      '                        "args": argv}) + "\\n")\n'
+                      'st = Path(os.environ.get("CRASH_REPRO_STATE", "/tmp"))\n'
+                      'st.mkdir(parents=True, exist_ok=True)\n'
+                      + FAKE_CODEX_NATIVE_APP)
         p = fake_bin / "codex"
         p.write_text(fake_codex, encoding="utf-8")
         os.chmod(p, 0o755)
         env = dict(os.environ)
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
         env["CRASH_REPRO_CALLS"] = str(calls)
+        env["CRASH_REPRO_STATE"] = str(fake_state)
+        env["FAKE_STATE"] = str(fake_state)
+        env["FAKE_NATIVE_MODE"] = "hang"
+        env["FAKE_NATIVE_THREAD"] = thread_id
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         def rows():
@@ -446,25 +494,30 @@ time.sleep(60)
         calls = fake_state / "codex-calls.jsonl"
         thread_id = "cancel-repro-thread-001"
 
-        fake_codex = '''#!/usr/bin/env python3
-import sys as _vs
-if _vs.argv[1:2] == ['--version']:
-    print('fake-harness 0.0.0'); raise SystemExit(0)
-import json, os, time
-from pathlib import Path
-p = Path(os.environ["CRASH_REPRO_CALLS"])
-with p.open("a") as f:
-    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),
-                        "args": __import__("sys").argv[1:]}) + "\\n")
-print(json.dumps({"type": "thread.started", "thread_id": "%s"}), flush=True)
-time.sleep(60)
-''' % thread_id
+        fake_codex = ('#!/usr/bin/env python3\n'
+                      "import sys as _vs\n"
+                      "if _vs.argv[1:2] == ['--version']:\n"
+                      "    print('fake-harness 0.0.0'); raise SystemExit(0)\n"
+                      'import json, os, sys\n'
+                      'from pathlib import Path\n'
+                      'p = Path(os.environ["CRASH_REPRO_CALLS"])\n'
+                      'argv = sys.argv[1:]\n'
+                      'with p.open("a") as f:\n'
+                      '    f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),\n'
+                      '                        "args": argv}) + "\\n")\n'
+                      'st = Path(os.environ.get("CRASH_REPRO_STATE", "/tmp"))\n'
+                      'st.mkdir(parents=True, exist_ok=True)\n'
+                      + FAKE_CODEX_NATIVE_APP)
         p = fake_bin / "codex"
         p.write_text(fake_codex, encoding="utf-8")
         os.chmod(p, 0o755)
         env = dict(os.environ)
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
         env["CRASH_REPRO_CALLS"] = str(calls)
+        env["CRASH_REPRO_STATE"] = str(fake_state)
+        env["FAKE_STATE"] = str(fake_state)
+        env["FAKE_NATIVE_MODE"] = "hang"
+        env["FAKE_NATIVE_THREAD"] = thread_id
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         def rows():

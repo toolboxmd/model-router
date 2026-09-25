@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from . import adapters, core, harnesses, policy, store
+from . import codex_native
 
 MAX_LOOP_STEPS = 12
 
@@ -77,6 +78,40 @@ def _task_summary(task_json: str) -> str:
 
 def _full_luna_prompt(task_json: str, extra: str = "") -> str:
     return adapters.build_luna_prompt(task_json or "", extra or "")
+
+
+def native_turn_meta(op: str, prompt: str, model: str | None, effort: str | None,
+                      route: str, reason: str) -> dict:
+    """Invocation meta for one native dispatcher turn (dispatch or resume).
+
+    The prompt, policy model, and effort travel in meta (never in argv),
+    so the driver argv stays stable across restarts and the action keeps
+    one identity. Tests reuse this helper to compute the same key.
+    """
+    return {"stage": "dispatch", "route": route, "reason": reason,
+            "prompt": prompt, "model": model, "effort": effort,
+            codex_native.NATIVE_META_KEY: {"op": op}}
+
+
+def _record_native_control_turn(state_dir, request_id: str, out) -> None:
+    """Best-effort control-turn tracking from converted driver output.
+
+    The native thread and turn ids stay authoritative; unrelated user
+    turns never appear in driver output (the driver filters by turn id),
+    so whatever parses here is the control turn. Never raises.
+    """
+    try:
+        patch = {}
+        turn_id = codex_native.turn_id_from_lines(out or "")
+        if turn_id:
+            patch["control_turn_id"] = turn_id
+        thread_id = codex_native.thread_id_from_lines(out or "")
+        if thread_id:
+            patch["thread_id"] = thread_id
+        if patch:
+            codex_native.write_runtime(state_dir, request_id, patch)
+    except Exception:
+        pass
 
 
 def _last_message_path(state_dir, request_id: str, suffix: str) -> str:
@@ -370,11 +405,6 @@ def _save_opencode_session(state_dir, request_id: str, session_id: str,
     finally:
         con.close()
     return core.get_job(state_dir, request_id)
-
-
-def _prompt_digest(text: str) -> str:
-    import hashlib
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _codex_probe_due(state_dir) -> bool:
@@ -855,7 +885,6 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     # adopts that invocation; it never starts a second dispatch.
     workspace = job["workspace"]
     prompt = _full_luna_prompt(job["task_json"])
-    last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
     dispatch_route = policy.stage_routes("dispatch")[0]
     if probe is not None:
         try:
@@ -898,12 +927,17 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     dispatch = policy.ROUTES[dispatch_route]
     if harnesses.route_uses_owned_server(dispatch_route):
         return _dispatch_on_opencode(state_dir, request_id, dispatch_route, prompt, run_cmd, "initial")
-    cmd = adapters.build_codex_dispatch_cmd(workspace, prompt, model=dispatch["model"],
-                                             effort=dispatch["variant"],
-                                             last_message_path=last_path)
+    # Native dispatcher transport (toolboxmd/model-router#86): one
+    # job-owned app-server drives the turn through the native protocol.
+    # The driver argv carries no prompt, port, or endpoint, so the action
+    # keeps one identity across restarts; the turn's converted JSONL flows
+    # through the same downstream handling as before.
+    cmd = codex_native.python_driver_cmd()
     try:
         rc, out, err = run_cmd(cmd, workspace, None, kind="codex_dispatch",
-                               meta={"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
+                               meta=native_turn_meta(codex_native.OP_DISPATCH, prompt,
+                                                     dispatch["model"], dispatch["variant"],
+                                                     dispatch_route, "initial"))
     except Exception as e:
         # A failed measurement (including a failed observed_model write) or
         # any other turn failure must block safely with evidence, never let
@@ -914,6 +948,7 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     task_id, _skind = codex_h.parse_session("codex_dispatch", out, err, job)
     _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
                   session_id=task_id, output_text=(out or "") + (err or ""))
+    _record_native_control_turn(state_dir, request_id, out)
     if task_id:
         # The thread exists even when the turn failed: save it so recovery
         # resumes it instead of creating a replacement task.
@@ -942,10 +977,14 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
         return out_blocked
     # A turn that provably never started for a missing runtime blocks
     # recoverably instead of falling through to signal classification,
-    # the OpenCode fallback, or a sticky dispatch failure.
+    # the OpenCode fallback, or a sticky dispatch failure. The check
+    # recomputes the exact action identity, so it carries the same
+    # native turn meta as the run above (prompt/model travel in meta).
     runtime_blocked = _block_runtime_missing(
         state_dir, request_id, "codex_dispatch", cmd,
-        {"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
+        native_turn_meta(codex_native.OP_DISPATCH, prompt,
+                         dispatch["model"], dispatch["variant"],
+                         dispatch_route, "initial"))
     if runtime_blocked is not None:
         if task_id:
             runtime_blocked["codex_task_id"] = task_id
@@ -1342,15 +1381,16 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     if harnesses.route_uses_owned_server(active):
         return _dispatch_on_opencode(state_dir, request_id, active, message, run_cmd,
                                      reason="resume", session_id=task_id, phase="resumed")
-    last_path = _last_message_path(state_dir, request_id,
-                                   "codex-resume-" + _prompt_digest(message))
     dispatch = policy.ROUTES[active]
-    cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
-                                          model=dispatch["model"], effort=dispatch["variant"])
-    # Resume uses the saved workspace as cwd; never --cd/--reasoning.
+    # Native resume (toolboxmd/model-router#86): metadata-only attach to
+    # the saved thread on the job-owned server, then a new control turn.
+    # The saved thread id travels in the job row, never in argv.
+    cmd = codex_native.python_driver_cmd()
     try:
         rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
-                               meta={"stage": "dispatch", "route": active, "reason": "resume"})
+                               meta=native_turn_meta(codex_native.OP_RESUME, message,
+                                                     dispatch["model"], dispatch["variant"],
+                                                     active, "resume"))
     except Exception as e:
         return _block_codex_observation_failure(
             state_dir, request_id, "codex_resume", e)
@@ -1358,6 +1398,7 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
     resumed_id, _skind = codex_h.parse_session("codex_resume", out, err, job)
     _record_child(state_dir, request_id, "codex_resume", cmd, rc,
                   session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
+    _record_native_control_turn(state_dir, request_id, out)
     # Observed-model gate before any failure classification, envelope, or
     # route movement, like dispatch. A mismatched failed resume beats the
     # generic failure handling. Only genuinely missing or unreadable rollout
@@ -1374,10 +1415,14 @@ def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
         _mark_blocked(state_dir, request_id, _mm_reason)
         return {"action": "blocked", "reason": _mm_reason}
     # A resume that provably never started for a missing runtime blocks
-    # recoverably instead of the sticky turn-not-completed failure.
+    # recoverably instead of the sticky turn-not-completed failure. The
+    # check recomputes the exact action identity, so it carries the same
+    # native turn meta as the run above.
     runtime_blocked = _block_runtime_missing(
         state_dir, request_id, "codex_resume", cmd,
-        {"stage": "dispatch", "route": active, "reason": "resume"})
+        native_turn_meta(codex_native.OP_RESUME, message,
+                         dispatch["model"], dispatch["variant"],
+                         active, "resume"))
     if runtime_blocked is not None:
         return runtime_blocked
     if not codex_h.turn_ok("codex_resume", rc, out, cmd):

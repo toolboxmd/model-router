@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, harnesses, policy  # noqa: E402
+from runner import codex_native, controller, core, harnesses, policy  # noqa: E402
 from runner import kits as kitmod  # noqa: E402
 
 LIVE_STDOUT = "Missing bearer or basic authentication in header\n"
@@ -317,7 +317,16 @@ class TestDispatchAuthBlock(unittest.TestCase):
         self.assertTrue(job["block_reason"].startswith("codex_auth_failed: "))
         # Auth never falls back to another route: exactly one child ran.
         self.assertEqual(len(calls), 1)
-        self.assertIn("codex", calls[0][0][0])
+        # Native seam (#86): the driver argv is stable (no prompt, port,
+        # or endpoint); op/model/effort/prompt travel in invocation meta.
+        cmd, kw = calls[0]
+        self.assertEqual(cmd, codex_native.python_driver_cmd())
+        self.assertNotIn("ws://", " ".join(cmd))
+        meta = kw.get("meta") or {}
+        self.assertEqual((meta.get("native") or {}).get("op"), "dispatch")
+        self.assertEqual(meta.get("model"), policy.ROUTES["luna/max"]["model"])
+        self.assertEqual(meta.get("effort"), policy.ROUTES["luna/max"]["variant"])
+        self.assertTrue(meta.get("prompt"))
         view = core.status_view(sd, "a44-auth-1")
         self.assertTrue(view["job"]["block_reason"].startswith("codex_auth_failed: "))
         self.assertIn("codex_auth_failed", view["job"]["block_reason"])

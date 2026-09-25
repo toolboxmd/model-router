@@ -464,11 +464,34 @@ class CodexCLI(Harness):
     def spawn_spec(self, inv, env):
         """Codex sessions run on the route's kit via an isolated CODEX_HOME.
 
+        Native dispatcher turns (meta carries the ``native`` op) run
+        against the job-owned app-server instead: no per-turn kit is
+        materialized and no CODEX_HOME override applies. The driver
+        reaches the server through the published loopback endpoint; its
+        coordinates travel in MR_NATIVE_* environment values so the
+        driver argv stays stable across restarts (action identity).
+
         The kit directory is generated from policy (see ``runner/kits.py``);
         nothing is inherited from the user's Codex configuration.
         The planner callback keeps the user's own session and is never
         isolated, like the Claude planner callback.
         """
+        from . import codex_native as _native
+
+        if isinstance(_kit_meta(inv), dict) \
+                and isinstance(_kit_meta(inv).get(_native.NATIVE_META_KEY), dict):
+            env = dict(env)
+            try:
+                state_dir = _kit_state_dir(inv)
+            except Exception:
+                state_dir = None
+            if state_dir is not None:
+                env["MR_NATIVE_STATE_DIR"] = str(state_dir)
+            if (inv or {}).get("request_id"):
+                env["MR_NATIVE_REQUEST_ID"] = str((inv or {}).get("request_id"))
+            if (inv or {}).get("invocation_id"):
+                env["MR_NATIVE_INVOCATION_ID"] = str((inv or {}).get("invocation_id"))
+            return env, None
         from . import kits as _kits
 
         env = dict(env)
@@ -535,6 +558,28 @@ class CodexCLI(Harness):
                     state_dir, str(request_id), str(invocation_id), thread_id)
                 if not (isinstance(observed, str) and observed):
                     observed = None
+            if not observed and isinstance(meta, dict) \
+                    and isinstance(meta.get("native"), dict) \
+                    and ctx.get("state_dir") is not None and ctx.get("request_id"):
+                # Native dispatcher turns share the job sessions directory
+                # through the server kit (no per-turn kit exists): read the
+                # observed model from the thread's own rollout there.
+                try:
+                    from . import codex_native as _native_model
+                    shared_paths = _native_model.shared_rollout_paths(
+                        ctx["state_dir"], str(ctx["request_id"]), thread_id)
+                except Exception:
+                    shared_paths = []
+                for path in shared_paths:
+                    try:
+                        text = _KitPath(str(path)).read_text(
+                            encoding="utf-8", errors="replace")
+                    except (OSError, ValueError):
+                        continue
+                    model = parse_codex_rollout_model_text(text)
+                    if isinstance(model, str) and model:
+                        observed = model
+                        break
         return usage, observed, None, ids
 
     def infer_rc(self, kind, stdout, cmd=None):

@@ -17,11 +17,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runner import controller, core, harnesses, policy, store  # noqa: E402
-from tests.fakes import FAKE_CLAUDE, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
+from runner import codex_native, controller, core, harnesses, policy, store  # noqa: E402
+from tests.fakes import FAKE_CLAUDE, FAKE_CODEX_NATIVE_APP, FAKE_OPENCODE, VERSION_GUARD, write_fake  # noqa: E402
 from runner.core import _is_pid_alive  # noqa: E402
 
 PY = sys.executable
+
+# Dispatcher turns run on the native app-server branch (#86); exec bodies
+# below stay for the planner-callback path.
+_FAKE_CODEX_HEAD = r"""
+import json, os, sys
+from pathlib import Path
+st = Path(os.environ["FAKE_STATE"])
+argv = sys.argv[1:]
+with open(st / "codex.log", "a") as f:
+    f.write(json.dumps(argv) + "\n")
+"""
+
+
+def _native_rpcs(fs):
+    path = fs / "native-requests.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _stop_native_server(sd, rid):
+    # Stop only the job-owned native server recorded in durable state;
+    # ownership-checked, never a pattern kill.
+    try:
+        codex_native.stop_server(sd, rid, "test-cleanup")
+    except Exception:
+        pass
 
 
 def cli(state_dir, *args, env=None, timeout=25):
@@ -67,6 +94,8 @@ class TestCompletedChildBeforeRecover(unittest.TestCase):
         bindir.mkdir()
         calls = base / "calls.jsonl"
         release = base / "finish-child"
+        fake_state = base / "fakestate"
+        fake_state.mkdir()
         fake = bindir / "codex"
         fake.write_text("#!" + PY + "\n" + VERSION_GUARD + r"""
 import json, os, pathlib, sys, time
@@ -74,13 +103,12 @@ p = pathlib.Path(os.environ["REPRO_CALLS"])
 n = 1 + (len(p.read_text().splitlines()) if p.exists() else 0)
 with p.open("a") as f:
     f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0), "n": n}) + "\n")
+st = pathlib.Path(os.environ["FAKE_STATE"])
+st.mkdir(parents=True, exist_ok=True)
+argv = sys.argv[1:]
+""" + FAKE_CODEX_NATIVE_APP + r"""
 print(json.dumps({"type": "thread.started", "thread_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}), flush=True)
-end = time.monotonic() + 20
-while n == 1 and not pathlib.Path(os.environ["REPRO_RELEASE"]).exists() and time.monotonic() < end:
-    time.sleep(0.05)
-a = {"action": "completion", "output": "FIRST_COMPLETION" if n == 1 else "REPLAYED_COMPLETION", "artifact": ""}
-if "--output-last-message" in sys.argv:
-    pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(json.dumps(a))
+a = {"action": "completion", "output": "UNREACHABLE_VIA_EXEC", "artifact": ""}
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(a)}}), flush=True)
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}}), flush=True)
 """)
@@ -89,6 +117,13 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 0, "output
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
         env["REPRO_CALLS"] = str(calls)
         env["REPRO_RELEASE"] = str(release)
+        env["FAKE_STATE"] = str(fake_state)
+        # Native turn holds for the release file, then answers the first
+        # and only completion; the thread ID is fixed for the drill.
+        env["FAKE_NATIVE_THREAD"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        env["FAKE_NATIVE_PLAN"] = "completion"
+        env["FAKE_NATIVE_OUTPUT"] = "FIRST_COMPLETION"
+        env["FAKE_NATIVE_RELEASE"] = str(release)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         rc, out, err = cli(sd, "submit", "--request-id", "completed-child",
@@ -96,6 +131,7 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 0, "output
                            "--workspace", str(ws), "--planner-session", "fake-planner",
                            "--start", env=env)
         self.assertEqual(rc, 0, err)
+        self.addCleanup(_stop_native_server, sd, "completed-child")
         self.assertTrue(wait_for(lambda: calls.exists() and core.get_job(sd, "completed-child").get("codex_task_id")))
         first = core.get_job(sd, "completed-child")
         controller_pid = first["owner_pid"]
@@ -103,7 +139,11 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 0, "output
         os.kill(int(controller_pid), signal.SIGKILL)
         release.write_text("finish")
         rows = lambda: [json.loads(l) for l in calls.read_text().splitlines()] if calls.exists() else []
-        self.assertTrue(wait_for(lambda: rows() and not alive(rows()[0]["pid"])))
+        # The orphaned driver finishes the held turn on its own; the
+        # invocation row reaching completed is the finished child.
+        self.assertTrue(wait_for(lambda: any(
+            i["kind"] == "codex_dispatch" and i["state"] == "completed"
+            for i in core._list_invocations(sd, "completed-child")), 30))
         rc, rec, err = cli(sd, "recover", "--request-id", "completed-child", env=env)
         self.assertEqual(rc, 0, err)
         job = core.get_job(sd, "completed-child")
@@ -113,6 +153,9 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 0, "output
         rc, start_out, err = cli(sd, "start", "--request-id", "completed-child", env=env)
         self.assertNotEqual(rc, 0)
         self.assertEqual(len(rows()), 1, rows())
+        rpcs = _native_rpcs(fake_state)
+        self.assertEqual(len([r for r in rpcs if r["method"] == "turn/start"]), 1,
+                         "the finished turn is consumed, never replayed")
 
 
 class TestNullPidWindow(unittest.TestCase):
@@ -160,13 +203,10 @@ class TestAnswerRecoverContinues(unittest.TestCase):
         fake_state.mkdir()
         thread = "answer-recover-thread"
         planner = "planner-ar-1"
-        (bindir / "codex").write_text("#!" + PY + "\n" + VERSION_GUARD + r"""
+        (bindir / "codex").write_text(
+            "#!" + PY + "\n" + VERSION_GUARD + _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
 import json, os, sys, time
 from pathlib import Path
-st = Path(os.environ["FAKE_STATE"])
-log = st / "codex.log"
-argv = sys.argv[1:]
-log.open("a").write(json.dumps(argv) + "\n")
 tid = os.environ["THREAD_ID"]
 count_f = st / "n"
 n = int(count_f.read_text()) if count_f.exists() else 0
@@ -197,11 +237,17 @@ print(json.dumps({"type": "turn.completed"}), flush=True)
         env["FAKE_STATE"] = str(fake_state)
         env["THREAD_ID"] = thread
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Native dispatcher turns: question, then implementation, then done.
+        env["FAKE_NATIVE_THREAD"] = thread
+        env["FAKE_NATIVE_PLAN"] = "planner_first"
+        env["FAKE_NATIVE_QID"] = "q-ar"
+        env["FAKE_NATIVE_OUTPUT"] = "ANSWER_RECOVER_DONE"
         rc, out, err = cli(sd, "submit", "--request-id", "ar1",
                            "--task", '{"goal":"answer recover"}',
                            "--workspace", str(ws), "--planner-session", planner,
                            "--start", env=env)
         self.assertEqual(rc, 0, err)
+        self.addCleanup(_stop_native_server, sd, "ar1")
         self.assertTrue(wait_for(lambda: bool(core.list_questions(sd, "ar1")), 15))
         job = core.get_job(sd, "ar1")
         kill_pid(job["owner_pid"])
@@ -825,13 +871,9 @@ class TestOwnedOpenCodeServe(unittest.TestCase):
         self.assertEqual(envelope.get("signal"), "stalled")
 
 
-FAKE_LUNA = r"""
+FAKE_LUNA = _FAKE_CODEX_HEAD + FAKE_CODEX_NATIVE_APP + r"""
 import json, os, sys
 from pathlib import Path
-st = Path(os.environ["FAKE_STATE"])
-argv = sys.argv[1:]
-with open(st / "codex.log", "a") as f:
-    f.write(json.dumps(argv) + "\n")
 tid = "impl-crash-thread"
 n_f = st / "codex_n"
 n = int(n_f.read_text()) + 1 if n_f.exists() else 1
@@ -872,7 +914,16 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         env = dict(os.environ)
         env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
                    FAKE_STATE=str(self.fs), FAKE_OC_DELAY=str(delay),
-                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1",
+                   FAKE_NATIVE_THREAD="impl-crash-thread",
+                   FAKE_NATIVE_QID="q1",
+                   FAKE_NATIVE_OUTPUT="IMPL_CRASH_DONE")
+        # The native plan mirrors the exec envelopes: plain runs answer
+        # implementation then completion; FAKE_LUNA_ASK runs ask first.
+        if (extra_env or {}).get("FAKE_LUNA_ASK") == "1":
+            env["FAKE_NATIVE_PLAN"] = "planner_first"
+        else:
+            env["FAKE_NATIVE_PLAN"] = "implement_then_complete"
         env.update(extra_env or {})
         self.env = env
         self.addCleanup(self._cleanup)
@@ -900,6 +951,7 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
                         os.killpg(int(pg), signal.SIGKILL)
                     except Exception:
                         pass
+        _stop_native_server(self.sd, "ib1")
 
     def _lines(self, name):
         f = self.fs / name
@@ -920,7 +972,16 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         self.assertEqual(len(self._lines("opencode.log")), 1, "one owned server only")
         prompts = [l for l in self._lines("opencode-requests.jsonl") if "prompt_async" in l]
         self.assertEqual(len(prompts), 1, "one implementation turn only")
-        self.assertEqual(len(self._lines("codex.log")), 2, "dispatch plus one resume")
+        self.assertEqual(len(self._lines("codex.log")), 1, "one job-owned server")
+        rpcs = _native_rpcs(self.fs)
+        self.assertEqual(len([r for r in rpcs if r["method"] == "thread/start"]), 1,
+                         "dispatch starts the thread once")
+        self.assertEqual(len([r for r in rpcs if r["method"] == "turn/start"]), 2,
+                         "dispatch plus one resume turn")
+        attaches = [r for r in rpcs if r["method"] == "thread/resume"]
+        self.assertEqual(len(attaches), 1, "the resume reattaches metadata-only")
+        self.assertEqual(attaches[0]["params"], {"threadId": "impl-crash-thread",
+                                                 "excludeTurns": True})
         kinds = [i["kind"] for i in core._list_invocations(self.sd, "ib1")]
         self.assertEqual(kinds.count("opencode_control"), 1)
         reused = [e for e in core.status_view(self.sd, "ib1")["recent_events"]
@@ -956,9 +1017,16 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         qs = core.list_questions(self.sd, "ib1", only_pending=False)
         self.assertEqual([(q["qid"], q["status"], q["answer"]) for q in qs],
                          [("q1", "answered", "Descending.")])
-        resumes = [json.loads(l) for l in self._lines("codex.log") if '"resume"' in l]
+        # Both dispatcher resumes reattach to the exact saved thread
+        # metadata-only, and the first resume carries the planner answer.
+        rpcs = _native_rpcs(self.fs)
+        resumes = [r for r in rpcs if r["method"] == "thread/resume"]
         self.assertEqual(len(resumes), 2)
-        self.assertIn("Descending.", resumes[0][-1])
+        for r in resumes:
+            self.assertEqual(r["params"], {"threadId": "impl-crash-thread",
+                                           "excludeTurns": True})
+        turns = [r for r in rpcs if r["method"] == "turn/start"]
+        self.assertIn("Descending.", turns[1]["params"]["input"][0]["text"])
 
     def test_supervisor_killed_stops_orphaned_server_and_blocks(self):
         inv = self._setup(delay=30.0)
@@ -1007,7 +1075,10 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
         env = dict(os.environ)
         env.update(PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
                    FAKE_STATE=str(fs), FAKE_OC_DELAY="0.2",
-                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1")
+                   FAKE_OC_WRITE="fix.txt", PYTHONDONTWRITEBYTECODE="1",
+                   FAKE_NATIVE_THREAD="impl-crash-thread",
+                   FAKE_NATIVE_PLAN="implement_then_complete",
+                   FAKE_NATIVE_OUTPUT="IMPL_CRASH_DONE")
         env.update(extra_env or {})
         rc, out, err = cli(sd, "submit", "--request-id", request_id,
                            "--task", '{"goal":"issue13 cli drill"}',
@@ -1030,6 +1101,7 @@ class TestIssue13PublicCLIDrills(unittest.TestCase):
                         os.killpg(int(pg), signal.SIGKILL)
                     except Exception:
                         pass
+        _stop_native_server(sd, request_id)
 
     def _requests(self, fs):
         f = fs / "opencode-requests.jsonl"
