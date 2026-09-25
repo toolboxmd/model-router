@@ -36,7 +36,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from runner import controller, core, policy, store  # noqa: E402
+from runner import adapters, controller, core, policy, store  # noqa: E402
 from runner.supervisor import process_start_identity  # noqa: E402
 from tests.fakes import FAKE_OPENCODE, write_fake  # noqa: E402
 
@@ -1198,6 +1198,22 @@ class FailedCallbackWakeup(unittest.TestCase):
             core.start_controller = real_start
         self.assertEqual(rec["action"], "resumed-controller", rec)
         self.assertEqual(calls, ["cbk"])
+
+
+class ProtocolWording(unittest.TestCase):
+    def test_no_concrete_route_in_implementation_example(self):
+        # The implementation envelope example carries no route field, so
+        # a repeated default can never read as planner direction; an
+        # explicit direction travels only as directed_route.
+        self.assertNotIn('"route":"muse-spark-xhigh-free"',
+                         adapters.LUNA_ACTION_PROTOCOL)
+        self.assertIn("directed_route", adapters.LUNA_ACTION_PROTOCOL)
+
+    def test_no_remote_means_complete_without_pr(self):
+        # Workspaces without an origin push remote cannot open a PR: the
+        # dispatcher completes without one instead of waking the planner
+        # for a gate the runner waives.
+        self.assertIn("no origin push remote", adapters.LUNA_ACTION_PROTOCOL)
 
 
 class RoutedTrace(unittest.TestCase):
