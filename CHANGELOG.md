@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.35.5] - 2026-09-26
+
+### Changed
+
+- The dispatcher supplies the proof command so the runner checks every job (#128)
+
 ## [0.35.4] - 2026-09-25
 
 ### Changed

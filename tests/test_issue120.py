@@ -270,8 +270,9 @@ class T3Cancellation(unittest.TestCase):
             t3exec, "client_for_job", side_effect=t3exec.T3Error("unreachable"))
         with unreachable:
             first = core.cancel(self.sd, "r1")
-        self.assertEqual(first["status"], "cancelling")
-        self.assertEqual(core.recover_one(self.sd, "r1")["status"], "cancelling")
+            self.assertEqual(first["status"], "cancelling")
+            # Recover under the same patch: a live T3_SERVER_URL must never be reached.
+            self.assertEqual(core.recover_one(self.sd, "r1")["status"], "cancelling")
 
         fake = FakeT3Client(planner=PLANNER)
         fake.scripts["sub.planner-t3.dispatch"] = snap(

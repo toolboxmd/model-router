@@ -1156,7 +1156,7 @@ def _baseline_proof_gate(state_dir, request_id: str) -> dict | None:
         return None
     workspace = job["workspace"]
     base = job.get("base_commit")
-    proof_cmd = _proof_command(job["task_json"])
+    proof_cmd = _proof_command(job)
     try:
         task = json.loads(job["task_json"] or "null")
     except ValueError:
@@ -1909,7 +1909,7 @@ def _finish_worker_turn(state_dir, request_id, job, route, seq, artifact,
             "output": str(full.get("assistant_text") or "")}
 
 
-def _proof_command(task_json: str) -> str | None:
+def _task_proof(task_json: str | None) -> str | None:
     """The task's own proof command, when the task JSON names one."""
     try:
         task = json.loads(task_json or "null")
@@ -1918,6 +1918,49 @@ def _proof_command(task_json: str) -> str | None:
     if isinstance(task, dict) and isinstance(task.get("proof"), str) and task["proof"].strip():
         return task["proof"].strip()
     return None
+
+
+def _proof_command(job: dict) -> str | None:
+    """The job's proof command: the task's own, else the dispatcher's bound one."""
+    bound = _load_controller_state(job).get("dispatcher_proof")
+    return _task_proof(job.get("task_json")) or (
+        bound if isinstance(bound, str) and bound else None)
+
+
+def _bind_dispatcher_proof(state_dir, request_id: str, payload: dict | None) -> dict | None:
+    """Bind the dispatcher's ``payload.proof`` once when the task has none (#128).
+
+    A task ``proof`` always wins, and the first bound command stays for the
+    whole job, so a later envelope cannot weaken it. A bound proof without
+    a recorded baseline runs the baseline gate (again after a crash between
+    binding and the gate), and a proof that already fails on the base
+    commit blocks the job as it does for task proof. A proof first bound
+    after a worker turn started skips the baseline: the scratch worktree
+    of the base lacks the workspace's untracked dependencies and could
+    blame a healthy main. Returns the blocked result or None.
+    """
+    job = core.get_job(state_dir, request_id)
+    if _task_proof(job.get("task_json")):
+        return None
+    st = _load_controller_state(job)
+    if not st.get("dispatcher_proof"):
+        proof = payload.get("proof") if isinstance(payload, dict) else None
+        if not isinstance(proof, str) or not proof.strip():
+            return None
+        fields = {"dispatcher_proof": proof.strip()}
+        if (st.get("baseline_proof") or {}).get("skipped") == "no proof command":
+            fields["baseline_proof"] = None
+        _set_phase(state_dir, request_id, **fields)
+        job = core.get_job(state_dir, request_id)
+        st = _load_controller_state(job)
+    if isinstance(st.get("baseline_proof"), dict):
+        return None
+    if core.latest_turn_report(state_dir, request_id) is not None or any(
+            k.startswith("impl_") for k in _t3_threads_map(job)):
+        _set_phase(state_dir, request_id,
+                   baseline_proof={"skipped": "bound after worker turns"})
+        return None
+    return _baseline_proof_gate(state_dir, request_id)
 
 
 def _unquote_git_path(path: str) -> str:
@@ -2169,7 +2212,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     store.secure_write_text(turn_dir / "worker.txt", worker_text)
     files, diff, note = _git_changes(workspace)
     store.secure_write_text(turn_dir / "diff.patch", diff if not note else f"# {note}\n")
-    proof_cmd = _proof_command(job.get("task_json") or "")
+    proof_cmd = _proof_command(job)
     proof_rc = None
     proof_class = "none"
     proof_skipped = None
@@ -3444,6 +3487,9 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict, to
     """
     artifact = envelope.get("artifact")
     payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else None
+    blocked = _bind_dispatcher_proof(state_dir, request_id, payload)
+    if blocked is not None:
+        return blocked
     if _consume_planner_authorized_attempt(state_dir, request_id, envelope,
                                            token):
         impl = run_implementation(state_dir, request_id, artifact=artifact,

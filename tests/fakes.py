@@ -7,6 +7,7 @@ dispatcher thread the way a real dispatch would.
 """
 import copy
 import json
+import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -15,6 +16,20 @@ from runner import store, t3exec
 PLANNER = "planner-1"
 PROJECT = "proj-1"
 NOW = datetime.now(timezone.utc)
+
+
+def isolate_t3_env():
+    """Keep a test module off any live T3 (call from ``setUpModule``).
+
+    Some tests reach T3 discovery without a fake client; inside a runner
+    job ``T3_SERVER_URL``/``T3_SERVER_TOKEN`` name the live server, and
+    without them the default URL and ``t3 auth`` do. Point both at a
+    closed port for the module and restore them afterwards.
+    """
+    patcher = mock.patch.dict("os.environ", {"T3_SERVER_URL": "http://127.0.0.1:9",
+                                             "T3_SERVER_TOKEN": "test-token"})
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 def iso(dt):

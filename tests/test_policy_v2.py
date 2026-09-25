@@ -11,6 +11,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from runner import cli, controller, core, policy, store  # noqa: E402
+from tests.fakes import isolate_t3_env  # noqa: E402
+
+
+def setUpModule():
+    isolate_t3_env()
 
 
 class PolicyData(unittest.TestCase):
