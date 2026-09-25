@@ -140,13 +140,15 @@ allowance; the runner never invents a reset time.
 
 `submit --planner-t3-thread TID` selects the T3 execution path
 (toolboxmd/model-router#106) instead of the direct CLI path: every
-dispatcher and worker invocation runs as a T3 child thread of that
-planner thread, created through `POST /api/orchestration/dispatch` on
-the route's provider, model and effort. Until the fork parent link lands
-(toolboxmd/t3code#8) a child id follows the spike convention
-`sub.<parent>.<suffix>` and the create payload also carries
-`parentThreadId`, so a fork server honors the link either way. The
-child's first message names the job and links the parent thread. Policy,
+dispatcher and worker invocation runs as a T3 child thread, created
+through `POST /api/orchestration/dispatch` on the route's provider,
+model and effort. A job's threads form a tree (#113): the dispatcher
+thread is a child of the planner thread, and worker, correction and
+recovery threads are children of the dispatcher thread (the planner
+thread when no dispatcher thread was saved). A child id follows the fork
+convention `sub.<parent>.<suffix>` (toolboxmd/t3code#8) and the create
+payload also carries `parentThreadId`. Every child's first message names
+the job and links the planner thread. Policy,
 capacity probes, the ledger, the controller, and dispatcher envelope
 handling are unchanged: the same routes, preflight, exhaustion fallback,
 escalation ladder, reports, and proof binding apply; only the turn

@@ -5,7 +5,9 @@ controller branches, and a fake HTTP orchestration server proves the wire
 shapes (dispatch command, thread snapshot, bearer auth). Coverage:
 
 - child identity (``sub.<parent>.<suffix>`` + ``parentThreadId`` payload,
-  first message names the job and links the parent),
+  first message names the job and links the planner thread),
+- thread tree (#113): dispatcher under the planner thread, workers under
+  the dispatcher thread,
 - route mapping (provider instance, model, effort; unknown routes raise),
 - submit persistence and idempotency of the T3 fields,
 - dispatcher and worker turns through T3 with envelope/report handling,
@@ -487,6 +489,106 @@ class WorkerViaT3(Base):
                  if c.get("type") == "thread.turn.start"
                  and c.get("threadId") == created[0]]
         self.assertEqual(len(turns), 2)
+
+
+class ThreadTree(Base):
+    """#113: dispatcher under the planner, workers under the dispatcher."""
+
+    def _scripted(self, fake, created):
+        orig = fake.dispatch
+
+        def located(command):
+            out = orig(command)
+            if command.get("type") == "thread.create":
+                tid = command["threadId"]
+                created.append(command)
+                text = (luna_impl_envelope() if len(created) == 1
+                        else "Done. PR: https://example.test/pr/11")
+                fake.scripts[tid] = snap(tid, state="completed", text=text)
+            return out
+
+        fake.dispatch = located
+
+    def test_worker_is_a_child_of_the_dispatcher_thread(self):
+        self.submit_t3("tree1")
+        fake = FakeT3Client()
+        created = []
+        self._scripted(fake, created)
+        res = controller.dispatch(self.sd, "tree1", t3_client=fake)
+        self.assertEqual(res["action"], "dispatched", res)
+        dispatcher = res["t3_thread_id"]
+        res = controller.run_implementation(self.sd, "tree1", t3_client=fake)
+        self.assertEqual(res["action"], "implementation_ok", res)
+        self.assertEqual(len(created), 2)
+        disp_create, worker_create = created
+        self.assertEqual(disp_create["parentThreadId"], PLANNER)
+        self.assertEqual(t3exec.parent_of_child(dispatcher), PLANNER)
+        worker = worker_create["threadId"]
+        self.assertTrue(worker.startswith(f"sub.{dispatcher}."))
+        self.assertEqual(worker_create["parentThreadId"], dispatcher)
+        self.assertEqual(t3exec.parent_of_child(worker), dispatcher)
+        # Same T3 project as the planner thread.
+        self.assertEqual(worker_create["projectId"], PROJECT)
+        # The worker's first message names the job and links the planner.
+        first = [t for tid, t in fake.posts if tid == worker][0]
+        for needle in ("tree1", "worker seq", f"planner thread {PLANNER}"):
+            self.assertIn(needle, first)
+        # Recovery still finds every job thread in the one map.
+        threads = controller._t3_threads_map(core.get_job(self.sd, "tree1"))
+        self.assertEqual(threads["dispatch"]["thread_id"], dispatcher)
+        self.assertEqual(threads["impl_1"]["thread_id"], worker)
+        events = [json.loads(r["payload_json"]) for r in
+                  controller.store.connect(self.sd).execute(
+                      "SELECT payload_json FROM events WHERE request_id='tree1' "
+                      "AND kind='t3_thread'").fetchall()]
+        self.assertIn(worker, [e["thread_id"] for e in events])
+
+    def test_worker_without_a_saved_dispatcher_falls_back_to_planner(self):
+        self.submit_t3("tree2")
+        fake = FakeT3Client()
+        created = []
+        orig = fake.dispatch
+
+        def located(command):
+            out = orig(command)
+            if command.get("type") == "thread.create":
+                created.append(command)
+                fake.scripts[command["threadId"]] = snap(
+                    command["threadId"], state="completed", text="Done.")
+            return out
+
+        fake.dispatch = located
+        res = controller.run_implementation(self.sd, "tree2", t3_client=fake)
+        self.assertEqual(res["action"], "implementation_ok", res)
+        self.assertEqual(created[0]["parentThreadId"], PLANNER)
+        self.assertTrue(created[0]["threadId"].startswith(f"sub.{PLANNER}."))
+
+    def test_run_t3_turn_links_planner_in_first_message(self):
+        fake = FakeT3Client()
+        dispatcher = t3exec.child_thread_id(PLANNER, suffix="disp")
+        orig = fake.dispatch
+
+        def located(command):
+            out = orig(command)
+            if command.get("type") == "thread.create":
+                fake.scripts[command["threadId"]] = snap(
+                    command["threadId"], state="completed", text="ok")
+            return out
+
+        fake.dispatch = located
+        out = t3exec.run_t3_turn(
+            fake, request_id="r9", kind_label="worker seq 1",
+            parent_thread_id=dispatcher, project_id=PROJECT,
+            route="muse-spark-xhigh-free", role="implementation",
+            prompt="Do it.", title="t", child_suffix="w1",
+            planner_thread_id=PLANNER,
+            watch_kwargs={"timeout_secs": 5})
+        self.assertEqual(out["thread_id"], f"sub.{dispatcher}.w1")
+        self.assertEqual(out["parent_thread_id"], dispatcher)
+        self.assertEqual(out["planner_thread_id"], PLANNER)
+        first = fake.posts[0][1]
+        self.assertIn(f"planner thread {PLANNER}", first)
+        self.assertNotIn(f"planner thread {dispatcher}", first)
 
 
 class TerminalViaT3(Base):
