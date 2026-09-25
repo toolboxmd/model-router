@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.34.0] - 2026-09-25
+
+### Added
+
+- T3 path: a job submitted with `--planner-t3-thread` runs its dispatcher and worker turns as T3 child threads of the planner thread (`sub.<planner>.<suffix>`, plus `parentThreadId` for the fork link), created through the T3 orchestration API on the route's provider, model and effort; each child's first message names the job and links the planner thread (#106)
+- Dispatcher questions and the terminal report for a T3-hosted planner go into the planner thread as messages, and the planner's in-thread reply is read back as the answer; no headless process resumes the planner session. The direct CLI path is unchanged for jobs without a planner thread (#106)
+- Activity-based liveness on the T3 path: an open tool or task call keeps a turn healthy however long it runs, silence with no running tool (including a tool held behind an unanswered approval) is flagged after about a minute and probed at once, and explicit provider errors, including a refused turn start, act at once (#106)
+
 ## [0.33.1] - 2026-09-25
 
 ### Changed

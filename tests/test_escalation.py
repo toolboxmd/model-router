@@ -608,6 +608,11 @@ class TestPublicQuestionDrill(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertTrue(cleared.get("cleared"))
         self.assertEqual(core.get_job(sd, rid)["status"], "running")
+        # The blocked controller delivers its end-of-job report (#94) before
+        # releasing the job; start only once it has let go, or the launch
+        # races it as a duplicate.
+        self.assertTrue(wait_for(lambda: not core.get_job(sd, rid).get("owner_token"), 60),
+                        core.get_job(sd, rid))
         rc, out, err = cli(sd, "start", "--request-id", rid, env=env)
         self.assertEqual(rc, 0, err)
         self.assertTrue(wait_for(lambda: core.get_job(sd, rid)["status"] == "succeeded", 60),
