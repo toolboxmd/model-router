@@ -343,10 +343,45 @@ def _drain_owned_children(state_dir, request_id: str, owner=None) -> bool:
     signal is checked against the recorded start identity first, so a
     reused PID of an unrelated process is never signalled.
     """
-    del state_dir, request_id
-    if owner is not None:
+    if owner is not None and owner.get("owner_pid") is not None:
         _signal_pid(owner.get("owner_pid"), owner.get("owner_start"), signal.SIGTERM)
+        if not _wait_controller_exit(owner, 2.0):
+            _signal_pid(owner.get("owner_pid"), owner.get("owner_start"), signal.SIGKILL)
+            if not _wait_controller_exit(owner, 2.0):
+                return False
+    # Revoke the lease only after the controller is confirmed gone. A live
+    # controller that passed its step guard cannot race the final snapshot.
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL"
+                    " WHERE request_id=? AND cancel_requested IN (1, 2)",
+                    (request_id,))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        return False
+    finally:
+        con.close()
     return True
+
+
+def _wait_controller_exit(owner: dict, timeout_secs: float) -> bool:
+    """Confirm the recorded controller is gone or its PID was reused."""
+    pid = owner.get("owner_pid") if isinstance(owner, dict) else None
+    if pid is None:
+        return True
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        state = _identity_state(pid, owner.get("owner_start"))
+        if state in ("dead", "mismatch"):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def get_job(state_dir, request_id: str) -> dict:
@@ -1765,7 +1800,9 @@ def cancel(state_dir, request_id: str) -> dict:
     # children confirm dead.
     children_dead = _drain_owned_children(state_dir, request_id, owner)
     proof_dead = _drain_proof_group(state_dir, request_id)
-    all_dead = bool(children_dead and proof_dead)
+    remote_settled = (_interrupt_saved_t3_threads(state_dir, request_id, dict(job))
+                      if children_dead and proof_dead else False)
+    all_dead = bool(children_dead and proof_dead and remote_settled)
 
     # Best-effort stop of the legacy owned worker PID when ownership proven.
     try:
@@ -1777,11 +1814,95 @@ def cancel(state_dir, request_id: str) -> dict:
     except OSError:
         pass
 
-    _finalize_stopped(state_dir, request_id, all_dead)
+    _finalize_stopped(state_dir, request_id, all_dead, remote_settled,
+                      local_settled=bool(children_dead and proof_dead),
+                      controller_fenced=children_dead)
     return get_job(state_dir, request_id)
 
 
-def _finalize_stopped(state_dir, request_id: str, all_dead: bool) -> None:
+def _interrupt_saved_t3_threads(state_dir, request_id: str, job: dict) -> bool:
+    """Interrupt and confirm every saved T3 child turn is settled."""
+    try:
+        state = json.loads(job.get("controller_state") or "{}")
+        threads = state.get("t3_threads") if isinstance(state, dict) else {}
+    except (ValueError, TypeError):
+        threads = {}
+    if not isinstance(threads, dict) or not threads:
+        return True
+    try:
+        client = t3exec.client_for_job(job)
+    except t3exec.T3Error:
+        _record_t3_interrupt_event(
+            state_dir, request_id, "t3_turn_interrupt_failed",
+            {"error": "T3 client unavailable"})
+        return False
+    settled = True
+    for slot, record in threads.items():
+        thread_id = record.get("thread_id") if isinstance(record, dict) else None
+        if not thread_id:
+            continue
+        try:
+            snapshot = client.thread_snapshot(thread_id)
+            thread = t3exec.snapshot_thread(snapshot)
+            if not thread or "latestTurn" not in thread:
+                settled = False
+                continue
+            latest = thread.get("latestTurn")
+            state = latest.get("state") if isinstance(latest, dict) else None
+            if latest is None or state in ("completed", "error", "interrupted"):
+                continue
+            result = client.dispatch(t3exec.turn_interrupt_command(thread_id))
+            confirmed = client.thread_snapshot(thread_id)
+            confirmed_thread = t3exec.snapshot_thread(confirmed)
+            if not confirmed_thread or "latestTurn" not in confirmed_thread:
+                settled = False
+                continue
+            confirmed_latest = confirmed_thread.get("latestTurn")
+            confirmed_state = (confirmed_latest.get("state")
+                               if isinstance(confirmed_latest, dict) else None)
+            if (confirmed_latest is not None
+                    and confirmed_state not in ("completed", "error", "interrupted")):
+                settled = False
+            _record_t3_interrupt_event(
+                state_dir, request_id, "t3_turn_interrupt",
+                {"slot": slot, "thread_id": thread_id,
+                 "result": result if isinstance(result, dict) else {},
+                 "settled": confirmed_latest is None or confirmed_state in (
+                     "completed", "error", "interrupted"),
+                 "state": confirmed_state})
+        except t3exec.T3NotFoundError:
+            # After the controller exits, a typed 404 means this child was
+            # never observed remotely. Connection errors are not absence.
+            continue
+        except Exception as e:  # best effort; local cancellation still proceeds
+            settled = False
+            _record_t3_interrupt_event(
+                state_dir, request_id, "t3_turn_interrupt_failed",
+                {"slot": slot, "thread_id": thread_id,
+                 "error": str(e)[:300]})
+    return settled
+
+
+def _record_t3_interrupt_event(state_dir, request_id: str, kind: str,
+                               payload: dict) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _event(con, request_id, kind, payload)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
+def _finalize_stopped(state_dir, request_id: str, all_dead: bool,
+                      remote_settled: bool = True,
+                      local_settled: bool = True,
+                      controller_fenced: bool = True) -> None:
     """Finish a cancel or timeout drain in one guarded statement.
 
     The outcome follows the intent stored at commit time (cancel=1 wins
@@ -1794,12 +1915,15 @@ def _finalize_stopped(state_dir, request_id: str, all_dead: bool) -> None:
         con.execute("BEGIN IMMEDIATE")
         if not all_dead:
             # Keep the workspace claimed until recover confirms the stop.
+            status = ("cancelling"
+                      if not controller_fenced
+                      or (not remote_settled and local_settled) else "blocked")
             cur = con.execute(
-                "UPDATE jobs SET status='blocked', block_reason=CASE WHEN cancel_requested=2"
+                "UPDATE jobs SET status=?, block_reason=CASE WHEN cancel_requested=2"
                 " THEN 'timeout_pending: live child process group remains'"
                 " ELSE 'cancellation_pending: live child process group remains' END,"
                 " updated_at=? WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
-                (now, request_id))
+                (status, now, request_id))
             if cur.rowcount:
                 _event(con, request_id, "blocked", {"reason": "stop_pending"})
             con.execute("COMMIT")
@@ -1991,8 +2115,13 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.close()
             children_dead = _drain_owned_children(state_dir, request_id, dict(job))
             proof_dead = _drain_proof_group(state_dir, request_id)
-            all_dead = bool(children_dead and proof_dead)
-            _finalize_stopped(state_dir, request_id, all_dead)
+            remote_settled = (_interrupt_saved_t3_threads(
+                state_dir, request_id, dict(job))
+                if children_dead and proof_dead else False)
+            all_dead = bool(children_dead and proof_dead and remote_settled)
+            _finalize_stopped(state_dir, request_id, all_dead, remote_settled,
+                              local_settled=bool(children_dead and proof_dead),
+                              controller_fenced=children_dead)
             fin = get_job(state_dir, request_id)
             return {"request_id": request_id,
                     "action": "timeout" if fin["error_class"] == "timeout" else "cancelled",

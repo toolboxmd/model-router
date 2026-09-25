@@ -74,6 +74,9 @@ T3_PLANNER_HARNESS = "t3"
 T3_SILENCE_SECS = 60.0
 # Poll interval while watching a T3 turn.
 T3_POLL_SECS = 2.0
+# Recovery must not watch an already-saved child forever when its turn was
+# never started or the server lost the turn state.
+T3_RECOVERY_WATCH_SECS = 120.0
 
 # A running activity of these kinds keeps a turn healthy regardless of
 # message silence (a long test run is a running tool, never a stall).
@@ -122,6 +125,17 @@ _HARD_MARKERS = (
 
 class T3Error(Exception):
     """A T3 orchestration call failed (unreachable server, auth, bad payload)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class T3NotFoundError(T3Error):
+    """The T3 server confirmed that the requested resource is absent."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status=404)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +377,16 @@ def turn_start_command(thread_id: str, text: str, route: str | None = None,
     return cmd
 
 
+def turn_interrupt_command(thread_id: str) -> dict:
+    """Interrupt the active turn on an existing T3 thread."""
+    return {
+        "type": "thread.turn.interrupt",
+        "commandId": _new_id("cmd"),
+        "threadId": validate_thread_id(thread_id),
+        "createdAt": _utcnow_iso(),
+    }
+
+
 def child_first_message(request_id: str, kind_label: str, planner_thread_id: str,
                         route: str, prompt: str) -> str:
     """First message on a job child: names the job and links the planner thread."""
@@ -416,7 +440,10 @@ class T3Client:
                 detail = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 detail = ""
-            raise T3Error(f"T3 {method} {path} failed: HTTP {e.code} {detail}") from e
+            message = f"T3 {method} {path} failed: HTTP {e.code} {detail}"
+            if e.code == 404:
+                raise T3NotFoundError(message) from e
+            raise T3Error(message, status=e.code) from e
         except OSError as e:
             raise T3Error(f"T3 {method} {path} unreachable at {self.server_url}: {e}") from e
         try:
@@ -956,8 +983,12 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                 role: str, prompt: str, title: str,
                 child_suffix: str | None = None,
                 existing_thread_id: str | None = None,
+                existing_thread_state: dict | None = None,
                 watch_kwargs: dict | None = None,
-                planner_thread_id: str | None = None) -> dict:
+                planner_thread_id: str | None = None,
+                on_thread_created=None,
+                on_thread_state=None,
+                before_thread_start=None) -> dict:
     """Run one job turn as a T3 child thread: create, start, watch.
 
     ``parent_thread_id`` is the thread the child is created under (the
@@ -972,17 +1003,79 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
     if existing_thread_id is not None:
         thread_id = validate_thread_id(existing_thread_id)
         adopted = True
+        state = existing_thread_state if isinstance(existing_thread_state, dict) else {}
+        created = bool(state.get("created", True))
+        turn_started = bool(state.get("turn_started", True))
+        if not created:
+            try:
+                client.thread_snapshot(thread_id)
+            except T3Error as e:
+                if "404" not in str(e):
+                    raise
+                client.create_child(thread_id, parent_thread_id, project_id,
+                                    title, route, role)
+            if on_thread_state is not None:
+                on_thread_state(thread_id, "created")
+            created = True
+        if not turn_started:
+            try:
+                snapshot = client.thread_snapshot(thread_id)
+                thread = snapshot_thread(snapshot)
+                if not thread or "latestTurn" not in thread:
+                    return {"state": "unknown",
+                            "reason": "T3 child snapshot has unknown turn state",
+                            "thread_id": thread_id, "adopted": adopted,
+                            "parent_thread_id": validate_thread_id(parent_thread_id),
+                            "planner_thread_id": planner, "route": route}
+                latest = thread.get("latestTurn")
+                if latest is None:
+                    turn_started = False
+                elif isinstance(latest, dict) and latest.get("turnId"):
+                    turn_started = True
+                else:
+                    return {"state": "unknown",
+                            "reason": "T3 child snapshot has unknown turn state",
+                            "thread_id": thread_id, "adopted": adopted,
+                            "parent_thread_id": validate_thread_id(parent_thread_id),
+                            "planner_thread_id": planner, "route": route}
+            except T3Error as e:
+                return {"state": "unknown", "reason": f"T3 child snapshot failed: {e}",
+                        "thread_id": thread_id, "adopted": adopted,
+                        "parent_thread_id": validate_thread_id(parent_thread_id),
+                        "planner_thread_id": planner, "route": route}
+            if turn_started and on_thread_state is not None:
+                on_thread_state(thread_id, "started")
+            if not turn_started:
+                if before_thread_start is not None:
+                    before_thread_start()
+                client.post_message(thread_id,
+                                    child_first_message(request_id, kind_label,
+                                                        planner, route, prompt),
+                                    route=route, role=role, title_seed=title)
+                if on_thread_state is not None:
+                    on_thread_state(thread_id, "started")
+                turn_started = True
     else:
         thread_id = child_thread_id(parent_thread_id, child_suffix)
+        if on_thread_created is not None:
+            on_thread_created(thread_id)
         client.create_child(thread_id, parent_thread_id, project_id,
                             title, route, role)
+        if on_thread_state is not None:
+            on_thread_state(thread_id, "created")
+        if before_thread_start is not None:
+            before_thread_start()
         client.post_message(thread_id,
                             child_first_message(request_id, kind_label,
                                                 planner, route, prompt),
                             route=route, role=role, title_seed=title)
+        if on_thread_state is not None:
+            on_thread_state(thread_id, "started")
         adopted = False
     kwargs = dict(watch_kwargs or {})
-    if not adopted:
+    if adopted and not turn_started:
+        kwargs.setdefault("timeout_secs", T3_RECOVERY_WATCH_SECS)
+    if not adopted or not turn_started:
         kwargs.setdefault("await_new_turn", True)
     outcome = watch_turn(client, thread_id, **kwargs)
     outcome["thread_id"] = thread_id
