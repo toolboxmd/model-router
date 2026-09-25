@@ -139,8 +139,9 @@ allowance; the runner never invents a reset time.
    in the capacity ledger with the verbatim message as evidence, and the
     job dispatches on `luna-go/max` in the same step without retrying Codex,
     with the dispatch reason recorded separately from any worker route
-    reason: `dispatch_route_reason` in the controller state (kept when a
-    later worker move overwrites the shared `route_reason` key) and
+    reason: `dispatch_route_reason` in the controller state (the shared
+    `route_reason` key is left for worker moves, so the first worker
+    invocation keeps reason `initial`) and
     `scope: dispatch` on the `route_switched` event (worker moves carry
     `scope: worker`), so a worker attempt is never misread with the
     dispatch cause. A dispatch that fails with no recognized
@@ -199,7 +200,8 @@ allowance; the runner never invents a reset time.
     evidence is missing, or while the PR check fails. The
     completion envelope carries the opened PR URL (`pr_url`) and, when the
     task names required acceptance evidence, its `acceptance_evidence`;
-    `result` shows them; nothing merges the PR. A completion
+    `result` shows the PR URL, the acceptance evidence, and the candidate
+    head commit it was bound to; nothing merges the PR. A completion
     envelope arriving with a non-zero `proof_exit_code` or a `failed` report
     status is refused: the controller records `completion_refused: proof
     failed rc=<n>` (or `proof timed out rc=124` for a proof that ran past
@@ -217,9 +219,11 @@ allowance; the runner never invents a reset time.
     through the same once-then-block pattern, with evidence naming the
     exact gap instead of a proof failure. The PR check reads the PR live
     with `gh pr view` once per completion (stubbed in deterministic tests);
-    an unavailable check refuses as unverified, never as verified. The
-    first usable PR URL is preserved as the job's single PR identity
-    (`pr_url` in the controller state, `pr_identity_preserved` event):
+    an unavailable check refuses as unverified, never as verified. A PR URL
+    is preserved as the job's single PR identity (`pr_url` in the
+    controller state, `pr_identity_preserved` event) only after the live
+    check passes, so an invalid first URL never poisons the job and a
+    corrected URL is accepted instead of refused as a duplicate:
     correction and recovery update that PR, never open a second, and the
     worker prompt carries it. Recovery refuses the same way when it
     consumes a completion.
@@ -236,41 +240,58 @@ launches cover the 48-step job budget before launch-budget exhaustion.
 
 Escalation ladder. A turn fails when the worker or provider errors (not a
 capacity signal, which moves routes instead; hard errors end the turn as
-`implementation_failed` for this ladder) or when the task's own proof
+`implementation_failed` for this ladder without running the suite) or when the task's own proof
 command exits non-zero. The first failure leads to a correction in the same
 worker session on the same route. The second leads to a fresh correction on
 the correction stage's route (Kimi K2.7 Code). The third is the single
 escalation to the recovery stage (Grok 4.6 on Go, then native Grok Build on
 the xAI subscription, then OpenCode's xAI provider; those pool moves are not
-second escalations; recovery never reuses a rung the job already ran, and
-when every rung was used the job blocks with `recovery_exhausted`). Every
+second escalations; recovery never reuses a rung the job already ran).
+The ladder stays authoritative: an ordinary implementation envelope carries
+no route and never moves the job, so a repeated default can never undo a
+correction or recovery move. Every
 rung move records a `recovery_decision` event (failures, rung, route
-target, the failed attempt's seq and proof timestamps where known, the next
-attempt seq) so Observer can measure failure-to-restart and recovery
-success; the next attempt's report and invocation rows join on that seq.
-After the escalation the evidence returns to the planner as a concrete
-decision (the decision required, the evidence, the attempted remedies, and
-the dispatcher's recommendation), never a request for the planner to
-implement. Routine mechanical recovery stays inside the dispatch subsystem
+target, the failed attempt's seq and proof timestamps where known, reason;
+the next attempt seq stays unknown there) so Observer can measure failure-to-restart and recovery
+success; `recovery_next_attempt` links the decision to the actual next
+attempt seq when that worker invocation starts, and
+`recovery_attempt_result` preserves its outcome, so the next attempt's report and invocation rows join on that seq.
+When every rung was used, the evidence returns to the planner as a concrete
+decision through a planner question (the decision required, the evidence,
+attempted remedies, the genuinely eligible dispatcher routes, and the
+dispatcher's recommendation), never a request for the planner to
+implement; the job and Observer identities are preserved. Routine mechanical
+recovery stays inside the dispatch subsystem
 (the runner's bounded ladder and capacity moves); missing authority or a
-consequential scope or approach decision reaches the planner, which returns
-direction through the dispatcher. The submitted candidate stays
+consequential scope or approach decision reaches the planner, which answers
+with direction (an approach or an eligible route the dispatcher relays as
+`directed_route`). That answer permits exactly one explicitly authorized
+attempt assigned under the routing policy, never an implicit loop or
+unlimited retries. The submitted candidate stays
 dispatcher-owned throughout: a failure never authorizes the planner to take
 over implementation, debugging, test execution, or verification. The planner
 may direct a different approach or a stronger eligible agent through the
-dispatcher by naming it (an implementation envelope route or a planner
+dispatcher by naming it (an implementation envelope `directed_route` or a planner
 answer): the dispatcher assigns that work under the routing policy when the
-route is dispatcher-assignable and has capacity, and rejects anything else
+route is dispatcher-assignable and has capacity (correction and recovery
+stage routes are valid from any lane; other routes must sit in the job
+lane), and rejects anything else
 with a `planner_route_rejected` event, never a silent substitution. Two
 routes stay explicitly planner-executed and are never auto-selected or
 dispatcher-assigned: the planner-chosen rungs (Astra medium on Codex, Opus
 5.5 high on the Claude harness), which the planner itself chooses and runs
-in its own session, and `critical` work, which the planner does in its own
-session before submitting and never inside a submitted job. A fourth failure
-ends the job as `failed` with `ESCALATION_EXHAUSTED` and the same concrete
+in its own session before submission, and `critical` work, which the planner does in its own
+session before submitting and never inside a submitted job. A failure after
+the single authorized directed attempt ends the job as `failed` with
+`ESCALATION_EXHAUSTED` and the same concrete
 decision content in its error payload, which is the planner's to act on. A
 failed turn does not block the job: the dispatcher receives the report and
-decides; the runner enforces the ceiling.
+decides; the runner enforces the ceiling. A stopped turn with a supervisor
+result and every owned process group confirmed dead (an OpenCode rc124
+startup failure or an rc143 confirmed stop) returns its evidence to the
+dispatcher as a failed turn instead of a sticky block; missing results,
+rc125, and ambiguous ownership keep the sticky block so no second writer
+starts behind a possible owner.
 
 A stored answer is reused only when the stored prompt matches the
 dispatcher's prompt; a reused `qid` with a different prompt blocks with
@@ -759,13 +780,25 @@ redacted output, or truthfully records that the suite was skipped and why),
 `diff.patch` (`git diff HEAD` plus untracked files, or a note
 when the workspace is not a checkout), and `worker.txt` (the worker's full
 text, redacted). Writing the failure report is separate from executing
-proof: exhausted, stalled, crashed, or otherwise incomplete turns skip the
+proof: exhausted, stalled, crashed, hard-error, or otherwise incomplete
+turns skip the
 suite (`proof_class skipped` with its reason) instead of running the full
 suite automatically against an unfinished candidate; the dispatcher requests
 useful proof of a coherent candidate, and required final verification still
 refuses completion without a bound passing proof. A proof that runs past its
 budget has its whole process group stopped and classifies `timeout` (rc 124),
-apart from an executable-not-found `not_found` (rc 127). Turn failure classes
+apart from an executable-not-found `not_found` (rc 127); a main process that
+already exited while a background child holds the output pipe is reaped and
+classifies by its actual exit, never as a false timeout; leftover group
+members are stopped after a normal exit too, so no proof child races a later
+writer. The proof group is recorded durably while it runs
+(`proof-owner.json`): cancel and `recover` block on unresolved proof
+ownership instead of treating the job as stopped while the proof tree keeps
+running. Every executed proof is also a durable invocation row with
+`stage='verification'` (kind `proof`), its start/end timestamps, exit code,
+proof class, and elapsed time, so verification outcomes are observable from
+the existing invocation records. A supervisor-level rc124 with no proof run
+(a startup failure) classifies `infrastructure`, never `timeout`. Turn failure classes
 are timeout, stall, provider (exhausted, overloaded, context), infrastructure
 (hard errors, missing runtime, lost supervisor, unconfirmed stop),
 implementation (the worker ran and errored without a capacity signal), and
@@ -782,8 +815,10 @@ missing, skipped, stale, or for a different candidate, and never reruns the
 full suite automatically against an unfinished candidate.
 
 Every invocation records its stage, requested route, policy version, route
-reason (worker moves; dispatch moves additionally record
-`dispatch_route_reason`), harness version, elapsed time, terminal class (completed, failed,
+reason (worker moves record `route_reason` with `scope: worker`; dispatch
+moves record `dispatch_route_reason` with `scope: dispatch` and leave the
+worker's reason alone, so the first worker invocation keeps `initial`),
+harness version, elapsed time, terminal class (completed, failed,
 crashed, cancelled, timeout, quota, overloaded, stalled, context, hard_error),
 longest observed stream silence (`longest_silence_secs`), usage counters
 verbatim under a source label, the observed model and the observed variant as
@@ -799,7 +834,25 @@ measurements including native identities, variants, and schema versions,
 plus the `capacity` marks and usage-probe `readings`;
 `status` keeps the redacted error evidence (signal, evidence, retry counts
 and caps) so CLI readers need not query the database directly;
-`result` also lists the turn reports.
+`result` also lists the turn reports. Recovery links are observable from
+existing records: each `recovery_decision` event carries the failed seq,
+rung, route target, reason, and proof timestamps where known (its
+`next_attempt_seq` stays unknown until linked); `recovery_next_attempt`
+binds the decision to the actual next worker seq when that invocation
+starts; `recovery_attempt_result` preserves that attempt's outcome.
+Verification attempts are invocation rows with `stage='verification'`
+(kind `proof`) carrying started/ended timestamps, exit code, proof class,
+and elapsed time; cancellation intent lives on the job
+(`cancel_requested`) with `cancelled`/`timeout` events. Combined
+acceptance with Agent Observer still needs its importer to read these
+fields (it currently discards Router events and never reads `report.json`):
+the remaining adapter additions are importing `recovery_decision`,
+`recovery_next_attempt`, `recovery_attempt_result`, and
+`verification_attempt` events, `stage='verification'` invocation rows,
+`dispatch_route_reason` versus worker `route_reason` (event scope
+`dispatch` versus `worker`), and the job cancel intent; no new Router
+fields are planned for this. Unknown timestamps, causes, and ownership
+stay unknown throughout and are never fabricated.
 
 `--state-dir` (or `DURABLE_RUNNER_STATE_DIR`) is made absolute and is
 `0700`. Detached controllers and supervisors start from the package

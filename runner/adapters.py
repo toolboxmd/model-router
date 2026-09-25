@@ -88,8 +88,14 @@ LUNA_ACTION_PROTOCOL = (
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
-    '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"},"route":"muse-spark-xhigh-free"}\n'
+    '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"}}\n'
     '{"action":"completion","output":"<final result text>","artifact":"<path or empty>","pr_url":"<opened PR URL>","acceptance_evidence":"<required acceptance evidence when the task names it>"}\n'
+    "The escalation ladder owns the worker route: an ordinary implementation "
+    "envelope carries no route field and never changes the route. Relay an "
+    "explicit planner direction only with the optional field "
+    '"directed_route" (an eligible policy route the planner chose for this '
+    "job); the runner assigns it under the routing policy or rejects it "
+    "with evidence, never substituting silently. "
     "Rules: exactly one envelope; valid JSON; action must be one of "
     "planner_question, implementation, completion; use a new qid for each "
     "new question; completion carries the opened PR URL and required acceptance "

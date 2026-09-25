@@ -246,7 +246,8 @@ _PKG_ROOT = str(Path(__file__).resolve().parents[1])
 RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "unknown worker ownership", "live invocation",
                         "orphaned server", "timeout_pending", "cancellation_pending",
-                        "controller_step_budget_exhausted", "runtime_missing")
+                        "controller_step_budget_exhausted", "runtime_missing",
+                        "unresolved proof ownership")
 # Steps across every launch of one job; a launch has MAX_LOOP_STEPS of them.
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
@@ -1423,11 +1424,16 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             st["last_action"] = envelope
             st["last_action_name"] = action_name
             st["seq"] = int(st.get("seq") or 0) + 1
-            # One job owns one PR: preserve the envelope's identity here,
-            # inside the same transaction, so correction and recovery
+            # One job owns one PR: the envelope's identity is preserved
+            # here only after the live check passed (pre_refusal is None
+            # covers the bound proof, acceptance, PR presence, identity,
+            # and live-PR gates computed above), so an invalid first URL
+            # never poisons the job and a corrected URL is accepted
+            # instead of refused as a duplicate. Correction and recovery
             # update the existing PR instead of opening another.
             _cur = envelope.get("pr_url") if isinstance(envelope, dict) else None
-            if isinstance(_cur, str) and _cur.strip() and not (
+            if action_name == "completion" and pre_refusal is None \
+                    and isinstance(_cur, str) and _cur.strip() and not (
                     isinstance(st.get("pr_url"), str) and st["pr_url"].strip()):
                 st["pr_url"] = _cur.strip()
                 _event(con, request_id, "pr_identity_preserved",
@@ -1459,9 +1465,14 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
                     output = str(envelope.get("output") or "done")
                     _pr = (envelope.get("pr_url") if isinstance(envelope, dict) else None)
                     _pr_norm = _pr if isinstance(_pr, str) and _pr.strip() else None
+                    _acc = (envelope.get("acceptance_evidence")
+                            if isinstance(envelope, dict) else None)
+                    _acc_norm = _acc if isinstance(_acc, str) and _acc.strip() else None
                     result = {"ok": True, "output": json.dumps({"output": output,
                                                                 "artifact": envelope.get("artifact"),
-                                                                "pr_url": _pr_norm},
+                                                                "pr_url": _pr_norm,
+                                                                "acceptance_evidence": _acc_norm,
+                                                                "head_commit": head_commit},
                                                                sort_keys=True)}
                     con.execute(
                         "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
@@ -1523,11 +1534,16 @@ def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) ->
             root = store.ensure_state_dir(state_dir)
             _mpr = (envelope or {}).get("pr_url") if isinstance(envelope, dict) else None
             _mpr_norm = _mpr if isinstance(_mpr, str) and _mpr.strip() else None
+            _macc = (envelope or {}).get("acceptance_evidence") \
+                if isinstance(envelope, dict) else None
+            _macc_norm = _macc if isinstance(_macc, str) and _macc.strip() else None
             _mirror_result(state_dir, request_id,
                 json.dumps({"request_id": request_id, "status": "succeeded",
                             "result": {"ok": True, "output": (envelope or {}).get("output"),
                                        "artifact": (envelope or {}).get("artifact"),
-                                       "pr_url": _mpr_norm}}),
+                                       "pr_url": _mpr_norm,
+                                       "acceptance_evidence": _macc_norm,
+                                       "head_commit": head_commit}}),
             )
         except OSError:
             pass
@@ -1739,6 +1755,144 @@ def _event(con: sqlite3.Connection, request_id: str, kind: str, payload: dict) -
     )
 
 
+def proof_owner_path(state_dir, request_id: str):
+    """Durable proof-process ownership file for one job."""
+    return store.job_dir_for(store.ensure_state_dir(state_dir),
+                             request_id) / "proof-owner.json"
+
+
+def record_proof_owner(state_dir, request_id: str,
+                       pid: int | None, pgid: int | None) -> None:
+    """Persist the running proof's process group before it runs.
+
+    Lets cancel and recover block on unresolved proof ownership when
+    the controller dies mid-proof instead of treating the job as
+    stopped while the proof tree keeps running. Never raises past the
+    caller: an unrecorded proof still runs, it just reads as unknown.
+    """
+    try:
+        path = proof_owner_path(state_dir, request_id)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        store.secure_write_text(path, json.dumps(
+            {"pid": pid, "pgid": pgid, "started_at": _utcnow()},
+            sort_keys=True))
+    except Exception:
+        pass
+
+
+def clear_proof_owner(state_dir, request_id: str) -> None:
+    """Forget the proof owner after the proof tree is reaped."""
+    try:
+        proof_owner_path(state_dir, request_id).unlink()
+    except Exception:
+        pass
+
+
+def proof_owner_alive(state_dir, request_id: str) -> bool:
+    """True when a recorded proof process group may still be running.
+
+    A missing or unreadable file reads as not alive (unknown ownership
+    is handled by the invocation ledger, never invented here). A live
+    group blocks cancel and recover until it is reaped.
+    """
+    try:
+        raw = proof_owner_path(state_dir, request_id).read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    try:
+        rec = json.loads(raw or "null")
+    except ValueError:
+        return False
+    if not isinstance(rec, dict):
+        return False
+    return bool(_is_pgid_alive(rec.get("pgid")))
+
+
+def record_verification_attempt(state_dir, request_id: str, seq,
+                                  route: str | None, proof_command: str | None,
+                                  proof_rc: int | None, proof_class: str | None,
+                                  started_at: str | None, ended_at: str | None,
+                                  report_path: str | None,
+                                  proof_log: str | None) -> None:
+    """Persist one executed verification attempt as an observable row.
+
+    The task's own proof run becomes a durable invocation row with
+    ``stage='verification'`` (kind ``proof``), its start/end timestamps,
+    exit code, proof class, and elapsed time, so Agent Observer can
+    measure verification outcomes from the existing invocation records
+    instead of the report files it never reads. The row is inserted
+    already consumed with its measurement: it is evidence, never work
+    to rerun, and recovery never replays it. Never raises past the
+    caller: a missed row leaves the report file itself, never a
+    fabricated attempt.
+    """
+    try:
+        started = _parse_ts(started_at) if started_at else None
+    except Exception:
+        started = None
+    try:
+        ended = _parse_ts(ended_at) if ended_at else None
+    except Exception:
+        ended = None
+    elapsed = round(max(0.0, ended - started), 3) \
+        if started is not None and ended is not None else None
+    try:
+        tclass = terminal_class_for(proof_rc, None)
+    except Exception:
+        tclass = "failed" if proof_rc else "completed"
+    now = _utcnow()
+    invocation_id = secrets.token_hex(8)
+    try:
+        job = get_job(state_dir, request_id)
+        owner_token = job.get("owner_token") or ""
+        workspace = job.get("workspace") or ""
+    except Exception:
+        owner_token, workspace = "", ""
+    try:
+        seq_i = int(seq) if seq is not None else None
+    except (TypeError, ValueError):
+        seq_i = None
+    meta = {"seq": seq_i, "route": route, "stage": "verification",
+            "proof_class": proof_class, "report": report_path}
+    log = str(proof_log or "")
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO invocations("
+            " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
+            " stdout_path, stderr_path, started_at, ended_at, state, rc,"
+            " consumed_at, result_json, meta_json, action_key,"
+            " stage, requested_route, policy_version, reason, schema_version,"
+            " terminal_class, elapsed_secs, report_path"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (invocation_id, request_id, "proof",
+             json.dumps(["/bin/sh", "-c", proof_command or ""]),
+             workspace, owner_token, log, log,
+             started_at or now, ended_at or now,
+             "completed" if proof_rc == 0 else "failed", proof_rc, now,
+             json.dumps({"proof_class": proof_class, "seq": seq_i},
+                        sort_keys=True),
+             json.dumps(meta, sort_keys=True), f"proof:{seq_i}",
+             "verification", route, policy.POLICY_VERSION,
+             proof_class or "unknown", store.SCHEMA_VERSION,
+             tclass, elapsed,
+             str(report_path or "")),
+        )
+        _event(con, request_id, "verification_attempt",
+               {"seq": seq_i, "route": route, "rc": proof_rc,
+                "proof_class": proof_class})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+
+
 def record_recovery_decision(state_dir, request_id: str, failures: int,
                              rung: str, target: str | None, failed_seq,
                              reason: str,
@@ -1747,14 +1901,17 @@ def record_recovery_decision(state_dir, request_id: str, failures: int,
 
     The decision records which attempt failed (``failed_seq``, the
     ladder's counted seq), the rung chosen for the correction, the route
-    target (None for a same-route correction), and the next attempt seq
-    the standard flow assigns (one dispatcher resume between the
-    decision and the next attempt, so ``failed_seq + 1`` when the failed
-    seq is known, else unknown). ``failed_at`` comes from the failed
-    turn's own proof timestamps when the report carries them, else
-    unknown: Observer joins this event to the next attempt's report and
-    invocation rows to measure failure-to-restart and recovery success.
-    Returns the payload.
+    target (None for a same-route correction), and the reason. The next
+    attempt seq is unknown at decision time (planner questions, refusals,
+    and completion envelopes may consume seq numbers first), so
+    ``next_attempt_seq`` stays None here: the controller emits a
+    ``recovery_next_attempt`` event with the actual seq when the next
+    worker invocation starts, and a ``recovery_attempt_result`` event
+    when that attempt's outcome is recorded. ``failed_at`` comes from
+    the failed turn's own proof timestamps when the report carries
+    them, else unknown: Observer joins these events to the next
+    attempt's report and invocation rows to measure failure-to-restart
+    and recovery success. Returns the payload.
     """
     try:
         failed_i = int(failed_seq) if failed_seq is not None else None
@@ -1770,7 +1927,7 @@ def record_recovery_decision(state_dir, request_id: str, failures: int,
     decided_at = _utcnow()
     payload = {"failures": int(failures), "rung": rung,
                "target": target, "failed_seq": failed_i,
-               "next_attempt_seq": (failed_i + 1) if failed_i is not None else None,
+               "next_attempt_seq": None,
                "failed_at": failed_at, "decided_at": decided_at,
                "reason": reason}
     con = store.connect(state_dir)
@@ -3151,7 +3308,8 @@ def _complete_with_token(state_dir, request_id: str, token: str, ok: bool,
         if ok:
             status = "succeeded"
             err_class = None
-            result = {"ok": True, "output": output}
+            result = {"ok": True, "output": output,
+                      "head_commit": head_commit}
         else:
             status = "failed"
             err = error if isinstance(error, dict) else {"message": str(error) if error else "failed"}
@@ -3355,11 +3513,13 @@ def recover_one(state_dir, request_id: str) -> dict:
             return {"request_id": request_id, "action": "noop-terminal",
                     "status": status}
         # Cancellation intent persisted previously. Stop owned children and
-        # finalize cancellation only after every owned process group is dead.
+        # finalize cancellation only after every owned process group is dead,
+        # including a proof tree that outlived its controller.
         if job["cancel_requested"]:
             con.execute("COMMIT")
             con.close()
-            all_dead = _drain_owned_children(state_dir, request_id, dict(job))
+            all_dead = _drain_owned_children(state_dir, request_id, dict(job)) \
+                and not proof_owner_alive(state_dir, request_id)
             _finalize_stopped(state_dir, request_id, all_dead)
             fin = get_job(state_dir, request_id)
             return {"request_id": request_id,
@@ -3612,6 +3772,16 @@ def recover_one(state_dir, request_id: str) -> dict:
         # lease PID must also be dead.
         worker_gone = not controller_alive
         if worker_gone and status in ("running", "question_pending", "pending", "blocked"):
+            # A proof process group outlived its controller: the proof
+            # tree keeps running without an owner, so no replacement
+            # controller starts behind it. The block re-evaluates on the
+            # next recover once the group is reaped.
+            if proof_owner_alive(state_dir, request_id):
+                mark_blocked("unresolved proof ownership: a proof process group "
+                             "may still run; refusing duplicate")
+                con.execute("COMMIT")
+                return {"request_id": request_id, "action": "blocked-unresolved-proof",
+                        "status": "blocked"}
             # Mark known attempting/acknowledged launches without live workers dead.
             if lease_token:
                 con.execute(
@@ -3630,7 +3800,15 @@ def recover_one(state_dir, request_id: str) -> dict:
             runtime_missing_block = (
                 status == "blocked"
                 and str(job["block_reason"] or "").startswith("runtime_missing"))
-            if pending_q > 0 and (status == "question_pending" or runtime_missing_block) \
+            # A job blocked on an exhausted escalation still owes the
+            # planner's decision: one recover restarts its callback like
+            # a question_pending job instead of sticking forever.
+            recovery_exhausted_block = (
+                status == "blocked"
+                and str(job["block_reason"] or "").startswith("recovery_exhausted")
+                and pending_q > 0)
+            if pending_q > 0 and (status == "question_pending" or runtime_missing_block
+                                  or recovery_exhausted_block) \
                     and job["codex_task_id"] \
                     and int(job["attempts"]) < int(job["max_attempts"]):
                 # The controller asks the saved planner again through the

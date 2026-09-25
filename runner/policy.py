@@ -376,11 +376,14 @@ STAGES = {
                       "routes": ["astra/medium", "opus-5.5/high"],
                       "capabilities": [],
                       "planner_selects": True,
-                      "note": "the planner itself chooses a rung and runs it in its own session; "
-                              "the runner never dispatches these"},
+                      "note": "the planner itself chooses a rung and runs it in its own session "
+                              "before submission; the runner never dispatches these, and once a "
+                              "task is submitted the candidate stays dispatcher-owned"},
     "critical": {"executor": "planner", "routes": [], "capabilities": [],
                  "note": "a load-bearing step or prose the rest depends on is done by the planner "
-                         "itself in its own host session; the runner never dispatches it"},
+                         "itself in its own host session before submission; the runner never "
+                         "dispatches it, and a failure never authorizes the planner to take over "
+                         "a submitted candidate"},
     "correction": {"executor": "runner", "routes": ["kimi-k2.7-code-go"],
                    "capabilities": ["workspace_write", "session_resume"],
                    "note": "once per job; the same worker session is tried first"},
@@ -388,8 +391,9 @@ STAGES = {
                  "capabilities": ["workspace_write"],
                  "note": "one escalation per job, Grok 4.6 on Go, then native Grok Build on "
                          "the xAI subscription, then OpenCode's xAI provider; pool moves "
-                         "are not second escalations, then the planner; "
-                         "skips rungs the job already used"},
+                         "are not second escalations, then the planner decides through a "
+                         "planner question (exactly one authorized directed attempt after "
+                         "its answer); skips rungs the job already used"},
     "review_ticket": {"executor": "host", "routes": ["luna-max-review", "luna-go-review"],
                       "capabilities": ["read_only"],
                       "note": "native Codex subagent first, then Luna on OpenCode Go in plan mode"},
@@ -1720,8 +1724,9 @@ def render_skill_table() -> str:
         "",
         "## Planner-chosen rungs",
         "",
-        "The planner itself chooses one rung and runs it in its own session; "
-        "the runner never selects these automatically: "
+        "The planner itself chooses one rung and runs it in its own session "
+        "before submission; the runner never selects these automatically and "
+        "never assigns them as dispatcher worker turns: "
         + "; ".join(f"`{r}` = `{ROUTES[r]['model']}` {ROUTES[r]['variant']}"
                     for r in STAGES["planner_rungs"]["routes"]) + ".",
         "",
@@ -1825,11 +1830,15 @@ def render_skill_table() -> str:
         "`edit`, outside-workspace writes, web fetch/search, doom-loop, `question` and `task` "
         "stay denied (the coordinator role never needs them).",
         "- One escalation per job; afterwards the evidence returns to the planner "
-        "as a concrete decision (the decision required, the evidence, attempted "
-        "remedies, and the dispatcher's recommendation), never a request for the "
-        "planner to implement. The submitted candidate stays dispatcher-owned: "
-        "the planner returns direction through the dispatcher, which assigns that "
-        "work under the routing policy. No "
+        "as a concrete decision through a planner question (the decision required, "
+        "the evidence, attempted remedies, the eligible dispatcher routes, and "
+        "the dispatcher's recommendation), never a request for the planner to "
+        "implement. The planner answers with direction (an approach or an eligible "
+        "route the dispatcher relays as directed_route), which permits exactly one "
+        "authorized attempt assigned under the routing policy. The submitted "
+        "candidate stays dispatcher-owned: "
+        "a failure never authorizes the planner to take over implementation, "
+        "debugging, test execution, or recovery. No "
         "duplicate attempts, no retry loops. Never substitute a route silently; if "
         "the selected route is unavailable, stop that dispatch with the reason.",
         "- Every callback prompt carries the stored handoff summary before "
