@@ -419,6 +419,49 @@ def _t3_watch_kwargs() -> dict:
     return {}
 
 
+def _luna_parse_error(text: str) -> str:
+    """Why no envelope parsed: the JSON error, never the reply text."""
+    stripped = (text or "").strip()
+    if "{" not in stripped:
+        return "no JSON object in the reply"
+    try:
+        json.loads(stripped[stripped.find("{"):])
+    except ValueError as e:
+        return str(e)[:200]
+    return "no valid action envelope in the reply"
+
+
+def _t3_repair_envelope(state_dir, request_id: str, *, thread_id: str,
+                        text: str, client, phase: str) -> dict | None:
+    """Ask the saved dispatcher thread once for the envelope only (#105).
+
+    Returns the repaired envelope, or None after blocking the job with
+    ``luna_missing_action``, which ``recover`` retries.
+    """
+    prompt = ("ENVELOPE REPAIR: your last reply had no parsable action "
+              f"envelope ({_luna_parse_error(text)}). Reply with the envelope "
+              "only: exactly one JSON object whose action is "
+              "planner_question, implementation or completion, and nothing else.")
+    try:
+        outcome = t3exec.post_and_watch(client, thread_id, prompt,
+                                        role="dispatch",
+                                        watch_kwargs=_t3_watch_kwargs())
+    except t3exec.T3Error as e:
+        _mark_blocked(state_dir, request_id, f"t3_unavailable: {e}")
+        return None
+    reply = outcome.get("assistant_text") or ""
+    if outcome.get("state") != "completed":
+        reason = f"repair turn {outcome.get('reason') or outcome.get('state')}"
+    else:
+        luna_action = parse_luna_action(reply)
+        _persist_envelope(state_dir, request_id, luna_action, phase)
+        if luna_action is not None:
+            return luna_action
+        reason = f"{_luna_parse_error(reply)}; reply {len(reply)} chars"
+    _mark_blocked(state_dir, request_id, f"luna_missing_action: {reason}"[:500])
+    return None
+
+
 def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
                  kind_label: str, route: str, role: str, prompt: str,
                  title: str, client, adopt: bool = True) -> dict:
@@ -506,9 +549,10 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
         _persist_envelope(state_dir, request_id, luna_action, "dispatched",
                           raw_text=text)
         if luna_action is None:
-            quote = " ".join(text.split())[:200] or "empty dispatcher text"
-            _mark_blocked(state_dir, request_id,
-                          f"luna_missing_action: {quote}")
+            luna_action = _t3_repair_envelope(
+                state_dir, request_id, thread_id=thread_id, text=text,
+                client=client, phase="dispatched")
+        if luna_action is None:
             return {"action": "blocked", "reason": "luna_missing_action",
                     "t3_thread_id": thread_id}
         return {"action": "dispatched", "t3_thread_id": thread_id,
@@ -733,7 +777,10 @@ def _resume_luna_via_t3(state_dir, request_id: str, message: str,
     _persist_envelope(state_dir, request_id, luna_action, "resumed",
                       raw_text=text)
     if luna_action is None:
-        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        luna_action = _t3_repair_envelope(
+            state_dir, request_id, thread_id=thread_id, text=text,
+            client=client, phase="resumed")
+    if luna_action is None:
         return {"action": "blocked", "reason": "luna_missing_action"}
     return {"action": "resumed", "luna_action": luna_action}
 
@@ -3486,6 +3533,20 @@ def _step_inner(state_dir, request_id: str, token: str | None = None) -> dict:
         return dispatch(state_dir, request_id)
     last = _load_controller_state(job).get("last_action")
     if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:
+        # A recovered envelope block (#105): ask the saved dispatcher again.
+        thread_id = (_t3_thread_for(job, "dispatch") or {}).get("thread_id")
+        if thread_id:
+            try:
+                client = _t3_client_for_job(job)
+                text = t3exec.latest_assistant_text(client.thread_snapshot(thread_id))
+            except t3exec.T3Error as e:
+                return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+            luna_action = _t3_repair_envelope(
+                state_dir, request_id, thread_id=thread_id, text=text,
+                client=client, phase="resumed")
+            if luna_action is None:
+                return {"action": "blocked", "reason": "luna_missing_action"}
+            return {"action": "resumed", "luna_action": luna_action}
         _mark_blocked(state_dir, request_id, "luna_missing_action: no saved action to continue")
         return {"action": "blocked", "reason": "luna_missing_action"}
     action_name = last.get("action")

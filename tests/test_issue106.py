@@ -226,12 +226,36 @@ class DispatchViaT3(Base):
                               if c["type"] == "thread.create"]), creates)
 
     def test_missing_envelope_blocks(self):
+        # No parsable envelope at all (#105): one repair turn on the same
+        # thread, then a block with evidence when the repair also fails.
         self.submit_t3("d4")
         fake = FakeT3Client()
-        _res, _child = self._dispatched("d4", fake, "just prose, no JSON")
+        fake.child_replies = ["still prose, no envelope"]
+        # The dispatch first-message post must not consume the repair reply.
+        orig_post = fake.post_message
+        skipped = []
+
+        def gated_post(thread_id, text, **kw):
+            if not skipped:
+                skipped.append(True)
+                saved, fake.child_replies = fake.child_replies, []
+                try:
+                    return orig_post(thread_id, text, **kw)
+                finally:
+                    fake.child_replies = saved
+            return orig_post(thread_id, text, **kw)
+
+        fake.post_message = gated_post
+        res, child = self._dispatched("d4", fake, "just prose, no JSON")
+        self.assertEqual(res["action"], "blocked", res)
         job = core.get_job(self.sd, "d4")
         self.assertEqual(job["status"], "blocked")
         self.assertIn("luna_missing_action", job["block_reason"])
+        repairs = [t for tid, t in fake.posts
+                   if tid == child and "ENVELOPE REPAIR" in t]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(len([c for c in fake.commands
+                              if c["type"] == "thread.create"]), 1)
 
 
 class DispatchFallbackAndErrors(Base):

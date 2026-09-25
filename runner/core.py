@@ -226,7 +226,9 @@ RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "unknown worker ownership", "live invocation",
                         "orphaned server", "timeout_pending", "cancellation_pending",
                         "controller_step_budget_exhausted", "runtime_missing",
-                        "unresolved proof ownership")
+                        "unresolved proof ownership",
+                        # An unparsable dispatcher reply is retried (#105).
+                        "luna_missing_action")
 # Steps across every launch of one job; a launch has MAX_LOOP_STEPS of them.
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
