@@ -14,11 +14,12 @@ import json
 import os
 import shlex
 import signal
+import secrets
 import subprocess
 import time
 from pathlib import Path
 
-from . import adapters, core, harnesses, policy, store
+from . import adapters, core, harnesses, policy, store, t3exec
 
 MAX_LOOP_STEPS = 12
 
@@ -834,7 +835,669 @@ def _dispatch_exhausted(state_dir, request_id: str, dispatch_route: str,
                                  reason="dispatch_exhausted")
 
 
-def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
+# ---------------------------------------------------------------------------
+# T3 execution path (toolboxmd/model-router#106)
+#
+# When a job names a planner T3 thread, dispatcher and worker invocations
+# run as T3 child threads of that planner thread, and terminal/question
+# posts go into the planner thread as messages instead of through the
+# harness-specific callback CLIs. Jobs without a planner T3 thread never
+# reach this block: the direct CLI path below applies unchanged.
+# ``t3_client`` is an injectable T3Client (deterministic tests); production
+# resolves it from the job's stored server URL plus token discovery.
+# ---------------------------------------------------------------------------
+
+T3_TURN_KIND = "t3_turn"
+T3_TERMINAL_POST_KIND = "t3_terminal_post"
+T3_QUESTION_POST_KIND = "t3_question_post"
+T3_ANSWER_KIND = "t3_planner_answer"
+
+
+def _t3_threads_map(job: dict) -> dict:
+    try:
+        st = _load_controller_state(job)
+    except Exception:
+        return {}
+    threads = st.get("t3_threads")
+    return dict(threads) if isinstance(threads, dict) else {}
+
+
+def _t3_thread_for(job: dict, slot: str) -> dict | None:
+    rec = _t3_threads_map(job).get(slot)
+    if isinstance(rec, dict) and rec.get("thread_id"):
+        return rec
+    return None
+
+
+def _save_t3_thread(state_dir, request_id: str, slot: str,
+                    thread_id: str, route: str | None = None) -> None:
+    """Record a T3 child thread id for adoption by later controllers."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        try:
+            st = json.loads(row["controller_state"] or "{}")
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        threads = st.get("t3_threads")
+        if not isinstance(threads, dict):
+            threads = {}
+        threads[slot] = {"thread_id": thread_id, "route": route,
+                         "updated_at": core._utcnow()}
+        st["t3_threads"] = threads
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "t3_thread",
+                    {"slot": str(slot)[:32], "thread_id": str(thread_id)[:64],
+                     "route": str(route or "")[:64]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _t3_client_for_job(job: dict, t3_client=None):
+    if t3_client is not None:
+        return t3_client
+    return t3exec.client_for_job(job)
+
+
+def _t3_block(state_dir, request_id: str, reason: str) -> dict:
+    _mark_blocked(state_dir, request_id, reason)
+    return {"action": "blocked", "reason": reason.split(":")[0]}
+
+
+def _t3_watch_kwargs() -> dict:
+    # Production watches carry no elapsed deadline (no per-turn deadline
+    # since #88): a productive T3 turn runs as long as it stays active,
+    # and only genuine stream silence ends it. Tests pass bounded watches.
+    return {}
+
+
+def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
+                 kind_label: str, route: str, role: str, prompt: str,
+                 title: str, client, adopt: bool = True) -> dict:
+    """Create (or adopt) the slot's T3 child thread and watch its turn."""
+    parent = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    existing = _t3_thread_for(job, slot)
+    existing_id = None
+    if adopt and existing is not None and existing.get("route") in (None, route):
+        existing_id = existing.get("thread_id")
+    try:
+        project_id = t3exec.project_id_for_thread(client, parent)
+    except t3exec.T3Error as e:
+        return {"action": "blocked", "reason": "t3_unavailable",
+                "detail": f"t3_unavailable: planner thread unreadable: {e}"}
+    try:
+        outcome = t3exec.run_t3_turn(
+            client, request_id=request_id, kind_label=kind_label,
+            parent_thread_id=parent, project_id=project_id, route=route,
+            role=role, prompt=prompt, title=title,
+            existing_thread_id=existing_id,
+            watch_kwargs=_t3_watch_kwargs())
+    except t3exec.T3Error as e:
+        # Create/start failed (auth, validation, unreachable mid-turn):
+        # block loudly, never silently run the direct path.
+        return {"action": "blocked", "reason": "t3_unavailable",
+                "detail": f"t3_unavailable: {e}"}
+    if not existing_id:
+        try:
+            _save_t3_thread(state_dir, request_id, slot,
+                            outcome["thread_id"], route)
+        except Exception:
+            pass
+    try:
+        rc = 0 if outcome.get("state") == "completed" else 1
+        _record_child(state_dir, request_id, T3_TURN_KIND,
+                      ["t3", slot, route], rc,
+                      session_id=outcome.get("thread_id"),
+                      output_text=adapters.redact_text(
+                          str(outcome.get("assistant_text") or "")[-2000:]))
+    except Exception:
+        pass
+    outcome["slot"] = slot
+    return outcome
+
+
+def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
+                         route: str, outcome: dict,
+                         client, fallback: list) -> dict:
+    """Interpret a T3 dispatcher turn like the direct dispatch path."""
+    state = outcome.get("state")
+    thread_id = outcome.get("thread_id")
+    if state == "completed":
+        text = outcome.get("assistant_text") or ""
+        luna_action = parse_luna_action(text)
+        _persist_envelope(state_dir, request_id, luna_action, "dispatched",
+                          raw_text=text)
+        if luna_action is None:
+            quote = " ".join(text.split())[:200] or "empty dispatcher text"
+            _mark_blocked(state_dir, request_id,
+                          f"luna_missing_action: {quote}")
+            return {"action": "blocked", "reason": "luna_missing_action",
+                    "t3_thread_id": thread_id}
+        return {"action": "dispatched", "t3_thread_id": thread_id,
+                "luna_action": luna_action, "route": route}
+    if state == "interrupted":
+        # The server cut the turn (restart): continue once on the same
+        # thread, then accept whatever that watch reports.
+        job = core.get_job(state_dir, request_id)
+        try:
+            second = t3exec.post_and_watch(client, thread_id, prompt, route=route,
+                                           role="dispatch",
+                                           watch_kwargs=_t3_watch_kwargs())
+        except t3exec.T3Error as e:
+            return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+        second["thread_id"] = thread_id
+        if second.get("state") == "completed":
+            return _t3_dispatch_outcome(state_dir, request_id, prompt, route,
+                                        second, client, [])
+        reason = second.get("reason") or second.get("state") or "interrupted"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "t3_dispatch", "route": route,
+                                 "signal": second.get("signal"),
+                                 "error": reason,
+                                 "thread_id": thread_id})
+        return _t3_block(state_dir, request_id,
+                         f"t3_dispatch_failed: dispatcher turn {second.get('state')}: {reason}"[:500])
+    detail = outcome.get("reason") or outcome.get("state") or "unknown"
+    signal = outcome.get("signal")
+    if state == "error" and signal == "exhausted" and fallback:
+        try:
+            core.record_capacity(state_dir, route, "exhausted",
+                                 {"source": "t3", "message": detail[:500]},
+                                 None, reset_source="assumed")
+        except Exception:
+            pass
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "t3_dispatch", "route": route,
+                                 "signal": "exhausted", "error": detail,
+                                 "thread_id": thread_id})
+        _record_dispatch_reason(state_dir, request_id, route,
+                                fallback[0], "dispatch_exhausted")
+        job = core.get_job(state_dir, request_id)
+        outcome2 = _t3_run_turn(state_dir, request_id, job, slot="dispatch",
+                                kind_label="dispatcher", route=fallback[0],
+                                role="dispatch", prompt=prompt,
+                                title=f"model-router {request_id} dispatcher",
+                                client=client, adopt=False)
+        if outcome2.get("action") == "blocked":
+            return _t3_block(state_dir, request_id,
+                             outcome2.get("detail") or "t3_unavailable")
+        return _t3_dispatch_outcome(state_dir, request_id, prompt,
+                                    fallback[0], outcome2, client, [])
+    _persist_error_evidence(state_dir, request_id,
+                            {"source": "t3_dispatch", "route": route,
+                             "signal": signal, "error": detail,
+                             "thread_id": thread_id,
+                             "silence": outcome.get("silence")})
+    if state == "stalled":
+        try:
+            client.dispatch({"type": "thread.turn.interrupt",
+                             "commandId": f"cmd-{request_id}-stall-{secrets.token_hex(4)}",
+                             "threadId": thread_id,
+                             "createdAt": t3exec._utcnow_iso()})
+        except Exception:
+            pass
+        return _t3_block(state_dir, request_id,
+                         f"t3_turn_stalled: no activity with no running tool: {detail}"[:500])
+    return _t3_block(state_dir, request_id,
+                     f"t3_dispatch_failed: {detail}"[:500])
+
+
+def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
+                     t3_client=None) -> dict:
+    """Run the dispatcher turn as a T3 child of the planner thread."""
+    job = core.get_job(state_dir, request_id)
+    st = _load_controller_state(job)
+    if _t3_thread_for(job, "dispatch") is not None and st.get("seq"):
+        threads = _t3_threads_map(job)
+        return {"action": "already-dispatched",
+                "t3_thread_id": threads["dispatch"]["thread_id"],
+                "luna_action": st.get("last_action")}
+    dispatch_route = policy.stage_routes("dispatch")[0]
+    route = dispatch_route
+    reason = "initial"
+    adopted = _t3_thread_for(job, "dispatch") is not None
+    if not adopted:
+        # Preflight mirrors the direct path: a dispatch route the capacity
+        # memory knows as exhausted or resting is skipped before any child
+        # starts; later jobs go straight to Luna on OpenCode Go.
+        try:
+            _skip = core.exhausted_routes(state_dir) | core.degraded_routes(state_dir)
+        except Exception:
+            _skip = set()
+        if dispatch_route in _skip:
+            try:
+                _exhausted_now = dispatch_route in core.exhausted_routes(state_dir)
+            except Exception:
+                _exhausted_now = dispatch_route in _skip
+            reason = "preflight_exhausted" if _exhausted_now else "preflight_degraded"
+            fallback = _dispatch_fallback_routes(dispatch_route)
+            if not fallback:
+                return _t3_block(state_dir, request_id,
+                                 "capacity_exhausted: no eligible route before dispatch "
+                                 f"on {dispatch_route}")
+            _record_dispatch_reason(state_dir, request_id, dispatch_route,
+                                    fallback[0], reason)
+            route = fallback[0]
+    try:
+        client = _t3_client_for_job(job, t3_client)
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    outcome = _t3_run_turn(state_dir, request_id, job, slot="dispatch",
+                           kind_label="dispatcher", route=route,
+                           role="dispatch", prompt=prompt,
+                           title=f"model-router {request_id} dispatcher",
+                           client=client)
+    if outcome.get("action") == "blocked":
+        return _t3_block(state_dir, request_id,
+                         outcome.get("detail") or "t3_unavailable")
+    return _t3_dispatch_outcome(state_dir, request_id, prompt, route,
+                                outcome, client,
+                                _dispatch_fallback_routes(route))
+
+
+def _resume_luna_via_t3(state_dir, request_id: str, message: str,
+                        t3_client=None) -> dict:
+    """Resume the saved T3 dispatcher thread with new context (never fork)."""
+    job = core.get_job(state_dir, request_id)
+    saved = _t3_thread_for(job, "dispatch")
+    if saved is None:
+        _mark_blocked(state_dir, request_id,
+                      "missing saved T3 dispatcher thread: refusing to fork")
+        return {"action": "blocked", "reason": "missing_t3_dispatch_thread"}
+    thread_id = saved["thread_id"]
+    route = saved.get("route") or _dispatcher_route(job)
+    try:
+        client = _t3_client_for_job(job, t3_client)
+        outcome = t3exec.post_and_watch(client, thread_id, message, role="dispatch",
+                                        watch_kwargs=_t3_watch_kwargs())
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    try:
+        rc = 0 if outcome.get("state") == "completed" else 1
+        _record_child(state_dir, request_id, T3_TURN_KIND,
+                      ["t3", "resume", route], rc, session_id=thread_id,
+                      output_text=adapters.redact_text(
+                          str(outcome.get("assistant_text") or "")[-2000:]))
+    except Exception:
+        pass
+    if outcome.get("state") != "completed":
+        detail = outcome.get("reason") or outcome.get("state") or "unknown"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": "t3_resume", "route": route,
+                                 "signal": outcome.get("signal"),
+                                 "error": detail, "thread_id": thread_id})
+        return _t3_block(state_dir, request_id,
+                         f"t3_resume_failed: {detail}"[:500])
+    text = outcome.get("assistant_text") or ""
+    luna_action = parse_luna_action(text)
+    _persist_envelope(state_dir, request_id, luna_action, "resumed",
+                      raw_text=text)
+    if luna_action is None:
+        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
+        return {"action": "blocked", "reason": "luna_missing_action"}
+    return {"action": "resumed", "luna_action": luna_action}
+
+
+def _t3_worker_full(outcome: dict, thread_id: str) -> tuple[dict, int]:
+    """Supervisor-shaped result dict for a T3 worker turn (shared finisher)."""
+    state = outcome.get("state")
+    text = outcome.get("assistant_text") or ""
+    if state == "completed":
+        return {"ok": True, "rc": 0, "assistant_text": text,
+                "finish": "stop", "t3_thread_id": thread_id}, 0
+    signal = outcome.get("signal")
+    if state == "stalled":
+        return {"ok": False, "rc": 1, "assistant_text": text,
+                "signal": "stalled",
+                "signal_evidence": {"silence": outcome.get("silence"),
+                                    "last_part": outcome.get("last_part"),
+                                    "probed": outcome.get("probed", True)},
+                "error": outcome.get("reason") or "t3 turn stalled",
+                "t3_thread_id": thread_id,
+                "idle_confirmed": bool(outcome.get("idle_confirmed", False))}, 1
+    if state == "interrupted":
+        return {"ok": False, "rc": 1, "assistant_text": text,
+                "signal": None,
+                "error": outcome.get("reason") or "t3 turn interrupted",
+                "t3_thread_id": thread_id}, 1
+    if signal in ("exhausted", "overloaded", "context"):
+        return {"ok": False, "rc": 1, "assistant_text": text,
+                "signal": signal,
+                "signal_evidence": {"message": (outcome.get("reason") or "")[:500]},
+                "error": outcome.get("reason") or f"t3 turn {signal}",
+                "quota": signal == "exhausted",
+                "t3_thread_id": thread_id, "idle_confirmed": True}, 1
+    return {"ok": False, "rc": 1, "assistant_text": text,
+            "signal": None,
+            "error": outcome.get("reason") or f"t3 turn {state}",
+            "t3_thread_id": thread_id}, 1
+
+
+def _run_t3_worker_turn(state_dir, request_id: str, job: dict,
+                        workspace: str, route: str, prompt: str, seq: int,
+                        route_reason: str, artifact=None, attempt: int = 0,
+                        t3_client=None) -> dict:
+    """Run one implementation turn as a T3 child thread (shared finisher)."""
+    del workspace, route_reason, attempt
+    role = policy.route_spec(route).get("role") or "implementation"
+    if role not in ("implementation", "correction", "recovery"):
+        role = "implementation"
+    slot = f"impl_{seq}"
+    try:
+        client = _t3_client_for_job(job, t3_client)
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    outcome = _t3_run_turn(state_dir, request_id, job, slot=slot,
+                           kind_label=f"worker seq {seq}", route=route,
+                           role=role, prompt=prompt,
+                           title=f"model-router {request_id} worker seq {seq}",
+                           client=client)
+    if outcome.get("action") == "blocked":
+        return _t3_block(state_dir, request_id,
+                         outcome.get("detail") or "t3_unavailable")
+    thread_id = outcome.get("thread_id")
+    if outcome.get("state") == "interrupted":
+        # The server cut the turn (restart): continue once on the same
+        # thread like the dispatcher path, then accept the second watch.
+        try:
+            second = t3exec.post_and_watch(client, thread_id, prompt,
+                                           route=route, role=role,
+                                           watch_kwargs=_t3_watch_kwargs())
+            second["thread_id"] = thread_id
+            outcome = second
+        except t3exec.T3Error as e:
+            return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    if outcome.get("state") == "stalled":
+        # Never start a second writer behind a possibly live server-side
+        # turn: interrupt first, then confirm idle before the shared
+        # stall path may move routes.
+        try:
+            client.dispatch({"type": "thread.turn.interrupt",
+                             "commandId": f"cmd-{request_id}-seq{seq}-{secrets.token_hex(4)}",
+                             "threadId": thread_id,
+                             "createdAt": t3exec._utcnow_iso()})
+        except Exception:
+            pass
+        try:
+            snap = client.thread_snapshot(thread_id)
+            ev = t3exec.evaluate_turn(snap, now=time.time(),
+                                      silence_secs=t3exec.T3_SILENCE_SECS)
+            outcome["idle_confirmed"] = ev.get("state") in (
+                "completed", "error", "interrupted")
+            if ev.get("state") == "completed" and not outcome.get("assistant_text"):
+                outcome["assistant_text"] = t3exec.latest_assistant_text(snap)
+        except Exception:
+            outcome["idle_confirmed"] = False
+    full, rc = _t3_worker_full(outcome, thread_id)
+    return _finish_worker_turn(state_dir, request_id, job, route, seq,
+                               artifact, full, thread_id, rc,
+                               source=T3_TURN_KIND)
+
+
+def _post_planner_text_via_t3(state_dir, request_id: str, text: str,
+                              kind: str, cmd: list,
+                              t3_client=None) -> tuple[bool, str]:
+    """Post one message into the planner thread; (posted, detail)."""
+    job = core.get_job(state_dir, request_id)
+    parent = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    try:
+        client = _t3_client_for_job(job, t3_client)
+        client.post_message(parent, text, role="dispatch")
+    except (t3exec.T3Error, ValueError) as e:
+        detail = f"t3 post failed: {e}"[:300]
+        try:
+            _record_child(state_dir, request_id, kind, cmd, 1,
+                          session_id=parent, output_text=detail)
+        except Exception:
+            pass
+        return False, detail
+    try:
+        _record_child(state_dir, request_id, kind, cmd, 0,
+                      session_id=parent,
+                      output_text=adapters.redact_text(text[-1000:]))
+    except Exception:
+        pass
+    return True, "posted"
+
+
+def _t3_question_record(job: dict, qid: str) -> dict | None:
+    try:
+        st = _load_controller_state(job)
+    except Exception:
+        return None
+    rec = (st.get("t3_questions") or {}).get(qid)
+    return rec if isinstance(rec, dict) and rec.get("message_id") else None
+
+
+def _save_t3_question(state_dir, request_id: str, qid: str, rec: dict) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads((row["controller_state"] if row else None) or "{}")
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        qs = st.get("t3_questions")
+        if not isinstance(qs, dict):
+            qs = {}
+        qs[qid] = rec
+        st["t3_questions"] = qs
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _planner_question_via_t3(state_dir, request_id: str, qid: str,
+                             question: str, t3_client=None) -> dict:
+    """Ask the planner in its own T3 thread and read its reply as the answer.
+
+    The question goes into the planner thread as a message
+    (``thread.turn.start``), so it appears in the thread the person has
+    open; no second headless process ever resumes the planner session.
+    The planner's reply in that turn is read back from the thread and
+    persisted as the answer. The message id is recorded before the post,
+    so a later controller adopts the same post instead of asking twice.
+    A reply that never arrives (error, silence, unreachable T3) leaves
+    the question pending for ``answer`` plus ``recover``.
+    """
+    job = core.get_job(state_dir, request_id)
+    parent = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    try:
+        client = _t3_client_for_job(job, t3_client)
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    rec = _t3_question_record(job, qid)
+    try:
+        snap = client.thread_snapshot(parent)
+        posted = False
+        if rec is not None:
+            posted = any(isinstance(m, dict) and m.get("id") == rec["message_id"]
+                         for m in (t3exec.snapshot_thread(snap).get("messages") or []))
+        if rec is None:
+            rec = {"message_id": f"msg-{request_id}-{qid}-{secrets.token_hex(4)}"[:120],
+                   "prior_turn_id": t3exec.latest_turn_id(snap),
+                   "posted_at": core._utcnow()}
+            _save_t3_question(state_dir, request_id, qid, rec)
+        if not posted:
+            client.post_message(parent, question, role="dispatch",
+                                message_id=rec["message_id"])
+            _record_child(state_dir, request_id, T3_QUESTION_POST_KIND,
+                          ["t3", "question", qid], 0, session_id=parent,
+                          output_text=adapters.redact_text(question[-1000:]))
+        outcome = t3exec.watch_turn(client, parent,
+                                    prior_turn_id=rec.get("prior_turn_id"),
+                                    await_new_turn=True,
+                                    **_t3_watch_kwargs())
+    except (t3exec.T3Error, ValueError) as e:
+        detail = f"t3 question failed: {e}"[:300]
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": T3_QUESTION_POST_KIND,
+                                 "qid": qid, "error": detail})
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {detail}")
+    answer = (outcome.get("assistant_text") or "").strip()
+    if outcome.get("state") != "completed" or not answer:
+        detail = outcome.get("reason") or outcome.get("state") or "no reply"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": T3_QUESTION_POST_KIND, "qid": qid,
+                                 "state": outcome.get("state"),
+                                 "error": str(detail)[:300],
+                                 "thread_id": parent})
+        stored = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
+                  if q["qid"] == qid and q["status"] == "answered"]
+        if stored:
+            return {"action": "answered", "qid": qid}
+        reason = (f"planner_question_pending: question {qid} is in the planner "
+                  f"T3 thread with no reply ({outcome.get('state')}); answer "
+                  f"with `answer` plus `recover`")
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "planner_question_pending", "qid": qid}
+    try:
+        _record_child(state_dir, request_id, T3_ANSWER_KIND,
+                      ["t3", "answer", qid], 0, session_id=parent,
+                      output_text=adapters.redact_text(answer[-1000:]))
+    except Exception:
+        pass
+    try:
+        core.answer(state_dir, request_id, qid, answer, lease_token=_LEASE["token"])
+    except core.ConflictError:
+        pass  # answered publicly meanwhile: the stored answer wins
+    return {"action": "answered", "qid": qid, "t3_thread_id": parent}
+
+
+def _t3_terminal_already_posted(state_dir, request_id: str,
+                                event_id: int) -> bool:
+    con = None
+    try:
+        con = store.connect(state_dir)
+        rows = con.execute(
+            "SELECT cmd_json, rc FROM child_calls WHERE request_id=? AND kind=?",
+            (request_id, T3_TERMINAL_POST_KIND)).fetchall()
+    except Exception:
+        return False
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception:
+            pass
+    for row in rows or []:
+        try:
+            cmd = json.loads(row["cmd_json"] or "[]")
+        except ValueError:
+            continue
+        if isinstance(cmd, list) and len(cmd) == 3 and cmd[2] == event_id \
+                and (row["rc"] or 0) == 0:
+            return True
+    return False
+
+
+def _deliver_terminal_report_via_t3(state_dir, request_id: str,
+                                    t3_client=None) -> dict:
+    """Post the terminal state into the planner thread as a message.
+
+    Runs after the terminal persist and never changes the job's status
+    or result. Delivery is claimed only after the post lands and the
+    delivered record persists; a finished prior post for the same
+    terminal event is adopted instead of duplicated.
+    """
+    job = core.get_job(state_dir, request_id)
+    status = job.get("status")
+    if status not in TERMINAL_REPORT_STATUSES:
+        rec = _terminal_report_record(job)
+        if rec and isinstance(rec.get("delivered_for"), dict) \
+                and rec["delivered_for"].get("status") == "blocked":
+            try:
+                _save_terminal_report_record(state_dir, request_id, {})
+            except Exception:
+                pass
+        return {"action": "noop-not-terminal", "status": status}
+    pr_url = _terminal_report_pr_url(job)
+    reason = _terminal_report_reason(job)
+    event_id = _terminal_event_id(state_dir, request_id)
+    key = {"status": status, "reason": reason, "pr_url": pr_url,
+           "event_id": event_id}
+    rec = _terminal_report_record(job)
+    if rec.get("state") == "delivered" and rec.get("delivered_for") == key:
+        return {"action": "already-reported", "status": status}
+    attempts = 0
+    try:
+        attempts = int(rec.get("attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= TERMINAL_REPORT_MAX_ATTEMPTS:
+        return {"action": "report-exhausted", "status": status,
+                "attempts": attempts}
+    if _t3_terminal_already_posted(state_dir, request_id, event_id):
+        save_err = _save_report_or_log(
+            state_dir, request_id,
+            {"state": "delivered", "attempts": attempts + 1,
+             "status": status, "delivered_for": key,
+             "last_reason": "adopted prior T3 post",
+             "updated_at": core._utcnow()})
+        if save_err is not None:
+            return {"action": "report-error", "status": status,
+                    "attempts": attempts + 1, "reason": save_err}
+        return {"action": "reported", "status": status,
+                "attempts": attempts + 1}
+    text = _terminal_report_text(request_id, status, pr_url, reason,
+                                 job.get("handoff_summary"))
+    posted, detail = _post_planner_text_via_t3(
+        state_dir, request_id, text, T3_TERMINAL_POST_KIND,
+        ["t3", "terminal-post", event_id], t3_client)
+    if not posted:
+        save_err = _save_report_or_log(
+            state_dir, request_id,
+            {"state": "failed", "attempts": attempts + 1,
+             "status": status, "last_reason": detail,
+             "updated_at": core._utcnow()})
+        if save_err is not None:
+            return {"action": "report-error", "status": status,
+                    "attempts": attempts + 1, "reason": save_err}
+        return {"action": "report-failed", "status": status,
+                "attempts": attempts + 1, "reason": detail}
+    save_err = _save_report_or_log(
+        state_dir, request_id,
+        {"state": "delivered", "attempts": attempts + 1,
+         "status": status, "delivered_for": key, "last_reason": None,
+         "updated_at": core._utcnow()})
+    if save_err is not None:
+        return {"action": "report-error", "status": status,
+                "attempts": attempts + 1, "reason": save_err}
+    return {"action": "reported", "status": status,
+            "attempts": attempts + 1}
+
+
+def dispatch(state_dir, request_id: str, run_cmd=None, probe=None,
+             t3_client=None) -> dict:
     """Ensure Codex dispatch; persist the task ID before accepting.
 
     ``probe`` is an optional on-demand usage probe
@@ -846,6 +1509,10 @@ def dispatch(state_dir, request_id: str, run_cmd=None, probe=None) -> dict:
     """
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
+    if t3exec.is_t3_job(job):
+        return _dispatch_via_t3(state_dir, request_id,
+                                _full_luna_prompt(job["task_json"]),
+                                t3_client=t3_client)
     st = _load_controller_state(job)
     if job.get("codex_task_id") and st.get("seq"):
         return {"action": "already-dispatched", "codex_task_id": job["codex_task_id"],
@@ -1230,7 +1897,7 @@ def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
 
 
 def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
-                     run_cmd=None) -> dict:
+                     run_cmd=None, t3_client=None) -> dict:
     """Persist question before waking the planner; persist answer before resume.
 
     The planner wakes automatically in its own harness without human
@@ -1249,7 +1916,18 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
         _mark_blocked(state_dir, request_id, "missing planner session: refusing to fork a new session")
         return {"action": "blocked", "reason": "missing_planner_session"}
     harness_name = job.get("planner_harness") or "claude"
-    if harness_name not in ("claude", "codex", "opencode", "grok"):
+    if t3exec.is_t3_job(job):
+        # T3-hosted planners are messaged in-thread, never resumed by CLI.
+        try:
+            core.post_question(state_dir, request_id, qid, prompt,
+                               lease_token=_LEASE["token"])
+        except core.ConflictError as e:
+            _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
+            return {"action": "blocked", "reason": "question_conflict"}
+        question = _planner_question_text(request_id, qid, prompt, job)
+        return _planner_question_via_t3(state_dir, request_id, qid,
+                                        question, t3_client=t3_client)
+    if harness_name not in ("claude", "codex", "opencode", "grok", "t3"):
         _mark_blocked(state_dir, request_id,
                       f"planner_harness_unsupported: {harness_name!r} has no callback")
         return {"action": "blocked", "reason": "planner_harness_unsupported"}
@@ -1405,10 +2083,14 @@ def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> 
 
 
 def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
-                label: str = "CONTEXT") -> dict:
+                label: str = "CONTEXT", t3_client=None) -> dict:
     """Resume only the saved Luna task ID with new context (never fork)."""
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
+    if t3exec.is_t3_job(job):
+        return _resume_luna_via_t3(state_dir, request_id,
+                                   adapters.build_luna_followup(label, prompt),
+                                   t3_client=t3_client)
     task_id = job.get("codex_task_id")
     if not task_id:
         _mark_blocked(state_dir, request_id, "missing saved Codex task ID: refusing to fork")
@@ -1967,11 +2649,23 @@ def _turns_by_route(state_dir, request_id: str) -> dict:
             route = None
         if route:
             counts[route] = counts.get(route, 0) + 1
+    # T3 child-thread turns leave no local invocation rows: they count
+    # from the authoritative t3_threads map instead, so the one-turn rule
+    # holds on the T3 path too.
+    try:
+        threads = _t3_threads_map(core.get_job(state_dir, request_id))
+    except Exception:
+        threads = {}
+    for slot, rec in threads.items():
+        if isinstance(slot, str) and slot.startswith("impl_") \
+                and isinstance(rec, dict) and rec.get("route"):
+            counts[rec["route"]] = counts.get(rec["route"], 0) + 1
     return counts
 
 
 def run_implementation(state_dir, request_id: str, artifact: str | None = None,
-                       payload: dict | None = None, run_cmd=None) -> dict:
+                       payload: dict | None = None, run_cmd=None,
+                       t3_client=None) -> dict:
     """Run one implementation turn for the current dispatcher action.
 
     The turn runs on the job route's harness through the harness seam:
@@ -2001,7 +2695,11 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     prior_tries = [i for i in core._list_invocations(state_dir, request_id)
                    if i.get("kind") in harnesses.worker_control_kinds() and i.get("state") != "abandoned"
                    and _turn_seq(i) == seq]
-    attempted = bool(prior_tries)
+    # T3 child-thread turns leave no local invocation rows: an existing
+    # slot for this seq counts as an attempt, so preflight never moves a
+    # same-seq T3 retry away (mirroring the direct path's gate).
+    t3_attempted = _t3_thread_for(job, f"impl_{seq}") is not None
+    attempted = bool(prior_tries) or (t3exec.is_t3_job(job) and t3_attempted)
     if not attempted:
         move = _preflight_move(state_dir, request_id, route)
         if move is not None:
@@ -2037,6 +2735,18 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         env = res.get("envelope")
         return isinstance(env, dict) and env.get("signal") == "stalled"
     attempt = sum(1 for i in prior_tries if _turn_stalled(i))
+    if t3exec.is_t3_job(job):
+        # T3 execution path (#106): the worker turn runs as a T3 child
+        # thread of the planner thread on the route's provider, model and
+        # effort, then finishes through the shared worker tail.
+        try:
+            job = core.get_job(state_dir, request_id)
+            route = job.get("route") or route
+        except Exception:
+            pass
+        return _run_t3_worker_turn(state_dir, request_id, job, workspace,
+                                   route, prompt, seq, route_reason,
+                                   artifact, attempt, t3_client=t3_client)
     if harness.owned_server:
         return _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
                                   seq, route_reason, run_cmd, artifact, attempt)
@@ -2123,15 +2833,34 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
                   session_id=session_id,
                   output_text=json.dumps({k: full.get(k) for k in (
                       "ok", "rc", "quota", "finish", "actual_model")}, sort_keys=True))
+    return _finish_worker_turn(state_dir, request_id, job, route, seq,
+                               artifact, full, session_id, rc,
+                               source="opencode_control", cmd=cmd, meta=oc_meta)
+
+
+def _finish_worker_turn(state_dir, request_id, job, route, seq, artifact,
+                        full, session_id, rc, source, cmd=None,
+                        meta=None) -> dict:
+    """Shared worker-turn tail: reports, capacity moves, and ladder inputs.
+
+    Both the owned-server path and the T3 child-thread path
+    (toolboxmd/model-router#106) finish here from a supervisor-shaped
+    ``full`` dict, so reports, the escalation ladder, and the capacity
+    memory behave identically. T3 turns skip the local runtime-missing
+    check (no local spawn exists server-side); the T3 thread id travels
+    in the worker session field by the existing Grok precedent, with the
+    authoritative ``t3_threads`` map and ``t3_thread`` events alongside.
+    """
     # A turn that provably never started for a missing runtime blocks
     # recoverably with its cause and next action, before capacity-signal
     # handling, the escalation ladder, or a sticky implementation failure
     # could count an unstarted action as an ordinary provider failure or
     # move its explicit route.
-    runtime_blocked = _block_runtime_missing(state_dir, request_id, "opencode_control",
-                                             cmd, oc_meta)
-    if runtime_blocked is not None:
-        return runtime_blocked
+    if source != T3_TURN_KIND:
+        runtime_blocked = _block_runtime_missing(state_dir, request_id, source,
+                                                 cmd, meta)
+        if runtime_blocked is not None:
+            return runtime_blocked
     if rc == 0 and full.get("ok"):
         report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
         _set_phase(state_dir, request_id, phase="implemented",
@@ -2148,7 +2877,7 @@ def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
     evidence = full.get("free_exhaustion_evidence") or full.get("signal_evidence")
     signal = full.get("signal") or ("exhausted" if full.get("quota") else None)
     _persist_error_evidence(state_dir, request_id,
-                            {"source": "opencode_control", "rc": rc,
+                            {"source": source, "rc": rc,
                              "error": full.get("error"), "quota": full.get("quota"),
                              "signal": signal, "evidence": evidence,
                              "idle_confirmed": full.get("idle_confirmed"),
@@ -3316,7 +4045,7 @@ def _send_report_turn(run_cmd, cmd, workspace, kind, meta):
 
 
 def deliver_terminal_report(state_dir, request_id: str, run_cmd=None,
-                            sleep_fn=None) -> dict:
+                            sleep_fn=None, t3_client=None) -> dict:
     """Send one end-of-job report to the saved planner session.
 
     Runs after the terminal state is persisted and never changes the
@@ -3368,6 +4097,11 @@ def deliver_terminal_report(state_dir, request_id: str, run_cmd=None,
                 "attempts": attempts}
     planner_session = job.get("planner_session_id")
     harness_name = job.get("planner_harness") or "claude"
+    if t3exec.is_t3_job(job):
+        # T3-hosted planners get the terminal state as a message in the
+        # planner thread, replacing the harness-specific callback CLIs.
+        return _deliver_terminal_report_via_t3(state_dir, request_id,
+                                               t3_client=t3_client)
     if not planner_session:
         record = {"state": "skipped", "attempts": attempts, "status": status,
                   "last_reason": "missing planner session: refusing to fork a new session",
@@ -3378,7 +4112,7 @@ def deliver_terminal_report(state_dir, request_id: str, run_cmd=None,
                     "attempts": attempts, "reason": save_err}
         return {"action": "report-skipped", "reason": "missing_planner_session",
                 "status": status}
-    if harness_name not in ("claude", "codex", "opencode", "grok"):
+    if harness_name not in ("claude", "codex", "opencode", "grok", "t3"):
         record = {"state": "skipped", "attempts": attempts, "status": status,
                   "last_reason": f"planner_harness_unsupported: {harness_name!r} has no callback",
                   "updated_at": core._utcnow()}
@@ -4434,7 +5168,11 @@ def _step_inner(state_dir, request_id: str, run_cmd=None, token: str | None = No
         return {"action": "cancelled", "status": job["status"]}
     if job["status"] == "blocked":
         return {"action": "blocked", "reason": job.get("block_reason")}
-    if not job.get("codex_task_id") or not _load_controller_state(job).get("seq"):
+    # The dispatcher identity is the Codex task id on the direct path and
+    # the saved dispatcher child thread on the T3 path (#106).
+    dispatcher_saved = bool(job.get("codex_task_id")) or (
+        t3exec.is_t3_job(job) and _t3_thread_for(job, "dispatch") is not None)
+    if not dispatcher_saved or not _load_controller_state(job).get("seq"):
         return dispatch(state_dir, request_id, run_cmd=run_cmd)
     last = _load_controller_state(job).get("last_action")
     if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:

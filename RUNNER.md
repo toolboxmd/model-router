@@ -17,6 +17,22 @@ Use Python 3.11 or newer, Git, and authenticated harness CLIs for the routes you
 intend to execute. Keep the full Model Router plugin together. Install AgentsMD
 and the Skills, plugins, and MCP integrations named by the selected role kit;
 missing dependencies block that dispatch. No credentials ship in this package.
+For the T3 execution path (a job submitted with `--planner-t3-thread`),
+the runner talks to a T3 server's orchestration API
+(`POST /api/orchestration/dispatch`, per-thread snapshots): server URL from
+`--t3-server-url`, else `T3_SERVER_URL`, else `http://127.0.0.1:3773`; bearer
+token from `T3_SERVER_TOKEN`, else `t3 auth session issue` (honoring
+`T3_BIN` and `T3CODE_HOME`, `T3_HOME` accepted as an alias, so an isolated
+server with a `/tmp` home issues its own token). The token never lands in
+the ledger. Without a token the job blocks as `t3_unavailable` instead of
+silently running the direct path. Route-to-provider mapping is
+`runner/t3exec.py`: the instance id follows the route's harness (`codex`,
+`opencode`, `claudeAgent`, `grok`; overridable with
+`MODEL_ROUTER_T3_INSTANCE_<HARNESS>`), OpenCode routes keep their
+`provider/model` slug, and effort travels under each adapter's own option
+id (`reasoningEffort` for Codex and Grok, `effort` for Claude, `variant`
+plus the route's `agent` for OpenCode). The T3 server must have each
+route's provider enabled (OpenCode is off by default in T3 settings).
 The planner callback wakes the saved planner session in its own harness
 (Claude resume, Codex `exec resume`, OpenCode `run --session`, Grok Build
 `grok --resume` read-only in the user's own Grok home; only an explicit
@@ -36,7 +52,8 @@ development.
   --workspace PATH --planner-session SID \
   [--planner-model M] [--planner-effort E] [--lane L | --route R] [--max-attempts N] \
   [--timeout-secs S] [--job-kind ordinary|experiment|replay] [--replay-of ID] \
-  [--planner-harness claude|codex|opencode|grok] [--handoff-summary TEXT | --handoff-summary-file F] \
+  [--planner-harness claude|codex|opencode|grok|t3] [--handoff-summary TEXT | --handoff-summary-file F] \
+  [--planner-t3-thread TID] [--t3-server-url URL] \
   [--start | --no-start]
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR start --request-id ID
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR status --request-id ID
@@ -79,10 +96,11 @@ the planner session, then submit the remainder. `--start` launches a detached
 controller after the commit.
 `--job-kind` is `ordinary`, `experiment`, or `replay`; a replay names the
 request it repeats with `--replay-of`. `--planner-harness` names the harness
-hosting the planner session (`claude`, `codex`, `opencode`, or `grok`);
+hosting the planner session (`claude`, `codex`, `opencode`, `grok`, or `t3`);
 `--planner-session` carries that harness's session id (a Claude session, a
-Codex thread, an OpenCode session, or the Grok session id, resumed
-read-only with `grok --resume` in the user's own Grok home). Planner callbacks run in
+Codex thread, an OpenCode session, the Grok session id resumed
+read-only with `grok --resume` in the user's own Grok home, or a T3 thread
+id). Planner callbacks run in
 the job workspace.
 `--handoff-summary` (or `--handoff-summary-file`) stores the durable handoff
 summary on the job; without it the summary is derived from the task packet
@@ -117,6 +135,54 @@ job like any other payload field.
 evidence, plus the latest usage-probe Reading per pool, model, and window.
 `--clear ROUTE` is an operator action after checking the provider
 allowance; the runner never invents a reset time.
+
+### T3 execution path
+
+`submit --planner-t3-thread TID` selects the T3 execution path
+(toolboxmd/model-router#106) instead of the direct CLI path: every
+dispatcher and worker invocation runs as a T3 child thread of that
+planner thread, created through `POST /api/orchestration/dispatch` on
+the route's provider, model and effort. Until the fork parent link lands
+(toolboxmd/t3code#8) a child id follows the spike convention
+`sub.<parent>.<suffix>` and the create payload also carries
+`parentThreadId`, so a fork server honors the link either way. The
+child's first message names the job and links the parent thread. Policy,
+capacity probes, the ledger, the controller, and dispatcher envelope
+handling are unchanged: the same routes, preflight, exhaustion fallback,
+escalation ladder, reports, and proof binding apply; only the turn
+transport differs.
+
+Liveness is activity-based, not a fixed silence window: a turn is
+healthy while assistant tokens stream (the message's `updatedAt`
+advances) or a tool or task call is open (`tool.started` until its
+`tool.completed`/`tool.denied`, `task.started` until `task.completed`), so
+a long test run is never a stall. A tool held behind an unresolved
+approval or user-input request is not running. Silence with no running
+tool past about a minute (`T3_SILENCE_SECS`, 60) is flagged and probed
+immediately with a fresh snapshot read; explicit provider errors,
+including a provider that refuses to start the turn at all, act at once.
+A message posted onto an existing thread (a resumed dispatcher, a
+continued worker, a planner question) is watched only through the turn
+it starts, never an earlier completed turn. Dispatcher children run in
+T3's default interaction mode with runtime `auto`; worker children run
+`full-access`. After a T3 server restart with `continueThreadsAfterServerUpdate`
+on, interrupted Claude, Codex and OpenCode turns continue on the same
+thread while Grok turns are re-sent by the router.
+
+The terminal state (ready to merge with the PR URL, or blocked/failed/
+cancelled with the reason) is posted into the planner thread as a
+message, replacing the harness-specific callback CLIs for T3-hosted
+planners. Mid-job dispatcher questions go into the planner thread the same
+way (`thread.turn.start`, so they appear in the thread the person has
+open) and the planner's reply in that turn is read back from the thread as
+the answer; no second headless process ever resumes the planner session.
+The posted message id is recorded first, so a recovering controller adopts
+the same post instead of asking twice. A reply that never comes (provider
+error, silence, unreachable T3) leaves the question pending for `answer`
+plus `recover`. The direct CLI path stays the fallback for every job that
+names no planner T3 thread, and a planner hosted in T3 must submit with
+`--planner-t3-thread`: without it the runner cannot know the session lives
+in T3 and resumes it headlessly through the harness callback.
 
 ## Flow
 
@@ -190,7 +256,9 @@ allowance; the runner never invents a reset time.
      forks a fresh answer: it blocks as `missing_planner_session`. The Astra fallback never resumes:
      it answers from the handoff summary in a fresh session with no resume
      (`controller.astra_fallback_prompt`), persisted the same way.
-     `questions` and `answer` stay as an optional human override.
+      `questions` and `answer` stay as an optional human override.
+      A T3-hosted planner is messaged in its planner thread instead of
+      resumed by CLI; its in-thread reply is the answer.
 4. The answer is saved, then the same Luna task resumes with `codex exec
    resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
    sandbox_mode="read-only"`. A resume that reports another thread, or none,
@@ -234,10 +302,11 @@ allowance; the runner never invents a reset time.
     correction and recovery update that PR, never open a second, and the
     worker prompt carries it. Recovery refuses the same way when it
     consumes a completion.
-    Every terminal state (succeeded, blocked, failed, cancelled) then wakes
-    the saved planner once with an end-of-job report through the same
-    callback path (Claude resume, Codex `exec resume`, OpenCode
-    `run --session`, Grok read-only `--resume`). The
+     Every terminal state (succeeded, blocked, failed, cancelled) then wakes
+     the saved planner once with an end-of-job report through the same
+     callback path (Claude resume, Codex `exec resume`, OpenCode
+     `run --session`, Grok read-only `--resume`; a T3-hosted planner gets
+     the report as a message in its planner thread instead). The
     report carries the request id, terminal status, PR URL or reason, and
     handoff summary; a succeeded report says ready to merge with the PR
     URL. Delivery runs after the terminal persist and never changes the

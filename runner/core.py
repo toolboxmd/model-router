@@ -33,6 +33,7 @@ from . import harnesses
 from . import policy
 from . import runtime
 from . import store
+from . import t3exec
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 HEARTBEAT_FRESH_SECS = 15.0
@@ -2102,7 +2103,24 @@ JOB_KINDS = ("ordinary", "experiment", "replay")
 # Grok Build --resume read-only in the user's own Grok home); only an
 # explicit recorded fallback for an unresumable Grok session answers
 # from a fresh read-only session seeded with the stored handoff summary.
-PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok")
+PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok", "t3")
+
+
+def _dispatcher_saved(job) -> bool:
+    """A saved dispatcher to continue: the Codex task id on the direct
+    path, or the dispatcher child thread on the T3 path (#106)."""
+    try:
+        if job["codex_task_id"]:
+            return True
+        planner_thread = job["planner_t3_thread"]
+        state = json.loads(job["controller_state"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+    if not planner_thread or not isinstance(state, dict):
+        return False
+    threads = state.get("t3_threads")
+    rec = threads.get("dispatch") if isinstance(threads, dict) else None
+    return isinstance(rec, dict) and bool(rec.get("thread_id"))
 
 
 def _workspace_head(workspace: str | None) -> str | None:
@@ -2559,13 +2577,15 @@ def submit(state_dir, request_id: str, task, workspace: str,
            lane: str | None = None,
            job_kind: str = "ordinary", replay_of: str | None = None,
            planner_harness: str = "claude",
-           handoff_summary: str | None = None) -> dict:
+           handoff_summary: str | None = None,
+           planner_t3_thread: str | None = None,
+           t3_server_url: str | None = None) -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Built-in defaults mean no executor/callback commands are required:
     only the prepared task, workspace, stable request ID, and original
     planner session ID are needed. The planner session may live in any
-    supported harness (claude, codex, opencode, grok); its harness and
+    supported harness (claude, codex, opencode, grok, t3); its harness and
     session ID are recorded so dispatcher questions wake it there.
     Planner model/effort default to the policy's planning route and may
     be overridden explicitly. The handoff summary is stored on the job
@@ -2573,6 +2593,15 @@ def submit(state_dir, request_id: str, task, workspace: str,
     callback prompt can carry it. Planner callbacks run in the job
     workspace. ``timeout_secs`` is a legacy compatibility slot, recorded
     but never enforced: jobs carry no age deadline since #88.
+
+    ``planner_t3_thread`` selects the T3 execution path
+    (toolboxmd/model-router#106): dispatcher and worker invocations run
+    as T3 child threads of that planner thread, and the terminal state
+    is posted back into it as a message, replacing the harness-specific
+    callback CLIs. ``t3_server_url`` optionally pins the T3 server;
+    otherwise discovery applies (explicit flag, T3_SERVER_URL, default).
+    The bearer token never lands in the ledger: it comes from
+    T3_SERVER_TOKEN or ``t3 auth session issue`` at turn time.
     """
     _validate_request_id(request_id)
     if not planner_session_id:
@@ -2620,6 +2649,17 @@ def submit(state_dir, request_id: str, task, workspace: str,
         raise ValueError("replay_of applies to replay jobs only")
     if planner_harness not in PLANNER_HARNESSES:
         raise ValueError(f"planner_harness must be one of {', '.join(PLANNER_HARNESSES)}")
+    # T3 execution path (toolboxmd/model-router#106): naming a planner T3
+    # thread selects it. The token never lands in the ledger.
+    if planner_t3_thread is not None:
+        planner_t3_thread = t3exec.validate_thread_id(planner_t3_thread)
+    t3_url = None
+    if t3_server_url is not None:
+        t3_url = t3_server_url.strip().rstrip("/")
+        if not t3_url:
+            raise ValueError("t3_server_url must not be blank")
+    if t3_url is not None and planner_t3_thread is None:
+        raise ValueError("t3_server_url needs --planner-t3-thread: it pins the T3 server only")
     # Planner defaults come from the first route in the policy's planning
     # stage; explicit overrides are preserved verbatim. Never fork a new
     # session implicitly.
@@ -2690,6 +2730,20 @@ def submit(state_dir, request_id: str, task, workspace: str,
             except Exception:
                 _hs = None
             if _hs is not None and _hs != summary:
+                same = False
+            # T3 path fields participate when already persisted (NULL =
+            # wildcard for pre-#106 rows so baseline idempotency holds).
+            try:
+                _t3t = existing["planner_t3_thread"]
+            except Exception:
+                _t3t = None
+            if _t3t is not None and (_t3t or None) != planner_t3_thread:
+                same = False
+            try:
+                _t3u = existing["t3_server_url"]
+            except Exception:
+                _t3u = None
+            if _t3u is not None and (_t3u or None) != t3_url:
                 same = False
             # An explicit route that differs is a different payload; a sticky
             # resubmission with the same payload returns the stored job.
@@ -2796,15 +2850,17 @@ def submit(state_dir, request_id: str, task, workspace: str,
             "INSERT INTO jobs(request_id,task_json,task_hash,workspace,policy_id,planner_session_id,"
             "executor_session_id,output_path,status,route,cancel_requested,attempts,max_attempts,timeout_secs,created_at,"
             "updated_at,planner_model,planner_effort,adapter,model,effort,planner_cwd,lane,"
-            "job_kind,replay_of,planner_harness,base_commit,handoff_summary)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "job_kind,replay_of,planner_harness,base_commit,handoff_summary,"
+            "planner_t3_thread,t3_server_url)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
               policy.worker_model_variant(route)[0],
               policy.worker_model_variant(route)[1] or "default", pcwd, lane_stage,
-             job_kind, replay_of, planner_harness, base_commit, summary),
+             job_kind, replay_of, planner_harness, base_commit, summary,
+             planner_t3_thread, t3_url),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
@@ -2842,7 +2898,9 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      lane: str | None = None,
                      job_kind: str = "ordinary", replay_of: str | None = None,
                      planner_harness: str = "claude",
-                     handoff_summary: str | None = None) -> dict:
+                     handoff_summary: str | None = None,
+                     planner_t3_thread: str | None = None,
+                     t3_server_url: str | None = None) -> dict:
     """Persist first, then launch the controller.
 
     The durable row commits before any spawn, so controller death leaves
@@ -2857,7 +2915,9 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                  timeout_secs=timeout_secs, planner_model=planner_model,
                  planner_effort=planner_effort,
                  lane=lane, job_kind=job_kind, replay_of=replay_of,
-                 planner_harness=planner_harness, handoff_summary=handoff_summary)
+                 planner_harness=planner_harness, handoff_summary=handoff_summary,
+                 planner_t3_thread=planner_t3_thread,
+                 t3_server_url=t3_server_url)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.
@@ -3936,7 +3996,7 @@ def recover_one(state_dir, request_id: str) -> dict:
                 and pending_q > 0)
             if pending_q > 0 and (status == "question_pending" or runtime_missing_block
                                   or recovery_exhausted_block) \
-                    and job["codex_task_id"] \
+                    and _dispatcher_saved(job) \
                     and int(job["attempts"]) < int(job["max_attempts"]):
                 # The controller asks the saved planner again through the
                 # same action identity: a finished callback is reused. The
@@ -3979,7 +4039,7 @@ def recover_one(state_dir, request_id: str) -> dict:
             # A dispatch that provably never started for a missing runtime
             # is resumed as well: its rows prove no child ran, so the new
             # controller remakes the action fresh without duplicating.
-            should_resume = bool(job["codex_task_id"]) or any(
+            should_resume = _dispatcher_saved(job) or any(
                 _is_dispatch_row(i) and i.get("state") == "completed"
                 for i in _list_invocations(state_dir, request_id))
             runtime_recovery = _has_runtime_missing_failure(state_dir, request_id)

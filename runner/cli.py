@@ -105,8 +105,15 @@ def main(argv=None) -> int:
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
-    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex", "opencode", "grok"),
+    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex", "opencode", "grok", "t3"),
                    help="harness that hosts the planner session (its session id goes in --planner-session)")
+    p.add_argument("--planner-t3-thread", default=None,
+                   help="planner T3 thread id: selects the T3 execution path (#106), running "
+                        "dispatcher and worker turns as its child threads and posting the "
+                        "terminal state back into it; without it the direct CLI path applies")
+    p.add_argument("--t3-server-url", default=None,
+                   help="T3 server URL for the T3 path (default: T3_SERVER_URL or "
+                        "http://127.0.0.1:3773); needs --planner-t3-thread")
     p.add_argument("--handoff-summary", default=None,
                    help="durable handoff summary stored on the job (default: derived from the task packet)")
     p.add_argument("--handoff-summary-file", default=None,
@@ -179,7 +186,9 @@ def main(argv=None) -> int:
                                             lane=args.lane, job_kind=args.job_kind,
                                             replay_of=args.replay_of,
                                             planner_harness=args.planner_harness,
-                                            handoff_summary=handoff_summary)
+                                            handoff_summary=handoff_summary,
+                                            planner_t3_thread=args.planner_t3_thread,
+                                            t3_server_url=args.t3_server_url)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
@@ -190,7 +199,9 @@ def main(argv=None) -> int:
                                   lane=args.lane, job_kind=args.job_kind,
                                   replay_of=args.replay_of,
                                   planner_harness=args.planner_harness,
-                                  handoff_summary=handoff_summary)
+                                  handoff_summary=handoff_summary,
+                                  planner_t3_thread=args.planner_t3_thread,
+                                  t3_server_url=args.t3_server_url)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
                          "policy": job["policy_id"]})

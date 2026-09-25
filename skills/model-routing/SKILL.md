@@ -41,9 +41,16 @@ owning submission and any work outside Router; a shared planner session is not
 exclusive to a job. Preserve both identities in the existing handoff. Missing
 capture remains a measurement gap and does not block other authorized work.
 
-A planner in any supported harness (Claude Code, Codex, OpenCode, Grok Build)
-can submit a job: pass that harness's session id as --planner-session with
---planner-harness, with no planner working directory. The dispatcher wakes the
+A planner in any supported harness (Claude Code, Codex, OpenCode, Grok Build,
+or a T3 thread) can submit a job: pass that harness's session id as
+--planner-session with --planner-harness, with no planner working
+directory. A planner working in T3 adds --planner-t3-thread with its T3
+thread id: dispatcher and worker turns then run as that thread's child
+threads on the route's provider, model and effort, dispatcher questions and
+the terminal state land in the planner thread as messages, and the planner's
+in-thread reply is the answer. A planner hosted in T3 must pass
+--planner-t3-thread; without it the runner resumes the session headlessly
+and the exchange never appears in the open thread. The dispatcher wakes the
 saved planner automatically in its own harness whenever its judgment is needed;
 `questions` and `answer` stay as an optional human override. Never invent a
 session id or substitute another session's id. On Codex, also read [native ticket review](references/codex-host.md)
