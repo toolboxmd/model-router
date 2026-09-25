@@ -18,14 +18,15 @@ import sys
 from pathlib import Path
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.7.1"
+POLICY_VERSION = "2.8.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), #28/#29 (role kits, 2026-09-20), "
                  "#34 (usage probes, 2026-09-20), #38 (planner handoff, 2026-09-20), "
                  "#17 (Opus 5.5, human request, 2026-09-23), "
                  "#62 (manual-only dispatch route removed, human direction, 2026-09-23), "
-                 "and #88 (no elapsed deadline for agent turns or jobs, human direction, 2026-09-24)")
+                 "#88 (no elapsed deadline for agent turns or jobs, human direction, 2026-09-24), "
+                 "and #96 (Grok planner session resume, human direction, 2026-09-24)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/29"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -1843,10 +1844,11 @@ def render_skill_table() -> str:
         "the selected route is unavailable, stop that dispatch with the reason.",
         "- Every callback prompt carries the stored handoff summary before "
         "the question. The dispatcher wakes the saved planner automatically "
-        "in its own harness: Claude, Codex, and OpenCode resume the saved "
-        "session (the answer counts only from that session), while a harness "
-        "without resume (such as Grok Build) answers from a fresh session "
-        "seeded with the summary; `questions` and `answer` stay as an "
+        "in its own harness: Claude, Codex, OpenCode, and Grok Build resume "
+        "the saved session read-only (the answer counts only from that "
+        "session; Grok answers from a fresh read-only session only as an "
+        "explicit recorded fallback when the saved session cannot resume); "
+        "`questions` and `answer` stay as an "
         "optional human override. The Claude `claude_callback` invocation "
         "records input, cache-read, and cache-creation tokens so the resumed "
         "context is visible per job; the Astra fallback answers from the handoff "

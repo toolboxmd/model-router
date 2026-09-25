@@ -834,6 +834,354 @@ class WorkerKit(unittest.TestCase):
                          f'"{self.src}/bin/project-direction" hook')
 
 
+def _grok_callback_ok(sid, text="Yes, ship it."):
+    return 0, json.dumps({"text": text, "stopReason": "end_turn",
+                          "sessionId": sid, "num_turns": 1,
+                          "model": "grok-4.6"}) + "\n", ""
+
+
+def _grok_callback_error(message="session not found, resume refused"):
+    return 1, json.dumps({"type": "error", "message": message}) + "\n", ""
+
+
+class GrokPlannerCallback(GrokBase):
+    """Grok planner callbacks resume the saved session read-only (#96).
+
+    Injected run_cmd only: no live model CLIs. Covers command shape
+    (resume, read-only flags, no --always-approve), saved-session
+    identity, callback cwd, user-home/kit isolation, the handoff
+    summary before the question, and the explicit fallback/block
+    evidence for missing or unresumable sessions.
+    """
+
+    def _submit_grok_planner(self, rid="gp1", sid="ses_plan_9"):
+        return core.submit(self.sd, rid, {"goal": "t"}, str(self.ws), sid,
+                           planner_harness="grok",
+                           handoff_summary="Decisions: ship it.")
+
+    def test_builder_resumes_read_only_without_worker_flags(self):
+        cmd = adapters.build_grok_planner_cmd("ses_plan_1", "Q?", "/tmp/ws")
+        self.assertEqual(cmd[0], "grok")
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "ses_plan_1")
+        self.assertEqual(cmd[cmd.index("-p") + 1], "Q?")
+        self.assertEqual(cmd[cmd.index("--cwd") + 1], "/tmp/ws")
+        self.assertIn("--verbatim", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
+        self.assertIn("--no-subagents", cmd)
+        self.assertIn("--disable-web-search", cmd)
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "json")
+        self.assertNotIn("--always-approve", cmd)
+        self.assertNotIn("-m", cmd)
+        self.assertNotIn("--effort", cmd)
+        with self.assertRaises(ValueError):
+            adapters.build_grok_planner_cmd("", "Q?", "/tmp/ws")
+        with self.assertRaises(ValueError):
+            adapters.build_grok_planner_cmd("ses_plan_1", "", "/tmp/ws")
+
+    def test_fallback_builder_is_fresh_read_only(self):
+        cmd = adapters.build_grok_planner_fallback_cmd("Q?", "/tmp/ws")
+        self.assertEqual(cmd[0], "grok")
+        self.assertNotIn("--resume", cmd)
+        self.assertNotIn("--always-approve", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
+        self.assertEqual(harnesses.kind_for_cmd(cmd), "grok_callback")
+
+    def test_kind_inference_keeps_worker_turns_on_control(self):
+        resume_cmd = adapters.build_grok_planner_cmd("ses_plan_1", "Q?", "/tmp/ws")
+        self.assertEqual(harnesses.kind_for_cmd(resume_cmd), "grok_callback")
+        worker_cmd, _env = adapters.build_grok_cmd("do", "/tmp/ws", "grok-4.6", "medium")
+        self.assertEqual(harnesses.kind_for_cmd(worker_cmd), "grok_control")
+        self.assertEqual(harnesses.kind_for_cmd(["grok", "-p", "x"]), "grok_control")
+
+    def test_callback_resumes_saved_session_read_only(self):
+        self._submit_grok_planner()
+        seen = {}
+
+        def fake(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            seen["cmd"] = list(cmd)
+            seen["cwd"] = cwd
+            seen["kind"] = kind
+            seen["meta"] = dict(meta or {})
+            pending = core.list_questions(self.sd, "gp1", only_pending=True)
+            assert len(pending) == 1 and pending[0]["prompt"] == "Ship now?"
+            return _grok_callback_ok("ses_plan_9")
+
+        res = controller.planner_callback(self.sd, "gp1", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "answered")
+        cmd = seen["cmd"]
+        self.assertEqual(seen["kind"], "grok_callback")
+        self.assertEqual(seen["cwd"],
+                         core.get_job(self.sd, "gp1")["workspace"])
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "ses_plan_9")
+        self.assertNotIn("--always-approve", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
+        self.assertIn("--no-subagents", cmd)
+        self.assertIn("--disable-web-search", cmd)
+        prompt = cmd[cmd.index("-p") + 1]
+        self.assertIn("HANDOFF SUMMARY", prompt)
+        self.assertIn("Decisions: ship it.", prompt)
+        self.assertIn("Ship now?", prompt)
+        self.assertLess(prompt.index("Decisions: ship it."),
+                        prompt.index("Ship now?"))
+        # The ordinary resume path carries no fallback marker.
+        self.assertNotIn("grok_resume", seen["meta"])
+        qs = core.list_questions(self.sd, "gp1", only_pending=False)
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["status"], "answered")
+        self.assertEqual(qs[0]["answer"], "Yes, ship it.")
+
+    def test_callback_mismatch_blocks_without_fallback(self):
+        self._submit_grok_planner()
+        calls = []
+
+        def fake(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            calls.append(list(cmd))
+            return _grok_callback_ok("ses_other")
+
+        res = controller.planner_callback(self.sd, "gp1", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(res["reason"], "planner_session_mismatch")
+        # A reported mismatch never hides behind a fresh fallback.
+        self.assertEqual(len(calls), 1)
+        job = core.get_job(self.sd, "gp1")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("planner_session_mismatch", job["block_reason"])
+        pending = core.list_questions(self.sd, "gp1", only_pending=True)
+        self.assertEqual(len(pending), 1)
+
+    def test_callback_resume_failure_falls_back_explicitly(self):
+        self._submit_grok_planner(rid="gp4")
+        calls = []
+
+        def fake(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            calls.append({"cmd": list(cmd), "meta": dict(meta or {})})
+            if "--resume" in cmd:
+                return _grok_callback_error()
+            return _grok_callback_ok("ses_fresh_1", "Fallback answer.")
+
+        res = controller.planner_callback(self.sd, "gp4", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "answered")
+        self.assertEqual(len(calls), 2)
+        first, second = calls
+        self.assertEqual(first["cmd"][first["cmd"].index("--resume") + 1],
+                         "ses_plan_9")
+        self.assertNotIn("--resume", second["cmd"])
+        self.assertNotIn("--always-approve", second["cmd"])
+        self.assertEqual(second["cmd"][second["cmd"].index("--tools") + 1], "")
+        self.assertEqual(second["cmd"][second["cmd"].index("--permission-mode") + 1],
+                         "plan")
+        self.assertNotIn("grok_resume", first["meta"])
+        self.assertEqual(second["meta"].get("grok_resume"), "fallback")
+        self.assertTrue(second["meta"].get("resume_error"))
+        # The fallback is recorded where status/result readers look.
+        con = store.connect(self.sd)
+        try:
+            rows = con.execute(
+                "SELECT kind, payload_json FROM events WHERE request_id='gp4'").fetchall()
+        finally:
+            con.close()
+        fallback = [json.loads(r["payload_json"]) for r in rows
+                    if r["kind"] == "grok_planner_fallback"]
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(fallback[0]["qid"], "q1")
+        self.assertTrue(fallback[0]["resume_error"])
+        self.assertEqual(fallback[0]["fallback_session"], "ses_fresh_1")
+        qs = core.list_questions(self.sd, "gp4", only_pending=False)
+        self.assertEqual(qs[0]["answer"], "Fallback answer.")
+
+    def test_callback_blocks_when_fallback_fails(self):
+        self._submit_grok_planner(rid="gp5")
+
+        def fake(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            return _grok_callback_error("still failing")
+
+        res = controller.planner_callback(self.sd, "gp5", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(res["reason"], "grok_planner_resume_failed")
+        job = core.get_job(self.sd, "gp5")
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("grok_planner_resume_failed", job["block_reason"])
+        self.assertIn("still failing", job["block_reason"])
+        pending = core.list_questions(self.sd, "gp5", only_pending=True)
+        self.assertEqual(len(pending), 1)
+
+    def test_missing_planner_session_never_forks(self):
+        self._submit_grok_planner(rid="gp6")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET planner_session_id='' WHERE request_id='gp6'")
+            con.commit()
+        finally:
+            con.close()
+        calls = []
+
+        def fake(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            calls.append(list(cmd))
+            return _grok_callback_ok("ses_fresh_9")
+
+        res = controller.planner_callback(self.sd, "gp6", "q1",
+                                          "Ship now?", run_cmd=fake)
+        self.assertEqual(res["action"], "blocked")
+        self.assertEqual(res["reason"], "missing_planner_session")
+        self.assertEqual(calls, [])
+
+    def test_callback_uses_user_home_never_kit(self):
+        h = harnesses.harness_named("grok")
+        inv = {"kind": "grok_callback", "request_id": "gp7",
+               "invocation_id": "inv-gp7",
+               "stdout_path": str(self.base / "o"),
+               "meta_json": json.dumps({"qid": "q1", "stage": "planning"})}
+        root = store.ensure_state_dir(self.sd)
+        before = {p.relative_to(root).as_posix()
+                  for p in root.rglob("*") if p.is_file()}
+        env = {"GROK_HOME": "/user/grok-home",
+               "MODEL_ROUTER_GROK_HOME": "/user/grok-override",
+               "PATH": os.environ.get("PATH", "")}
+        out_env, password = h.spawn_spec(inv, env)
+        self.assertIsNone(password)
+        # The caller's home (including an explicit override) passes
+        # through untouched: the planner session lives there.
+        self.assertEqual(out_env["GROK_HOME"], "/user/grok-home")
+        self.assertEqual(out_env["MODEL_ROUTER_GROK_HOME"], "/user/grok-override")
+        after = {p.relative_to(root).as_posix()
+                 for p in root.rglob("*") if p.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((root / "kits").exists())
+        # Without an override nothing is injected either: ~/.grok resolves.
+        out_plain, _ = h.spawn_spec(inv, {"PATH": os.environ.get("PATH", "")})
+        self.assertNotIn("GROK_HOME", out_plain)
+
+    def test_harness_identity_for_callback(self):
+        h = harnesses.harness_named("grok")
+        job = {"planner_session_id": "ses_plan_9"}
+        ok_same = json.dumps({"text": "A", "stopReason": "end_turn",
+                              "sessionId": "ses_plan_9"})
+        self.assertEqual(h.planner_answer("grok_callback", ok_same,
+                                          {"qid": "q1"}, job), ("q1", "A"))
+        ok_other = json.dumps({"text": "A", "stopReason": "end_turn",
+                               "sessionId": "ses_other"})
+        self.assertIsNone(h.planner_answer("grok_callback", ok_other,
+                                           {"qid": "q1"}, job))
+        # The explicit fallback is accepted despite the fresh session.
+        self.assertEqual(h.planner_answer("grok_callback", ok_other,
+                                          {"qid": "q1",
+                                           "grok_resume": "fallback"}, job),
+                         ("q1", "A"))
+        self.assertIn("mismatch", h.callback_failure_reason(
+            "grok_callback", 0, ok_other, job) or "")
+        self.assertIsNone(h.callback_failure_reason(
+            "grok_callback", 0, ok_other, job,
+            {"qid": "q1", "grok_resume": "fallback"}))
+        self.assertIn("planner_callback_failed", h.callback_failure_reason(
+            "grok_callback", 1, "no json\n", job) or "")
+
+
+class GrokPlannerDurable(GrokBase):
+    """Fake-binary drills: the durable callback runs in the user home."""
+
+    def _setup_callback(self, rid="gpd1", extra_env=None):
+        write_fake(self._bindir(), "grok", FAKE_GROK, PY)
+        prev_home = os.environ.get("GROK_HOME")
+        prev_resume_fail = os.environ.get("FAKE_GROK_RESUME_FAIL")
+        env = self._env(FAKE_GROK_MODE="ok")
+        if extra_env:
+            env.update(extra_env)
+        for k, v in env.items():
+            os.environ[k] = v
+        user_home = str(self.base / "user-grok-home")
+        os.makedirs(user_home, exist_ok=True)
+        os.environ["GROK_HOME"] = user_home
+
+        def _restore_home():
+            if prev_home is None:
+                os.environ.pop("GROK_HOME", None)
+            else:
+                os.environ["GROK_HOME"] = prev_home
+            if prev_resume_fail is None:
+                os.environ.pop("FAKE_GROK_RESUME_FAIL", None)
+            else:
+                os.environ["FAKE_GROK_RESUME_FAIL"] = prev_resume_fail
+
+        self.addCleanup(_restore_home)
+        core.submit(self.sd, rid, {"goal": "durable grok callback"}, str(self.ws),
+                    "ses_plan_d1", planner_harness="grok",
+                    handoff_summary="Decisions: ship it.")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET owner_token='tok' WHERE request_id=?", (rid,))
+            con.commit()
+        finally:
+            con.close()
+        self.addCleanup(self._kill_groups, rid)
+        return core.make_durable_run_cmd(self.sd, rid, "tok"), user_home
+
+    def test_durable_callback_resumes_in_user_home(self):
+        run, user_home = self._setup_callback("gpd1")
+        res = controller.planner_callback(self.sd, "gpd1", "q1",
+                                          "Ship now?", run_cmd=run)
+        self.assertEqual(res["action"], "answered")
+        calls = grok_calls(str(self.base / "fakestate"))
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["argv"][call["argv"].index("--resume") + 1],
+                         "ses_plan_d1")
+        self.assertNotIn("--always-approve", call["argv"])
+        self.assertEqual(call["argv"][call["argv"].index("--tools") + 1], "")
+        # The fake logs its resolved cwd (/private/var on macOS): compare
+        # resolved paths, since the callback runs with the workspace as cwd.
+        self.assertEqual(os.path.realpath(call["cwd"]),
+                         os.path.realpath(str(self.ws)))
+        # The child observed the caller's home, not a runner kit.
+        self.assertEqual(call["grok_home"], user_home)
+        self.assertNotIn("kits", call["grok_home"])
+        self.assertFalse((Path(self.sd) / "kits").exists())
+        prompt = call["argv"][call["argv"].index("-p") + 1]
+        self.assertLess(prompt.index("Decisions: ship it."),
+                        prompt.index("Ship now?"))
+        qs = core.list_questions(self.sd, "gpd1", only_pending=False)
+        self.assertEqual(qs[0]["answer"], "IMPLEMENTED by fake grok worker")
+        invs = [i for i in core._list_invocations(self.sd, "gpd1")
+                if i["kind"] == "grok_callback"]
+        self.assertEqual(len(invs), 1)
+        self.assertNotIn("grok_resume", json.loads(invs[0]["meta_json"]))
+
+    def test_durable_callback_fallback_is_recorded(self):
+        run, user_home = self._setup_callback(
+            "gpd2", extra_env={"FAKE_GROK_RESUME_FAIL": "1"})
+        res = controller.planner_callback(self.sd, "gpd2", "q1",
+                                          "Ship now?", run_cmd=run)
+        self.assertEqual(res["action"], "answered")
+        calls = grok_calls(str(self.base / "fakestate"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--resume", calls[0]["argv"])
+        self.assertNotIn("--resume", calls[1]["argv"])
+        self.assertNotIn("--always-approve", calls[1]["argv"])
+        for call in calls:
+            self.assertEqual(call["grok_home"], user_home)
+        invs = [i for i in core._list_invocations(self.sd, "gpd2")
+                if i["kind"] == "grok_callback"]
+        self.assertEqual(len(invs), 2)
+        metas = [json.loads(i["meta_json"]) for i in invs]
+        self.assertNotIn("grok_resume", metas[0])
+        self.assertEqual(metas[1].get("grok_resume"), "fallback")
+        self.assertTrue(metas[1].get("resume_error"))
+        con = store.connect(self.sd)
+        try:
+            rows = con.execute(
+                "SELECT kind, payload_json FROM events WHERE request_id='gpd2'").fetchall()
+        finally:
+            con.close()
+        fallback = [r for r in rows if r["kind"] == "grok_planner_fallback"]
+        self.assertEqual(len(fallback), 1)
+
+
 class GrokStore(unittest.TestCase):
     def test_jobs_carry_a_grok_session(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

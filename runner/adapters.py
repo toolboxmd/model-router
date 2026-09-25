@@ -843,6 +843,11 @@ def build_grok_cmd(prompt: str, workspace: str, model: str = GROK_MODEL,
     ``grok_kit_env``); empty when no kit directory is given. The live
     turn's kit arrives via the harness ``spawn_spec``; this ``env`` is the
     manual-run equivalent.
+
+    Planner callbacks never use this builder: they resume the saved
+    planner session read-only in the user's own Grok home through
+    :func:`build_grok_planner_cmd` (or the explicit recorded fallback
+    :func:`build_grok_planner_fallback_cmd`), without ``--always-approve``.
     """
     if not workspace:
         raise ValueError("missing workspace for grok worker turn")
@@ -932,6 +937,57 @@ def parse_grok_result(stdout: str) -> dict:
 
 
 
+
+
+# Read-only posture for Grok planner callbacks (Grok Build 1.0.41),
+# matching the Claude callback's no-tools stance as closely as Grok
+# allows: no tools, plan permission mode, no subagents, no web access.
+# The worker command's ``--always-approve`` never appears here, so a
+# planner turn answers from the saved session and takes no actions.
+GROK_PLANNER_PERMISSION_MODE = "plan"
+
+
+def _grok_planner_base_cmd(prompt: str, workspace: str) -> list[str]:
+    """Shared read-only planner argv (no ``--resume`` yet)."""
+    if not prompt:
+        raise ValueError("missing prompt for grok planner callback")
+    if not workspace:
+        raise ValueError("missing workspace for grok planner callback")
+    return [GROK_BIN, "-p", prompt, "--verbatim", "--cwd", workspace,
+            "--tools", "", "--permission-mode", GROK_PLANNER_PERMISSION_MODE,
+            "--no-subagents", "--disable-web-search",
+            "--output-format", "json"]
+
+
+def build_grok_planner_cmd(planner_session_id: str, prompt: str,
+                           workspace: str) -> list[str]:
+    """Resume the saved Grok planner session for one question, read-only.
+
+    ``grok --resume SID -p PROMPT --verbatim --cwd WS --tools ""
+    --permission-mode plan --no-subagents --disable-web-search
+    --output-format json`` in the job workspace, against the user's own
+    Grok home (where the planner session lives), never a runner kit.
+    The resumed session keeps its own model: no ``-m``/``--effort``
+    override, like the Codex and OpenCode planner callbacks. Missing
+    session is a caller error, so the runner never forks a fresh
+    session silently; the JSON result lets the caller verify the
+    resumed session identity.
+    """
+    if not planner_session_id:
+        raise ValueError("missing planner session ID: refusing to fork a new session")
+    cmd = _grok_planner_base_cmd(prompt, workspace)
+    return [cmd[0], "--resume", planner_session_id, *cmd[1:]]
+
+
+def build_grok_planner_fallback_cmd(prompt: str, workspace: str) -> list[str]:
+    """Fresh read-only Grok session for the explicit resume-failure fallback.
+
+    Same read-only flags as :func:`build_grok_planner_cmd` but without
+    ``--resume``. Call only when the saved planner session cannot resume,
+    and record the turn explicitly as a fallback (invocation metadata and
+    ledger event) so it is never mistaken for a same-session answer.
+    """
+    return _grok_planner_base_cmd(prompt, workspace)
 
 
 def build_luna_prompt(task_json_text: str, extra: str = "") -> str:

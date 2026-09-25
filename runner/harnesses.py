@@ -155,7 +155,8 @@ class Harness:
     def planner_answer(self, kind: str, stdout: str, meta: dict, job: dict) -> tuple | None:
         return None
 
-    def callback_failure_reason(self, kind: str, rc, stdout: str, job: dict) -> str | None:
+    def callback_failure_reason(self, kind: str, rc, stdout: str, job: dict,
+                                  meta=None) -> str | None:
         return None
 
     def record_session(self, con, request_id: str, sid: str, skind: str, kind: str,
@@ -604,7 +605,7 @@ class CodexCLI(Harness):
             return qid, parsed["answer"]
         return None
 
-    def callback_failure_reason(self, kind, rc, stdout, job):
+    def callback_failure_reason(self, kind, rc, stdout, job, meta=None):
         if kind != KIND_CODEX_CALLBACK:
             return None
         parsed = adapters.parse_codex_planner_answer(stdout)
@@ -1076,7 +1077,7 @@ class ClaudeCLI(Harness):
             return qid, parsed["answer"]
         return None
 
-    def callback_failure_reason(self, kind, rc, stdout, job):
+    def callback_failure_reason(self, kind, rc, stdout, job, meta=None):
         parsed = adapters.parse_claude_result(stdout)
         if rc != 0 or not parsed.get("ok"):
             return f"planner_callback_failed rc={rc} (consumed by recovery)"
@@ -1239,7 +1240,7 @@ class OpenCodeServer(Harness):
             return qid, parsed["answer"]
         return None
 
-    def callback_failure_reason(self, kind, rc, stdout, job):
+    def callback_failure_reason(self, kind, rc, stdout, job, meta=None):
         if kind != KIND_OPENCODE_CALLBACK:
             return None
         parsed = adapters.parse_opencode_run_planner_answer(stdout)
@@ -1659,24 +1660,36 @@ class GrokBuildCLI(Harness):
         return adapters.parse_grok_result(stdout)
 
     def planner_answer(self, kind, stdout, meta, job):
-        # The Grok planner fallback answers from a fresh session seeded
-        # with the handoff summary: no resume, so no session-identity
-        # check applies. Only a successful result with text counts.
+        # The Grok planner callback resumes the saved planner session:
+        # only a successful result from that same session counts. An
+        # explicitly marked resume-failure fallback (meta grok_resume)
+        # answers from a fresh read-only session and is recorded as a
+        # fallback, never as a same-session resume.
         if kind != KIND_GROK_CALLBACK:
             return None
         parsed = adapters.parse_grok_result(stdout)
         qid = (meta or {}).get("qid")
-        if parsed.get("ok") and qid and isinstance(parsed.get("text"), str) \
-                and parsed["text"].strip():
-            return qid, parsed["text"].strip()
+        if not parsed.get("ok") or not qid:
+            return None
+        text = parsed.get("text")
+        if not (isinstance(text, str) and text.strip()):
+            return None
+        if (meta or {}).get("grok_resume") == "fallback":
+            return qid, text.strip()
+        if parsed.get("session_id") == (job or {}).get("planner_session_id"):
+            return qid, text.strip()
         return None
 
-    def callback_failure_reason(self, kind, rc, stdout, job):
+    def callback_failure_reason(self, kind, rc, stdout, job, meta=None):
         if kind != KIND_GROK_CALLBACK:
             return None
         parsed = adapters.parse_grok_result(stdout)
         if rc != 0 or not parsed.get("ok"):
             return f"planner_callback_failed rc={rc} (consumed by recovery)"
+        if (meta or {}).get("grok_resume") == "fallback":
+            return None
+        if parsed.get("session_id") != (job or {}).get("planner_session_id"):
+            return "planner_session_mismatch (consumed by recovery)"
         return None
 
     def record_session(self, con, request_id, sid, skind, kind, job, meta, now):
@@ -1708,10 +1721,15 @@ class GrokBuildCLI(Harness):
         return readings
 
     def action_key(self, kind, cmd, meta):
-        """A resumed turn is the same logical turn: the ``--resume``
+        """A resumed worker turn is the same logical turn: the ``--resume``
         session learned after the first attempt started is volatile, so a
         restarted controller reuses the finished attempt instead of
-        starting a second writer."""
+        starting a second writer. A planner callback resumes the saved
+        planner session known upfront, so its ``--resume`` value stays in
+        the key; the explicit fresh fallback (no ``--resume``) is a
+        different action and never reuses the resume attempt."""
+        if kind == KIND_GROK_CALLBACK:
+            return super().action_key(kind, list(cmd or []), meta)
         stable_cmd = list(cmd or [])
         if "--resume" in stable_cmd:
             i = stable_cmd.index("--resume")
@@ -2548,6 +2566,13 @@ def kind_for_cmd(cmd: list) -> str:
             return KIND_OPENCODE_CALLBACK
         return KIND_OPENCODE_CONTROL
     if name == "grok":
+        # Worker turns carry --always-approve; planner callbacks carry the
+        # read-only markers (--permission-mode plan, --tools) and never
+        # --always-approve. A bare `grok -p` stays a worker turn.
+        if "--always-approve" in args:
+            return KIND_GROK_CONTROL
+        if "--permission-mode" in args or "--tools" in args:
+            return KIND_GROK_CALLBACK
         return KIND_GROK_CONTROL
     return "unknown"
 

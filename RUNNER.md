@@ -18,9 +18,10 @@ intend to execute. Keep the full Model Router plugin together. Install AgentsMD
 and the Skills, plugins, and MCP integrations named by the selected role kit;
 missing dependencies block that dispatch. No credentials ship in this package.
 The planner callback wakes the saved planner session in its own harness
-(Claude resume, Codex `exec resume`, OpenCode `run --session`; a harness
-without resume answers from a fresh session seeded with the handoff
-summary).
+(Claude resume, Codex `exec resume`, OpenCode `run --session`, Grok Build
+`grok --resume` read-only in the user's own Grok home; only an explicit
+recorded fallback for an unresumable Grok session answers from a fresh
+read-only session seeded with the handoff summary).
 
 ## Public CLI
 
@@ -80,8 +81,8 @@ controller after the commit.
 request it repeats with `--replay-of`. `--planner-harness` names the harness
 hosting the planner session (`claude`, `codex`, `opencode`, or `grok`);
 `--planner-session` carries that harness's session id (a Claude session, a
-Codex thread, an OpenCode session, or any Grok session id for the record:
-the Grok fallback answers from a fresh session). Planner callbacks run in
+Codex thread, an OpenCode session, or the Grok session id, resumed
+read-only with `grok --resume` in the user's own Grok home). Planner callbacks run in
 the job workspace.
 `--handoff-summary` (or `--handoff-summary-file`) stores the durable handoff
 summary on the job; without it the summary is derived from the task packet
@@ -160,30 +161,36 @@ allowance; the runner never invents a reset time.
 2. Luna replies with one envelope: `planner_question`, `implementation`, or
    `completion`. The envelope is saved before its effect.
 3. `planner_question`: the question is saved, then the saved planner wakes
-    automatically in its own harness without human action: Claude resumes
-    with `claude --resume SID --model M --effort E --output-format
-    json --tools "" -p PROMPT` in the job workspace, Codex resumes with
-    `codex exec resume THREAD --json -c sandbox_mode="read-only" PROMPT`,
-    OpenCode resumes with `opencode run --session SID --dir WS --format
-    json PROMPT`, and a harness without a usable resume path (such as Grok
-    Build) answers from a fresh `grok -p PROMPT` session seeded with the
-    stored handoff summary. PROMPT carries the
-    stored handoff summary before the dispatcher's question, so a callback
-    hours later resumes the exact saved planner session and answers from
-    the ledger. The
-    answer counts only when the result is a success from the same
-    session ID (the fresh Grok fallback records its new session as the
-    answer's source instead). The planner callback invocation records the resumed
-    context with elapsed
-    time, so the resumed context is visible per job in the Observer mapping
-    (`status` and `result` measurements); the Claude invocation also carries
-    input, cache-read, and cache-creation tokens. A running `claude` process that
-    names the session in its arguments is a busy planner. Busy, failed, or
-    mismatched callbacks block the job with a reason; the question stays
-    pending for `answer` plus `recover`. The Astra fallback never resumes:
-    it answers from the handoff summary in a fresh session with no resume
-    (`controller.astra_fallback_prompt`), persisted the same way.
-    `questions` and `answer` stay as an optional human override.
+     automatically in its own harness without human action: Claude resumes
+     with `claude --resume SID --model M --effort E --output-format
+     json --tools "" -p PROMPT` in the job workspace, Codex resumes with
+     `codex exec resume THREAD --json -c sandbox_mode="read-only" PROMPT`,
+     OpenCode resumes with `opencode run --session SID --dir WS --format
+     json PROMPT`, and Grok Build resumes with `grok --resume SID -p
+     PROMPT --verbatim --cwd WS --tools "" --permission-mode plan
+     --no-subagents --disable-web-search --output-format json` in the
+     user's own Grok home (where the planner session lives), never a
+     runner kit. PROMPT carries the
+     stored handoff summary before the dispatcher's question, so a callback
+     hours later resumes the exact saved planner session and answers from
+     the ledger. The
+     answer counts only when the result is a success from the same
+     session ID (a Grok resume the CLI cannot run falls back once to a
+     fresh read-only session, recorded explicitly as a fallback in the
+     invocation metadata and a `grok_planner_fallback` ledger event,
+     never as a same-session answer; a result from another session
+     blocks as a mismatch without fallback). The planner callback invocation records the resumed
+     context with elapsed
+     time, so the resumed context is visible per job in the Observer mapping
+     (`status` and `result` measurements); the Claude invocation also carries
+     input, cache-read, and cache-creation tokens. A running `claude` process that
+     names the session in its arguments is a busy planner. Busy, failed, or
+     mismatched callbacks block the job with a reason; the question stays
+     pending for `answer` plus `recover`. A missing planner session never
+     forks a fresh answer: it blocks as `missing_planner_session`. The Astra fallback never resumes:
+     it answers from the handoff summary in a fresh session with no resume
+     (`controller.astra_fallback_prompt`), persisted the same way.
+     `questions` and `answer` stay as an optional human override.
 4. The answer is saved, then the same Luna task resumes with `codex exec
    resume ID --json -m gpt-5.6-luna -c model_reasoning_effort="max" -c
    sandbox_mode="read-only"`. A resume that reports another thread, or none,
@@ -464,9 +471,12 @@ GROK_HOME=/tmp/grok-kit grok -p PROMPT --model grok-4.6
 
 The planner keeps the user's own session and is never
 isolated: `claude --resume SID -p PROMPT`, `codex exec resume THREAD --json
--c sandbox_mode="read-only" PROMPT`, or `opencode run --session SID --dir WS
---format json PROMPT` in the job workspace; a Grok planner answers from a
-fresh `grok -p PROMPT` session seeded with the handoff summary. Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, and
+-c sandbox_mode="read-only" PROMPT`, `opencode run --session SID --dir WS
+--format json PROMPT`, or read-only `grok --resume SID -p PROMPT
+--verbatim --cwd WS --tools "" --permission-mode plan --no-subagents
+--disable-web-search --output-format json` in the job workspace. Worker
+turns run on generated kits, but the Grok planner callback runs in the
+user's own Grok home where its session lives. Codex uses `CODEX_HOME`, Claude uses `CLAUDE_CONFIG_DIR`, and
 Grok Build uses `GROK_HOME` (or `~/.grok`) for their kit equivalents.
 
 The prompt goes through `POST /session/{id}/prompt_async` with the job

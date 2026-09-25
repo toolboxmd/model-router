@@ -20,7 +20,11 @@ stall, idle_incomplete, idle_empty, hard_error, context_error), ``FAKE_OC_MODE_G
 ``FAKE_CLAUDE_ANSWER``, ``FAKE_GROK_MODE`` (ok, exhaustion, overload,
 hard_error, hang, hold), ``FAKE_GROK_DELAY`` (seconds before success),
 ``FAKE_GROK_WRITE`` (relative file the fake worker writes),
-``FAKE_GROK_RELEASE`` (hold mode waits for this file, then succeeds).
+``FAKE_GROK_RELEASE`` (hold mode waits for this file, then succeeds),
+``FAKE_GROK_RESUME_FAIL`` (``1`` refuses every ``--resume`` attempt with a
+provider-shaped error while fresh sessions succeed, for the planner
+fallback drill; every call is still logged with its argv, cwd, and the
+``GROK_HOME`` it observed).
 ``FAKE_OC_TOOLS`` (``1`` appends one ``read`` tool part to text assistant
 messages, proving tool-part recording; unset keeps text-only turns).
 ``FAKE_OC_PLAN`` (plan-agent envelope sequence: ``completion`` (default)
@@ -487,7 +491,8 @@ st = Path(os.environ["FAKE_STATE"])
 st.mkdir(parents=True, exist_ok=True)
 argv = sys.argv[1:]
 with open(st / "grok.log", "a") as f:
-    f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
+    f.write(json.dumps({"argv": argv, "cwd": os.getcwd(),
+                        "grok_home": os.environ.get("GROK_HOME", "")}) + "\n")
 
 def flag(name):
     return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else None
@@ -514,6 +519,14 @@ def success():
     print(json.dumps({"text": "IMPLEMENTED by fake grok worker", "stopReason": "end_turn",
                       "sessionId": sid, "num_turns": 1, "model": model,
                       "usage": {"input_tokens": 60, "output_tokens": 12}}))
+
+if resume and os.environ.get("FAKE_GROK_RESUME_FAIL") == "1":
+    # Deterministic unresumable session: a resume attempt fails outright
+    # (clear provider-shaped error, non-zero exit), while a fresh session
+    # succeeds, so the planner-callback fallback drill runs resume-then-fallback.
+    print(json.dumps({"type": "error",
+                      "message": "session not found, resume refused"}))
+    sys.exit(1)
 
 if MODE == "hang":
     time.sleep(120)
