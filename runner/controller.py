@@ -431,18 +431,15 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             role=role, prompt=prompt, title=title,
             existing_thread_id=existing_id,
             watch_kwargs=_t3_watch_kwargs(),
-            planner_thread_id=planner)
+            planner_thread_id=planner,
+            on_thread_created=(
+                None if existing_id else
+                lambda tid: _save_t3_thread(state_dir, request_id, slot, tid, route)))
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
         # block loudly with the reason.
         return {"action": "blocked", "reason": "t3_unavailable",
                 "detail": f"t3_unavailable: {e}"}
-    if not existing_id:
-        try:
-            _save_t3_thread(state_dir, request_id, slot,
-                            outcome["thread_id"], route)
-        except Exception:
-            pass
     try:
         rc = 0 if outcome.get("state") == "completed" else 1
         _record_child(state_dir, request_id, T3_TURN_KIND,

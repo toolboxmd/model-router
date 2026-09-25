@@ -363,6 +363,16 @@ def turn_start_command(thread_id: str, text: str, route: str | None = None,
     return cmd
 
 
+def turn_interrupt_command(thread_id: str) -> dict:
+    """Interrupt the active turn on an existing T3 thread."""
+    return {
+        "type": "thread.turn.interrupt",
+        "commandId": _new_id("cmd"),
+        "threadId": validate_thread_id(thread_id),
+        "createdAt": _utcnow_iso(),
+    }
+
+
 def child_first_message(request_id: str, kind_label: str, planner_thread_id: str,
                         route: str, prompt: str) -> str:
     """First message on a job child: names the job and links the planner thread."""
@@ -957,7 +967,8 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                 child_suffix: str | None = None,
                 existing_thread_id: str | None = None,
                 watch_kwargs: dict | None = None,
-                planner_thread_id: str | None = None) -> dict:
+                planner_thread_id: str | None = None,
+                on_thread_created=None) -> dict:
     """Run one job turn as a T3 child thread: create, start, watch.
 
     ``parent_thread_id`` is the thread the child is created under (the
@@ -976,6 +987,8 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
         thread_id = child_thread_id(parent_thread_id, child_suffix)
         client.create_child(thread_id, parent_thread_id, project_id,
                             title, route, role)
+        if on_thread_created is not None:
+            on_thread_created(thread_id)
         client.post_message(thread_id,
                             child_first_message(request_id, kind_label,
                                                 planner, route, prompt),

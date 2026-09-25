@@ -323,6 +323,35 @@ class Wire(unittest.TestCase):
         self.assertIn("404", view["error"])
         self.assertEqual(t3snapshot.skip_sets(), (set(), set()))
 
+    def test_html_200_is_unknown_and_filters_nothing(self):
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen.append(self.path)
+                body = b"<!doctype html><html><body>old app shell</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = t3exec.T3Client(f"http://127.0.0.1:{server.server_port}", "tok")
+
+        snap = t3snapshot.refresh(client, None, "implementation_default", force=True)
+
+        self.assertIsNone(snap)
+        self.assertEqual(seen, ["/api/prism/snapshot"])
+        self.assertEqual(t3snapshot.view()["snapshot"], "unknown")
+        self.assertEqual(t3snapshot.skip_sets(), (set(), set()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1759,6 +1759,7 @@ def cancel(state_dir, request_id: str) -> dict:
     finally:
         con.close()
 
+    _interrupt_saved_t3_threads(state_dir, request_id, dict(job))
     # Stop every owned child process group, not just the controller PID,
     # including the actual owned proof process group recorded durably
     # while it runs. The workspace claim is retained until all owned
@@ -1779,6 +1780,54 @@ def cancel(state_dir, request_id: str) -> dict:
 
     _finalize_stopped(state_dir, request_id, all_dead)
     return get_job(state_dir, request_id)
+
+
+def _interrupt_saved_t3_threads(state_dir, request_id: str, job: dict) -> None:
+    """Interrupt active saved T3 child turns before draining local owners."""
+    try:
+        state = json.loads(job.get("controller_state") or "{}")
+        threads = state.get("t3_threads") if isinstance(state, dict) else {}
+        client = t3exec.client_for_job(job)
+    except (ValueError, TypeError, t3exec.T3Error):
+        return
+    if not isinstance(threads, dict):
+        return
+    for slot, record in threads.items():
+        thread_id = record.get("thread_id") if isinstance(record, dict) else None
+        if not thread_id:
+            continue
+        try:
+            snapshot = client.thread_snapshot(thread_id)
+            latest = t3exec.snapshot_thread(snapshot).get("latestTurn")
+            active = isinstance(latest, dict) and latest.get("state") == "running"
+            if not active:
+                continue
+            result = client.dispatch(t3exec.turn_interrupt_command(thread_id))
+            _record_t3_interrupt_event(
+                state_dir, request_id, "t3_turn_interrupt",
+                {"slot": slot, "thread_id": thread_id,
+                 "result": result if isinstance(result, dict) else {}})
+        except Exception as e:  # best effort; local cancellation still proceeds
+            _record_t3_interrupt_event(
+                state_dir, request_id, "t3_turn_interrupt_failed",
+                {"slot": slot, "thread_id": thread_id,
+                 "error": str(e)[:300]})
+
+
+def _record_t3_interrupt_event(state_dir, request_id: str, kind: str,
+                               payload: dict) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _event(con, request_id, kind, payload)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
 
 
 def _finalize_stopped(state_dir, request_id: str, all_dead: bool) -> None:
@@ -1989,6 +2038,7 @@ def recover_one(state_dir, request_id: str) -> dict:
         if job["cancel_requested"]:
             con.execute("COMMIT")
             con.close()
+            _interrupt_saved_t3_threads(state_dir, request_id, dict(job))
             children_dead = _drain_owned_children(state_dir, request_id, dict(job))
             proof_dead = _drain_proof_group(state_dir, request_id)
             all_dead = bool(children_dead and proof_dead)
