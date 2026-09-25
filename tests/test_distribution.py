@@ -53,7 +53,9 @@ class DistributionTests(unittest.TestCase):
         for relative in record["factSources"]["delivery"].values():
             manifest = json.loads((self.package / relative).read_text())
             self.assertEqual((manifest["name"], manifest["version"]), (record["id"], version))
-        for field in ("skills", "documentation", "requirements", "proof"):
+        # The marketplace rejects an empty path list; a module without Skills omits the field.
+        self.assertNotIn("skills", record["factSources"])
+        for field in ("documentation", "requirements", "proof"):
             for relative in record["factSources"][field]:
                 self.assertTrue((self.package / relative).is_file(), relative)
         self.assertFalse((self.package / "skills").exists())

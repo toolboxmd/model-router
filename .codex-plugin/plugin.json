@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.35.1",
+  "version": "0.35.2",
   "description": "Route authorized software work through one durable, capacity-aware subscription policy.",
   "author": {
     "name": "toolboxmd",

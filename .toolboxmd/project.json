@@ -10,7 +10,6 @@
       "claude-code": ".claude-plugin/plugin.json",
       "grok-build": ".grok-plugin/plugin.json"
     },
-    "skills": [],
     "documentation": ["README.md", "RUNNER.md"],
     "requirements": ["RUNNER.md"],
     "proof": ["tests/test_distribution.py", "tests/test_policy_v2.py", "tests/test_issue106.py"]

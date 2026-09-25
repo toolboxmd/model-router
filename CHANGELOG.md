@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.35.2] - 2026-09-25
+
+### Fixed
+
+- The Project Record omits `factSources.skills` instead of listing none, so the marketplace can promote the release (0.35.0 and 0.35.1 were rejected with `factSources.skills must be a non-empty list`)
+
 ## [0.35.1] - 2026-09-25
 
 ### Fixed
