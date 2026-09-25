@@ -22,6 +22,22 @@ class T3Persistence(unittest.TestCase):
         ws.mkdir()
         core.submit(self.sd, "r1", {"goal": "t", "proof": "true"},
                     str(ws), "session-r1", planner_t3_thread=PLANNER)
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='r1'",
+                        (json.dumps({"t3_threads": {"dispatch": {
+                            "thread_id": "sub.planner-t3.dispatch",
+                            "route": "luna/max", "created": True,
+                            "turn_started": True}}}),))
+            con.commit()
+        finally:
+            con.close()
+
+    def _recover_into(self, fn):
+        seen = []
+        with mock.patch.object(core, "start_controller", side_effect=fn):
+            seen.append(core.recover_one(self.sd, "r1"))
+        return seen[0]
 
     def test_child_is_saved_before_start_failure_and_reused_on_recovery(self):
         fake = FakeT3Client(planner=PLANNER)
@@ -41,13 +57,73 @@ class T3Persistence(unittest.TestCase):
         job = core.get_job(self.sd, "r1")
         saved = controller._t3_thread_for(job, "impl_0")
         self.assertIsNotNone(saved)
+        self.assertTrue(saved["created"])
+        self.assertFalse(saved["turn_started"])
         child_id = saved["thread_id"]
         fake.scripts[child_id] = snap(child_id, state="completed", text="Done")
 
-        result = controller.run_implementation(self.sd, "r1", t3_client=fake)
-        self.assertEqual(result["action"], "implementation_ok")
+        result = self._recover_into(
+            lambda sd, rid: controller.run_implementation(sd, rid, t3_client=fake))
+        self.assertEqual(result["action"], "resumed-controller")
         creates = [c for c in fake.commands if c.get("type") == "thread.create"]
         self.assertEqual([c["threadId"] for c in creates], [child_id])
+
+    def test_saved_fallback_dispatcher_is_adopted_with_its_route_on_recovery(self):
+        state = {"t3_threads": {
+            "dispatch": {"thread_id": "sub.planner-t3.dispatch",
+                          "route": "luna-go/max", "created": True,
+                          "turn_started": True}}}
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=?, status='running' WHERE request_id='r1'",
+                        (json.dumps(state),))
+            con.commit()
+        finally:
+            con.close()
+        fake = FakeT3Client(planner=PLANNER)
+        fake.scripts["sub.planner-t3.dispatch"] = snap(
+            "sub.planner-t3.dispatch", state="completed",
+            text=json.dumps({"action": "implementation", "artifact": "a1"}))
+        resumed = []
+
+        def resume(sd, rid):
+            resumed.append(controller.dispatch(sd, rid, t3_client=fake))
+            return {"pid": None}
+
+        out = self._recover_into(resume)
+        self.assertEqual(out["action"], "resumed-controller")
+        self.assertEqual(resumed[0]["action"], "dispatched")
+        creates = [c for c in fake.commands if c.get("type") == "thread.create"]
+        self.assertEqual(creates, [])
+        starts = [c for c in fake.commands if c.get("type") == "thread.turn.start"]
+        self.assertEqual(starts, [])
+
+    def test_crash_before_create_return_is_reconciled_on_recovery(self):
+        fake = FakeT3Client(planner=PLANNER)
+        original_create = fake.create_child
+        crashed = [False]
+
+        def crash_once(*args, **kwargs):
+            if not crashed[0]:
+                crashed[0] = True
+                original_create(*args, **kwargs)
+                raise RuntimeError("controller crashed before create returned")
+            return original_create(*args, **kwargs)
+
+        fake.create_child = crash_once
+        with self.assertRaises(RuntimeError):
+            controller.run_implementation(self.sd, "r1", t3_client=fake)
+        saved = controller._t3_thread_for(core.get_job(self.sd, "r1"), "impl_0")
+        self.assertFalse(saved["created"])
+        child_id = saved["thread_id"]
+        fake.scripts[child_id] = snap(child_id, state="completed", text="Done")
+        result = self._recover_into(
+            lambda sd, rid: controller.run_implementation(sd, rid, t3_client=fake))
+        self.assertEqual(result["action"], "resumed-controller")
+        self.assertTrue(controller._t3_thread_for(core.get_job(self.sd, "r1"), "impl_0")["created"])
+        self.assertTrue(controller._t3_thread_for(core.get_job(self.sd, "r1"), "impl_0")["turn_started"])
+        creates = [c for c in fake.commands if c.get("type") == "thread.create"]
+        self.assertEqual(len(creates), 1)
 
 
 class T3Cancellation(unittest.TestCase):
@@ -60,6 +136,16 @@ class T3Cancellation(unittest.TestCase):
         ws.mkdir()
         core.submit(self.sd, "r1", {"goal": "t"}, str(ws), "session-r1",
                     planner_t3_thread=PLANNER)
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='r1'",
+                        (json.dumps({"t3_threads": {"dispatch": {
+                            "thread_id": "sub.planner-t3.dispatch",
+                            "route": "luna/max", "created": True,
+                            "turn_started": True}}}),))
+            con.commit()
+        finally:
+            con.close()
 
     def test_cancel_interrupts_each_saved_active_child_and_records_result(self):
         state = {"t3_threads": {
@@ -80,6 +166,16 @@ class T3Cancellation(unittest.TestCase):
             fake.scripts[tid] = snap(tid, state="running")
         fake.scripts["sub.planner-t3.done"] = snap(
             "sub.planner-t3.done", state="completed", text="done")
+        original_dispatch = fake.dispatch
+
+        def interrupt_settles(command):
+            result = original_dispatch(command)
+            if command.get("type") == "thread.turn.interrupt":
+                fake.scripts[command["threadId"]] = snap(
+                    command["threadId"], state="interrupted")
+            return result
+
+        fake.dispatch = interrupt_settles
         with mock.patch.object(t3exec, "client_for_job", return_value=fake):
             job = core.cancel(self.sd, "r1")
 
@@ -95,6 +191,43 @@ class T3Cancellation(unittest.TestCase):
         finally:
             con.close()
         self.assertEqual(sum(e["kind"] == "t3_turn_interrupt" for e in events), 2)
+
+    def test_unreachable_t3_keeps_cancellation_non_terminal_until_retry(self):
+        state = {"t3_threads": {
+            "dispatch": {"thread_id": "sub.planner-t3.dispatch",
+                          "route": "luna/max", "created": True,
+                          "turn_started": True}}}
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id='r1'",
+                        (json.dumps(state),))
+            con.commit()
+        finally:
+            con.close()
+        unreachable = mock.patch.object(
+            t3exec, "client_for_job", side_effect=t3exec.T3Error("unreachable"))
+        with unreachable:
+            first = core.cancel(self.sd, "r1")
+        self.assertEqual(first["status"], "cancelling")
+        self.assertEqual(core.recover_one(self.sd, "r1")["status"], "cancelling")
+
+        fake = FakeT3Client(planner=PLANNER)
+        fake.scripts["sub.planner-t3.dispatch"] = snap(
+            "sub.planner-t3.dispatch", state="running")
+        original_dispatch = fake.dispatch
+
+        def interrupt_settles(command):
+            result = original_dispatch(command)
+            if command.get("type") == "thread.turn.interrupt":
+                fake.scripts[command["threadId"]] = snap(
+                    command["threadId"], state="interrupted")
+            return result
+
+        fake.dispatch = interrupt_settles
+        with mock.patch.object(t3exec, "client_for_job", return_value=fake):
+            final = core.recover_one(self.sd, "r1")
+        self.assertEqual(final["status"], "cancelled")
+        self.assertEqual(core.get_job(self.sd, "r1")["status"], "cancelled")
 
 
 if __name__ == "__main__":

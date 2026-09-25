@@ -112,6 +112,9 @@ class FakeT3Client:
         ctype = command.get("type")
         if ctype == "thread.create":
             self.scripts.setdefault(command["threadId"], [])
+        elif ctype == "thread.turn.interrupt":
+            self.scripts[command["threadId"]] = snap(
+                command["threadId"], state="interrupted")
         return {"sequence": len(self.commands)}
 
     def create_child(self, child_id, parent_thread_id, project_id,

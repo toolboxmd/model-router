@@ -336,7 +336,9 @@ def _t3_thread_for(job: dict, slot: str) -> dict | None:
 
 
 def _save_t3_thread(state_dir, request_id: str, slot: str,
-                    thread_id: str, route: str | None = None) -> None:
+                    thread_id: str, route: str | None = None,
+                    created: bool | None = None,
+                    turn_started: bool | None = None) -> None:
     """Record a T3 child thread id for adoption by later controllers."""
     con = store.connect(state_dir)
     try:
@@ -356,8 +358,15 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
         threads = st.get("t3_threads")
         if not isinstance(threads, dict):
             threads = {}
-        threads[slot] = {"thread_id": thread_id, "route": route,
-                         "updated_at": core._utcnow()}
+        previous = threads.get(slot) if isinstance(threads.get(slot), dict) else {}
+        record = dict(previous)
+        record.update({"thread_id": thread_id, "route": route,
+                       "updated_at": core._utcnow()})
+        if created is not None:
+            record["created"] = bool(created)
+        if turn_started is not None:
+            record["turn_started"] = bool(turn_started)
+        threads[slot] = record
         st["t3_threads"] = threads
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
@@ -417,8 +426,10 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             parent = t3exec.validate_thread_id(dispatcher["thread_id"])
     existing = _t3_thread_for(job, slot)
     existing_id = None
+    existing_state = None
     if adopt and existing is not None and existing.get("route") in (None, route):
         existing_id = existing.get("thread_id")
+        existing_state = existing
     try:
         project_id = t3exec.project_id_for_thread(client, planner)
     except t3exec.T3Error as e:
@@ -430,11 +441,18 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             parent_thread_id=parent, project_id=project_id, route=route,
             role=role, prompt=prompt, title=title,
             existing_thread_id=existing_id,
+            existing_thread_state=existing_state,
             watch_kwargs=_t3_watch_kwargs(),
             planner_thread_id=planner,
             on_thread_created=(
                 None if existing_id else
-                lambda tid: _save_t3_thread(state_dir, request_id, slot, tid, route)))
+                lambda tid: _save_t3_thread(state_dir, request_id, slot, tid, route,
+                                            created=False, turn_started=False)),
+            on_thread_state=(
+                lambda tid, state: _save_t3_thread(
+                    state_dir, request_id, slot, tid, route,
+                    created=state in ("created", "started"),
+                    turn_started=state == "started")))
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
         # block loudly with the reason.
@@ -605,9 +623,11 @@ def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
                 "t3_thread_id": threads["dispatch"]["thread_id"],
                 "luna_action": st.get("last_action")}
     dispatch_route = policy.stage_routes("dispatch")[0]
-    route = dispatch_route
+    saved = _t3_thread_for(job, "dispatch")
+    saved_route = saved.get("route") if saved else None
+    route = saved_route or dispatch_route
     reason = "initial"
-    adopted = _t3_thread_for(job, "dispatch") is not None
+    adopted = saved is not None
     if not adopted:
         # Preflight: a dispatch route the capacity
         # memory knows as exhausted or resting is skipped before any child
