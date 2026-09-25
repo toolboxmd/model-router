@@ -35,7 +35,7 @@ DEGRADED_PERCENT = 80.0
 
 # Prism role -> router stage, for the roles the router dispatches.
 ROLE_STAGES = {"dispatcher": "dispatch", "correction": "correction",
-               "recovery": "recovery"}
+               "recovery": "recovery", "reviewer": "review"}
 
 _CACHE: dict = {"key": None, "at": 0.0, "snapshot": None, "error": None,
                 "lane": None}
@@ -62,7 +62,7 @@ def stage_preferences(snapshot: dict, lane_stage: str | None) -> dict[str, list[
     """Stage orders from the snapshot's role lanes (non-empty lists only).
 
     Worker lanes map onto the three implementation stages; the
-    dispatcher, correction and recovery lists follow the job's lane.
+    dispatcher, reviewer, correction and recovery lists follow the job's lane.
     """
     roles = snapshot.get("roles") if isinstance(snapshot, dict) else None
     if not isinstance(roles, dict):

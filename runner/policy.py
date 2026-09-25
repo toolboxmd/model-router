@@ -18,14 +18,16 @@ import sys
 import time
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.9.0"
+POLICY_VERSION = "2.10.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), "
                  "#62 (manual-only dispatch route removed, human direction, 2026-09-23), "
                  "#88 (no elapsed deadline for agent turns or jobs, human direction, 2026-09-24), "
                  "and #115/#116 (routes are T3 model selections; models, limits and role "
-                 "preferences come from the T3 provider snapshot, human direction, 2026-09-25)")
+                 "preferences come from the T3 provider snapshot, human direction, 2026-09-25), "
+                 "and #126 (an independent review turn before a job completes, human "
+                 "direction, 2026-09-25)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/115"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -170,6 +172,10 @@ STAGES = {
                  "routes": ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"],
                  "note": "one escalation per job; pool moves are not second escalations; "
                          "then the planner decides through a planner question"},
+    "review": {"executor": "runner", "role": "reviewer",
+               "routes": ["luna/max", "luna-go/max"],
+               "note": "one read-only review turn on the candidate's exact head before "
+                       "a job completes; Luna max on Codex, then the same model on Go"},
 }
 IMPLEMENTATION_LANES = ["implementation_default", "implementation_small", "implementation_hard"]
 LANE_ALIASES = {"default": "implementation_default", "small": "implementation_small",
@@ -224,7 +230,8 @@ VENDOR_FREE_PROVIDER = "opencode"
 # ---------------------------------------------------------------------------
 
 DYNAMIC_PREFIX = "t3:"
-_ROLE_OF_STAGE = {"dispatch": "dispatch", "correction": "correction", "recovery": "recovery"}
+_ROLE_OF_STAGE = {"dispatch": "dispatch", "correction": "correction", "recovery": "recovery",
+                  "review": "review"}
 
 
 def preference_route(instance: str, model: str, effort: str | None = None) -> str:

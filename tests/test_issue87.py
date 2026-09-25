@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from runner import adapters, controller, core, store  # noqa: E402
-from tests.fakes import use_fake_t3  # noqa: E402
+from tests.fakes import approve_reviews, use_fake_t3  # noqa: E402
 from tests.fakes import isolate_t3_env  # noqa: E402
 
 
@@ -486,6 +486,7 @@ class CompletionBinding(unittest.TestCase):
             core.PR_VERIFIER = saved
 
     def test_step_completion_refuses_unverified_pr_without_poisoning(self):
+        approve_reviews(self)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
@@ -534,6 +535,7 @@ class CompletionBinding(unittest.TestCase):
             core.PR_VERIFIER = saved
 
     def test_completion_result_carries_acceptance_and_candidate(self):
+        approve_reviews(self)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)

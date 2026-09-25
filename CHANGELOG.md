@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.36.0] - 2026-09-26
+
+### Added
+
+- An independent review turn from the Prism Reviewer role approves or requests changes before a job completes (#126)
+
 ## [0.35.5] - 2026-09-26
 
 ### Changed

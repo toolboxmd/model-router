@@ -228,7 +228,12 @@ RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "controller_step_budget_exhausted", "runtime_missing",
                         "unresolved proof ownership",
                         # An unparsable dispatcher reply is retried (#105).
-                        "luna_missing_action")
+                        "luna_missing_action",
+                        # A failed or unreadable review turn, a reviewer that
+                        # changed the workspace, or no review capacity: a
+                        # fresh review runs on recover (#126).
+                        "review_failed", "review_missing_verdict",
+                        "review_changed_workspace", "review_capacity_wait")
 # Steps across every launch of one job; a launch has MAX_LOOP_STEPS of them.
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0

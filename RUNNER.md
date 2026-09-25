@@ -94,7 +94,7 @@ operator checked the provider allowance.
 `runner/policy.py` names each route as a T3 model selection (provider
 instance, model, effort) with its family, pool, caps, and context window,
 and orders them per stage: `dispatch`, the three implementation lanes,
-`correction`, and `recovery`. These orders are the default role
+`correction`, `recovery`, and `review`. These orders are the default role
 preferences.
 
 Before each controller step the runner reads the Prism provider snapshot,
@@ -106,8 +106,8 @@ token (toolboxmd/t3code#19; `runner/t3snapshot.py`, cached for 30 seconds):
   removes it from routing.
 - **Role preferences.** A non-empty Prism list for a role and lane replaces
   the policy order for that stage: `worker` easy, medium and hard for the
-  small, default and hard lanes; `dispatcher`, `correction` and `recovery`
-  for the job's lane. The first entry is the primary, the rest are
+  small, default and hard lanes; `dispatcher`, `reviewer`, `correction` and
+  `recovery` for the job's lane. The first entry is the primary, the rest are
   fallbacks. An entry that matches a policy route keeps its caps; any other
   runs as `t3:<instance>:<model>@<effort>`.
 - **Limits.** A pool's meter is one T3 driver's usage windows (`go` is
@@ -227,6 +227,36 @@ thread; Grok turns are re-sent by the router.
    that PR, never open a second. An ordinary job in a workspace without an
    origin push remote completes without a PR; experiment and replay jobs
    need none. Nothing merges the PR.
+
+   **Review turn (#126).** A completion that passes these checks first gets
+   one read-only review turn on the candidate's exact head, in a reviewer
+   child thread of the dispatcher thread, on the review stage's first
+   eligible route (the Prism Reviewer list, else Luna max on Codex, then
+   Luna on Go in plan mode); an exhaustion or overload error marks the route
+   and moves to the next in the same step. With every review route exhausted
+   or resting the job blocks as `review_capacity_wait` instead of running
+   one anyway. The reviewer ends its reply with
+   `{"verdict": "approve" | "request_changes", "findings": "..."}`; the
+   runner records the round, the verdict, the findings and the reviewed SHA
+   (`review_verdict` event). `approve` completes the job: the verdict and
+   SHA go into the job result and a marked section of the PR body. `request
+   changes` replaces the saved action with an implementation turn carrying
+   the findings and counts as one ladder failure, so the ladder below bounds
+   the rounds; the dispatcher then decides again and its next completion is
+   reviewed on the new head. The review slot is keyed by round and head, so
+   a restarted controller adopts the in-flight review thread and never
+   starts a second one. An interrupted review turn continues once on the
+   same thread. A reply without a parsable verdict gets one repair message
+   on the same thread (naming the parse problem, never quoting the reply),
+   then blocks as `review_missing_verdict`. The reviewer is read-only by
+   instruction and verified after the fact: when HEAD or a tracked file
+   changed during the turn (untracked files cannot enter the PR head and
+   are ignored), its verdict is discarded and the job blocks as
+   `review_changed_workspace`. `review_failed`, `review_missing_verdict`,
+   `review_changed_workspace` and `review_capacity_wait` are
+   recover-owned, and recover starts a fresh review thread instead of
+   re-reading the finished one; an old turn's limit error is never re-read
+   as new capacity evidence. The dispatcher never approves its own work.
 7. **Terminal report.** Every terminal state (succeeded with the PR URL,
    blocked, failed, cancelled with the reason) is posted once into the
    planner thread with the request id and handoff summary. Delivery runs
@@ -243,8 +273,8 @@ with `job_step_budget_exhausted`, which stays blocked. The default attempt
 budget is 5 launches.
 
 **Escalation ladder.** A turn fails when the worker or provider errors (not
-a capacity signal, which moves routes instead) or when the task's own proof
-exits non-zero. The first failure leads to a correction in the same worker
+a capacity signal, which moves routes instead), when the task's own proof
+exits non-zero, or when the reviewer requests changes. The first failure leads to a correction in the same worker
 thread on the same route. The second leads to a fresh correction on the
 correction route. The third is the single escalation to the recovery stage;
 its pool moves are not second escalations, and recovery never reuses a

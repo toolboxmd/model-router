@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, store  # noqa: E402
-from tests.fakes import use_fake_t3  # noqa: E402
+from tests.fakes import approve_reviews, use_fake_t3  # noqa: E402
 from tests.fakes import isolate_t3_env  # noqa: E402
 
 
@@ -379,6 +379,7 @@ class TestCompletionRefused(unittest.TestCase):
         return tmp, sd, ws, report
 
     def test_ordinary_completion_without_pr_url_refuses_once_then_blocks(self):
+        approve_reviews(self)
         # With an origin push remote, every unusable pr_url shape refuses
         # on the live path; none succeeds, and the reason names the
         # missing PR URL (never a proof failure, which passes here).
@@ -444,6 +445,7 @@ class TestCompletionRefused(unittest.TestCase):
         self.assertEqual(core.get_job(sd, "pr-exp")["status"], "succeeded")
 
     def test_ordinary_completion_without_remote_succeeds_and_records_null(self):
+        approve_reviews(self)
         # Without an origin push remote, ordinary completion succeeds as
         # before and records pr_url as JSON null, on the live path.
         for ws_kind, setup in (("plain", None), ("git-no-remote", "git")):
