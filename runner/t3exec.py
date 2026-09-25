@@ -13,11 +13,13 @@ command (``thread.create``, ``thread.turn.start``, ...), and
 ``GET /api/orchestration/threads/:threadId`` returns the thread
 detail snapshot (messages, activities, session, latestTurn).
 
-Child identity: until the fork parent link lands (toolboxmd/t3code#8),
-a child id follows the spike convention ``sub.<parent>.<suffix>`` and
-the ``thread.create`` payload additionally carries ``parentThreadId``,
-so a fork server that honors the link keeps working without a runner
-change. The child's first message names the job and links the parent
+Child identity: a child id follows the fork convention
+``sub.<parent>.<suffix>`` (toolboxmd/t3code#8) and the ``thread.create``
+payload additionally carries ``parentThreadId``, so a server that honors
+the field keeps working without a runner change. A job's threads form a
+tree (#113): the dispatcher thread is a child of the planner thread, and
+worker, correction and recovery threads are children of the dispatcher
+thread. Every child's first message names the job and links the planner
 thread.
 
 Liveness is activity-based, never a fixed silence window: a turn is
@@ -384,14 +386,14 @@ def turn_start_command(thread_id: str, text: str, route: str | None = None,
     return cmd
 
 
-def child_first_message(request_id: str, kind_label: str, parent_thread_id: str,
+def child_first_message(request_id: str, kind_label: str, planner_thread_id: str,
                         route: str, prompt: str) -> str:
-    """First message on a job child: names the job and links the parent."""
+    """First message on a job child: names the job and links the planner thread."""
     return (
         f"[model-router job {request_id} {kind_label} on route {route}; "
-        f"planner thread {parent_thread_id}]\n\n"
+        f"planner thread {planner_thread_id}]\n\n"
         f"This turn belongs to model-router job {request_id}. "
-        f"Report back in this thread; the planner follows from thread {parent_thread_id}.\n\n"
+        f"Report back in this thread; the planner follows from thread {planner_thread_id}.\n\n"
         f"{prompt}"
     )
 
@@ -951,13 +953,19 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                 role: str, prompt: str, title: str,
                 child_suffix: str | None = None,
                 existing_thread_id: str | None = None,
-                watch_kwargs: dict | None = None) -> dict:
+                watch_kwargs: dict | None = None,
+                planner_thread_id: str | None = None) -> dict:
     """Run one job turn as a T3 child thread: create, start, watch.
 
-    ``existing_thread_id`` adopts a turn a previous controller already
-    created (crash recovery) instead of starting a second writer. Returns
-    the watch outcome plus ``thread_id`` and the child identity.
+    ``parent_thread_id`` is the thread the child is created under (the
+    planner for a dispatcher, the dispatcher for a worker);
+    ``planner_thread_id`` is the planner thread the first message links,
+    defaulting to the parent. ``existing_thread_id`` adopts a turn a
+    previous controller already created (crash recovery) instead of
+    starting a second writer. Returns the watch outcome plus
+    ``thread_id`` and the child identity.
     """
+    planner = validate_thread_id(planner_thread_id or parent_thread_id)
     if existing_thread_id is not None:
         thread_id = validate_thread_id(existing_thread_id)
         adopted = True
@@ -967,7 +975,7 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
                             title, route, role)
         client.post_message(thread_id,
                             child_first_message(request_id, kind_label,
-                                                parent_thread_id, route, prompt),
+                                                planner, route, prompt),
                             route=route, role=role, title_seed=title)
         adopted = False
     kwargs = dict(watch_kwargs or {})
@@ -977,5 +985,6 @@ def run_t3_turn(client: T3Client, *, request_id: str, kind_label: str,
     outcome["thread_id"] = thread_id
     outcome["adopted"] = adopted
     outcome["parent_thread_id"] = validate_thread_id(parent_thread_id)
+    outcome["planner_thread_id"] = planner
     outcome["route"] = route
     return outcome

@@ -896,7 +896,7 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
                     (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
         core._event(con, request_id, "t3_thread",
-                    {"slot": str(slot)[:32], "thread_id": str(thread_id)[:64],
+                    {"slot": str(slot)[:32], "thread_id": str(thread_id)[:256],
                      "route": str(route or "")[:64]})
         con.execute("COMMIT")
     except Exception:
@@ -930,14 +930,31 @@ def _t3_watch_kwargs() -> dict:
 def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
                  kind_label: str, route: str, role: str, prompt: str,
                  title: str, client, adopt: bool = True) -> dict:
-    """Create (or adopt) the slot's T3 child thread and watch its turn."""
-    parent = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    """Create (or adopt) the slot's T3 child thread and watch its turn.
+
+    The dispatcher thread is a child of the planner thread; every other
+    slot (worker, correction, recovery) is a child of the job's saved
+    dispatcher thread (#113), falling back to the planner thread when no
+    dispatcher thread was saved.
+    """
+    planner = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    parent = planner
+    if slot != "dispatch":
+        dispatcher = _t3_thread_for(job, "dispatch")
+        if dispatcher is None:
+            try:
+                dispatcher = _t3_thread_for(core.get_job(state_dir, request_id),
+                                            "dispatch")
+            except Exception:
+                dispatcher = None
+        if dispatcher is not None:
+            parent = t3exec.validate_thread_id(dispatcher["thread_id"])
     existing = _t3_thread_for(job, slot)
     existing_id = None
     if adopt and existing is not None and existing.get("route") in (None, route):
         existing_id = existing.get("thread_id")
     try:
-        project_id = t3exec.project_id_for_thread(client, parent)
+        project_id = t3exec.project_id_for_thread(client, planner)
     except t3exec.T3Error as e:
         return {"action": "blocked", "reason": "t3_unavailable",
                 "detail": f"t3_unavailable: planner thread unreadable: {e}"}
@@ -947,7 +964,8 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             parent_thread_id=parent, project_id=project_id, route=route,
             role=role, prompt=prompt, title=title,
             existing_thread_id=existing_id,
-            watch_kwargs=_t3_watch_kwargs())
+            watch_kwargs=_t3_watch_kwargs(),
+            planner_thread_id=planner)
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
         # block loudly, never silently run the direct path.
