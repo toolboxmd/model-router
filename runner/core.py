@@ -819,8 +819,10 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             con.execute("ROLLBACK")
             raise LeaseLostError(f"job {request_id}: controller no longer holds the lease")
         if cur["cancel_requested"] or cur["status"] in store.TERMINAL:
-            con.execute("ROLLBACK")
-            raise LeaseLostError(f"job {request_id}: cancelled or terminal")
+            if not (harnesses.is_terminal_report_send(kind, meta)
+                    and cur["status"] in store.TERMINAL_REPORT_STATUSES):
+                con.execute("ROLLBACK")
+                raise LeaseLostError(f"job {request_id}: cancelled or terminal")
         other = con.execute(
             "SELECT invocation_id FROM invocations WHERE request_id=? AND state IN ('running','cancelling')"
             " AND (action_key IS NULL OR action_key != ?)", (request_id, key)).fetchone()
@@ -1006,11 +1008,6 @@ def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
         kind = kind or _infer_invocation_kind(cmd)
         return _durable_run(state_dir, request_id, owner_token, kind,
                             cmd, cwd=cwd, timeout=timeout, meta=meta)
-    # Terminal-report delivery never rides this closure (see
-    # controller._send_report_turn): a read-only notification needs no
-    # supervised invocation, and a durable row on a blocked job would race
-    # recover's ownership reconciliation.
-    run_cmd.is_durable_runner = True  # type: ignore[attr-defined]
     return run_cmd
 
 

@@ -204,6 +204,11 @@ CREATE INDEX IF NOT EXISTS idx_readings_pool ON readings(pool, model, window);
 SCHEMA_VERSION = 2
 
 TERMINAL = ("succeeded", "failed", "cancelled")
+# Job states that wake the saved planner once with an end-of-job
+# terminal report (Issue #94). ``blocked`` is not in TERMINAL (recover
+# can resume it) but still ends the job from the planner's point of
+# view, so it reports like the final states.
+TERMINAL_REPORT_STATUSES = ("succeeded", "blocked", "failed", "cancelled")
 ACTIVE_WORKSPACE_STATUSES = ("pending", "running", "question_pending", "blocked", "cancelling")
 
 

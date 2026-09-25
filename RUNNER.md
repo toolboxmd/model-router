@@ -237,11 +237,17 @@ allowance; the runner never invents a reset time.
     Every terminal state (succeeded, blocked, failed, cancelled) then wakes
     the saved planner once with an end-of-job report through the same
     callback path (Claude resume, Codex `exec resume`, OpenCode
-    `run --session`, Grok fresh session from the handoff summary). The
+    `run --session`, Grok read-only `--resume`). The
     report carries the request id, terminal status, PR URL or reason, and
     handoff summary; a succeeded report says ready to merge with the PR
     URL. Delivery runs after the terminal persist and never changes the
-    job's status or result. A busy planner retries within a bounded window;
+    job's status or result: the send is a durable invocation under a
+    stable per-event action key, so a finished prior send is adopted by its actual
+    output (a crash between send and record can neither duplicate nor
+    lose the report) and only then does a fresh send start. A retry of the
+    same terminal event reuses its key; a later terminal event gets a new
+    key and reports again. A busy
+    planner retries within a bounded window;
     the delivery outcome is recorded on the job and visible in `status`,
     and recovery sends no duplicate.
 

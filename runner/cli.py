@@ -49,6 +49,27 @@ def _err(msg, code=1) -> int:
     return code
 
 
+def _deliver_after_cli(state_dir: str, request_id: str) -> None:
+    """Best-effort terminal report after an operator command.
+
+    Uses a durable invocation under the job's current lease (if any),
+    so the send is adopted by stable action key like any controller
+    send: a lost lease or a competing owned invocation defers without
+    duplicating. Never raises past the command.
+    """
+    try:
+        tok = core.get_job(state_dir, request_id).get("owner_token")
+    except core.NotFoundError:
+        return
+    except Exception:
+        return
+    try:
+        run = core.make_durable_run_cmd(state_dir, request_id, tok)
+        controller.deliver_terminal_report(state_dir, request_id, run_cmd=run)
+    except Exception:
+        pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="runner",
                                  description="Durable local task runner.")
@@ -200,10 +221,7 @@ def main(argv=None) -> int:
             # A cancelled job has no controller step left to report it:
             # wake the saved planner once through the existing callback
             # path. Best-effort: the cancellation already persisted above.
-            try:
-                controller.deliver_terminal_report(sd, args.request_id)
-            except Exception:
-                pass
+            _deliver_after_cli(sd, args.request_id)
             job = core.get_job(sd, args.request_id)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"]})
@@ -214,15 +232,12 @@ def main(argv=None) -> int:
                     try:
                         rid = (entry or {}).get("request_id")
                         if rid:
-                            controller.deliver_terminal_report(sd, rid)
+                            _deliver_after_cli(sd, rid)
                     except Exception:
                         continue
                 return _out({"recovered": recovered})
             out = core.recover_one(sd, args.request_id)
-            try:
-                controller.deliver_terminal_report(sd, args.request_id)
-            except Exception:
-                pass
+            _deliver_after_cli(sd, args.request_id)
             return _out(out)
     except (core.NotFoundError, core.ConflictError, core.WorkspaceConflictError,
             core.TerminalError, core.BlockedError, core.OwnershipError,

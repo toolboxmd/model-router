@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.33.0] - 2026-09-25
+
+### Added
+
+- The runner wakes the saved planner once per terminal state (succeeded, blocked, failed, cancelled) with an end-of-job report through the existing callback path, carrying the request id, status, PR URL or reason, and handoff summary; busy planners retry within a bounded window, delivery is recorded on the job and visible in status, and restarts send no duplicates (#94)
+- Terminal-report delivery is a durable per-event send: a finished prior send is adopted by its output, so a crash between send and record neither duplicates nor loses the report (#94)
+- Grok terminal reports resume the saved planner session read-only through the #96 callback path, with the same identity check and busy wait as the other harnesses (#94)
+
 ## [0.32.0] - 2026-09-25
 
 ### Added
@@ -29,7 +37,6 @@
 ### Added
 
 - A failure caused by a removed plugin runtime recovers through the currently installed compatible runtime: the missing path is diagnosed with its cause and next action, only provably never-started actions are remade with identities preserved, and unsupported state is retained with its specific reason
-- The runner wakes the saved planner once per terminal state (succeeded, blocked, failed, cancelled) with an end-of-job report through the existing callback path, carrying the request id, status, PR URL or reason, and handoff summary; busy planners retry within a bounded window, delivery is recorded on the job and visible in status, and restarts send no duplicates (#94)
 
 ## [0.29.2] - 2026-09-24
 

@@ -106,7 +106,8 @@ class Harness:
         import hashlib as _hashlib
         import json as _json
         m = dict(meta or {})
-        stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid", "try")}
+        stable = {k: m.get(k) for k in ("prompt", "model", "allowance", "seq", "qid", "try",
+                                        "terminal_event_id")}
         blob = _json.dumps([kind, list(cmd), stable], sort_keys=True)
         return _hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -2547,6 +2548,23 @@ def harness_named(name: str) -> Harness:
     if name not in HARNESSES:
         raise ValueError(f"unknown harness: {name!r}")
     return HARNESSES[name]
+
+
+PLANNER_CALLBACK_SEND_KINDS = (KIND_CLAUDE_CALLBACK, KIND_CODEX_CALLBACK,
+                                 KIND_OPENCODE_CALLBACK, KIND_GROK_CALLBACK)
+
+
+def is_terminal_report_send(kind: str | None, meta: dict | None) -> bool:
+    """True when this spawn is a read-only terminal-report notification.
+
+    Terminal-report turns reuse the planner callback path only to deliver
+    text to the saved planner session: they
+    take no tools-backed actions and fork no writers, so the durable
+    spawn and the supervisor claim allow them on an already terminal or
+    blocked job. Anything else keeps the refusal.
+    """
+    return (kind in PLANNER_CALLBACK_SEND_KINDS
+            and isinstance(meta, dict) and meta.get("reason") == "terminal_report")
 
 
 def kind_for_cmd(cmd: list) -> str:

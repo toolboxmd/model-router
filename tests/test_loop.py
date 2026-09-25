@@ -177,6 +177,17 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded",
                          f"job={job.get('status')} block={job.get('block_reason')} err={job.get('last_error_json')}")
         self.assertEqual(job["codex_task_id"], THREAD_ID)
+        # The terminal report is delivered through a durable callback
+        # turn after the persist: wait for its record, not just success.
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            st = json.loads(core.get_job(sd, req).get("controller_state") or "{}")
+            if (st.get("terminal_report") or {}).get("state") == "delivered":
+                break
+            time.sleep(0.2)
+        st = json.loads(core.get_job(sd, req).get("controller_state") or "{}")
+        self.assertEqual((st.get("terminal_report") or {}).get("state"),
+                         "delivered", st.get("terminal_report"))
 
         def read_log(name):
             f = fake_state / name
@@ -267,10 +278,11 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("codex_resume", kinds)
         self.assertIn("claude_callback", kinds)
         self.assertIn("opencode_control", kinds)
-        # Every model child ran under a supervisor and was collected once.
+        # Every model child ran under a supervisor and was collected once:
+        # the question callback plus the terminal-report callback turn.
         invs = core._list_invocations(sd, req)
         self.assertEqual(sorted(i["kind"] for i in invs),
-                         ["claude_callback", "codex_dispatch",
+                         ["claude_callback", "claude_callback", "codex_dispatch",
                           "codex_resume", "codex_resume", "opencode_control"])
         self.assertTrue(all(i["state"] == "completed" and i["consumed_at"] for i in invs))
 

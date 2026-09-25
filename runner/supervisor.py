@@ -138,13 +138,22 @@ def supervise_invocation(state_dir: str, request_id: str, invocation_id: str) ->
             _historical = ()
         inv_kind = row["kind"]
         refuse = None
+        try:
+            _claim_meta = json.loads(row["meta_json"] or "{}") or {}
+        except ValueError:
+            _claim_meta = {}
         if (inv_kind or "") in _historical:
             refuse = f"historical invocation kind {inv_kind!r} is readable but never executable"
         elif _STOP["requested"]:
             refuse = "termination requested before spawn"
         elif row["state"] != "running" or row["supervisor_pid"] not in (None, my_pid):
             refuse = "invocation already closed or claimed"
-        elif job_row["cancel_requested"] or job_row["status"] in store.TERMINAL:
+        elif (job_row["cancel_requested"] or job_row["status"] in store.TERMINAL) \
+                and not (_harnesses.is_terminal_report_send(inv_kind, _claim_meta)
+                         and job_row["status"] in store.TERMINAL_REPORT_STATUSES):
+            # A read-only terminal-report notification is claimed like any
+            # turn: its outcome is adopted by action key, so a crash
+            # between send and record can neither lose nor duplicate it.
             refuse = "job cancelled or terminal before spawn"
         elif job_row["owner_token"] != row["owner_token"]:
             refuse = "controller lost the lease before spawn"
