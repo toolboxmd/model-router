@@ -133,13 +133,6 @@ class RouteMapping(Base):
         with self.assertRaises(ValueError):
             t3exec.route_model_selection("nope/not-a-route")
 
-    def test_instance_override_env(self):
-        with mock.patch.dict("os.environ",
-                             {"MODEL_ROUTER_T3_INSTANCE_OPENCODE": "custom-oc"}):
-            self.assertEqual(t3exec.route_instance_id("luna-go/max"),
-                             "custom-oc")
-            self.assertEqual(t3exec.route_instance_id("luna/max"), "codex")
-
 
 class SubmitT3(Base):
     def test_fields_persist_and_resubmit_is_identical(self):

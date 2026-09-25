@@ -100,6 +100,10 @@ class FakeT3Client:
         # Reply used once ``child_replies`` runs out (None: the child turn
         # never completes, which a bounded watch reports as stalled).
         self.default_child_reply = None
+        # Prism provider snapshot served to the router (None: an older
+        # server without the endpoint, answered with HTTP 404).
+        self.prism = None
+        self.prism_reads = []
 
     def dispatch(self, command):
         self.commands.append(copy.deepcopy(command))
@@ -154,9 +158,38 @@ class FakeT3Client:
             return copy.deepcopy(script)
         return snap(thread_id, state="running", age_secs=0)
 
+    def prism_snapshot(self, project_id=None):
+        self.prism_reads.append(project_id)
+        if self.prism is None:
+            raise t3exec.T3Error("T3 GET /api/prism/snapshot failed: HTTP 404")
+        return copy.deepcopy(self.prism)
+
     def complete(self, thread_id, text):
         self.scripts[thread_id] = snap(thread_id, state="completed",
                                        text=text)
+
+
+def prism_provider(instance, models, driver=None, enabled=True, windows=None):
+    """One provider entry of a Prism snapshot (toolboxmd/t3code#19 shape)."""
+    entry = {"instanceId": instance, "driver": driver or instance, "enabled": enabled,
+             "status": "ready",
+             "models": [{"slug": m, "name": m, "isCustom": False, "capabilities": None}
+                        for m in models]}
+    if windows is not None:
+        entry["usageLimits"] = {"checkedAt": iso(NOW), "windows": windows}
+    return entry
+
+
+def prism_snapshot(providers, lanes=None):
+    """A Prism snapshot: providers plus role kits with ``lanes`` per role."""
+    roles = {role: {"instructions": "", "skills": [], "threadTools": "none",
+                    "lanes": {"easy": [], "medium": [], "hard": []}}
+             for role in ("planner", "dispatcher", "reviewer", "worker",
+                          "correction", "recovery")}
+    for role, per_lane in (lanes or {}).items():
+        roles[role]["lanes"].update(per_lane)
+    return {"generatedAt": iso(NOW), "projectId": PROJECT, "providers": providers,
+            "roles": roles}
 
 
 def use_fake_t3(testcase, sd, rid, replies=None, planner=None, default=None):

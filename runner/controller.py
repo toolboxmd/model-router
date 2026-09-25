@@ -17,7 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import adapters, core, policy, store, t3exec
+from . import adapters, core, policy, store, t3exec, t3snapshot
 
 MAX_LOOP_STEPS = 12
 
@@ -503,9 +503,10 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
     signal = outcome.get("signal")
     if state == "error" and signal == "exhausted" and fallback:
         try:
-            core.record_capacity(state_dir, route, "exhausted",
-                                 {"source": "t3", "message": detail[:500]},
-                                 None, reset_source="assumed")
+            evidence = dict(t3exec.evidence_dict(detail), source="t3")
+            reset_at, source = core.reset_at_for_evidence(route, evidence, "exhausted")
+            core.record_capacity(state_dir, route, "exhausted", evidence,
+                                 reset_at, reset_source=source)
         except Exception:
             pass
         _persist_error_evidence(state_dir, request_id,
@@ -722,7 +723,7 @@ def _t3_worker_full(outcome: dict, thread_id: str) -> tuple[dict, int]:
     if signal in ("exhausted", "overloaded", "context"):
         return {"ok": False, "rc": 1, "assistant_text": text,
                 "signal": signal,
-                "signal_evidence": {"message": (outcome.get("reason") or "")[:500]},
+                "signal_evidence": t3exec.evidence_dict(outcome.get("reason")),
                 "error": outcome.get("reason") or f"t3 turn {signal}",
                 "quota": signal == "exhausted",
                 "t3_thread_id": thread_id, "idle_confirmed": True}, 1
@@ -1244,8 +1245,8 @@ def _pool_target_in_lane(pool_target: str | None, route: str, lane: str | None) 
 
 def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
                        evidence: dict) -> dict:
-    """Exhaustion: zero retries, the same model on the next pool, else the
-    next family. Overload and stalled: the next family; the route rests for
+    """Exhaustion: zero retries, the whole pool rests, then the same model
+    on the next pool, else the next family. Overload and stalled: the next family; the route rests for
     the documented cooldown. Moves stay inside the job's stored lane and skip
     one-turn routes already used. No eligible route blocks with a reason."""
     job = core.get_job(state_dir, request_id)
@@ -1254,6 +1255,10 @@ def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
     exhausted = core.exhausted_routes(state_dir)
     degraded = core.degraded_routes(state_dir)
     if signal == "exhausted":
+        # The allowance is shared: the whole pool rests, so the move never
+        # lands on another model of the same pool.
+        pool = policy.route_pool(route)
+        exhausted |= {r for r in policy.known_routes() if policy.route_pool(r) == pool}
         exhausted.add(route)
         pool_target = policy.next_pool_route(route)
         if pool_target and (pool_target in exhausted or pool_target in degraded
@@ -1303,15 +1308,21 @@ def _move_after_context(state_dir, request_id: str, route: str, evidence: dict) 
     except ValueError:
         return None
     target = None
-    if stage is not None:
+    try:
         size = policy.route_context_window(route)
+    except ValueError:
+        stage = None  # a snapshot route with no known size cannot compare
+    if stage is not None:
         order = policy.stage_routes(stage)
         for cand in order[order.index(route) + 1:]:
             if cand in exhausted or cand in degraded:
                 continue
             if policy.one_turn_routes_used(cand, turns):
                 continue
-            if policy.route_context_window(cand) <= size:
+            try:
+                if policy.route_context_window(cand) <= size:
+                    continue
+            except ValueError:
                 continue
             if core.route_concurrency_full(state_dir, cand, exclude=request_id):
                 continue
@@ -3488,6 +3499,9 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
                 _mark_blocked(state_dir, request_id,
                               f"job_step_budget_exhausted after {total} steps across launches")
                 break
+            # Eligible models, usage windows and role preferences come from
+            # the T3 snapshot (cached briefly; unknown never blocks).
+            t3snapshot.refresh_for_job(core.get_job(state_dir, request_id))
             res = step(state_dir, request_id, token=token)
         except core.LeaseLostError:
             return 0  # another controller owns the job; touch nothing

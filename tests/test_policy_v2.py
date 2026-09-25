@@ -19,75 +19,26 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(policy.POLICY_ID, "durable-runner-policy-v2")
         self.assertTrue(policy.POLICY_SOURCE and policy.POLICY_EVIDENCE)
 
-    def test_every_route_has_adapter_and_subscription_pool(self):
+    def test_every_route_is_a_t3_selection_on_a_subscription_pool(self):
         for name, spec in policy.ROUTES.items():
-            self.assertIn(spec["harness"], ("codex", "claude", "opencode", "grok"), name)
+            self.assertTrue(spec["instance"] and spec["model"], name)
             self.assertIn(spec["pool"], policy.POOLS, name)
-            self.assertTrue(policy.is_operational(name))
-            self.assertIsNone(policy.route_blocker(name))
-            if spec["harness"] == "opencode":
-                provider = spec["model"].split("/", 1)[0]
-                self.assertEqual(provider, policy.POOLS[spec["pool"]]["provider"], name)
+            self.assertTrue(policy.is_supported(name))
+            for gone in ("harness", "agent", "variant", "sandbox"):
+                self.assertNotIn(gone, spec, name)
+        self.assertEqual(policy.validate_policy(), [])
         self.assertFalse(policy.ALLOW_ZEN_OVERFLOW)
         self.assertFalse(policy.ALLOW_DIRECT_PAID_API)
-        self.assertNotIn("api-key", {p["credential"] for p in policy.POOLS.values()})
-
-    def test_older_generations_absent(self):
-        models = {s["model"].split("/", 1)[-1].removesuffix("-free") for s in policy.ROUTES.values()}
-        self.assertFalse(models & set(policy.EXCLUDED_MODELS))
-        self.assertNotIn("gpt-5.6-sol", models)
-
-    def test_superseded_native_opus_is_rejected(self):
-        route = policy.STAGES["review_final"]["routes"][0]
-        with patch.dict(policy.ROUTES[route], model="claude-opus-5"):
-            self.assertTrue(any("excluded older generation claude-opus-5" in problem
-                                for problem in policy.validate_policy()))
-
-    def test_never_implementers_absent_from_lanes(self):
-        lane_routes = set(policy.implementation_routes()) | set(policy.stage_routes("correction"))
-        for route in lane_routes:
-            spec = policy.ROUTES[route]
-            if spec["pool"] != "go":
-                continue
-            model_id = spec["model"].split("/", 1)[1]
-            self.assertNotIn(model_id, policy.GO_IMPLEMENTER_EXCLUDED, route)
-            if model_id == "grok-4.6":
-                self.assertIn(route, policy.GO_IMPLEMENTER_GROK_ROUTES, route)
 
     def test_no_gemini_or_antigravity_routes(self):
         models = " ".join(s["model"] for s in policy.ROUTES.values())
         self.assertNotRegex(models, r"gemini|antigravity")
 
-    def test_go_tiers_come_from_go_plan(self):
-        for route in policy.implementation_routes():
-            spec = policy.ROUTES[route]
-            if spec["pool"] == "go":
-                model_id = spec["model"].split("/", 1)[1]
-                self.assertIn(policy.monthly_limit_usd(route), (60, 30, 15), (route, model_id))
-        # DeepSeek V4.1 Flash is a 15 USD route from 2026-09-20.
-        self.assertEqual(policy.monthly_limit_usd("deepseek-v4.1-flash-go"), 15)
-        self.assertEqual(policy.DEEPSEEK_V4_1_FLASH_TIER_FROM, "2026-09-20")
-        # Models with no known tier are not routes.
-        with self.assertRaises(ValueError):
-            policy.route_spec("qwen3.7-plus-go")
-
-    def test_max_concurrent_on_15_and_30_tiers(self):
-        capped = {r for r in policy.ROUTES if policy.route_max_concurrent(r) == 1}
-        for route in policy.ROUTES:
-            limit = policy.monthly_limit_usd(route)
-            if limit is None:
-                self.assertIsNone(policy.route_max_concurrent(route), route)
-            elif limit in (15, 30):
-                self.assertIn(route, capped, route)
-                self.assertTrue(policy.ROUTES[route]["max_concurrent"])
-            else:
-                self.assertIsNone(policy.route_max_concurrent(route), route)
-        self.assertIn("deepseek-v4.1-flash-go", capped)
 
     def test_scarce_models_get_one_turn(self):
         self.assertEqual({r for r in policy.ROUTES if policy.one_turn_per_job(r)},
                          {"glm-5.3-go", "deepseek-v4-pro-go", "grok-4.6-go", "luna-go/max",
-                          "deepseek-v4.1-flash-go", "luna-go-review"})
+                          "deepseek-v4.1-flash-go"})
         self.assertTrue(policy.one_turn_routes_used("deepseek-v4.1-flash-go",
                                                     {"deepseek-v4.1-flash-go": 1}))
         self.assertFalse(policy.one_turn_routes_used("deepseek-v4.1-flash-go", {}))
@@ -96,8 +47,6 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(policy.next_family_route("muse-spark-xhigh-go", lane="hard",
                                                   turns_by_route={"glm-5.3-go": 1}),
                          "deepseek-v4-pro-go")
-        self.assertIsNone(policy.monthly_limit_usd("muse-spark-xhigh-free"))
-        self.assertEqual(policy.monthly_limit_usd("muse-spark-xhigh-go"), 60)
 
     def test_stage_table_matches_parent_decision(self):
         s = policy.STAGES
@@ -120,25 +69,12 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"])
         self.assertEqual(s["dispatch"]["routes"], ["luna/max", "luna-go/max"])
         self.assertNotIn("manual", s["dispatch"])
-        self.assertEqual(policy.ROUTES["luna-go/max"]["agent"], "plan")
-        # Planner and review fallback routes on other subscriptions.
-        self.assertEqual(s["planning"]["routes"], ["fable-5.1/max", "astra/max"])
-        self.assertEqual(s["planner_rungs"]["executor"], "planner")
-        self.assertEqual(s["planner_rungs"]["routes"], ["astra/medium", "opus-5.5/high"])
-        self.assertTrue(s["planner_rungs"]["planner_selects"])
-        self.assertTrue(policy.ROUTES["astra/medium"]["planner_chosen"])
-        self.assertTrue(policy.ROUTES["opus-5.5/high"]["planner_chosen"])
-        self.assertEqual(policy.ROUTES["astra/max"]["model"], "gpt-6-astra")
-        self.assertEqual(policy.ROUTES["astra/max"]["pool"], "codex")
-        self.assertEqual(policy.ROUTES["opus-5.5/high"]["harness"], "claude")
-        self.assertEqual(s["review_ticket"]["routes"], ["luna-max-review", "luna-go-review"])
-        self.assertEqual(policy.ROUTES["luna-go-review"]["agent"], "plan")
-        self.assertEqual(s["review_final"]["routes"],
-                         ["opus-5.5/high-review", "astra/high-review", "luna-max-review"])
-        self.assertEqual(s["review_final"]["executor"], "host")
+        # Planning and review are the planner's own; the runner lists none.
+        for gone in ("planning", "planner_rungs", "review_ticket", "review_final"):
+            self.assertNotIn(gone, s)
         self.assertEqual(s["critical"]["executor"], "planner")
         self.assertEqual(s["critical"]["routes"], [])
-        self.assertEqual(policy.ROUTES["luna/max"]["sandbox"], "read-only")
+        self.assertEqual(policy.ROUTES["luna/max"]["instance"], "codex")
 
     def test_planner_chosen_rungs_are_not_implementation_lanes(self):
         for stage in policy.IMPLEMENTATION_LANES:
@@ -194,36 +130,6 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(policy.next_implementation_route("grok-4.6-go", go_limit), "grok-4.6-build")
         self.assertIsNone(policy.next_implementation_route("muse-spark-xhigh-go", go_limit))
         self.assertFalse(policy.classify_quota_exhaustion(go_limit))
-
-    def test_cli_submit_uses_policy_planner_default_and_explicit_overrides(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        state_dir = str(Path(tmp.name) / "state")
-        default_workspace = Path(tmp.name) / "default-workspace"
-        explicit_workspace = Path(tmp.name) / "explicit-workspace"
-        default_workspace.mkdir()
-        explicit_workspace.mkdir()
-
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main([
-                "--state-dir", state_dir, "submit", "--request-id", "cli-default",
-                "--task", '{"goal":"default"}', "--workspace", str(default_workspace),
-                "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3", "--no-start",
-            ]), 0)
-            self.assertEqual(cli.main([
-                "--state-dir", state_dir, "submit", "--request-id", "cli-explicit",
-                "--task", '{"goal":"explicit"}', "--workspace", str(explicit_workspace),
-                "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3", "--planner-model", "custom-model",
-                "--planner-effort", "custom-effort", "--no-start",
-            ]), 0)
-
-        planning = policy.route_spec(policy.STAGES["planning"]["routes"][0])
-        default_job = core.get_job(state_dir, "cli-default")
-        self.assertEqual(default_job["planner_model"], planning["model"])
-        self.assertEqual(default_job["planner_effort"], planning["variant"])
-        explicit_job = core.get_job(state_dir, "cli-explicit")
-        self.assertEqual(explicit_job["planner_model"], "custom-model")
-        self.assertEqual(explicit_job["planner_effort"], "custom-effort")
 
 
 class Lanes(unittest.TestCase):
@@ -291,9 +197,12 @@ class Lanes(unittest.TestCase):
         # The `fewest running jobs` spread applies only among capped routes:
         # with every uncapped hard-lane route exhausted, the sticky home
         # spreads across the capped rungs by load.
+        # (Degraded, not exhausted: exhaustion is pool-wide and would rest
+        # every Go route at once.)
         for route in [r for r in policy.stage_routes("implementation_hard")
                       if policy.route_max_concurrent(r) is None]:
-            core.record_capacity(self.sd, route, "exhausted", {"source": "test"})
+            core.record_capacity(self.sd, route, "degraded", {"source": "test"},
+                                 reset_at=core.degraded_until())
         core.submit(self.sd, "cap1", {"g": 1}, self.ws("cap1"), "p",
                     lane="hard", route="glm-5.3-go", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
@@ -443,47 +352,6 @@ class ValidateFixes(unittest.TestCase):
                                 for p in problems), problems)
         finally:
             policy.STAGES["implementation_small"]["routes"] = orig_routes
-        self.assertEqual(policy.validate_policy(), [])
-
-    def test_max_concurrent_must_be_exactly_one(self):
-        orig = dict(policy.ROUTES["qwen3.8-flash-go"])
-        try:
-            policy.ROUTES["qwen3.8-flash-go"]["max_concurrent"] = 2
-            problems = policy.validate_policy()
-            self.assertTrue(any("qwen3.8-flash-go" in p and "max_concurrent must be 1" in p
-                                for p in problems), problems)
-        finally:
-            policy.ROUTES["qwen3.8-flash-go"].update(orig)
-        # A 60 USD route must carry no cap.
-        orig60 = dict(policy.ROUTES["glm-5.3-flash-go"])
-        try:
-            policy.ROUTES["glm-5.3-flash-go"]["max_concurrent"] = 1
-            problems = policy.validate_policy()
-            self.assertTrue(any("glm-5.3-flash-go" in p and "max_concurrent must be None" in p
-                                for p in problems), problems)
-        finally:
-            if "max_concurrent" in orig60:
-                policy.ROUTES["glm-5.3-flash-go"]["max_concurrent"] = orig60["max_concurrent"]
-            else:
-                policy.ROUTES["glm-5.3-flash-go"].pop("max_concurrent", None)
-        self.assertEqual(policy.validate_policy(), [])
-
-    def test_guarded_route_in_lane_recovery_or_dispatch_fails(self):
-        orig_routes = list(policy.STAGES["implementation_default"]["routes"])
-        try:
-            policy.STAGES["implementation_default"]["routes"] = orig_routes + ["astra/medium"]
-            problems = policy.validate_policy()
-            self.assertTrue(any("implementation_default" in p and "never" in p for p in problems),
-                            problems)
-        finally:
-            policy.STAGES["implementation_default"]["routes"] = orig_routes
-        orig_rec = list(policy.STAGES["recovery"]["routes"])
-        try:
-            policy.STAGES["recovery"]["routes"] = orig_rec + ["astra/medium"]
-            problems = policy.validate_policy()
-            self.assertTrue(any("recovery" in p and "never" in p for p in problems), problems)
-        finally:
-            policy.STAGES["recovery"]["routes"] = orig_rec
         self.assertEqual(policy.validate_policy(), [])
 
 

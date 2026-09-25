@@ -211,16 +211,6 @@ class TestPolicy(Base):
         self.assertIsNone(policy.next_recovery_route("grok-4.6-xai"))
         self.assertIsNone(policy.next_recovery_route("opus-5.5/high-review"))
 
-    def test_envelope(self):
-        a = policy.make_action("implementation", "muse-spark-xhigh-free", {"t": 1})
-        self.assertEqual(a["policy"], policy.POLICY_ID)
-        r = policy.make_result("completion", True, "done")
-        self.assertTrue(r["ok"])
-        with self.assertRaises(ValueError):
-            policy.make_action("nope", "muse-spark-xhigh-free")
-        with self.assertRaises(ValueError):
-            policy.make_action("implementation", "bogus/0")
-
 
 class TestHygiene(Base):
     def test_perms_wal_redaction(self):

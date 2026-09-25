@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -61,6 +62,8 @@ from . import policy
 # reconfigured by the runner (nothing here stops any server at all).
 T3_USER_PORT = 3773
 T3_DEFAULT_URL = f"http://127.0.0.1:{T3_USER_PORT}"
+# The fork's Prism snapshot endpoint (toolboxmd/t3code#19).
+PRISM_SNAPSHOT_PATH = "/api/prism/snapshot"
 
 # Planner harness name for T3-hosted planners. Stored in jobs.planner_harness
 # alongside claude/codex/opencode/grok; selecting it is not required to use
@@ -78,25 +81,13 @@ T3_POLL_SECS = 2.0
 # message silence (a long test run is a running tool, never a stall).
 TOOL_ACTIVITY_PREFIXES = ("tool.", "task.")
 
-# Route harness -> T3 provider instance id. T3 keys instances by driver
-# kind (``defaultInstanceIdForDriver`` in toolboxmd/t3code contracts), so a
-# route maps by its harness, not its pool: an OpenCode route on the xAI
-# pool still runs on the OpenCode instance. Overridable per harness with
-# MODEL_ROUTER_T3_INSTANCE_<HARNESS> (e.g. MODEL_ROUTER_T3_INSTANCE_OPENCODE).
-T3_DEFAULT_INSTANCES = {
-    "codex": "codex",
-    "opencode": "opencode",
-    "claude": "claudeAgent",
-    "grok": "grok",
-}
-
-# Reasoning-effort option id per harness, as each T3 adapter reads it
+# Reasoning-effort option id per T3 driver, as each adapter reads it
 # (CodexAdapter/GrokAdapter ``reasoningEffort``, ClaudeAdapter ``effort``,
-# OpenCodeAdapter ``variant``).
+# OpenCodeAdapter ``variant``). A route's driver follows its instance id.
 T3_EFFORT_OPTION = {
     "codex": "reasoningEffort",
     "grok": "reasoningEffort",
-    "claude": "effort",
+    "claudeAgent": "effort",
     "opencode": "variant",
 }
 
@@ -258,56 +249,48 @@ def discover_token(explicit: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def route_instance_id(route: str) -> str:
-    """T3 provider instance id for a policy route (harness-keyed, env-overridable)."""
-    spec = policy.route_spec(route)
-    harness = spec.get("harness") or ""
-    override = os.environ.get(f"MODEL_ROUTER_T3_INSTANCE_{harness.upper().replace('-', '_')}")
-    if isinstance(override, str) and override.strip():
-        return override.strip()
-    return T3_DEFAULT_INSTANCES.get(harness, harness)
+    """T3 provider instance id for a policy or snapshot route."""
+    return policy.route_spec(route)["instance"]
+
+
+def route_driver(route: str) -> str:
+    """T3 driver kind for a route: the known driver its instance id names."""
+    instance = route_instance_id(route)
+    return next((d for d in T3_EFFORT_OPTION if instance.startswith(d)), instance)
 
 
 def route_model_id(route: str) -> str:
-    """T3 model id for a policy route.
-
-    OpenCode selections keep the ``<provider>/<model>`` slug: the T3
-    OpenCode adapter rejects anything else, and the provider prefix is
-    what separates Zen free from Go. Other harnesses carry the bare model.
-    """
-    spec = policy.route_spec(route)
-    model = spec.get("model") or ""
-    if spec.get("harness") != "opencode" and "/" in model:
-        model = model.split("/", 1)[1]
+    """T3 model slug for a route (OpenCode keeps ``<provider>/<model>``,
+    which is what separates Zen free from Go)."""
+    model = policy.route_spec(route).get("model") or ""
     if not model:
         raise ValueError(f"route {route!r} carries no model")
     return model
 
 
 def route_effort(route: str) -> str | None:
-    """Reasoning effort for a policy route (the variant), or None."""
-    return policy.route_spec(route).get("variant")
+    """Reasoning effort for a route, or None for the provider default."""
+    return policy.route_spec(route).get("effort")
 
 
-def route_model_selection(route: str) -> dict:
-    """T3 ``ModelSelection`` for a policy route: instance, model, effort.
+def route_model_selection(route: str, role: str | None = None) -> dict:
+    """T3 ``ModelSelection`` for a route: instance, model, effort.
 
     Options use the canonical ``[{id, value}]`` array with the option id
-    the route's T3 adapter reads; OpenCode routes also carry their agent.
-    Unknown routes raise (never a silent substitution), matching the
-    direct path's rule.
+    the route's T3 adapter reads; OpenCode turns also carry their agent
+    (``plan`` for the dispatcher, ``build`` otherwise). Unknown routes
+    raise (never a silent substitution).
     """
-    spec = policy.route_spec(route)
-    harness = spec.get("harness") or ""
+    driver = route_driver(route)
     selection: dict = {"instanceId": route_instance_id(route),
                        "model": route_model_id(route)}
     options: list[dict] = []
     effort = route_effort(route)
     if effort:
-        options.append({"id": T3_EFFORT_OPTION.get(harness, "effort"),
-                        "value": effort})
-    agent = spec.get("agent")
-    if harness == "opencode" and isinstance(agent, str) and agent:
-        options.append({"id": "agent", "value": agent})
+        options.append({"id": T3_EFFORT_OPTION.get(driver, "effort"), "value": effort})
+    if driver == "opencode":
+        is_dispatch = (role or policy.route_spec(route).get("role")) == "dispatch"
+        options.append({"id": "agent", "value": "plan" if is_dispatch else "build"})
     if options:
         selection["options"] = options
     return selection
@@ -345,7 +328,7 @@ def child_create_command(child_id: str, parent_thread_id: str, project_id: str,
         "threadId": validate_thread_id(child_id),
         "projectId": project_id,
         "title": title[:200] or f"model-router {child_id}",
-        "modelSelection": route_model_selection(route),
+        "modelSelection": route_model_selection(route, role),
         "runtimeMode": modes["runtimeMode"],
         "interactionMode": modes["interactionMode"],
         "branch": None,
@@ -380,7 +363,7 @@ def turn_start_command(thread_id: str, text: str, route: str | None = None,
         "createdAt": _utcnow_iso(),
     }
     if route is not None:
-        cmd["modelSelection"] = route_model_selection(route)
+        cmd["modelSelection"] = route_model_selection(route, role)
     if title_seed:
         cmd["titleSeed"] = title_seed[:200]
     return cmd
@@ -466,6 +449,13 @@ class T3Client:
         """Post one user message as a turn on an existing thread."""
         return self.dispatch(turn_start_command(thread_id, text, route, role,
                                                 title_seed, message_id))
+
+    def prism_snapshot(self, project_id: str | None = None) -> dict:
+        """GET the Prism provider snapshot (models, usage windows, roles)."""
+        path = PRISM_SNAPSHOT_PATH
+        if project_id:
+            path += "?projectId=" + urllib.parse.quote(project_id, safe="")
+        return self._request("GET", path)
 
     def create_child(self, child_id: str, parent_thread_id: str,
                      project_id: str, title: str, route: str,
@@ -650,6 +640,25 @@ def classify_provider_error(text: str | None) -> str | None:
     if any(m in low for m in _HARD_MARKERS):
         return "hard"
     return None
+
+
+def evidence_dict(text: str | None) -> dict:
+    """Structured evidence for a provider error message: the message, plus
+    the first JSON object it embeds (OpenCode's retry status carries the
+    reset as ``next`` in epoch milliseconds) under ``detail``."""
+    msg = (text or "")[:2000]
+    out: dict = {"message": msg[:500]}
+    start = msg.find("{")
+    while start != -1:
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(msg[start:])
+        except ValueError:
+            start = msg.find("{", start + 1)
+            continue
+        if isinstance(obj, dict):
+            out["detail"] = obj
+        break
+    return out
 
 
 def error_evidence(snapshot: dict, turn_id: str | None = None) -> str | None:

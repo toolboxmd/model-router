@@ -115,10 +115,9 @@ class TestPublicDefaults(Base):
         self.assertTrue(out.get("acknowledged"))
         job = core.get_job(self.sd, "r1")
         self.assertEqual(job["planner_session_id"], "claude-1")
-        # Production planner default is Fable 5.1 max; Sonnet medium is
-        # only the explicit bounded live-test override.
-        self.assertEqual(job["planner_model"], "claude-fable-5-1")
-        self.assertEqual(job["planner_effort"], "max")
+        # The planner runs in its own T3 thread: nothing is chosen for it.
+        self.assertIsNone(job["planner_model"])
+        self.assertIsNone(job["planner_effort"])
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         self.assertEqual(job["attempts"], 0)
         self.assertIsNone(job["owner_token"])

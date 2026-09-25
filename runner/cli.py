@@ -30,7 +30,7 @@ import json
 import os
 import sys
 
-from . import controller, core, policy
+from . import controller, core, policy, t3snapshot
 
 
 def _state_dir(args) -> str:
@@ -90,9 +90,9 @@ def main(argv=None) -> int:
                         "agent turns and jobs carry no elapsed deadline since "
                         "toolboxmd/model-router#88, so this bounds nothing")
     p.add_argument("--planner-model", default=None,
-                   help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
+                   help="planner model, recorded as evidence")
     p.add_argument("--planner-effort", default=None,
-                   help="planner effort (default: policy planning route; live-test override medium)")
+                   help="planner effort, recorded as evidence")
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
@@ -141,9 +141,13 @@ def main(argv=None) -> int:
     g.add_argument("--request-id", default=None)
     g.add_argument("--all", action="store_true")
 
-    p = sub.add_parser("capacity", help="show remembered route capacity; --clear forgets one")
+    p = sub.add_parser("capacity", help="show capacity marks and the T3 snapshot view; "
+                                        "--clear forgets one route's marks")
     p.add_argument("--clear", default=None, metavar="ROUTE",
                    help="operator action after checking the provider allowance")
+    p.add_argument("--t3-server-url", default=None,
+                   help="T3 server to read the snapshot from (default: T3_SERVER_URL or "
+                        "http://127.0.0.1:3773)")
 
     args = ap.parse_args(argv)
     sd = _state_dir(args)
@@ -202,8 +206,11 @@ def main(argv=None) -> int:
         if args.cmd == "capacity":
             if args.clear:
                 return _out(core.clear_capacity(sd, args.clear))
-            return _out({"capacity": core.list_capacity(sd),
-                         "readings": core.list_readings(sd)})
+            # The snapshot view reads the T3 server named by
+            # --t3-server-url, T3_SERVER_URL, or the default; unknown when
+            # it cannot be read.
+            t3snapshot.refresh_for_job({"t3_server_url": args.t3_server_url}, force=True)
+            return _out({"capacity": core.list_capacity(sd), "t3": t3snapshot.view()})
         if args.cmd == "result":
             return _out(core.result_view(sd, args.request_id))
         if args.cmd == "status":

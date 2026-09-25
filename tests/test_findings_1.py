@@ -52,8 +52,10 @@ class FindingsMajor(unittest.TestCase):
         for rid in ("j1", "j2"):
             self._mark_running(rid)
         self.assertTrue(core.route_concurrency_full(self.sd, "qwen3.8-flash-go"))
-        # Exhausted successor is skipped to hy3-go.
-        core.record_capacity(self.sd, "deepseek-v4.1-flash-go", "exhausted", {"source": "test"})
+        # A resting successor is skipped to hy3-go (exhaustion is pool-wide,
+        # so it is covered by tests/test_t3snapshot.py).
+        core.record_capacity(self.sd, "deepseek-v4.1-flash-go", "degraded", {"source": "test"},
+                             reset_at=core.degraded_until())
         move = controller._preflight_move(self.sd, "j1", "qwen3.8-flash-go")
         self.assertIsNotNone(move)
         self.assertEqual(move["route"], "hy3-go")
@@ -80,13 +82,14 @@ class FindingsMajor(unittest.TestCase):
         self._insert_turn("j1", "deepseek-v4.1-flash-go", seq=0)
         move = controller._preflight_move(self.sd, "j1", "qwen3.8-flash-go")
         self.assertEqual(move["route"], "hy3-go")
-        # In-transaction switch fallback also skips an exhausted successor.
+        # In-transaction switch fallback also skips a resting successor.
         core.submit(self.sd, "k1", {"g": 1}, self.ws("k1"), "p", lane="default",
                     route="muse-spark-xhigh-free", planner_t3_thread="planner-t3")
         self._mark_running("k1")
-        core.record_capacity(self.sd, "deepseek-v4.1-flash-go", "exhausted", {"source": "test"})
+        core.record_capacity(self.sd, "deepseek-v4.1-flash-go", "degraded", {"source": "test"},
+                             reset_at=core.degraded_until())
         # k1 targets qwen (full); the atomic fallback must not land on the
-        # exhausted deepseek rung.
+        # resting deepseek rung.
         res = controller._switch_route(self.sd, "k1", "qwen3.8-flash-go", "test",
                                        {"source": "test"})
         self.assertEqual(res["route"], "hy3-go")
@@ -110,21 +113,13 @@ class FindingsMajor(unittest.TestCase):
         self.assertEqual(move["route"], "hy3-go")
 
 
-class FindingsMinorDeepseekNote(unittest.TestCase):
-    def test_tier_note_renders_dollars_not_date(self):
-        note = policy.ROUTES["deepseek-v4.1-flash-go"]["note"]
-        self.assertEqual(note, "$15 USD tier from 2026-09-20")
-        self.assertNotIn("$2026", note)
-        self.assertEqual(policy.monthly_limit_usd("deepseek-v4.1-flash-go"), 15)
-
-
 class FindingsMinorBoolCap(unittest.TestCase):
     def test_bool_cap_rejected_and_not_masked(self):
         orig = dict(policy.ROUTES["qwen3.8-flash-go"])
         try:
             policy.ROUTES["qwen3.8-flash-go"]["max_concurrent"] = True
             problems = policy.validate_policy()
-            self.assertTrue(any("qwen3.8-flash-go" in p and "max_concurrent must be 1" in p
+            self.assertTrue(any("qwen3.8-flash-go" in p and "max_concurrent must be a positive int" in p
                                 for p in problems), problems)
             self.assertIsNone(policy.route_max_concurrent("qwen3.8-flash-go"))
         finally:

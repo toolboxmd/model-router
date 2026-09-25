@@ -25,7 +25,7 @@ class TestClearCapacityPK(unittest.TestCase):
         core.submit(sd, "cap1", {"g": 1}, str(ws), "p1", planner_t3_thread="planner-t3")
         core.record_capacity(sd, "grok-4.6-go", "exhausted", {"class": "GoUsageLimitError"})
         rows = [r for r in core.list_capacity(sd) if r["route"] == "grok-4.6-go"]
-        self.assertEqual({r["window"] for r in rows}, {"5h", "weekly", "monthly"})
+        self.assertEqual({r["window"] for r in rows}, {"limit"})
         # Simulate an orphan row sharing pool/model but with a stale route label
         # (PK overwrite left the old label behind in a hypothetical sharer).
         con = store.connect(sd)
