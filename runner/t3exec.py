@@ -1,11 +1,9 @@
 """T3 execution path for the durable local runner. Stdlib only.
 
-When a job names a planner T3 thread (``submit --planner-t3-thread``),
+Every job names a planner T3 thread (``submit --planner-t3-thread``):
 dispatcher and worker invocations run as T3 child threads of that
-planner thread instead of local harness CLIs, and the terminal job
-state is posted back into the planner thread as a message. Jobs
-without a planner T3 thread keep the direct CLI execution path
-unchanged; this module is never consulted for them.
+planner thread, and questions and the terminal job state are posted
+into the planner thread as messages (#106, #110).
 
 Wire reference: toolboxmd/t3code ``packages/contracts`` —
 ``POST /api/orchestration/dispatch`` carries a client orchestration
@@ -105,7 +103,7 @@ T3_RUNTIME_MODES = {
 
 # Error text -> provider signal. Structured evidence only where the
 # snapshot carries it (session.lastError, error-tone activities); model
-# text is never classified, matching the direct path's rule.
+# text is never classified.
 _EXHAUSTED_MARKERS = (
     "usage limit", "usage_limit", "usagelimit", "free_tier_limit",
     "freeusagelimiterror", "gousagelimiterror", "insufficient_quota",
@@ -131,10 +129,7 @@ class T3Error(Exception):
 # ---------------------------------------------------------------------------
 
 def is_t3_job(job: dict | None) -> bool:
-    """True when the job names a planner T3 thread: the T3 path applies.
-
-    The direct CLI path stays the fallback for every other job.
-    """
+    """True when the job names a planner T3 thread (every job since #110)."""
     tid = (job or {}).get("planner_t3_thread")
     return isinstance(tid, str) and bool(tid.strip())
 
@@ -231,8 +226,7 @@ def discover_token(explicit: str | None = None) -> str:
     """Bearer token: explicit value wins, then T3_SERVER_TOKEN, then the CLI.
 
     Raises T3Error when no token is available: the caller blocks with the
-    reason instead of silently falling back to the direct path, so a
-    broken T3 setup can never masquerade as a direct-path job.
+    reason, so a broken T3 setup is always visible.
     """
     for cand in (explicit, os.environ.get("T3_SERVER_TOKEN")):
         if isinstance(cand, str) and cand.strip():
@@ -818,8 +812,8 @@ def watch_turn(client: T3Client, thread_id: str, *,
     A stalled read is probed immediately with a fresh snapshot before it
     counts: a turn that produced activity between the two reads stays
     running. ``timeout_secs`` bounds only the watch (tests and operator
-    tools); production watches carry no elapsed deadline, matching the
-    direct path (no per-turn deadline since #88): pass None to wait as
+    tools); production watches carry no elapsed deadline (no per-turn
+    deadline since #88): pass None to wait as
     long as the turn stays active. Explicit provider errors return at
     once.
     """

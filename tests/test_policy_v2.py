@@ -1,4 +1,4 @@
-"""Policy v2: data consistency, derived skill table, lanes, and signal classes."""
+"""Policy v2: data consistency, lanes, caps, and signal classes."""
 import json
 import io
 import sys

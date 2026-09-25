@@ -306,11 +306,9 @@ def _dispatch_fallback_routes(dispatch_route: str) -> list:
 # ---------------------------------------------------------------------------
 # T3 execution path (toolboxmd/model-router#106)
 #
-# When a job names a planner T3 thread, dispatcher and worker invocations
-# run as T3 child threads of that planner thread, and terminal/question
-# posts go into the planner thread as messages instead of through the
-# harness-specific callback CLIs. Jobs without a planner T3 thread never
-# reach this block: the direct CLI path below applies unchanged.
+# Dispatcher and worker turns run as T3 child threads of the planner
+# thread, and terminal/question posts go into the planner thread as
+# messages (#106, #110).
 # ``t3_client`` is an injectable T3Client (deterministic tests); production
 # resolves it from the job's stored server URL plus token discovery.
 # ---------------------------------------------------------------------------
@@ -436,7 +434,7 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             planner_thread_id=planner)
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
-        # block loudly, never silently run the direct path.
+        # block loudly with the reason.
         return {"action": "blocked", "reason": "t3_unavailable",
                 "detail": f"t3_unavailable: {e}"}
     if not existing_id:
@@ -614,7 +612,7 @@ def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
     reason = "initial"
     adopted = _t3_thread_for(job, "dispatch") is not None
     if not adopted:
-        # Preflight mirrors the direct path: a dispatch route the capacity
+        # Preflight: a dispatch route the capacity
         # memory knows as exhausted or resting is skipped before any child
         # starts; later jobs go straight to Luna on OpenCode Go.
         try:
@@ -1599,8 +1597,8 @@ def _apply_planner_directed_route(state_dir, request_id: str,
     ordinary envelope ``route`` field (and any legacy concrete route in
     an older example) is inert: the escalation ladder stays authoritative
     and a repeated default never undoes a correction or recovery move.
-    Anything else (an unknown route, a planner-harness rung that runs in
-    the planner session, or a route with no capacity left) is rejected
+    Anything else (an unknown route, a dispatch route, or a route with
+    no capacity left) is rejected
     with a ``planner_route_rejected`` event and the job keeps its route:
     explicit choices are never silently substituted and models never
     silently swapped. Correction and recovery stage routes are valid
@@ -1620,8 +1618,8 @@ def _apply_planner_directed_route(state_dir, request_id: str,
         _record_planner_route_rejection(
             state_dir, request_id, requested,
             f"route {requested!r} is not dispatcher-assignable: "
-            "planner-harness rungs run in the planner session, and unknown "
-            "routes never substitute a model")
+            "only implementation-lane, correction and recovery routes are "
+            "assignable, and unknown routes never substitute a model")
         return False
     lane = job.get("lane")
     try:
@@ -2045,9 +2043,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
                        full: dict, session_id: str | None, status: str = "ok",
                        error=None, *, run_proof: bool = True,
                        proof_skipped_reason: str | None = None,
-                       proof_timeout: int = 600,
-                       turn_rc: int | None = None,
-                       harness_crash: bool = False) -> dict:
+                       proof_timeout: int = 600) -> dict:
     """Write report.json, proof.log, diff.patch, and worker.txt for one turn.
 
     The runner runs the task's own proof command and records the exit code;
@@ -2118,20 +2114,10 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         signal_name = None
     failure_class = None
     if status != "ok":
-        failure_class = core.failure_class_for(
-            signal=signal_name, proof_class=proof_class, rc=turn_rc)
-        if failure_class == "timeout" and harness_crash and turn_rc == 124:
-            # A supervisor-level rc124 with no proof outcome (an OpenCode
-            # startup failure, a legacy 124 record) is infrastructure,
-            # never a proof timeout: the suite never ran, so nothing
-            # timed out. A proof that ran past its budget carries
-            # proof_class timeout instead and stays timeout.
-            failure_class = "infrastructure"
-        if failure_class == "unknown" and (error or turn_rc not in (None, 0)):
-            # The worker or harness errored without a capacity signal:
-            # a vanished supervisor is infrastructure, a finished worker
-            # that errored is implementation.
-            failure_class = "infrastructure" if harness_crash else "implementation"
+        failure_class = core.failure_class_for(signal=signal_name, proof_class=proof_class)
+        if failure_class == "unknown" and error:
+            # The worker errored without a capacity signal.
+            failure_class = "implementation"
     am = full.get("actual_model") if isinstance(full.get("actual_model"), dict) else {}
     observed = (f"{am.get('providerID')}/{am.get('modelID')}" if am.get("providerID") and am.get("modelID") else None)
     observed_variant = am.get("variant") if isinstance(am.get("variant"), str) else None
@@ -2788,8 +2774,8 @@ LADDER_RUNGS = ("initial", "correction", "correction_fresh", "recovery")
 def eligible_directed_routes(state_dir, request_id: str) -> list[str]:
     """Genuinely eligible dispatcher routes for a planner direction.
 
-    A route qualifies when the dispatcher may assign it (owned-server
-    or headless-worker harness, never a planner-harness rung), it sits
+    A route qualifies when the dispatcher may assign it (an
+    implementation-lane, correction, or recovery route), it sits
     in the job lane or on the correction/recovery stage, and it has
     capacity (not exhausted or degraded, one-turn routes unused,
     concurrency cap free). The escalation evidence lists these so a

@@ -1,16 +1,31 @@
 # Changelog
 
-## [Unreleased]
+## [0.35.0] - 2026-09-25
 
 ### Changed
 
+- Jobs run only as T3 threads: `submit` requires `--planner-t3-thread`, and every stage (dispatch, resume, worker, correction and recovery turns, planner questions, terminal report) runs through T3. `--planner-harness`, `--planner-model` and `--planner-effort` are recorded as evidence only (#110, #116)
+- Models, limits and role preferences come from T3's Prism provider snapshot (`GET /api/prism/snapshot`, toolboxmd/t3code#19), read before each controller step: a model turned off in T3 leaves routing, a usage window at 100 percent rests every route on that meter until `resetsAt` (or a later read), 80 percent degrades, and a non-empty Prism (role, lane) list replaces the policy order, with unknown entries running as `t3:<instance>:<model>@<effort>`. An unreadable snapshot filters nothing (#116)
+- Error marks expire at their reset (OpenCode's `next` in epoch milliseconds, a `resetsAt`, a `retry_after`, else one assumed 5-hour window), so a stale Zen free mark no longer blocks Muse free; exhaustion rests the whole pool, so a Go limit never moves laterally to another Go model; a successful turn clears assumed marks on its pool (#111, #116)
+- Routes are T3 model selections (instance, model, effort) with pool, family and caps; policy 2.9.0 (#116)
 - T3 path: a job's threads form a tree. The dispatcher thread stays a child of the planner thread, and worker, correction and recovery threads are children of the dispatcher thread (`sub.<dispatcher>.<suffix>`, plus `parentThreadId`), so the planner's Agents panel shows one dispatcher per job. Questions and the terminal report still go to the planner thread, and every child's first message still links the planner thread (#113)
-
-## [0.35.0] - 2026-09-25
 
 ### Added
 
-- T3 is the only execution path; models and limits from the T3 snapshot; model-routing skill removed
+- Baseline proof: before the first dispatch the task's proof runs once on the base commit (in place when the workspace is clean there, else in a removed scratch worktree); a red base blocks as `baseline_proof_failed` before any thread starts. `"baseline_proof": false` opts out (#111, #116)
+- A capacity signal on the correction route moves laterally into the job's lane instead of blocking (#111, #116)
+- The dispatcher's evidence carries the job branch's commits since base and any open branch PR, so finished work is not mistaken for no work (#116)
+- `capacity` shows the T3 snapshot view per route next to the error marks (#116)
+
+### Fixed
+
+- A capped fallback dispatch route is reserved before its thread starts, and an exhausted escalation asks the planner in its thread on the next step instead of waiting for `recover` (#116)
+
+### Removed
+
+- The direct harness path: Codex CLI dispatch and resume, the owned OpenCode server, the Grok Build CLI worker, the Claude, Codex, OpenCode and Grok planner callbacks and their busy checks, the CLI terminal-report senders, child-process supervision, role kits, direction supply, and per-harness silence windows (#110, #116)
+- The model-routing Skill and its generated routing reference; the plugin is now the runtime's distribution and usage guidance lives in Chromeria's Prism tool descriptions (#115, #116)
+- Go cost tables and tier derivations, usage probes and readings, prose reset parsing, and the host-only planning, review and planner-rung routes (#116)
 
 ## [0.34.0] - 2026-09-25
 

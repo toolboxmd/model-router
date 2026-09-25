@@ -821,7 +821,7 @@ def terminal_class_for(rc, result_obj, crashed: bool = False,
 
 # Failure taxonomy for issue 87 (toolboxmd/model-router#87). Turn-level
 # classes Agent Observer measures: timeout (a turn or proof that ran out
-# of time), stall (stream silence past the harness window), provider (a
+# of time), stall (activity silence on a T3 turn), provider (a
 # capacity signal: exhausted, overloaded, or context pressure),
 # infrastructure (a hard provider error, a missing runtime, a lost
 # supervisor, or an unconfirmed stop), implementation (the worker ran and
@@ -930,8 +930,8 @@ def _derive_handoff_summary(task, request_id: str,
 
     An explicit summary wins; a task packet carrying ``handoff_summary``
     is next; otherwise the summary is derived from the packet's Issue,
-    decisions, proof command, and goal so a callback can be answered from
-    the ledger alone, including by the Astra fallback in a fresh session.
+    decisions, proof command, and goal so a planner question can be
+    answered from the ledger alone.
     Free-text secrets are masked before persisting.
     """
     if isinstance(handoff_summary, str) and handoff_summary.strip():
