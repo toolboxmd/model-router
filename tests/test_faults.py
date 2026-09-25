@@ -942,17 +942,27 @@ class TestImplementationBoundaryFaults(unittest.TestCase):
         job = core.get_job(self.sd, "ib1")
         self.assertEqual(job["status"], "succeeded", job.get("block_reason"))
         lines = self._lines("claude.log")
-        # Exactly one planner turn: the callback resuming the saved
-        # session. Submit performs no planner mutation, so recovery
-        # asks once and never forks a second planner session.
-        self.assertEqual(len(lines), 1,
-                         "one planner callback, no planner mutation at submit")
+        # The planner question is asked exactly once; the Issue #94
+        # terminal report wakes the saved session once more on success.
+        # Submit performs no planner mutation, so recovery asks once and
+        # never forks a second planner session for the question.
+        self.assertTrue(wait_for(lambda: (
+            json.loads(core.get_job(self.sd, "ib1").get("controller_state")
+                       or "{}").get("terminal_report") or {}).get("state")
+            == "delivered", 25), "terminal report delivered")
+        lines = self._lines("claude.log")
+        self.assertEqual(len(lines), 2,
+                         "one planner callback plus one terminal report")
         entry = json.loads(lines[0])
         argv = entry["argv"]
         self.assertEqual(harnesses.kind_for_cmd(["claude"] + list(argv)),
                          "claude_callback")
         self.assertIn("p-ib", argv)
         self.assertIn("HANDOFF SUMMARY", argv[-1])
+        report = json.loads(lines[1])
+        self.assertIn("p-ib", report["argv"])
+        self.assertIn("terminal report", report["argv"][-1])
+        self.assertIn("succeeded", report["argv"][-1])
         qs = core.list_questions(self.sd, "ib1", only_pending=False)
         self.assertEqual([(q["qid"], q["status"], q["answer"]) for q in qs],
                          [("q1", "answered", "Descending.")])

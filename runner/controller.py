@@ -2825,10 +2825,664 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
             "evidence.")
 
 
+# Terminal states that wake the saved planner once with an end-of-job
+# report (Issue #94). ``blocked`` is not in ``store.TERMINAL`` (recover can
+# resume it) but still ends the job from the planner's point of view, so it
+# reports like the final states. Delivery always runs after the terminal
+# state is persisted and never changes the job's status or result.
+TERMINAL_REPORT_STATUSES = store.TERMINAL_REPORT_STATUSES
+# Bounded busy-planner window: at most this many delivery attempts per
+# terminal state, with a short sleep between busy retries.
+TERMINAL_REPORT_MAX_ATTEMPTS = 5
+TERMINAL_REPORT_RETRY_DELAY_SECS = 2.0
+
+
+def _terminal_report_pr_url(job: dict) -> str | None:
+    """PR URL from the persisted result, or None when none was recorded.
+
+    The lease-held completion nests the payload as a JSON string inside
+    ``output``; the offline path stores it top-level. Both read here so
+    the report quotes the persisted URL instead of inventing one.
+    """
+    try:
+        res = json.loads(job.get("result_json") or "null")
+    except ValueError:
+        return None
+    if not isinstance(res, dict):
+        return None
+    cand = res.get("pr_url")
+    if isinstance(cand, str) and cand.strip():
+        return cand.strip()
+    out = res.get("output")
+    inner = None
+    if isinstance(out, str):
+        try:
+            inner = json.loads(out)
+        except ValueError:
+            inner = None
+    elif isinstance(out, dict):
+        inner = out
+    if isinstance(inner, dict):
+        cand = inner.get("pr_url")
+        if isinstance(cand, str) and cand.strip():
+            return cand.strip()
+    return None
+
+
+def _terminal_report_reason(job: dict) -> str | None:
+    """Block/failure/cancellation reason for the report, or None."""
+    status = job.get("status")
+    if status == "blocked":
+        reason = job.get("block_reason")
+        return str(reason)[:500] if reason else "blocked (no reason recorded)"
+    if status == "failed":
+        err_class = job.get("error_class")
+        if isinstance(err_class, str) and err_class.strip():
+            return str(err_class)[:500]
+        try:
+            res = json.loads(job.get("result_json") or "null")
+        except ValueError:
+            res = None
+        if isinstance(res, dict):
+            err = res.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("code") or err.get("message") or "")[:500]
+            else:
+                detail = str(err or "")[:500]
+            if detail.strip():
+                return detail
+        return "failed (no reason recorded)"
+    if status == "cancelled":
+        return "cancelled by operator request"
+    return None
+
+
+def _terminal_report_text(request_id: str, status: str,
+                           pr_url: str | None, reason: str | None,
+                           summary: str | None) -> str:
+    """End-of-job report: request id, status, PR URL or reason, summary.
+
+    Succeeded reports say ready to merge with the PR URL. Free-text parts
+    are redacted before they travel back to the planner session.
+    """
+    summary = (summary or "").strip() or "-"
+    try:
+        reason = adapters.redact_text(reason) if reason else None
+    except Exception:
+        pass
+    head = f"Job {request_id} terminal report."
+    if status == "succeeded":
+        head = f"Job {request_id} has succeeded: ready to merge."
+        if pr_url:
+            head = f"Job {request_id} has succeeded: ready to merge {pr_url}."
+    elif status == "blocked":
+        head = f"Job {request_id} is blocked and needs your judgment."
+    elif status == "failed":
+        head = f"Job {request_id} has failed."
+    elif status == "cancelled":
+        head = f"Job {request_id} was cancelled."
+    lines = [head, "", f"Request: {request_id}", f"Status: {status}"]
+    if pr_url:
+        lines.append(f"PR: {pr_url}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+    lines += ["", f"HANDOFF SUMMARY for job {request_id}:", summary, "",
+              "This is a terminal report, not a question: no answer is required. "
+              "Merging stays with the human."]
+    return "\n".join(lines)
+
+
+def _terminal_report_record(job: dict) -> dict:
+    """Durable delivery record from the controller state, or {}."""
+    try:
+        st = _load_controller_state(job)
+    except Exception:
+        return {}
+    rec = st.get("terminal_report")
+    return dict(rec) if isinstance(rec, dict) else {}
+
+
+def _terminal_report_lease_guard(con, request_id: str) -> None:
+    """Lease check for terminal-report writes.
+
+    Unlike :func:`_lease_guard`, a terminal status never voids the
+    write: the delivery record is *supposed* to land after the terminal
+    persist. Only a superseded controller (owner token mismatch) is
+    refused, so a stale writer cannot overwrite a newer delivery record.
+    """
+    token = _LEASE["token"]
+    if token is None:
+        return
+    row = con.execute("SELECT owner_token FROM jobs WHERE request_id=?",
+                      (request_id,)).fetchone()
+    if row is None or row["owner_token"] != token:
+        con.execute("ROLLBACK")
+        raise core.LeaseLostError(f"job {request_id}: terminal report writer no longer holds the lease")
+
+
+def _save_terminal_report_record(state_dir, request_id: str,
+                                 record: dict) -> None:
+    """Persist the delivery record without touching status or result.
+
+    Merges only the ``terminal_report`` key into the controller state and
+    emits a ``terminal_report`` ledger event, so the outcome is visible in
+    ``status``. Lease-guarded like every other controller write.
+    """
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _terminal_report_lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        try:
+            st = json.loads(row["controller_state"] or "{}")
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        st["terminal_report"] = record
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        try:
+            detail = {"state": str(record.get("state") or "")[:32],
+                      "attempts": int(record.get("attempts") or 0),
+                      "status": str(record.get("status") or "")[:32]}
+            last = record.get("last_reason")
+            if isinstance(last, str) and last.strip():
+                detail["last_reason"] = adapters.redact_text(last)[:200]
+        except Exception:
+            detail = {"state": "unknown"}
+        core._event(con, request_id, "terminal_report", detail)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+# Planner binaries holding a live session per harness, for the
+# terminal-report busy check. Every harness resumes the saved session
+# (Grok read-only since #96), so every one is gated.
+_TERMINAL_BUSY_BINARIES = {"claude": adapters.CLAUDE_BIN,
+                           "codex": adapters.CODEX_BIN,
+                           "opencode": adapters.OPENCODE_BIN,
+                           "grok": adapters.GROK_BIN}
+
+
+def _terminal_report_busy_reason(harness_name: str, planner_session: str,
+                                 exclude_pids) -> str | None:
+    """Busy detail when the planner session is held, else None.
+
+    Every resume-based harness is gated, not just Claude: the argv check
+    sees a live process holding the session (``--resume SID``,
+    ``--session SID``, or the joined ``--session-id=<SID>`` form), and
+    Claude adds the transcript check for a turn still writing. Either
+    means the report must wait for the next retry inside the bounded
+    window.
+    """
+    binary = _TERMINAL_BUSY_BINARIES.get(harness_name)
+    if binary is None:
+        return None
+    try:
+        busy = adapters.planner_process_in_use(binary, planner_session,
+                                               exclude_pids=exclude_pids)
+    except Exception:
+        busy = []
+    if busy:
+        return f"planner_busy: session in use by pid {busy[0]}"
+    if harness_name == "claude":
+        try:
+            quiet = adapters.wait_planner_quiet(planner_session)
+        except Exception:
+            quiet = True
+        if not quiet:
+            return "planner_busy: session transcript is still changing"
+    return None
+
+
+def _terminal_report_invocation(harness_name: str, planner_session: str,
+                                  text: str, workspace: str,
+                                  job: dict) -> tuple[str, list[str]]:
+    """(invocation kind, argv) for one terminal-report turn.
+
+    Reuses the existing planner callback builders: Claude and Codex
+    resume the exact saved session, OpenCode resumes its session, and
+    Grok resumes its saved session read-only (#96). Never forks a new
+    planner session.
+    """
+    if harness_name == "codex":
+        return (harnesses.KIND_CODEX_CALLBACK,
+                adapters.build_codex_planner_cmd(planner_session, text))
+    if harness_name == "opencode":
+        return (harnesses.KIND_OPENCODE_CALLBACK,
+                adapters.build_opencode_planner_cmd(planner_session, text,
+                                                    workspace))
+    if harness_name == "grok":
+        return (harnesses.KIND_GROK_CALLBACK,
+                adapters.build_grok_planner_cmd(planner_session, text,
+                                                workspace))
+    planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
+    planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
+    return (harnesses.KIND_CLAUDE_CALLBACK,
+            adapters.build_claude_cmd(planner_session, text,
+                                       model=planner_model,
+                                       effort=planner_effort))
+
+
+def _terminal_event_id(state_dir, request_id: str) -> int:
+    """Durable identity of the current terminalization event.
+
+    The latest terminal-state ledger event id (blocked, completed,
+    failed, cancelled, timeout), ignoring terminal_report rows. A retry
+    of the same event sees the same id, so it reuses the same stable
+    action key; a blocked job that later becomes terminal again has a
+    new ledger event, so its report gets a distinct key and is never
+    collapsed into the earlier one.
+    """
+    try:
+        con = store.connect(state_dir)
+        try:
+            row = con.execute(
+                "SELECT MAX(id) AS m FROM events WHERE request_id=? AND kind IN"
+                " ('blocked','completed','failed','cancelled','timeout')",
+                (request_id,)).fetchone()
+        finally:
+            con.close()
+        m = row["m"] if row is not None else None
+        return int(m) if m is not None else 0
+    except Exception:
+        return 0
+
+
+def _terminal_report_meta(text: str, event_id: int = 0) -> dict:
+    meta = {"stage": "planning", "reason": "terminal_report",
+            "prompt_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+    try:
+        meta["terminal_event_id"] = int(event_id)
+    except (TypeError, ValueError):
+        meta["terminal_event_id"] = 0
+    return meta
+
+
+def _parse_terminal_send(harness_name: str, kind: str,
+                         out: str) -> tuple[bool, str | None, str | None, str | None]:
+    """(ok, error, reported_session, answer) from actual send output."""
+    if harness_name == "codex":
+        parsed = harnesses.harness_named("codex").parsed_planner_result(kind, out)
+        return (bool(parsed.get("ok")), parsed.get("error"),
+                parsed.get("session_id"), parsed.get("answer"))
+    if harness_name == "opencode":
+        parsed = harnesses.harness_named("opencode").parsed_planner_result(kind, out)
+        return (bool(parsed.get("ok")), parsed.get("error"),
+                parsed.get("session_id"), parsed.get("answer"))
+    if harness_name == "grok":
+        parsed = harnesses.harness_named("grok").parsed_planner_result(kind, out)
+        return (bool(parsed.get("ok")), parsed.get("error"),
+                parsed.get("session_id"), parsed.get("text"))
+    parsed = harnesses.harness_named("claude").parsed_result(kind, out)
+    return (bool(parsed.get("ok")), parsed.get("error"),
+            parsed.get("session_id"), parsed.get("answer"))
+
+
+def _terminal_report_identity_checked(harness_name: str) -> bool:
+    """Whether the send must come from the exact saved session.
+
+    Every harness resumes the saved planner session (Grok read-only
+    since #96), so every send must answer from the saved one.
+    """
+    return True
+
+
+def _save_report_or_log(state_dir, request_id: str,
+                          record: dict) -> str | None:
+    """Persist the delivery record; None on success, else error detail.
+
+    Delivery counts as successful only after its outcome is durably
+    recorded and visible in `status`. A failed write also appends one
+    line to the job log, so the failure stays visible in `status`
+    output_tail even when the ledger itself is unwritable.
+    """
+    try:
+        _save_terminal_report_record(state_dir, request_id, record)
+        return None
+    except Exception as e:  # noqa: BLE001 - logged, never raised
+        detail = f"{type(e).__name__}: {str(e)[:150]}"
+        try:
+            root = store.ensure_state_dir(state_dir)
+            store.append_text(store.output_path_for(root, request_id),
+                              f"[terminal_report record_failed {detail}]\n")
+        except OSError:
+            pass
+        return detail
+
+
+def _is_terminal_report_row(inv: dict, kind: str) -> bool:
+    """True when this invocation row is a terminal-report send of ``kind``.
+
+    The meta reason separates report sends from planner-question
+    callbacks sharing the kind: only the report's own rows are adopted,
+    so a question's answer can never count as a report delivery.
+    """
+    if not isinstance(inv, dict) or inv.get("kind") != kind:
+        return False
+    try:
+        meta = json.loads(inv.get("meta_json") or "{}")
+    except ValueError:
+        return False
+    return isinstance(meta, dict) and meta.get("reason") == "terminal_report"
+
+
+def _read_invocation_text(inv: dict, name: str) -> str | None:
+    try:
+        return Path(inv[name]).read_text(encoding="utf-8", errors="replace")
+    except (OSError, KeyError, TypeError):
+        return None
+
+
+def _record_terminal_send_outcome(state_dir, request_id: str, kind: str,
+                                  harness_name: str, planner_session: str,
+                                  key: dict, status: str, rc: int,
+                                  out: str, attempts: int) -> dict:
+    """Record the outcome of actual send output; never invent delivery.
+
+    ``attempts`` already counts this send. Delivered is returned only
+    after the record persists; otherwise the failure stays visible
+    without changing the job outcome.
+    """
+    ok, error, reported, _answer = _parse_terminal_send(harness_name, kind, out or "")
+    mismatch = _terminal_report_identity_checked(harness_name) \
+        and reported != planner_session
+    if rc == 0 and ok and not mismatch:
+        save_err = _save_report_or_log(
+            state_dir, request_id,
+            {"state": "delivered", "attempts": attempts, "status": status,
+             "delivered_for": key, "last_reason": None,
+             "updated_at": core._utcnow()})
+        if save_err is not None:
+            return {"action": "report-failed", "status": status,
+                    "attempts": attempts,
+                    "reason": f"terminal_report_record_failed: {save_err}"[:300]}
+        return {"action": "reported", "status": status, "attempts": attempts}
+    if mismatch:
+        last_reason = ("planner_session_mismatch: resumed result came "
+                       "from another session")
+    else:
+        last_reason = f"terminal_report_failed rc={rc}: {error or 'error'}"[:500]
+    _save_report_or_log(
+        state_dir, request_id,
+        {"state": "failed", "attempts": attempts, "status": status,
+         "last_reason": last_reason, "updated_at": core._utcnow()})
+    return {"action": "report-failed", "status": status,
+            "attempts": attempts, "reason": last_reason}
+
+
+def _adopt_terminal_send(state_dir, request_id: str, action_key: str,
+                         kind: str, harness_name: str, planner_session: str,
+                         key: dict, status: str, attempts: int) -> dict | None:
+    """Adopt a prior send for this terminal state, or defer to a live one.
+
+    A controller that died after the send but before recording leaves a
+    finished invocation row carrying the planner's actual answer:
+    adopting its output closes the crash window with neither a duplicate
+    send nor a lost report. A send still owned elsewhere defers without
+    duplicating it. Returns a result dict when adopted or deferred, else
+    None to proceed with a fresh send.
+    """
+    rows = [i for i in core._list_invocations(state_dir, request_id)
+            if i.get("action_key") == action_key
+            and i.get("state") != "abandoned"
+            and _is_terminal_report_row(i, kind)]
+    if not rows:
+        return None
+    try:
+        core.consume_finished_invocations(state_dir, request_id)
+    except Exception:
+        pass
+    rows = [i for i in core._list_invocations(state_dir, request_id)
+            if i.get("action_key") == action_key
+            and i.get("state") != "abandoned"
+            and _is_terminal_report_row(i, kind)]
+    # Only terminal rows carry adoptable evidence: a running row is
+    # either live elsewhere (defer below) or never started (the send
+    # path decides, and the durable path abandons plus proceeds).
+    terminal_rows = [i for i in rows
+                     if i.get("state") in ("completed", "failed")]
+    done = [i for i in terminal_rows
+            if i.get("state") == "completed" and i.get("rc") == 0]
+    failed = [i for i in terminal_rows if i not in done]
+    pick = done[-1] if done else (failed[-1] if failed else None)
+    if pick is not None:
+        out = _read_invocation_text(pick, "stdout_path")
+        err = _read_invocation_text(pick, "stderr_path") or ""
+        if out is None:
+            # No evidence on disk yet; the send path decides (the durable
+            # path adopts or respawns by the same key, never duplicates).
+            return None
+        try:
+            core._mark_collected(state_dir, request_id,
+                                 pick["invocation_id"], reused=True)
+        except Exception:
+            pass
+        try:
+            rc = int(pick.get("rc") or 0)
+        except (TypeError, ValueError):
+            rc = 0
+        return _record_terminal_send_outcome(
+            state_dir, request_id, kind, harness_name, planner_session,
+            key, status, rc, out, attempts + 1)
+    live = [i for i in rows
+            if core._invocation_ownership(i) in ("live", "unresolved", "orphaned")]
+    if live:
+        attempts += 1
+        last_reason = ("report deferred: send for this terminal state is "
+                       f"owned elsewhere ({live[0]['invocation_id'][:8]})")
+        save_err = _save_report_or_log(
+            state_dir, request_id,
+            {"state": "pending", "attempts": attempts, "status": status,
+             "last_reason": last_reason, "updated_at": core._utcnow()})
+        if save_err is not None:
+            return {"action": "report-error", "status": status,
+                    "attempts": attempts, "reason": save_err}
+        return {"action": "report-deferred", "status": status,
+                "attempts": attempts, "reason": last_reason}
+    return None
+
+
+def _send_report_turn(run_cmd, cmd, workspace, kind, meta):
+    """(rc, out, err, send_refused) for one terminal-report turn.
+
+    The turn runs through the given ``run_cmd``: the durable closure in
+    production (supervised invocation, adopted by stable action key), a
+    fake in tests. A lost lease or a competing owned invocation comes
+    back as ``send_refused`` so the caller defers without starting a
+    duplicate.
+    """
+    try:
+        rc, out, err = run_cmd(cmd, workspace, None, kind=kind, meta=meta)
+        return rc, out, err, None
+    except core.LeaseLostError as e:
+        return 125, "", f"report deferred: {e}"[:300], "deferred"
+    except core.OwnershipError as e:
+        return 125, "", f"report deferred: {e}"[:300], "deferred"
+    except Exception as e:  # noqa: BLE001 - recorded, never raised
+        return 125, "", f"report spawn failed: {type(e).__name__}: {str(e)[:200]}", "spawn"
+
+
+def deliver_terminal_report(state_dir, request_id: str, run_cmd=None,
+                            sleep_fn=None) -> dict:
+    """Send one end-of-job report to the saved planner session.
+
+    Runs after the terminal state is persisted and never changes the
+    job's status or result: it only merges the ``terminal_report``
+    delivery record into the controller state. The report travels
+    through the existing planner callback path (Claude resume, Codex
+    ``exec resume``, OpenCode ``run --session``, Grok read-only
+    ``--resume``) and carries the request id, terminal status,
+    PR URL or reason, and handoff summary. The send is a durable
+    invocation under a stable action key: a finished prior send is
+    adopted by its actual output (so a crash between send and record
+    can neither duplicate nor lose the report), a live one defers, and
+    only then does a fresh send start. A busy planner is retried until
+    idle or ``TERMINAL_REPORT_MAX_ATTEMPTS``; recovery and restarted
+    controllers see the delivered record and send no duplicate.
+    Delivered is claimed only after the outcome is durably recorded.
+    """
+    run_cmd = run_cmd or default_run_cmd
+    sleep_fn = sleep_fn or time.sleep
+    job = core.get_job(state_dir, request_id)
+    status = job.get("status")
+    if status not in TERMINAL_REPORT_STATUSES:
+        # A job that left blocked behind (recovered to running) clears the
+        # previous terminal record, so a later terminal state reports
+        # again; a restarted controller on a still-terminal job keeps it.
+        rec = _terminal_report_record(job)
+        if rec and isinstance(rec.get("delivered_for"), dict) \
+                and rec["delivered_for"].get("status") == "blocked":
+            try:
+                _save_terminal_report_record(state_dir, request_id, {})
+            except Exception:
+                pass
+        return {"action": "noop-not-terminal", "status": status}
+    pr_url = _terminal_report_pr_url(job)
+    reason = _terminal_report_reason(job)
+    event_id = _terminal_event_id(state_dir, request_id)
+    key = {"status": status, "reason": reason, "pr_url": pr_url,
+           "event_id": event_id}
+    rec = _terminal_report_record(job)
+    if rec.get("state") == "delivered" and rec.get("delivered_for") == key:
+        return {"action": "already-reported", "status": status}
+    attempts = 0
+    try:
+        attempts = int(rec.get("attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= TERMINAL_REPORT_MAX_ATTEMPTS:
+        return {"action": "report-exhausted", "status": status,
+                "attempts": attempts}
+    planner_session = job.get("planner_session_id")
+    harness_name = job.get("planner_harness") or "claude"
+    if not planner_session:
+        record = {"state": "skipped", "attempts": attempts, "status": status,
+                  "last_reason": "missing planner session: refusing to fork a new session",
+                  "updated_at": core._utcnow()}
+        save_err = _save_report_or_log(state_dir, request_id, record)
+        if save_err is not None:
+            return {"action": "report-error", "status": status,
+                    "attempts": attempts, "reason": save_err}
+        return {"action": "report-skipped", "reason": "missing_planner_session",
+                "status": status}
+    if harness_name not in ("claude", "codex", "opencode", "grok"):
+        record = {"state": "skipped", "attempts": attempts, "status": status,
+                  "last_reason": f"planner_harness_unsupported: {harness_name!r} has no callback",
+                  "updated_at": core._utcnow()}
+        save_err = _save_report_or_log(state_dir, request_id, record)
+        if save_err is not None:
+            return {"action": "report-error", "status": status,
+                    "attempts": attempts, "reason": save_err}
+        return {"action": "report-skipped", "reason": "planner_harness_unsupported",
+                "status": status}
+    text = _terminal_report_text(request_id, status, pr_url, reason,
+                                 job.get("handoff_summary"))
+    workspace = job["workspace"]
+    kind, cmd = _terminal_report_invocation(harness_name, planner_session,
+                                            text, workspace, job)
+    meta = _terminal_report_meta(text, event_id)
+    action_key = harnesses.harness_for(kind).action_key(kind, cmd, meta)
+    # Crash-window adoption first: a controller that died after the send
+    # but before recording leaves a finished row with the planner's
+    # actual answer. Adopting it needs no busy wait and no new spawn.
+    adopted = _adopt_terminal_send(state_dir, request_id, action_key, kind,
+                                   harness_name, planner_session, key,
+                                   status, attempts)
+    if adopted is not None:
+        return adopted
+    own_pids = _own_invocation_pids(state_dir, request_id)
+    while attempts < TERMINAL_REPORT_MAX_ATTEMPTS:
+        busy_reason = _terminal_report_busy_reason(harness_name, planner_session,
+                                                   own_pids)
+        if busy_reason is not None:
+            attempts += 1
+            state = "pending" if attempts < TERMINAL_REPORT_MAX_ATTEMPTS else "failed"
+            save_err = _save_report_or_log(
+                state_dir, request_id,
+                {"state": state, "attempts": attempts, "status": status,
+                 "last_reason": busy_reason, "updated_at": core._utcnow()})
+            if save_err is not None:
+                return {"action": "report-error", "status": status,
+                        "attempts": attempts, "reason": save_err}
+            if attempts >= TERMINAL_REPORT_MAX_ATTEMPTS:
+                return {"action": "report-exhausted", "status": status,
+                        "attempts": attempts, "reason": "planner_busy"}
+            try:
+                sleep_fn(TERMINAL_REPORT_RETRY_DELAY_SECS)
+            except Exception:
+                pass
+            continue
+        rc, out, err, refused = _send_report_turn(run_cmd, cmd, workspace, kind, meta)
+        if refused is not None:
+            # The turn never started (lost lease, competing owner, or a
+            # spawn failure): visible without duplicating it.
+            attempts += 1
+            if refused == "deferred":
+                record = {"state": "pending", "attempts": attempts,
+                          "status": status, "last_reason": err,
+                          "updated_at": core._utcnow()}
+                action = "report-deferred"
+            else:
+                record = {"state": "failed", "attempts": attempts,
+                          "status": status, "last_reason": err,
+                          "updated_at": core._utcnow()}
+                action = "report-failed"
+            save_err = _save_report_or_log(state_dir, request_id, record)
+            if save_err is not None:
+                return {"action": "report-error", "status": status,
+                        "attempts": attempts, "reason": save_err}
+            return {"action": action, "status": status,
+                    "attempts": attempts, "reason": err}
+        _ok, _error, _reported, _answer = _parse_terminal_send(
+            harness_name, kind, out or "")
+        try:
+            _record_child(state_dir, request_id, kind, cmd, rc,
+                          session_id=_reported or planner_session,
+                          output_text=(_answer or "") + "\n" + (err or "")[-1000:])
+        except Exception:
+            pass
+        return _record_terminal_send_outcome(
+            state_dir, request_id, kind, harness_name, planner_session,
+            key, status, rc, out, attempts + 1)
+    return {"action": "report-exhausted", "status": status,
+            "attempts": attempts}
+
+
+def _deliver_terminal_report_best_effort(state_dir, request_id: str,
+                                         run_cmd=None) -> dict:
+    """Terminal delivery that never raises past its caller.
+
+    The terminal persist already committed before this runs; a delivery
+    failure must not change the job's result, status, or the caller's
+    action. Unknown jobs stay loud for direct callers, so only delivery
+    errors are swallowed here.
+    """
+    try:
+        return deliver_terminal_report(state_dir, request_id, run_cmd=run_cmd)
+    except core.NotFoundError:
+        raise
+    except Exception:  # noqa: BLE001 - delivery never breaks the caller
+        return {"action": "report-error", "status": None}
+
+
 def _complete_job(state_dir, request_id: str, token: str | None,
                    output: str, artifact: str | None = None,
                    pr_url: str | None = None,
-                   acceptance_evidence: str | None = None) -> dict:
+                   acceptance_evidence: str | None = None,
+                   run_cmd=None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
     job = core.get_job(state_dir, request_id)
     use_token = token or job.get("owner_token")
@@ -2861,12 +3515,18 @@ def _complete_job(state_dir, request_id: str, token: str | None,
             raise core.LeaseLostError(str(e))
         except core.TerminalError:
             return {"action": "noop-terminal", "status": core.get_job(state_dir, request_id)["status"]}
-        return {"action": "completed", "status": done["status"]}
+        out = {"action": "completed", "status": done["status"]}
+        # The terminal result is persisted above; the end-of-job report
+        # follows through the existing callback path without changing it.
+        _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
+        return out
     if use_token:
         try:
             done = core.complete(state_dir, request_id, use_token,
                                  json.dumps(result_payload, sort_keys=True))
-            return {"action": "completed", "status": done["status"]}
+            out = {"action": "completed", "status": done["status"]}
+            _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
+            return out
         except (core.OwnershipError, core.TerminalError, core.NotFoundError):
             pass
     # Offline helper paths without a live lease: durable terminal write
@@ -2905,6 +3565,7 @@ def _complete_job(state_dir, request_id: str, token: str | None,
         store.append_text(store.output_path_for(root, request_id), "[succeeded]\n")
     except OSError:
         pass
+    _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
     return {"action": "completed", "status": "succeeded"}
 
 
@@ -3763,7 +4424,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
     return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
 
 
-def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> dict:
+def _step_inner(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> dict:
     """Advance exactly one useful bounded controller transition."""
     run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
@@ -3832,10 +4493,32 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> 
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
                              last.get("artifact"), last.get("pr_url"),
-                             last.get("acceptance_evidence"))
+                             last.get("acceptance_evidence"),
+                             run_cmd=run_cmd)
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}
+
+
+def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> dict:
+    """Advance one transition, then report a freshly terminal job once.
+
+    The inner transition persists the terminal state first; the
+    end-of-job report follows through the existing planner callback path
+    when the job now sits in a reporting state (succeeded, blocked,
+    failed, cancelled). Delivery never changes the transition's action,
+    the job's status, or its result: a restarted controller or recover
+    sees the delivered record and sends no duplicate.
+    """
+    res = _step_inner(state_dir, request_id, run_cmd=run_cmd, token=token)
+    try:
+        job = core.get_job(state_dir, request_id)
+    except core.NotFoundError:
+        return res
+    if job.get("status") in TERMINAL_REPORT_STATUSES:
+        _deliver_terminal_report_best_effort(
+            state_dir, request_id, run_cmd or default_run_cmd)
+    return res
 
 
 def _count_step(state_dir, request_id: str) -> int:
@@ -3960,6 +4643,14 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
                               f"controller_step_budget_exhausted after {MAX_LOOP_STEPS} steps")
         except Exception:
             pass
+    # The loop leaves the job terminal or blocked (or lease-lost, which
+    # returns above): report the terminal state once through the existing
+    # callback path. The persist above committed first; delivery never
+    # changes the job's status or result.
+    try:
+        _deliver_terminal_report_best_effort(state_dir, request_id, durable_run_cmd)
+    except Exception:
+        pass
     core.release_controller(state_dir, request_id, token)
     return 0
 

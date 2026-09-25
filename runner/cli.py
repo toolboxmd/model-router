@@ -30,7 +30,7 @@ import json
 import os
 import sys
 
-from . import core, policy
+from . import controller, core, policy
 
 
 def _state_dir(args) -> str:
@@ -47,6 +47,27 @@ def _err(msg, code=1) -> int:
     print(json.dumps({"error": msg}), file=sys.stderr)
     print(json.dumps({"error": msg}))
     return code
+
+
+def _deliver_after_cli(state_dir: str, request_id: str) -> None:
+    """Best-effort terminal report after an operator command.
+
+    Uses a durable invocation under the job's current lease (if any),
+    so the send is adopted by stable action key like any controller
+    send: a lost lease or a competing owned invocation defers without
+    duplicating. Never raises past the command.
+    """
+    try:
+        tok = core.get_job(state_dir, request_id).get("owner_token")
+    except core.NotFoundError:
+        return
+    except Exception:
+        return
+    try:
+        run = core.make_durable_run_cmd(state_dir, request_id, tok)
+        controller.deliver_terminal_report(state_dir, request_id, run_cmd=run)
+    except Exception:
+        pass
 
 
 def main(argv=None) -> int:
@@ -197,12 +218,27 @@ def main(argv=None) -> int:
             return _out({"acknowledged": True, "qid": q["qid"], "status": q["status"]})
         if args.cmd == "cancel":
             job = core.cancel(sd, args.request_id)
+            # A cancelled job has no controller step left to report it:
+            # wake the saved planner once through the existing callback
+            # path. Best-effort: the cancellation already persisted above.
+            _deliver_after_cli(sd, args.request_id)
+            job = core.get_job(sd, args.request_id)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"]})
         if args.cmd == "recover":
             if args.all:
-                return _out({"recovered": core.recover_all(sd)})
-            return _out(core.recover_one(sd, args.request_id))
+                recovered = core.recover_all(sd)
+                for entry in recovered:
+                    try:
+                        rid = (entry or {}).get("request_id")
+                        if rid:
+                            _deliver_after_cli(sd, rid)
+                    except Exception:
+                        continue
+                return _out({"recovered": recovered})
+            out = core.recover_one(sd, args.request_id)
+            _deliver_after_cli(sd, args.request_id)
+            return _out(out)
     except (core.NotFoundError, core.ConflictError, core.WorkspaceConflictError,
             core.TerminalError, core.BlockedError, core.OwnershipError,
             core.RunnerError, ValueError) as e:

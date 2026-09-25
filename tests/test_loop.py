@@ -177,6 +177,17 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded",
                          f"job={job.get('status')} block={job.get('block_reason')} err={job.get('last_error_json')}")
         self.assertEqual(job["codex_task_id"], THREAD_ID)
+        # The terminal report is delivered through a durable callback
+        # turn after the persist: wait for its record, not just success.
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            st = json.loads(core.get_job(sd, req).get("controller_state") or "{}")
+            if (st.get("terminal_report") or {}).get("state") == "delivered":
+                break
+            time.sleep(0.2)
+        st = json.loads(core.get_job(sd, req).get("controller_state") or "{}")
+        self.assertEqual((st.get("terminal_report") or {}).get("state"),
+                         "delivered", st.get("terminal_report"))
 
         def read_log(name):
             f = fake_state / name
@@ -201,15 +212,23 @@ class TestPublicLoopProof(unittest.TestCase):
 
         # One Claude --resume of the exact original planner ID, run in
         # the planner's directory (default: the workspace). Submit never
-        # touches the planner session: the only Claude turn is a callback.
-        self.assertEqual(len(claude_calls), 1, claude_calls)
+        # touches the planner session: the Claude turns are the question
+        # callback plus the Issue #94 terminal report on success.
+        self.assertEqual(len(claude_calls), 2, claude_calls)
         for c in claude_calls:
             self.assertEqual(harnesses.kind_for_cmd(["claude"] + list(c)),
                              "claude_callback")
             self.assertIn("--resume", c)
             self.assertIn(PLANNER_SID, c)
         self.assertIn("HANDOFF SUMMARY", " ".join(str(a) for a in claude_calls[0]))
+        self.assertIn(QID, " ".join(str(a) for a in claude_calls[0]))
         self.assertIn(req, " ".join(str(a) for a in claude_calls[0]))
+        report_text = " ".join(str(a) for a in claude_calls[1])
+        self.assertIn("terminal report", report_text)
+        self.assertIn("succeeded", report_text)
+        self.assertIn("ready to merge", report_text)
+        self.assertIn("HANDOFF SUMMARY", report_text)
+        self.assertIn(req, report_text)
         self.assertEqual(read_log("claude.log")[0]["cwd"], os.path.realpath(ws))
 
         # Owned ephemeral OpenCode server with the real API contract.
@@ -259,14 +278,17 @@ class TestPublicLoopProof(unittest.TestCase):
         self.assertIn("codex_resume", kinds)
         self.assertIn("claude_callback", kinds)
         self.assertIn("opencode_control", kinds)
-        # Every model child ran under a supervisor and was collected once.
+        # Every model child ran under a supervisor and was collected once:
+        # the question callback plus the terminal-report callback turn.
         invs = core._list_invocations(sd, req)
         self.assertEqual(sorted(i["kind"] for i in invs),
-                         ["claude_callback", "codex_dispatch",
+                         ["claude_callback", "claude_callback", "codex_dispatch",
                           "codex_resume", "codex_resume", "opencode_control"])
         self.assertTrue(all(i["state"] == "completed" and i["consumed_at"] for i in invs))
 
-        # Recover/restart must not fork a second planner session or writer.
+        # Recover/restart must not wake the planner again: the question
+        # callback and the terminal report already ran, so no duplicate
+        # writer starts.
         n_claude_before = len(read_log("claude.log"))
         n_codex_before = len(codex_calls)
         rc, _, _ = self._cli(sd, "recover", "--request-id", req, env=env)
@@ -275,7 +297,7 @@ class TestPublicLoopProof(unittest.TestCase):
         codex_after = read_log("codex.log")
         claude_after = read_log("claude.log")  # noqa: F841
         self.assertEqual(len(claude_after), n_claude_before,
-                         "recover must never fork a second planner session")
+                         "recover must never send a duplicate terminal report")
         self.assertEqual(len(codex_after), n_codex_before,
                          "recover must never start a duplicate writer")
         job2 = core.get_job(sd, req)

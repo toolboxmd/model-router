@@ -819,8 +819,10 @@ def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
             con.execute("ROLLBACK")
             raise LeaseLostError(f"job {request_id}: controller no longer holds the lease")
         if cur["cancel_requested"] or cur["status"] in store.TERMINAL:
-            con.execute("ROLLBACK")
-            raise LeaseLostError(f"job {request_id}: cancelled or terminal")
+            if not (harnesses.is_terminal_report_send(kind, meta)
+                    and cur["status"] in store.TERMINAL_REPORT_STATUSES):
+                con.execute("ROLLBACK")
+                raise LeaseLostError(f"job {request_id}: cancelled or terminal")
         other = con.execute(
             "SELECT invocation_id FROM invocations WHERE request_id=? AND state IN ('running','cancelling')"
             " AND (action_key IS NULL OR action_key != ?)", (request_id, key)).fetchone()
@@ -5601,7 +5603,8 @@ def status_view(state_dir, request_id: str) -> dict:
         st = json.loads(job_public.get("controller_state") or "{}") or {}
     except ValueError:
         st = {}
-    job_public["controller_state"] = {k: st.get(k) for k in ("phase", "last_action_name", "seq")}
+    job_public["controller_state"] = {k: st.get(k) for k in ("phase", "last_action_name", "seq",
+                                                          "terminal_report")}
     try:
         le = json.loads(job_public.get("last_error_json") or "null")
     except ValueError:
