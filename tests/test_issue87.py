@@ -26,7 +26,6 @@ merged #75 (runtime recovery) and #88 (no elapsed kill):
 """
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -36,9 +35,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from runner import adapters, controller, core, policy, store  # noqa: E402
-from runner.supervisor import process_start_identity  # noqa: E402
-from tests.fakes import FAKE_OPENCODE, write_fake  # noqa: E402
+from runner import adapters, controller, core, store  # noqa: E402
+from tests.fakes import use_fake_t3  # noqa: E402
 
 PY = sys.executable
 
@@ -75,6 +73,23 @@ def set_controller_state(sd, rid, **fields):
         con.close()
 
 
+def mark_turns(sd, rid, routes):
+    """Record worker turns on ``routes`` as the job's T3 thread slots."""
+    con = store.connect(sd)
+    try:
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (rid,)).fetchone()
+        st = json.loads(row["controller_state"] or "{}")
+        threads = st.setdefault("t3_threads", {})
+        for i, route in enumerate(routes):
+            threads[f"impl_used{i}"] = {"thread_id": f"sub.p.{rid}{i}", "route": route}
+        con.execute("UPDATE jobs SET controller_state=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), rid))
+        con.commit()
+    finally:
+        con.close()
+
+
 def stub_pr_verifier(result):
     def _verify(workspace, pr_url):
         return dict(result)
@@ -104,8 +119,8 @@ class DispatchWorkerReasonSeparation(unittest.TestCase):
     def test_dispatch_reason_kept_apart_from_worker_reason(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "sep", {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='sep'")
+        core.submit(sd, "sep", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='sep'")
         controller._record_dispatch_reason(sd, "sep", "luna/max", "luna-go/max",
                                            "dispatch_exhausted")
         st = controller._load_controller_state(core.get_job(sd, "sep"))
@@ -140,8 +155,8 @@ class DispatchWorkerReasonSeparation(unittest.TestCase):
     def test_first_worker_invocation_reason_is_initial_after_fallback(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "sep2", {"g": 1, "proof": "true"}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='sep2'")
+        core.submit(sd, "sep2", {"g": 1, "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='sep2'")
         set_controller_state(sd, "sep2", seq=1)
         controller._record_dispatch_reason(sd, "sep2", "luna/max", "luna-go/max",
                                            "dispatch_fallback rc=1")
@@ -156,7 +171,7 @@ class ProofSeparation(unittest.TestCase):
     def test_capacity_turn_skips_proof_truthfully(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "skip", {"g": 1, "proof": "false"}, str(ws), "p")
+        core.submit(sd, "skip", {"g": 1, "proof": "false"}, str(ws), "p", planner_t3_thread="planner-t3")
         job = core.get_job(sd, "skip")
         full = {"assistant_text": "t", "usage": None, "native_ids": {},
                 "finish": "stop", "actual_model": None,
@@ -182,7 +197,7 @@ class ProofSeparation(unittest.TestCase):
     def test_stalled_turn_report_marks_stall_class(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "stallrep", {"g": 1, "proof": "true"}, str(ws), "p")
+        core.submit(sd, "stallrep", {"g": 1, "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         job = core.get_job(sd, "stallrep")
         full = {"assistant_text": "t", "usage": None, "native_ids": {},
                 "finish": "stop", "actual_model": None,
@@ -238,7 +253,7 @@ class ProofSeparation(unittest.TestCase):
     def test_executed_proof_records_verification_row(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "vrow", {"g": 1, "proof": "true"}, str(ws), "p")
+        core.submit(sd, "vrow", {"g": 1, "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         job = core.get_job(sd, "vrow")
         full = {"assistant_text": "t", "usage": None, "native_ids": {},
                 "finish": "stop", "actual_model": None}
@@ -263,7 +278,7 @@ class ProofSeparation(unittest.TestCase):
     def test_skipped_proof_records_no_attempt_row(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "vskip", {"g": 1, "proof": "true"}, str(ws), "p")
+        core.submit(sd, "vskip", {"g": 1, "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         job = core.get_job(sd, "vskip")
         full = {"assistant_text": "t", "usage": None, "native_ids": {},
                 "finish": "stop", "actual_model": None,
@@ -317,7 +332,7 @@ class CompletionBinding(unittest.TestCase):
         base = Path(tmp.name)
         sd = str(base / "state")
         ws = self._git_ws(base, "ws")
-        core.submit(sd, "stale", {"goal": "x", "proof": "true"}, str(ws), "p")
+        core.submit(sd, "stale", {"goal": "x", "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         self._passing_report(sd, "stale", ws)
         (ws / "b.txt").write_text("two\n")
         subprocess.run(["git", "add", "-A"], cwd=str(ws), check=True, capture_output=True)
@@ -335,7 +350,7 @@ class CompletionBinding(unittest.TestCase):
         base = Path(tmp.name)
         sd = str(base / "state")
         ws = self._git_ws(base, "ws")
-        core.submit(sd, "fresh", {"goal": "x", "proof": "true"}, str(ws), "p")
+        core.submit(sd, "fresh", {"goal": "x", "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         job = core.get_job(sd, "fresh")
         report = self._passing_report(sd, "fresh", ws)
         self.assertIsNone(core.incomplete_proof_reason(job["task_json"], report, str(ws)))
@@ -354,7 +369,7 @@ class CompletionBinding(unittest.TestCase):
     def test_duplicate_pr_refused_and_identity_preserved(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "dup", {"g": 1}, str(ws), "p")
+        core.submit(sd, "dup", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         self.assertIsNone(core.duplicate_pr_reason(
             None, {"action": "completion", "pr_url": "https://example.test/pr/1"}))
         core.record_known_pr(sd, "dup", "https://example.test/pr/1")
@@ -432,19 +447,6 @@ class CompletionBinding(unittest.TestCase):
             "https://github.com/toolboxmd/model-router/pull/100"),
             "toolboxmd/model-router")
 
-    def _refusing_resume(self, output="STILL DONE"):
-        def run(cmd, cwd=None, timeout=None, kind=None, meta=None):
-            env = {"action": "completion", "output": output, "artifact": ""}
-            lines = [
-                json.dumps({"type": "thread.started", "thread_id": "thr"}),
-                json.dumps({"type": "item.completed",
-                            "item": {"type": "agent_message",
-                                     "text": json.dumps(env)}}),
-                json.dumps({"type": "turn.completed", "usage": {}}),
-            ]
-            return 0, "\n".join(lines) + "\n", ""
-        return run
-
     def test_step_completion_applies_new_gates(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
@@ -453,9 +455,11 @@ class CompletionBinding(unittest.TestCase):
         ws = self._git_ws(base, "ws", with_origin=True)
         core.submit(sd, "gate-a", {"goal": "x", "proof": "true",
                                    "acceptance": "real interaction"},
-                    str(ws), "p")
+                    str(ws), "p", planner_t3_thread="planner-t3")
         self._passing_report(sd, "gate-a", ws)
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='gate-a'")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='gate-a'")
+        use_fake_t3(self, sd, "gate-a", default={"action": "completion",
+                                                 "output": "STILL DONE"})
         saved = core.PR_VERIFIER
         core.PR_VERIFIER = stub_pr_verifier(
             {"ok": True, "state": "OPEN", "is_draft": False,
@@ -468,7 +472,7 @@ class CompletionBinding(unittest.TestCase):
                 last_action={"action": "completion", "output": "DONE",
                              "pr_url": "https://github.com/example/repo/pull/7"},
                 last_action_name="completion")
-            first = controller.step(sd, "gate-a", run_cmd=self._refusing_resume())
+            first = controller.step(sd, "gate-a")
             self.assertEqual(first["action"], "completion-refused-resumed")
             st = controller._load_controller_state(core.get_job(sd, "gate-a"))
             self.assertIn("acceptance", st.get("completion_refused_reason") or "")
@@ -481,9 +485,11 @@ class CompletionBinding(unittest.TestCase):
         base = Path(tmp.name)
         sd = str(base / "state")
         ws = self._git_ws(base, "ws", with_origin=True)
-        core.submit(sd, "gate-b", {"goal": "x", "proof": "true"}, str(ws), "p")
+        core.submit(sd, "gate-b", {"goal": "x", "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
         self._passing_report(sd, "gate-b", ws)
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='gate-b'")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='gate-b'")
+        use_fake_t3(self, sd, "gate-b", default={"action": "completion",
+                                                 "output": "STILL DONE"})
         saved = core.PR_VERIFIER
         core.PR_VERIFIER = stub_pr_verifier(
             {"ok": True, "state": "CLOSED", "is_draft": False,
@@ -496,7 +502,7 @@ class CompletionBinding(unittest.TestCase):
                 last_action={"action": "completion", "output": "DONE",
                              "pr_url": "https://github.com/example/repo/pull/7"},
                 last_action_name="completion")
-            first = controller.step(sd, "gate-b", run_cmd=self._refusing_resume())
+            first = controller.step(sd, "gate-b")
             self.assertEqual(first["action"], "completion-refused-resumed")
             st = controller._load_controller_state(core.get_job(sd, "gate-b"))
             self.assertIn("pr_not_open", st.get("completion_refused_reason") or "")
@@ -514,7 +520,7 @@ class CompletionBinding(unittest.TestCase):
                 last_action={"action": "completion", "output": "DONE",
                              "pr_url": "https://github.com/example/repo/pull/8"},
                 last_action_name="completion")
-            done = controller.step(sd, "gate-b", run_cmd=self._refusing_resume())
+            done = controller.step(sd, "gate-b")
             self.assertEqual(done["action"], "completed")
             self.assertEqual(core.known_pr_url(sd, "gate-b"),
                              "https://github.com/example/repo/pull/8")
@@ -529,15 +535,17 @@ class CompletionBinding(unittest.TestCase):
         ws = self._git_ws(base, "ws")
         core.submit(sd, "gate-c", {"goal": "x", "proof": "true",
                                    "acceptance": "real interaction"},
-                    str(ws), "p")
+                    str(ws), "p", planner_t3_thread="planner-t3")
         self._passing_report(sd, "gate-c", ws)
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='gate-c'")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='gate-c'")
+        use_fake_t3(self, sd, "gate-c", default={"action": "completion",
+                                                 "output": "STILL DONE"})
         set_controller_state(
             sd, "gate-c", seq=1,
             last_action={"action": "completion", "output": "DONE",
                          "acceptance_evidence": "drove the real interaction"},
             last_action_name="completion")
-        done = controller.step(sd, "gate-c", run_cmd=self._refusing_resume())
+        done = controller.step(sd, "gate-c")
         self.assertEqual(done["action"], "completed")
         job = core.get_job(sd, "gate-c")
         result = json.loads(job["result_json"])
@@ -551,24 +559,10 @@ class ExhaustionContent(unittest.TestCase):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
         core.submit(sd, "exh", {"g": 1, "observer_task_id": "model-router-87"},
-                    str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh'")
+                    str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='exh'")
         # Every recovery rung already ran once in this job.
-        con = store.connect(sd)
-        try:
-            for i, route in enumerate(("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai")):
-                con.execute(
-                    "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                    "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
-                    "action_key,started_at,stdout_path,stderr_path) VALUES"
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"used{i}", "exh", "grok_control", "[]", str(ws), "tok",
-                     "completed", 0, "implementation", route, "x",
-                     json.dumps({"route": route}), f"key{i}", core._utcnow(),
-                     "/dev/null", "/dev/null"))
-            con.commit()
-        finally:
-            con.close()
+        mark_turns(sd, "exh", ("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"))
         set_controller_state(sd, "exh", ladder={"failures": 3, "rung": "recovery",
                                                 "escalated": True})
         ended = controller._apply_ladder(sd, "exh")
@@ -595,24 +589,10 @@ class ExhaustionContent(unittest.TestCase):
     def test_exhaustion_answer_permits_exactly_one_directed_attempt(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "exh2", {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh2'")
+        core.submit(sd, "exh2", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='exh2'")
         # Every recovery rung already ran once in this job.
-        con = store.connect(sd)
-        try:
-            for i, route in enumerate(("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai")):
-                con.execute(
-                    "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                    "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
-                    "action_key,started_at,stdout_path,stderr_path) VALUES"
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"x2used{i}", "exh2", "grok_control", "[]", str(ws), "tok",
-                     "completed", 0, "implementation", route, "x",
-                     json.dumps({"route": route}), f"x2key{i}", core._utcnow(),
-                     "/dev/null", "/dev/null"))
-            con.commit()
-        finally:
-            con.close()
+        mark_turns(sd, "exh2", ("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"))
         set_controller_state(sd, "exh2", ladder={"failures": 3, "rung": "recovery",
                                                  "escalated": True})
         ended = controller._apply_ladder(sd, "exh2")
@@ -640,8 +620,7 @@ class ExhaustionContent(unittest.TestCase):
                 sd, "exh2",
                 {"action": "planner_question", "qid": "recovery-decision",
                  "prompt": core.list_questions(
-                     sd, "exh2", only_pending=False)[0]["prompt"]},
-                run_cmd=lambda *a, **k: (0, "", ""))
+                     sd, "exh2", only_pending=False)[0]["prompt"]})
         finally:
             controller.resume_luna = real_resume
         self.assertEqual(answered["action"], "question-answered-resumed")
@@ -674,8 +653,7 @@ class ExhaustionContent(unittest.TestCase):
             out = controller._handle_implementation_action(
                 sd, "exh2",
                 {"action": "implementation",
-                 "directed_route": "glm-5.3-flash-go"},
-                run_cmd=lambda *a, **k: (0, "", ""))
+                 "directed_route": "glm-5.3-flash-go"})
         finally:
             controller.run_implementation = real_impl
             controller.resume_luna = real_resume2
@@ -701,23 +679,9 @@ class ExhaustionContent(unittest.TestCase):
     def test_used_authorization_ends_terminally_without_another_question(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "exh3", {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='exh3'")
-        con = store.connect(sd)
-        try:
-            for i, route in enumerate(("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai")):
-                con.execute(
-                    "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                    "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
-                    "action_key,started_at,stdout_path,stderr_path) VALUES"
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"u{i}", "exh3", "grok_control", "[]", str(ws), "tok",
-                     "completed", 0, "implementation", route, "x",
-                     json.dumps({"route": route}), f"k{i}", core._utcnow(),
-                     "/dev/null", "/dev/null"))
-            con.commit()
-        finally:
-            con.close()
+        core.submit(sd, "exh3", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='exh3'")
+        mark_turns(sd, "exh3", ("grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"))
         set_controller_state(sd, "exh3", ladder={"failures": 3, "rung": "recovery",
                                                  "escalated": True},
                              planner_recovery_authorized=True,
@@ -739,8 +703,8 @@ class ExhaustionContent(unittest.TestCase):
         # go-to-build regression below).
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "approach", {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='approach'")
+        core.submit(sd, "approach", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='approach'")
         before_route = core.get_job(sd, "approach")["route"]
         set_controller_state(sd, "approach",
                              ladder={"failures": 3, "rung": "recovery", "escalated": True},
@@ -795,8 +759,8 @@ class ExhaustionContent(unittest.TestCase):
         # does the job end terminally with the same concrete decision.
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "esc", {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='esc'")
+        core.submit(sd, "esc", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='esc'")
         set_controller_state(sd, "esc", ladder={"failures": 4, "rung": "recovery",
                                                 "escalated": True})
         first = controller._apply_ladder(sd, "esc")
@@ -827,8 +791,8 @@ class ExhaustionContent(unittest.TestCase):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
         core.submit(sd, "norm4", {"g": 1, "observer_task_id": "model-router-87"},
-                    str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='norm4'")
+                    str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id='norm4'")
         set_controller_state(sd, "norm4", ladder={"failures": 4, "rung": "recovery",
                                                   "escalated": True})
         ended = controller._apply_ladder(sd, "norm4")
@@ -843,8 +807,8 @@ class ExhaustionContent(unittest.TestCase):
     def test_recovery_decision_events_link_attempts(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "dec", {"g": 1}, str(ws), "p")
-        sql(sd, ("UPDATE jobs SET codex_task_id='thr', opencode_session_id='s',"
+        core.submit(sd, "dec", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, ("UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), opencode_session_id='s',"
                  " status='running' WHERE request_id='dec'"))
         set_controller_state(sd, "dec", seq=3,
                              ladder={"failures": 1, "counted_seq": 3})
@@ -908,24 +872,11 @@ class PlannerAuthorizedInflight(unittest.TestCase):
         core.submit(sd, rid,
                     {"goal": "inflight drill", "proof": "true",
                      "observer_task_id": "model-router-87"},
-                    str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running',"
+                    str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running',"
             " route='grok-4.6-go' WHERE request_id=?", (rid,))
         # grok-4.6-go already ran its one turn in this job.
-        con = store.connect(sd)
-        try:
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
-                "action_key,started_at,stdout_path,stderr_path) VALUES"
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f"go-used-001", rid, "grok_control", "[]", str(ws), "tok",
-                 "completed", 0, "implementation", "grok-4.6-go", "x",
-                 json.dumps({"route": "grok-4.6-go"}), "go-key-001",
-                 core._utcnow(), "/dev/null", "/dev/null"))
-            con.commit()
-        finally:
-            con.close()
+        mark_turns(sd, rid, ("grok-4.6-go",))
         set_controller_state(sd, rid, seq=5,
                              ladder={"failures": 4, "rung": "recovery",
                                      "escalated": True, "counted_seq": 4},
@@ -933,19 +884,12 @@ class PlannerAuthorizedInflight(unittest.TestCase):
                              last_action={"action": "implementation"},
                              last_action_name="implementation")
         envelope = {"action": "implementation"}
-        worker_calls: list = []
+        fake = use_fake_t3(self, sd, rid,
+                           default="IMPLEMENTED by fake grok worker")
 
-        def fake_run(cmd, cwd=None, timeout=None, kind=None, meta=None):
-            if kind == "grok_control":
-                route = (meta or {}).get("route")
-                worker_calls.append({"route": route, "seq": (meta or {}).get("seq")})
-                body = json.dumps({"text": "IMPLEMENTED by fake grok worker",
-                                   "stopReason": "end_turn",
-                                   "sessionId": "ses_grok_inflight_001",
-                                   "num_turns": 1, "model": "grok-4.6"})
-                return 0, body + "\n", ""
-            return 1, "", f"unexpected kind {kind}"
-
+        def worker_threads():
+            return [c for c in fake.commands if c.get("type") == "thread.create"
+                    and c.get("threadId", "").rsplit(".", 1)[0] != "sub.planner-t3"]
         real_resume = controller.resume_luna
         controller.resume_luna = lambda *a, **k: {
             "action": "resumed", "luna_action": {"action": "completion"}}
@@ -953,7 +897,7 @@ class PlannerAuthorizedInflight(unittest.TestCase):
         # Step one: approach-only answer hits the preflight one-turn move.
         # No worker runs yet, so the authorization must stay in flight.
         first = controller._handle_implementation_action(
-            sd, rid, dict(envelope), run_cmd=fake_run)
+            sd, rid, dict(envelope))
         self.assertIn(first.get("action"), ("route_switched", "transferred_to_go",
                                             "stalled_retry"))
         self.assertEqual(core.get_job(sd, rid)["route"], "grok-4.6-build")
@@ -961,8 +905,8 @@ class PlannerAuthorizedInflight(unittest.TestCase):
         self.assertTrue(st.get("planner_recovery_in_flight"))
         self.assertFalse(st.get("planner_recovery_used"),
                          "preflight must not consume the authorized attempt")
-        self.assertEqual(worker_calls, [],
-                         "preflight starts no worker invocation")
+        self.assertEqual(worker_threads(), [],
+                         "preflight starts no worker thread")
         self.assertEqual(core.list_questions(sd, rid), [],
                          "no repeated planner question while in flight")
         con = store.connect(sd)
@@ -985,11 +929,11 @@ class PlannerAuthorizedInflight(unittest.TestCase):
         # Step two: the same authorized attempt continues and runs once on
         # the post-move route, with no second question or decision.
         second = controller._handle_implementation_action(
-            sd, rid, dict(envelope), run_cmd=fake_run)
+            sd, rid, dict(envelope))
         self.assertEqual(second.get("action"), "implementation-resumed")
-        self.assertEqual(len(worker_calls), 1)
-        self.assertEqual(worker_calls[0]["route"], "grok-4.6-build")
-        self.assertEqual(worker_calls[0]["seq"], 5)
+        self.assertEqual(len(worker_threads()), 1)
+        threads = controller._t3_threads_map(core.get_job(sd, rid))
+        self.assertEqual(threads["impl_5"]["route"], "grok-4.6-build")
         self.assertEqual(core.get_job(sd, rid)["route"], "grok-4.6-build")
         st = controller._load_controller_state(core.get_job(sd, rid))
         self.assertTrue(st.get("planner_recovery_used"),
@@ -1048,8 +992,8 @@ class PlannerDirectedRoute(unittest.TestCase):
     def _impl_job(self, rid):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, rid, {"g": 1}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id=?", (rid,))
+        core.submit(sd, rid, {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running' WHERE request_id=?", (rid,))
         return tmp, sd, ws
 
     def test_eligible_planner_route_is_assigned(self):
@@ -1059,8 +1003,7 @@ class PlannerDirectedRoute(unittest.TestCase):
                              last_action_name="implementation")
         out = controller._handle_implementation_action(
             sd, "pdr-ok",
-            {"action": "implementation", "directed_route": "muse-spark-xhigh-go"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+            {"action": "implementation", "directed_route": "muse-spark-xhigh-go"})
         self.assertEqual(core.get_job(sd, "pdr-ok")["route"], "muse-spark-xhigh-go")
         con = store.connect(sd)
         try:
@@ -1082,8 +1025,7 @@ class PlannerDirectedRoute(unittest.TestCase):
                              last_action_name="implementation")
         controller._handle_implementation_action(
             sd, "pdr-ladder",
-            {"action": "implementation", "route": "muse-spark-xhigh-free"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+            {"action": "implementation", "route": "muse-spark-xhigh-free"})
         self.assertEqual(core.get_job(sd, "pdr-ladder")["route"],
                          "kimi-k2.7-code-go")
         con = store.connect(sd)
@@ -1104,8 +1046,7 @@ class PlannerDirectedRoute(unittest.TestCase):
         controller._handle_implementation_action(
             sd, "pdr-corr",
             {"action": "implementation",
-             "directed_route": "kimi-k2.7-code-go"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+             "directed_route": "kimi-k2.7-code-go"})
         self.assertEqual(core.get_job(sd, "pdr-corr")["route"],
                          "kimi-k2.7-code-go")
 
@@ -1117,8 +1058,7 @@ class PlannerDirectedRoute(unittest.TestCase):
                              last_action_name="implementation")
         out = controller._handle_implementation_action(
             sd, "pdr-no",
-            {"action": "implementation", "directed_route": "no-such-route"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+            {"action": "implementation", "directed_route": "no-such-route"})
         self.assertEqual(core.get_job(sd, "pdr-no")["route"], before)
         con = store.connect(sd)
         try:
@@ -1140,8 +1080,7 @@ class PlannerDirectedRoute(unittest.TestCase):
                              last_action_name="implementation")
         controller._handle_implementation_action(
             sd, "pdr-rung",
-            {"action": "implementation", "directed_route": "astra/medium"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+            {"action": "implementation", "directed_route": "astra/medium"})
         self.assertEqual(core.get_job(sd, "pdr-rung")["route"], before)
         con = store.connect(sd)
         try:
@@ -1153,105 +1092,6 @@ class PlannerDirectedRoute(unittest.TestCase):
         self.assertIn("astra/medium", json.loads(ev["payload_json"])["requested"])
 
 
-class Runtime75Caveats(unittest.TestCase):
-    def test_blocked_runtime_missing_question_recovers_in_one_call(self):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, "qrm", {"g": 1}, str(ws), "p")
-        sql(sd, ("UPDATE jobs SET codex_task_id='thr', status='blocked',"
-                 " block_reason='runtime_missing: old runtime path /gone is gone; run recover"
-                 " on the installed runtime (do not restore cache directories)'"
-                 " WHERE request_id='qrm'"))
-        core.post_question(sd, "qrm", "q1", "which approach?")
-        calls = []
-        real_start = core.start_controller
-        core.start_controller = lambda s, r: calls.append(r) or {"pid": 999}
-        try:
-            rec = core.recover_one(sd, "qrm")
-        finally:
-            core.start_controller = real_start
-        self.assertEqual(rec["action"], "resumed-controller", rec)
-        self.assertEqual(calls, ["qrm"])
-
-    def test_live_child_replacement_gated_on_incompatible_runtime(self):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, "gate75", {"g": 1}, str(ws), "p")
-        proc = subprocess.Popen(["sleep", "60"])
-        self.addCleanup(lambda: (proc.kill(), proc.wait()))
-        pgid = os.getpgid(proc.pid)
-        start = process_start_identity(proc.pid)
-        self_ident = process_start_identity(os.getpid())
-        root = store.ensure_state_dir(sd)
-        out_path = root / "outputs" / "live.stdout"
-        err_path = root / "outputs" / "live.stderr"
-        store.secure_write_text(out_path, "")
-        store.secure_write_text(err_path, "")
-        sql(sd, ("UPDATE jobs SET codex_task_id='thr', status='running',"
-                 " owner_token=NULL, owner_pid=NULL WHERE request_id='gate75'"))
-        con = store.connect(sd)
-        try:
-            # Live owned-server child, but a stored schema newer than this
-            # runtime's: the installed runtime cannot take this state over.
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                "owner_token,pid,pgid,process_start,supervisor_pid,supervisor_start,"
-                "stdout_path,stderr_path,started_at,state,rc,stage,requested_route,"
-                "policy_version,meta_json,action_key) VALUES"
-                "('live1','gate75','opencode_control','[]',"
-                "?,?,?,?,?,?,?,?,?,?,"
-                "'running',NULL,'implementation','muse-spark-xhigh-free','x','{}','key1')",
-                (str(ws), "tok", proc.pid, pgid, start, os.getpid(), self_ident,
-                 str(out_path), str(err_path), core._utcnow()))
-            con.commit()
-        finally:
-            con.close()
-        invs = core._list_invocations(sd, "gate75")
-        self.assertEqual(core._invocation_ownership(invs[0]), "live")
-        sql(sd, "UPDATE invocations SET schema_version=999 WHERE invocation_id='live1'")
-        calls = []
-        real_start = core.start_controller
-        core.start_controller = lambda s, r: calls.append(r) or {"pid": 999}
-        try:
-            rec = core.recover_one(sd, "gate75")
-        finally:
-            core.start_controller = real_start
-        self.assertEqual(rec["action"], "adopted-live-invocation", rec)
-        self.assertEqual(calls, [], "incompatible state must not start a replacement controller")
-        self.assertIn("runtime_incompatible", rec.get("resume_error") or "")
-
-    def test_terminal_late_rows_are_consumed_for_measurements(self):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, "late", {"g": 1}, str(ws), "p")
-        root = store.ensure_state_dir(sd)
-        store.secure_write_text(root / "outputs" / "late1.stdout", "")
-        store.secure_write_text(root / "outputs" / "late1.stderr", "")
-        sql(sd, "UPDATE jobs SET status='succeeded' WHERE request_id='late'")
-        con = store.connect(sd)
-        try:
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                "owner_token,pid,pgid,stdout_path,stderr_path,started_at,state,rc,stage,"
-                "requested_route,policy_version,meta_json,action_key) VALUES"
-                "('late1','late','grok_control','[]',"
-                "?,?,999998,999999,?,?,?,"
-                "'completed',0,'implementation','grok-4.6-build','x','{}','key9')",
-                (str(ws), "tok",
-                 str(root / "outputs" / "late1.stdout"),
-                 str(root / "outputs" / "late1.stderr"), core._utcnow()))
-            con.commit()
-        finally:
-            con.close()
-        rec = core.recover_one(sd, "late")
-        self.assertEqual(rec["action"], "noop-terminal")
-        self.assertEqual(rec["status"], "succeeded")
-        invs = core._list_invocations(sd, "late")
-        self.assertTrue(invs[0]["consumed_at"], "late evidence is recorded, never resurrected")
-        self.assertTrue(invs[0]["terminal_class"], "late rows carry a classified outcome")
-        self.assertEqual(core.get_job(sd, "late")["status"], "succeeded")
-
-
 def _dead_group():
     """A real process group proven dead: spawn detached, reap, verify."""
     proc = subprocess.Popen(["sleep", "0.05"], start_new_session=True)
@@ -1260,189 +1100,6 @@ def _dead_group():
     time.sleep(0.2)
     assert not core._is_pgid_alive(pgid), "fixture group must be dead"
     return proc.pid, pgid
-
-
-def _finished_worker_row(sd, rid, ws, kind="opencode_control", rc=1,
-                         with_groups=True):
-    # Recoverable stops carry explicit known-dead group evidence: real
-    # child and supervisor process groups that have exited and verified
-    # dead. A row without group identities proves nothing and must stay
-    # blocked (with_groups=False covers that regression).
-    pid, pgid = _dead_group() if with_groups else (None, None)
-    spid, spgid = _dead_group() if with_groups else (None, None)
-    con = store.connect(sd)
-    try:
-        con.execute(
-            "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-            "owner_token,pid,pgid,stdout_path,stderr_path,started_at,ended_at,state,rc,"
-            "consumed_at,stage,requested_route,policy_version,meta_json,action_key,"
-            "supervisor_pid,supervisor_pgid)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"fin-{rid}-{kind}", rid, kind, "[]", str(ws), "",
-             pid, pgid, "/dev/null", "/dev/null",
-             core._utcnow(), core._utcnow(),
-             "failed", rc, core._utcnow(), "implementation",
-             "muse-spark-xhigh-free", "x",
-             json.dumps({"route": "muse-spark-xhigh-free", "seq": 1}), "k1",
-             spid, spgid))
-        con.commit()
-    finally:
-        con.close()
-
-
-def _supervisor_run(rc, result):
-    def run(cmd, cwd=None, timeout=None, kind=None, meta=None):
-        return rc, "RUNNER_RESULT " + json.dumps(result) + "\n", ""
-    return run
-
-
-class ConfirmedStopRecovery(unittest.TestCase):
-    def _running_job(self, rid):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, rid, {"g": 1, "proof": "true"}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
-                " WHERE request_id=?", (rid,))
-        return tmp, sd, ws
-
-    def _turn(self, sd, rid, ws, run):
-        job = core.get_job(sd, rid)
-        return controller._run_opencode_turn(
-            sd, rid, job, str(ws), "muse-spark-xhigh-free", "prompt",
-            1, "initial", run, artifact=None, attempt=0)
-
-    def test_rc124_startup_failure_returns_evidence(self):
-        _tmp, sd, ws = self._running_job("stop124")
-        _finished_worker_row(sd, "stop124", ws)
-        res = self._turn(sd, "stop124", ws, _supervisor_run(
-            124, {"ok": False, "rc": 124,
-                  "error": "opencode serve did not emit a localhost URL"}))
-        self.assertEqual(res["action"], "implementation_failed")
-        self.assertEqual(res["report"]["failure_class"], "infrastructure")
-        self.assertNotEqual(res["report"]["failure_class"], "timeout")
-        self.assertEqual(core.get_job(sd, "stop124")["status"], "running")
-
-    def test_rc143_confirmed_stop_returns_evidence(self):
-        _tmp, sd, ws = self._running_job("stop143")
-        _finished_worker_row(sd, "stop143", ws)
-        res = self._turn(sd, "stop143", ws, _supervisor_run(
-            143, {"ok": False, "rc": 143,
-                  "error": "terminated by cancellation"}))
-        self.assertEqual(res["action"], "implementation_failed")
-        self.assertEqual(res["report"]["failure_class"], "infrastructure")
-        self.assertEqual(core.get_job(sd, "stop143")["status"], "running")
-
-    def test_rc143_grok_confirmed_stop_returns_evidence(self):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, "stopg", {"g": 1, "proof": "true"}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
-                " WHERE request_id='stopg'")
-        _finished_worker_row(sd, "stopg", ws, kind="grok_control", rc=143)
-        job = core.get_job(sd, "stopg")
-        res = controller._run_grok_turn(
-            sd, "stopg", job, str(ws), "grok-4.6-build", "prompt",
-            1, "initial",
-            _supervisor_run(143, {"ok": False, "rc": 143,
-                                  "error": "terminated by cancellation"}),
-            artifact=None, attempt=0)
-        self.assertEqual(res["action"], "implementation_failed")
-        self.assertEqual(core.get_job(sd, "stopg")["status"], "running")
-
-    def test_missing_result_stays_blocked(self):
-        _tmp, sd, ws = self._running_job("stop-missing")
-        _finished_worker_row(sd, "stop-missing", ws)
-        res = self._turn(sd, "stop-missing", ws,
-                         lambda *a, **k: (1, "", ""))
-        self.assertEqual(res["action"], "blocked")
-        self.assertEqual(core.get_job(sd, "stop-missing")["status"], "blocked")
-
-    def test_rc125_supervisor_loss_stays_blocked(self):
-        _tmp, sd, ws = self._running_job("stop125")
-        _finished_worker_row(sd, "stop125", ws)
-        res = self._turn(sd, "stop125", ws, _supervisor_run(
-            125, {"ok": False, "rc": 125, "error": "supervisor gone"}))
-        self.assertEqual(res["action"], "blocked")
-
-    def test_unresolved_ownership_stays_blocked(self):
-        _tmp, sd, ws = self._running_job("stop-unres")
-        con = store.connect(sd)
-        try:
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                "owner_token,stdout_path,stderr_path,started_at,state,stage,"
-                "requested_route,policy_version,meta_json,action_key)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("unres1", "stop-unres", "opencode_control", "[]", str(ws), "",
-                 "/dev/null", "/dev/null", core._utcnow(), "running",
-                 "implementation", "muse-spark-xhigh-free", "x", "{}", "k9"))
-            con.commit()
-        finally:
-            con.close()
-        res = self._turn(sd, "stop-unres", ws, _supervisor_run(
-            143, {"ok": False, "rc": 143, "error": "terminated"}))
-        self.assertEqual(res["action"], "blocked")
-        self.assertEqual(core.get_job(sd, "stop-unres")["status"], "blocked")
-
-    def test_finished_row_with_absent_group_ownership_stays_blocked(self):
-        # A finished database row without recorded child and supervisor
-        # group identities proves nothing about the processes: the stop
-        # stays sticky-blocked instead of returning evidence.
-        _tmp, sd, ws = self._running_job("stop-absent")
-        _finished_worker_row(sd, "stop-absent", ws, with_groups=False)
-        res = self._turn(sd, "stop-absent", ws, _supervisor_run(
-            143, {"ok": False, "rc": 143,
-                  "error": "terminated by cancellation"}))
-        self.assertEqual(res["action"], "blocked")
-        self.assertEqual(core.get_job(sd, "stop-absent")["status"], "blocked")
-
-    def test_finished_row_with_live_group_stays_blocked(self):
-        # A finished database row alone never proves the group died:
-        # members that ignore SIGTERM can survive the supervisor's
-        # leader-only wait, and the next writer must not start beside
-        # them.
-        import subprocess as _sp
-        _tmp, sd, ws = self._running_job("stop-live")
-        proc = _sp.Popen(["sleep", "60"], start_new_session=True)
-        self.addCleanup(lambda: (proc.kill(), proc.wait()))
-        pgid = os.getpgid(proc.pid)
-        con = store.connect(sd)
-        try:
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
-                "owner_token,pid,pgid,stdout_path,stderr_path,started_at,ended_at,"
-                "state,rc,stage,requested_route,policy_version,meta_json,action_key)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("livefin1", "stop-live", "opencode_control", "[]", str(ws), "",
-                 proc.pid, pgid, "/dev/null", "/dev/null",
-                 core._utcnow(), core._utcnow(), "failed", 143,
-                 "implementation", "muse-spark-xhigh-free", "x", "{}", "kLive"))
-            con.commit()
-        finally:
-            con.close()
-        res = self._turn(sd, "stop-live", ws, _supervisor_run(
-            143, {"ok": False, "rc": 143, "error": "terminated by cancellation"}))
-        self.assertEqual(res["action"], "blocked")
-        self.assertEqual(core.get_job(sd, "stop-live")["status"], "blocked")
-
-    def test_startup_rc124_invocation_row_matches_infrastructure_report(self):
-        # The same startup rc124 attempt must read infrastructure in both
-        # the turn report and the durable invocation row Observer reads.
-        self.assertEqual(
-            core.terminal_class_for(
-                124, {"ok": False, "rc": 124,
-                      "error": "opencode serve did not emit a localhost URL"}),
-            "infrastructure")
-        self.assertEqual(
-            core.terminal_class_for(124, {}), "timeout",
-            "an actual proof timeout without a startup marker stays timeout")
-        _tmp, sd, ws = self._running_job("stop124row")
-        _finished_worker_row(sd, "stop124row", ws)
-        res = self._turn(sd, "stop124row", ws, _supervisor_run(
-            124, {"ok": False, "rc": 124,
-                  "error": "opencode serve did not emit a localhost URL"}))
-        self.assertEqual(res["action"], "implementation_failed")
-        self.assertEqual(res["report"]["failure_class"], "infrastructure")
 
 
 class TerminalClassCancelIntent(unittest.TestCase):
@@ -1459,20 +1116,6 @@ class TerminalClassCancelIntent(unittest.TestCase):
             core.terminal_class_for(143, None), "unknown",
             "a stop with no evidence and no intent stays unknown")
 
-    def test_measurement_threads_job_cancel_intent(self):
-        tmp, sd, ws = new_dirs()
-        self.addCleanup(tmp.cleanup)
-        core.submit(sd, "intent", {"g": 1}, str(ws), "p")
-        stop = {"ok": False, "rc": 143, "error": "terminated by cancellation"}
-        m = core._compute_invocation_measurement(
-            sd, "intent", "inv1", "opencode_control", "", "",
-            {"seq": 1}, core._utcnow(), core._utcnow(), 143, stop)
-        self.assertEqual(m["terminal_class"], "infrastructure")
-        sql(sd, "UPDATE jobs SET cancel_requested=1 WHERE request_id='intent'")
-        m = core._compute_invocation_measurement(
-            sd, "intent", "inv1", "opencode_control", "", "",
-            {"seq": 1}, core._utcnow(), core._utcnow(), 143, stop)
-        self.assertEqual(m["terminal_class"], "cancelled")
 
     def test_class_boundaries_preserved(self):
         self.assertEqual(
@@ -1490,17 +1133,16 @@ class HardErrorSkipsProof(unittest.TestCase):
     def test_failed_turn_skips_suite_truthfully(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "hard", {"g": 1, "proof": "true"}, str(ws), "p")
-        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running'"
+        core.submit(sd, "hard", {"g": 1, "proof": "true"}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, "UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='running'"
                 " WHERE request_id='hard'")
         job = core.get_job(sd, "hard")
-        res = controller._run_opencode_turn(
-            sd, "hard", job, str(ws), "muse-spark-xhigh-free", "prompt",
-            1, "initial",
-            _supervisor_run(1, {"ok": False, "rc": 1, "signal": "hard",
-                                "signal_evidence": {"name": "DataPolicyError"},
-                                "error": "consent denied"}),
-            artifact=None, attempt=0)
+        res = controller._finish_worker_turn(
+            sd, "hard", job, "muse-spark-xhigh-free", 1, None,
+            {"ok": False, "rc": 1, "signal": "hard",
+             "signal_evidence": {"name": "DataPolicyError"},
+             "error": "consent denied"},
+            "sub.planner-t3.w1", 1, source=controller.T3_TURN_KIND)
         self.assertEqual(res["action"], "implementation_failed")
         report = res["report"]
         self.assertEqual(report["proof_class"], "skipped")
@@ -1546,7 +1188,7 @@ class ProofTreeOwnership(unittest.TestCase):
         # row in the test's own group.
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "proofown", {"g": 1}, str(ws), "p")
+        core.submit(sd, "proofown", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         core.record_proof_owner(sd, "proofown", proc.pid,
@@ -1564,7 +1206,7 @@ class ProofTreeOwnership(unittest.TestCase):
     def test_proof_owner_records_start_identity(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "proofid", {"g": 1}, str(ws), "p")
+        core.submit(sd, "proofid", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         core.record_proof_owner(sd, "proofid", proc.pid,
@@ -1585,7 +1227,7 @@ class ProofTreeOwnership(unittest.TestCase):
         # claim only until ownership is confirmed dead.
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "cancelproof", {"g": 1}, str(ws), "p")
+        core.submit(sd, "cancelproof", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         pgid = os.getpgid(proc.pid)
         pid = proc.pid
@@ -1613,7 +1255,7 @@ class ProofTreeOwnership(unittest.TestCase):
         from runner import store as _store
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "ambigproof", {"g": 1}, str(ws), "p")
+        core.submit(sd, "ambigproof", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         path = core.proof_owner_path(sd, "ambigproof")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _store.secure_write_text(path, json.dumps(
@@ -1630,7 +1272,7 @@ class ProofTreeOwnership(unittest.TestCase):
         from runner import store as _store
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "badproof", {"g": 1}, str(ws), "p")
+        core.submit(sd, "badproof", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         path = core.proof_owner_path(sd, "badproof")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _store.secure_write_text(path, "{not json")
@@ -1644,7 +1286,7 @@ class EligibleDirectedRoutes(unittest.TestCase):
     def test_lists_assignable_routes_and_rejects_rungs(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "elig", {"g": 1}, str(ws), "p")
+        core.submit(sd, "elig", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
         eligible = controller.eligible_directed_routes(sd, "elig")
         self.assertIn("muse-spark-xhigh-go", eligible)
         self.assertIn("kimi-k2.7-code-go", eligible)
@@ -1658,8 +1300,8 @@ class FailedCallbackWakeup(unittest.TestCase):
     def test_answer_then_recover_resumes_controller(self):
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
-        core.submit(sd, "cbk", {"g": 1}, str(ws), "p")
-        sql(sd, ("UPDATE jobs SET codex_task_id='thr', status='blocked',"
+        core.submit(sd, "cbk", {"g": 1}, str(ws), "p", planner_t3_thread="planner-t3")
+        sql(sd, ("UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')), status='blocked',"
                  " block_reason='planner_callback_failed rc=1: boom'"
                  " WHERE request_id='cbk'"))
         core.post_question(sd, "cbk", "q1", "which approach?")
@@ -1691,145 +1333,6 @@ class ProtocolWording(unittest.TestCase):
         # dispatcher completes without one instead of waking the planner
         # for a gate the runner waives.
         self.assertIn("no origin push remote", adapters.LUNA_ACTION_PROTOCOL)
-
-
-class RoutedTrace(unittest.TestCase):
-    """Ordinary routed task: failure reaches the dispatcher with evidence,
-    the dispatcher assigns correction, and the job continues verified with
-    no planner implementation. Runs on deterministic fixture harnesses
-    only; no model is called and no subscription is spent."""
-
-    def _setup(self, task):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
-        base = Path(tmp.name)
-        sd = str(base / "state")
-        ws = base / "ws"
-        ws.mkdir()
-        bindir = base / "bin"
-        bindir.mkdir()
-        fakestate = base / "fakestate"
-        fakestate.mkdir()
-        write_fake(bindir, "opencode", FAKE_OPENCODE, PY)
-        saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_STATE", "FAKE_OC_MODE",
-                                                "FAKE_OC_PLAN", "FAKE_OC_WRITE")}
-        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None
-                                 else os.environ.__setitem__(k, v)
-                                 for k, v in saved.items()])
-        os.environ["PATH"] = str(bindir) + os.pathsep + (saved["PATH"] or "")
-        os.environ["FAKE_STATE"] = str(fakestate)
-        os.environ["FAKE_OC_PLAN"] = "implement_twice_then_complete"
-        os.environ.pop("FAKE_OC_WRITE", None)
-        write_fake(bindir, "codex",
-                   "import sys\nsys.exit(1)\n", PY)
-        core.submit(sd, "trace87", dict(task), str(ws), "planner-session-87",
-                    planner_harness="claude")
-        return tmp, sd, ws, bindir
-
-    def _kill_groups(self, sd):
-        for inv in core._list_invocations(sd, "trace87"):
-            for pg in (inv.get("pgid"), inv.get("supervisor_pgid")):
-                if pg:
-                    try:
-                        os.killpg(int(pg), signal.SIGKILL)
-                    except Exception:
-                        pass
-
-    def test_failure_then_dispatcher_recovery_then_verified_continuation(self):
-        task = {"goal": "write fix.txt", "proof": "test -f fix.txt",
-                "observer_task_id": "model-router-87"}
-        tmp, sd, ws, _bindir = self._setup(task)
-        self.addCleanup(lambda: self._kill_groups(sd))
-        run = core.make_durable_run_cmd(sd, "trace87", "tok-trace")
-        sql(sd, "UPDATE jobs SET owner_token='tok-trace' WHERE request_id='trace87'")
-
-        def step():
-            return controller.step(sd, "trace87", run_cmd=run, token="tok-trace")
-
-        # Dispatch falls back to Luna on OpenCode Go (fake Codex fails).
-        first = step()
-        self.assertEqual(first["action"], "dispatched")
-        st = controller._load_controller_state(core.get_job(sd, "trace87"))
-        self.assertEqual(st.get("dispatch_route"), "luna-go/max")
-        self.assertEqual(st.get("dispatch_route_reason"), "dispatch_fallback rc=1")
-
-        # First worker turn writes nothing: the task proof fails, the turn
-        # fails for verification, and the evidence returns to Luna.
-        second = step()
-        self.assertEqual(second["action"], "implementation-resumed")
-        job = core.get_job(sd, "trace87")
-        rep1 = core.latest_turn_report(sd, "trace87")
-        self.assertEqual(rep1["status"], "failed")
-        self.assertEqual(rep1["proof_exit_code"], 1)
-        self.assertEqual(rep1["failure_class"], "verification")
-        self.assertEqual(rep1["proof_class"], "failed")
-        self.assertEqual(controller._ladder(job)["failures"], 1)
-        self.assertEqual(controller._ladder(job)["rung"], "correction")
-
-        # The dispatcher assigns correction on the same logical job: the
-        # fake worker now writes the file, proof passes, and the report
-        # binds that proof to the candidate commit.
-        os.environ["FAKE_OC_WRITE"] = "fix.txt"
-        third = step()
-        self.assertEqual(third["action"], "implementation-resumed")
-        self.assertEqual(third["luna_action"]["action"], "completion")
-        rep2 = core.latest_turn_report(sd, "trace87")
-        self.assertEqual(rep2["status"], "ok")
-        self.assertEqual(rep2["proof_exit_code"], 0)
-        self.assertTrue((ws / "fix.txt").exists())
-
-        # Completion carries no PR (fixture workspace has no origin
-        # remote) and succeeds with the bound proof; identities persist.
-        done = step()
-        self.assertEqual(done["action"], "completed")
-        job = core.get_job(sd, "trace87")
-        self.assertEqual(job["status"], "succeeded")
-        stored_task = json.loads(job["task_json"])
-        self.assertEqual(stored_task.get("observer_task_id"), "model-router-87")
-        questions = core.list_questions(sd, "trace87", only_pending=False)
-        self.assertEqual(questions, [], "no planner implementation was ever requested")
-        invs = core._list_invocations(sd, "trace87")
-        self.assertFalse([i for i in invs if i.get("state") in ("running", "cancelling")])
-        con = store.connect(sd)
-        try:
-            decisions = [json.loads(r["payload_json"]) for r in con.execute(
-                "SELECT payload_json FROM events WHERE request_id='trace87'"
-                " AND kind='recovery_decision' ORDER BY id").fetchall()]
-            links = [json.loads(r["payload_json"]) for r in con.execute(
-                "SELECT payload_json FROM events WHERE request_id='trace87'"
-                " AND kind='recovery_next_attempt' ORDER BY id").fetchall()]
-            results = [json.loads(r["payload_json"]) for r in con.execute(
-                "SELECT payload_json FROM events WHERE request_id='trace87'"
-                " AND kind='recovery_attempt_result' ORDER BY id").fetchall()]
-        finally:
-            con.close()
-        self.assertTrue(decisions, "recovery decision links the failed attempt")
-        self.assertEqual(decisions[0]["failed_seq"], rep1["seq"])
-        self.assertIsNone(decisions[0]["next_attempt_seq"],
-                          "the decision never guesses the next seq")
-        self.assertTrue(decisions[0].get("failed_at") and decisions[0].get("decided_at"))
-        self.assertTrue(links, "the actual next attempt links when it starts")
-        self.assertEqual((links[0]["failed_seq"], links[0]["next_seq"]),
-                         (rep1["seq"], rep2["seq"]))
-        self.assertTrue(results, "the attempt outcome is preserved")
-        self.assertEqual(results[0]["outcome"], "ok")
-        # Every executed proof is an observable verification row with
-        # stage, timestamps, and class for the Observer importer.
-        con = store.connect(sd)
-        try:
-            proofs = con.execute(
-                "SELECT kind, stage, rc, reason, started_at, ended_at, elapsed_secs,"
-                " terminal_class FROM invocations WHERE request_id='trace87'"
-                " AND kind='proof' ORDER BY id").fetchall()
-        finally:
-            con.close()
-        self.assertEqual([(dict(p)["rc"], dict(p)["reason"]) for p in proofs],
-                         [(1, "failed"), (0, "pass")])
-        for p in proofs:
-            row = dict(p)
-            self.assertEqual((row["kind"], row["stage"]), ("proof", "verification"))
-            self.assertTrue(row["started_at"] and row["ended_at"])
-            self.assertIn(row["terminal_class"], ("failed", "completed"))
 
 
 if __name__ == "__main__":

@@ -495,13 +495,6 @@ def read_worker_identity(root: Path, request_id: str) -> dict | None:
         return None
 
 
-def write_worker_identity(root: Path, request_id: str, token: str, pid: int, updated: str) -> None:
-    secure_write_text(
-        worker_identity_path(root, request_id),
-        json.dumps({"token": token, "pid": pid, "updated": updated}),
-    )
-
-
 _SECRET_KEY_PARTS = ("secret", "token", "password", "api_key", "apikey", "credential", "auth")
 
 

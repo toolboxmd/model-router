@@ -16,7 +16,7 @@ shapes (dispatch command, thread snapshot, bearer auth). Coverage:
   no running tool flagged within about a minute and probed immediately,
   explicit provider errors at once, long tool runs never stalled),
 - restart behavior (Codex-family turns continue, Grok turns re-sent),
-- fallback (jobs without a planner T3 thread never touch T3),
+- submit requires a planner T3 thread (the only execution path, #110),
 - provider errors (exhausted dispatch falls back, hard errors block),
 - unavailable T3 blocks instead of silently running direct.
 """
@@ -26,7 +26,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -35,149 +35,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, store, t3exec  # noqa: E402
-
-PLANNER = "planner-1"
-PROJECT = "proj-1"
-NOW = datetime.now(timezone.utc)
-
-
-def iso(dt):
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def msg(text, role="assistant", streaming=False, age_secs=0, turn="t1"):
-    ts = iso(NOW - timedelta(seconds=age_secs))
-    return {"id": f"m-{role}-{age_secs}", "role": role, "text": text,
-            "turnId": turn, "streaming": streaming,
-            "createdAt": ts, "updatedAt": ts}
-
-
-def act(kind, age_secs=0, turn="t1", tone="tool", call=None, task=None):
-    payload = {}
-    if call is not None:
-        payload["toolCallId"] = call
-    if task is not None:
-        payload["taskId"] = task
-    return {"id": f"a-{kind}-{age_secs}-{call or task or ''}", "tone": tone,
-            "kind": kind, "summary": kind, "payload": payload, "turnId": turn,
-            "createdAt": iso(NOW - timedelta(seconds=age_secs))}
-
-
-def snap(tid, *, state="running", text="", streaming=False,
-         activities=None, session_status="running", last_error=None,
-         age_secs=0, project=PROJECT, turn="t1", user_text=None,
-         requested_age_secs=None):
-    session = {"threadId": tid, "status": session_status,
-               "providerName": "test", "runtimeMode": "full-access",
-               "activeTurnId": turn if state == "running" else None,
-               "lastError": last_error,
-               "updatedAt": iso(NOW - timedelta(seconds=age_secs))}
-    messages = []
-    if user_text is not None:
-        messages.append(msg(user_text, role="user", age_secs=age_secs,
-                            turn=turn))
-    if text or streaming:
-        messages.append(msg(text, streaming=streaming, age_secs=age_secs,
-                            turn=turn))
-    requested = iso(NOW - timedelta(
-        seconds=(age_secs if requested_age_secs is None
-                 else requested_age_secs)))
-    return {"snapshotSequence": 1,
-            "thread": {"id": tid, "projectId": project,
-                       "messages": messages,
-                       "activities": list(activities or []),
-                       "session": session,
-                       "latestTurn": {"turnId": turn, "state": state,
-                                     "requestedAt": requested,
-                                     "startedAt": requested,
-                                     "completedAt": (iso(NOW) if state == "completed"
-                                                     else None),
-                                     "assistantMessageId": None}}}
-
-
-def planner_snap():
-    return snap(PLANNER, state="completed", text="planning here",
-                project=PROJECT)
-
-
-class FakeT3Client:
-    """In-memory orchestration server behind the T3Client interface."""
-
-    def __init__(self, planner=PLANNER, project=PROJECT):
-        self.planner = planner
-        self.project = project
-        self.commands = []
-        self.posts = []
-        self.reads = {}
-        self.scripts = {}
-        self.dispatch_error = None
-        # Planner replies: each post into the planner thread consumes one
-        # (None = the planner never answers); the reply lands as a new
-        # completed turn after the posted user message.
-        self.planner_replies = []
-        self.planner_messages = []
-        self.planner_turns = 0
-        # Child replies: each post onto a child thread consumes one and
-        # completes a new turn with that text.
-        self.child_replies = []
-        self.child_turns = {}
-
-    def dispatch(self, command):
-        self.commands.append(copy.deepcopy(command))
-        if self.dispatch_error is not None:
-            raise self.dispatch_error
-        ctype = command.get("type")
-        if ctype == "thread.create":
-            self.scripts.setdefault(command["threadId"], [])
-        return {"sequence": len(self.commands)}
-
-    def create_child(self, child_id, parent_thread_id, project_id,
-                     title, route, role="implementation"):
-        return self.dispatch(t3exec.child_create_command(
-            child_id, parent_thread_id, project_id, title, route, role))
-
-    def post_message(self, thread_id, text, route=None, role="implementation",
-                     title_seed=None, message_id=None):
-        self.posts.append((thread_id, text))
-        cmd = t3exec.turn_start_command(thread_id, text, route, role,
-                                        title_seed, message_id)
-        out = self.dispatch(cmd)
-        if thread_id == self.planner:
-            self.planner_messages.append(
-                {**msg(text, role="user", turn=None),
-                 "id": cmd["message"]["messageId"]})
-            reply = self.planner_replies.pop(0) if self.planner_replies else None
-            if reply is not None:
-                self.planner_turns += 1
-                self.planner_messages.append(
-                    msg(reply, turn=f"pt{self.planner_turns}"))
-        elif self.child_replies:
-            n = self.child_turns.get(thread_id, 0) + 1
-            self.child_turns[thread_id] = n
-            self.scripts[thread_id] = snap(thread_id, state="completed",
-                                           text=self.child_replies.pop(0),
-                                           turn=f"ct{n}")
-        return out
-
-    def thread_snapshot(self, thread_id):
-        self.reads[thread_id] = self.reads.get(thread_id, 0) + 1
-        if thread_id == self.planner:
-            base = planner_snap()
-            base["thread"]["messages"] += copy.deepcopy(self.planner_messages)
-            if self.planner_turns:
-                base["thread"]["latestTurn"]["turnId"] = f"pt{self.planner_turns}"
-            return base
-        script = self.scripts.get(thread_id)
-        if isinstance(script, list) and script:
-            return script.pop(0)
-        if isinstance(script, dict):
-            return copy.deepcopy(script)
-        return snap(thread_id, state="running", age_secs=0)
-
-    def complete(self, thread_id, text):
-        self.scripts[thread_id] = snap(thread_id, state="completed",
-                                       text=text)
-
+from tests.fakes import (FakeT3Client, NOW, PLANNER, PROJECT,  # noqa: E402,F401
+                         act, iso, msg, snap)
 
 def luna_impl_envelope():
     return json.dumps({"action": "implementation", "artifact": "a1"})
@@ -274,13 +133,6 @@ class RouteMapping(Base):
         with self.assertRaises(ValueError):
             t3exec.route_model_selection("nope/not-a-route")
 
-    def test_instance_override_env(self):
-        with mock.patch.dict("os.environ",
-                             {"MODEL_ROUTER_T3_INSTANCE_OPENCODE": "custom-oc"}):
-            self.assertEqual(t3exec.route_instance_id("luna-go/max"),
-                             "custom-oc")
-            self.assertEqual(t3exec.route_instance_id("luna/max"), "codex")
-
 
 class SubmitT3(Base):
     def test_fields_persist_and_resubmit_is_identical(self):
@@ -307,9 +159,11 @@ class SubmitT3(Base):
         with self.assertRaises(ValueError):
             core.submit(self.sd, "r4", {"goal": "t"}, self.ws("r4"),
                         "s", t3_server_url="http://127.0.0.1:3999")
+        with self.assertRaises(ValueError):
+            core.submit(self.sd, "r6", {"goal": "t"}, self.ws("r6"), "s")
         job = core.submit(self.sd, "r5", {"goal": "t"}, self.ws("r5"), "s",
-                          planner_harness="t3")
-        self.assertEqual(job["planner_harness"], "t3")
+                          planner_harness="claude", planner_t3_thread=PLANNER)
+        self.assertEqual(job["planner_harness"], "claude")
 
 
 class DispatchViaT3(Base):
@@ -615,9 +469,7 @@ class TerminalViaT3(Base):
     def test_succeeded_post_carries_pr_url(self):
         self.submit_t3("t2")
         controller._complete_job(
-            self.sd, "t2", None, "done", None, "https://example.test/pr/7",
-            run_cmd=lambda *a, **k: (_ for _ in ()).throw(
-                AssertionError("no harness CLI on the T3 path")))
+            self.sd, "t2", None, "done", None, "https://example.test/pr/7")
         job = core.get_job(self.sd, "t2")
         self.assertEqual(job["status"], "succeeded")
         # _complete_job's internal best-effort delivery had no token, so it
@@ -674,8 +526,7 @@ class PlannerQuestionViaT3(Base):
         self.submit_t3("q1")
         fake = FakeT3Client()
         fake.planner_replies = ["Use approach B."]
-        res = controller.planner_callback(self.sd, "q1", "qq", "Which approach?",
-                                          run_cmd=self._no_cli, t3_client=fake)
+        res = controller.planner_callback(self.sd, "q1", "qq", "Which approach?", t3_client=fake)
         self.assertEqual(res["action"], "answered", res)
         self.assertEqual(len(fake.posts), 1)
         tid, text = fake.posts[0]
@@ -704,7 +555,6 @@ class PlannerQuestionViaT3(Base):
                                return_value={"sleep_fn": lambda s: None,
                                              "silence_secs": 0.0}):
             res = controller.planner_callback(self.sd, "q2", "qq", "Which?",
-                                              run_cmd=self._no_cli,
                                               t3_client=fake)
         self.assertEqual(res["action"], "blocked", res)
         self.assertEqual(res["reason"], "planner_question_pending")
@@ -720,8 +570,7 @@ class PlannerQuestionViaT3(Base):
         with mock.patch.object(controller, "_t3_watch_kwargs",
                                return_value={"sleep_fn": lambda s: None,
                                              "silence_secs": 0.0}):
-            controller.planner_callback(self.sd, "q3", "qq", "Which?",
-                                        run_cmd=self._no_cli, t3_client=fake)
+            controller.planner_callback(self.sd, "q3", "qq", "Which?", t3_client=fake)
         self.assertEqual(len(fake.posts), 1)
         # The planner answers late; a recovering controller adopts the
         # same post and reads the reply without asking twice.
@@ -733,8 +582,7 @@ class PlannerQuestionViaT3(Base):
                     "WHERE request_id='q3'")
         con.commit()
         con.close()
-        res = controller.planner_callback(self.sd, "q3", "qq", "Which?",
-                                          run_cmd=self._no_cli, t3_client=fake)
+        res = controller.planner_callback(self.sd, "q3", "qq", "Which?", t3_client=fake)
         self.assertEqual(res["action"], "answered", res)
         self.assertEqual(len(fake.posts), 1)
         answered = core.list_questions(self.sd, "q3", only_pending=False)
@@ -755,27 +603,11 @@ class PlannerQuestionViaT3(Base):
                 mock.patch.object(controller, "resume_luna", fake_resume):
             controller._handle_question_action(
                 self.sd, "q4", {"action": "planner_question", "qid": "q9",
-                                "prompt": "Big or small change?"},
-                run_cmd=self._no_cli)
+                                "prompt": "Big or small change?"})
         self.assertEqual(len(resumed), 1)
         self.assertEqual(resumed[0][0], "PLANNER ANSWER")
         self.assertIn("Go with the smaller change.", resumed[0][1])
         self.assertEqual(fake.posts[0][0], PLANNER)
-
-    def test_non_t3_planner_keeps_the_callback_path(self):
-        core.submit(self.sd, "q5", {"goal": "t"}, self.ws("q5"), "session-q5",
-                    planner_harness="claude")
-        calls = []
-
-        def run_cmd(cmd, cwd, stdin, kind=None, meta=None):
-            calls.append(kind)
-            return 1, "", "boom"
-
-        with mock.patch.object(t3exec, "client_for_job",
-                               side_effect=AssertionError("no T3 for direct jobs")):
-            controller.planner_callback(self.sd, "q5", "qq", "Which?",
-                                        run_cmd=run_cmd)
-        self.assertEqual(calls, ["claude_callback"])
 
 
 class StepLoopViaT3(Base):
@@ -796,9 +628,9 @@ class StepLoopViaT3(Base):
             raise AssertionError("the T3 path never runs a harness CLI")
 
         with mock.patch.object(t3exec, "client_for_job", return_value=fake):
-            first = controller.step(self.sd, "s1", run_cmd=no_cli)
+            first = controller.step(self.sd, "s1")
             self.assertEqual(first["action"], "dispatched", first)
-            second = controller.step(self.sd, "s1", run_cmd=no_cli)
+            second = controller.step(self.sd, "s1")
         self.assertEqual(second["action"], "question-answered-resumed", second)
         # One dispatcher child, two turns on it; one post into the planner.
         creates = [c for c in fake.commands if c["type"] == "thread.create"]
@@ -1005,36 +837,6 @@ class Restart(Base):
         self.assertEqual(res["t3_thread_id"], "sub.planner-1.adopted")
         self.assertEqual([c for c in fake.commands
                           if c["type"] == "thread.create"], [])
-
-
-class FallbackUntouched(Base):
-    def test_direct_job_never_touches_t3(self):
-        core.submit(self.sd, "f1", {"goal": "t"}, self.ws("f1"),
-                    "plan-f1", handoff_summary="s")
-        job = core.get_job(self.sd, "f1")
-        self.assertFalse(t3exec.is_t3_job(job))
-
-        def no_t3(*a, **k):
-            raise AssertionError("T3 must not be consulted for direct jobs")
-
-        seen = {}
-
-        def fake_run(cmd, cwd=None, timeout=120, **kw):
-            seen["kind"] = kw.get("kind")
-            thread = "codex-thread-1"
-            out = "\n".join(json.dumps(o) for o in [
-                {"type": "thread.started", "thread_id": thread},
-                {"type": "item.completed",
-                 "item": {"type": "agent_message",
-                          "text": luna_impl_envelope()}},
-                {"type": "turn.completed", "usage": {}},
-            ])
-            return 0, out, ""
-
-        res = controller.dispatch(self.sd, "f1", run_cmd=fake_run,
-                                  t3_client=no_t3)
-        self.assertEqual(res["action"], "dispatched")
-        self.assertEqual(seen["kind"], "codex_dispatch")
 
 
 class Discovery(Base):

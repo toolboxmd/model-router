@@ -16,9 +16,9 @@ State:
 
 Examples:
   python -m runner --state-dir /tmp/rr submit --request-id r1 \\
-    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session claude-1 --no-start
+    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session t-1 --planner-t3-thread t-1 --no-start
   python -m runner --state-dir /tmp/rr submit --request-id r1 \\
-    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session claude-1 --start
+    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session t-1 --planner-t3-thread t-1 --start
   python -m runner --state-dir /tmp/rr start --request-id r1
   python -m runner --state-dir /tmp/rr status --request-id r1
   python -m runner --state-dir /tmp/rr recover --all
@@ -30,7 +30,7 @@ import json
 import os
 import sys
 
-from . import controller, core, policy
+from . import controller, core, policy, t3snapshot
 
 
 def _state_dir(args) -> str:
@@ -52,20 +52,11 @@ def _err(msg, code=1) -> int:
 def _deliver_after_cli(state_dir: str, request_id: str) -> None:
     """Best-effort terminal report after an operator command.
 
-    Uses a durable invocation under the job's current lease (if any),
-    so the send is adopted by stable action key like any controller
-    send: a lost lease or a competing owned invocation defers without
-    duplicating. Never raises past the command.
+    Posts once into the planner thread like a controller would; the
+    delivered record prevents a duplicate. Never raises past the command.
     """
     try:
-        tok = core.get_job(state_dir, request_id).get("owner_token")
-    except core.NotFoundError:
-        return
-    except Exception:
-        return
-    try:
-        run = core.make_durable_run_cmd(state_dir, request_id, tok)
-        controller.deliver_terminal_report(state_dir, request_id, run_cmd=run)
+        controller.deliver_terminal_report(state_dir, request_id)
     except Exception:
         pass
 
@@ -99,21 +90,19 @@ def main(argv=None) -> int:
                         "agent turns and jobs carry no elapsed deadline since "
                         "toolboxmd/model-router#88, so this bounds nothing")
     p.add_argument("--planner-model", default=None,
-                   help="planner model (default: policy planning route; live-test override claude-sonnet-5)")
+                   help="planner model, recorded as evidence")
     p.add_argument("--planner-effort", default=None,
-                   help="planner effort (default: policy planning route; live-test override medium)")
+                   help="planner effort, recorded as evidence")
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
-    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex", "opencode", "grok", "t3"),
-                   help="harness that hosts the planner session (its session id goes in --planner-session)")
+    p.add_argument("--planner-harness", default="t3", choices=("claude", "codex", "opencode", "grok", "t3"),
+                   help="harness running inside the planner's T3 thread (recorded as evidence only)")
     p.add_argument("--planner-t3-thread", default=None,
-                   help="planner T3 thread id: selects the T3 execution path (#106), running "
-                        "dispatcher and worker turns as its child threads and posting the "
-                        "terminal state back into it; without it the direct CLI path applies")
+                   help="required: planner T3 thread id; dispatcher and worker turns run as "
+                        "its child threads, and questions and the terminal state are posted into it")
     p.add_argument("--t3-server-url", default=None,
-                   help="T3 server URL for the T3 path (default: T3_SERVER_URL or "
-                        "http://127.0.0.1:3773); needs --planner-t3-thread")
+                   help="T3 server URL (default: T3_SERVER_URL or http://127.0.0.1:3773)")
     p.add_argument("--handoff-summary", default=None,
                    help="durable handoff summary stored on the job (default: derived from the task packet)")
     p.add_argument("--handoff-summary-file", default=None,
@@ -152,9 +141,13 @@ def main(argv=None) -> int:
     g.add_argument("--request-id", default=None)
     g.add_argument("--all", action="store_true")
 
-    p = sub.add_parser("capacity", help="show remembered route capacity; --clear forgets one")
+    p = sub.add_parser("capacity", help="show capacity marks and the T3 snapshot view; "
+                                        "--clear forgets one route's marks")
     p.add_argument("--clear", default=None, metavar="ROUTE",
                    help="operator action after checking the provider allowance")
+    p.add_argument("--t3-server-url", default=None,
+                   help="T3 server to read the snapshot from (default: T3_SERVER_URL or "
+                        "http://127.0.0.1:3773)")
 
     args = ap.parse_args(argv)
     sd = _state_dir(args)
@@ -213,8 +206,11 @@ def main(argv=None) -> int:
         if args.cmd == "capacity":
             if args.clear:
                 return _out(core.clear_capacity(sd, args.clear))
-            return _out({"capacity": core.list_capacity(sd),
-                         "readings": core.list_readings(sd)})
+            # The snapshot view reads the T3 server named by
+            # --t3-server-url, T3_SERVER_URL, or the default; unknown when
+            # it cannot be read.
+            t3snapshot.refresh_for_job({"t3_server_url": args.t3_server_url}, force=True)
+            return _out({"capacity": core.list_capacity(sd), "t3": t3snapshot.view()})
         if args.cmd == "result":
             return _out(core.result_view(sd, args.request_id))
         if args.cmd == "status":

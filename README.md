@@ -1,18 +1,20 @@
 # Model Router
 
-One versioned routing policy and a durable runner. AgentsMD owns workflow,
-authority, and proof; Model Router owns the routes in
-[`runner/policy.py`](runner/policy.py), from which the
-[shared routing reference](skills/model-routing/references/codex.md) is generated.
-The [routing Skill](skills/model-routing/SKILL.md) sends implementation to the
-bundled runner. Codex-specific ticket review has a separate host reference. Terms are in
-[GLOSSARY.md](GLOSSARY.md).
+The runtime behind Prism in Chromeria (the T3 Code fork). A planner thread
+hands an authorized task to the durable runner, and a dispatcher carries it
+through worker threads to one open PR. Every turn runs as a T3 child thread
+of the planner thread. AgentsMD owns workflow, authority, and proof; Model
+Router owns the routes and lanes in [`runner/policy.py`](runner/policy.py),
+while T3 decides which models are enabled, their usage windows, and the
+Prism role preferences. Terms are in [GLOSSARY.md](GLOSSARY.md).
 
 ## Install from a release
 
-Install the complete plugin from an exact released source. The package contains
-`skills/`, `bin/model-router`, and `runner/`; installing only the Skill subtree
-omits the runtime and is unsupported.
+Install the complete plugin from an exact released source. The package is
+the runtime: `bin/model-router` and `runner/`. It carries no Skill; usage
+guidance lives in Chromeria's Prism tool descriptions (`prism_submit`,
+`prism_status`, `prism_questions`, `prism_answer`), which call the newest
+installed release.
 
 Once Toolybara promotes a release into ToolboxMD Marketplace, install it through
 your host's native plugin path:
@@ -33,34 +35,24 @@ grok plugin install model-router --trust
 ```
 
 Marketplace records the exact source tag, commit, and Project Record digest.
-Cursor distribution is generated from that same release with its launcher and
-runtime included. Provider publication and fresh-host acceptance remain separate
-proof. For a host that loads native Skills rather than these plugin manifests,
-keep the complete release in a stable directory and register its
-`skills/model-routing` directory through that host's Skill mechanism. Resolve
-symlinks to that release before locating the launcher.
-
-Start a fresh host session and confirm `model-routing` is available. Resolve
-`MODEL_ROUTER_ROOT` to that installed plugin's real root, then verify:
+Provider publication and fresh-host acceptance remain separate proof.
+Resolve `MODEL_ROUTER_ROOT` to the installed plugin's real root, then verify:
 
 ```sh
 "$MODEL_ROUTER_ROOT/bin/model-router" --version
 "$MODEL_ROUTER_ROOT/bin/model-router" --help
 ```
 
-The shared Skill can load across harnesses, and a planner in any supported
-harness (Claude Code, Codex, OpenCode, Grok Build) can submit a job: the
-dispatcher wakes that planner automatically in its own harness whenever its
-judgment is needed. Installing the package starts no service or model request and does
-not grant delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
+Installing the package starts no service or model request and does not grant
+delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
 
 ## Automatic releases
 
 A `VERSION` change merged into `main` starts the [release workflow](.github/workflows/release.yml).
 It runs the same complete deterministic proof used for pull requests, then
 validates the exact commit with released AgentsMD versionctl before creating an
-annotated tag and stable GitHub Release. Tests use disposable dependency homes;
-they require no installed agent plugins or credentials. Pull-request proof has
+annotated tag and stable GitHub Release. Tests run offline against T3 fakes;
+they require no installed agent plugins, credentials, or T3 server. Pull-request proof has
 read-only permissions; only the main-branch publishing job can write releases.
 `.version-policy.json` authorizes this through
 `githubReleasePolicy: on-version-commit`.
@@ -82,21 +74,20 @@ dispatch on `main` also supports recovery; other branches cannot publish.
 [Vision](VISION.md) · [Mission](MISSION.md) · [Objective](OBJECTIVE.md).
 Active work belongs in GitHub Issues.
 
-## Durable runner (opt-in, stdlib only)
+## Durable runner (stdlib only)
 
-The bundled `bin/model-router` accepts prepared work from a planner in any
-supported harness, hands it to a
-persistent Codex Luna dispatcher, returns planner questions, and runs
-implementation turns through an owned local OpenCode server, following the
-policy's lanes across the full OpenCode Go implementer chain with sticky
-homes and per-tier concurrency caps, or the native Grok Build CLI. Saved
-jobs survive planner exit and controller death without starting a second
-writer.
-It is not installed or started automatically. See [RUNNER.md](RUNNER.md).
+The bundled `bin/model-router` accepts prepared work from a planner in a T3
+thread, runs a Luna dispatcher and its workers as child threads of that
+planner thread, asks the planner in its thread when judgment is needed, and
+posts the end state there. Before each step it reads T3's Prism provider
+snapshot: models turned off in T3 leave routing, full usage windows rest
+their routes until the reset, and Prism role preferences reorder the lanes.
+Saved jobs survive planner exit and controller death without starting a
+second writer. It is not started automatically. See [RUNNER.md](RUNNER.md).
 
 ```
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR submit --request-id ID --task-file TASK.json \
-  --workspace PATH --planner-session SID --lane default --start
+  --workspace PATH --planner-session SID --planner-t3-thread TID --lane default --start
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR status --request-id ID
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR recover --request-id ID
 ```

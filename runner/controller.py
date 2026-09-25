@@ -1,25 +1,23 @@
 """Controller flow (stdlib only). See RUNNER.md.
 
 One :func:`step` advances one useful transition: dispatch Luna, ask the
-saved planner, run one Muse turn, or complete. The detached
-:func:`run_controller_process` loops a bounded number of steps with the
-durable run command, so every child is supervised, recorded before spawn,
-and reused by action identity after a restart. Resume always reuses saved
-session IDs. ``run_cmd`` stays injectable for deterministic tests.
+planner, run one worker turn, or complete. Every turn runs as a T3 child
+thread (see ``t3exec``); the saved thread ids let a restarted controller
+adopt a turn instead of repeating it. The detached
+:func:`run_controller_process` loops a bounded number of steps. Tests
+inject a T3 client or point the job at a fake T3 server.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import shlex
 import signal
 import secrets
 import subprocess
 import time
 from pathlib import Path
 
-from . import adapters, core, harnesses, policy, store, t3exec
+from . import adapters, core, policy, store, t3exec, t3snapshot
 
 MAX_LOOP_STEPS = 12
 
@@ -40,21 +38,6 @@ def _lease_guard(con, request_id: str) -> None:
             or row["status"] in store.TERMINAL:
         con.execute("ROLLBACK")
         raise core.LeaseLostError(f"job {request_id}: lease lost, cancelled, or terminal")
-
-
-def default_run_cmd(cmd: list[str], cwd: str | None = None,
-                    timeout: int = 120, **_kwargs) -> tuple[int, str, str]:
-    """Run a built-in adapter command (stdlib subprocess, no secrets logged)."""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, cwd=cwd or None)
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-    except FileNotFoundError as e:
-        return 127, "", f"command not found: {e}"
-    except subprocess.TimeoutExpired:
-        return 124, "", "command timeout"
-    except OSError as e:
-        return 127, "", f"spawn failed: {e}"
 
 
 def parse_luna_action(output_text: str,
@@ -78,20 +61,6 @@ def _task_summary(task_json: str) -> str:
 
 def _full_luna_prompt(task_json: str, extra: str = "") -> str:
     return adapters.build_luna_prompt(task_json or "", extra or "")
-
-
-def _last_message_path(state_dir, request_id: str, suffix: str) -> str:
-    """A 0600 file Codex writes its last message into."""
-    root = store.ensure_state_dir(state_dir)
-    path = root / "outputs" / f"{request_id}.{suffix}.json"
-    if not path.exists():
-        store.secure_write_text(path, "")
-    else:
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    return str(path)
 
 
 def _ensure_child_table(state_dir) -> None:
@@ -284,281 +253,6 @@ def _mark_blocked(state_dir, request_id: str, reason: str, extra: dict | None = 
     return core.get_job(state_dir, request_id)
 
 
-def _block_runtime_missing(state_dir, request_id: str, kind: str,
-                           cmd: list[str], meta: dict | None) -> dict | None:
-    """Recoverable block when a turn provably never started for a missing runtime.
-
-    Returns the blocked outcome when the action's newest non-abandoned
-    row carries explicit never-started runtime-missing evidence, else
-    None. The reason names the concrete cause and the next action (run
-    recover on the installed runtime); the planner is never asked to
-    restore cache directories. Rows without the explicit marker keep
-    their existing handling, however empty their output is.
-    """
-    detail = core.runtime_missing_for_action(state_dir, request_id, kind, cmd, meta)
-    if not detail:
-        return None
-    cause = detail.get("cause") or "old runtime path is gone; no supervisor or child started"
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": kind, "rc": 127, "error": cause})
-    reason = (f"runtime_missing: {cause}; run recover on the installed runtime "
-              "(do not restore cache directories)")
-    _mark_blocked(state_dir, request_id, reason)
-    return {"action": "blocked", "reason": "runtime_missing"}
-
-
-def _save_codex_task(state_dir, request_id: str, task_id: str,
-                     model: str = adapters.CODEX_MODEL,
-                     effort: str = adapters.CODEX_EFFORT,
-                     adapter: str = "codex",
-                     dispatch_route: str | None = None) -> dict:
-    """Persist the dispatcher task and its active route in one transaction,
-    so a crash between two writes cannot leave a session without its harness."""
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        _lease_guard(con, request_id)
-        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-        if job is None:
-            con.execute("ROLLBACK")
-            raise core.NotFoundError(f"unknown request: {request_id}")
-        now = core._utcnow()
-        st = _load_controller_state(dict(job))
-        st.update({"phase": "dispatched", "codex_task_id": task_id})
-        if dispatch_route is not None:
-            st["dispatch_route"] = dispatch_route
-        con.execute("UPDATE jobs SET codex_task_id=?, adapter=?, model=?, effort=?,"
-                    " controller_state=?, updated_at=? WHERE request_id=?",
-                    (task_id, adapter, model, effort,
-                     json.dumps(st, sort_keys=True), now, request_id))
-        core._event(con, request_id, "codex_dispatched", {"task": task_id[:12] + "..."})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    return core.get_job(state_dir, request_id)
-
-
-def _save_opencode_session(state_dir, request_id: str, session_id: str,
-                           route: str, adapter: str = "opencode",
-                           model: str = adapters.OPENCODE_FREE_MODEL,
-                           effort: str = adapters.OPENCODE_VARIANT) -> dict:
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        _lease_guard(con, request_id)
-        job = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-        if job is None:
-            con.execute("ROLLBACK")
-            raise core.NotFoundError(f"unknown request: {request_id}")
-        now = core._utcnow()
-        con.execute("UPDATE jobs SET opencode_session_id=?, route=?, adapter=?, model=?, effort=?,"
-                    " updated_at=? WHERE request_id=?",
-                    (session_id, route, adapter, model, effort, now, request_id))
-        core._event(con, request_id, "opencode_session_saved", {"route": route})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    return core.get_job(state_dir, request_id)
-
-
-def _prompt_digest(text: str) -> str:
-    import hashlib
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
-
-
-def _codex_probe_due(state_dir) -> bool:
-    """True when a Codex usage probe is due before dispatch."""
-    try:
-        readings = core.list_readings(state_dir, pool="codex")
-    except Exception:
-        return True
-    latest = None
-    for r in readings or []:
-        obs = r.get("observed_at")
-        if isinstance(obs, str) and obs:
-            if latest is None or obs > latest:
-                latest = obs
-    try:
-        return core.probe_due_for("codex", latest)
-    except Exception:
-        return True
-
-
-def _record_codex_probe_unknown(state_dir, route: str, reason: str,
-                                shape=None) -> None:
-    """Record unknown Codex readings for the probe windows, never raising.
-
-    ``shape`` is the keys-only outline of a response that carried no rate
-    record, so the parser can be fixed from the ledger.
-    """
-    try:
-        observed = core._utcnow()
-    except Exception:
-        import datetime as _dt
-        observed = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    try:
-        shape_list = [str(k) for k in (shape or [])][:20]
-    except Exception:
-        shape_list = []
-    for window in ("5h", "weekly"):
-        try:
-            detail = {"error": str(reason)[:300],
-                      "probe": "codex-rate-limits"}
-            if shape_list:
-                detail["shape"] = shape_list
-            core.note_probe_failure(state_dir, route, window,
-                                    source="provider_reported",
-                                    detail=detail,
-                                    observed_at=observed)
-        except Exception:
-            continue
-
-
-def _record_codex_probe_readings(state_dir, readings) -> None:
-    """Store parsed Codex probe readings, never raising."""
-    for r in readings or []:
-        try:
-            core.record_reading(state_dir, r["pool"], r["model"],
-                                r["window"], r["used"], r["limit"],
-                                r["reset_at"],
-                                observed_at=r["observed_at"],
-                                source=r["source"],
-                                detail=r.get("detail"))
-        except Exception:
-            continue
-
-
-def _default_codex_probe(state_dir, request_id: str, route: str,
-                         query_fn=None) -> dict:
-    """Best-effort Codex rate-limit probe before dispatch, never blocking.
-
-    When due, reads ``account/rateLimits/read`` through the app-server
-    first and stores the windows; a response with no rate record stores
-    unknown with the raw shape (keys only) in the reading detail. The
-    zero-cost session rollout is the fallback when the app-server cannot
-    be read; with neither source the probe records unknown with its
-    reason. Never raises: dispatch stays eligible on error evidence alone.
-    ``query_fn`` overrides the app-server read (deterministic tests).
-    """
-    if not _codex_probe_due(state_dir):
-        return {"action": "probe-skipped", "route": route}
-    harness = harnesses.harness_named("codex")
-    try:
-        observed = core._utcnow()
-    except Exception:
-        import datetime as _dt
-        observed = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    query_error = None
-    try:
-        query = query_fn or harness.query_app_server_rate_limits
-        payload = query()
-    except Exception as e:  # noqa: BLE001 - rollout fallback below
-        payload = None
-        query_error = f"{type(e).__name__}: {str(e)[:150]}"
-    if payload is not None:
-        try:
-            readings = harness.probe_rate_limits(payload, observed)
-        except Exception:
-            readings = []
-        if readings:
-            _record_codex_probe_readings(state_dir, readings)
-            return {"action": "probe-ok", "route": route,
-                    "windows": sorted({r.get("window") for r in readings})}
-        try:
-            shape = harnesses.codex_payload_shape(payload)
-        except Exception:
-            shape = []
-        _record_codex_probe_unknown(state_dir, route, "no rate record", shape)
-        return {"action": "probe-unknown", "route": route}
-    # Zero-cost fallback: the newest rollout file under the Codex home, when
-    # one exists. Before the first dispatch there is usually none, which
-    # records unknown like any other unreadable probe.
-    try:
-        try:
-            home = policy._codex_home()
-        except Exception:
-            home = None
-        candidates: list = []
-        if home is not None:
-            try:
-                from pathlib import Path as _P
-                root = _P(os.path.expanduser(str(home)))
-                for pat in ("rollouts/**/*.jsonl", "rollouts/*.jsonl",
-                            "sessions/**/*.jsonl", "*.jsonl"):
-                    try:
-                        candidates.extend([p for p in root.glob(pat) if p.is_file()])
-                    except Exception:
-                        continue
-            except Exception:
-                candidates = []
-        candidates = sorted(
-            (p for p in candidates if p.is_file()),
-            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
-            reverse=True)[:3]
-        for cand in candidates:
-            try:
-                readings = harness.read_rollout(str(cand))
-            except Exception:
-                continue
-            if not readings:
-                continue
-            _record_codex_probe_readings(state_dir, readings)
-            return {"action": "probe-ok", "route": route,
-                    "windows": sorted({r.get("window") for r in readings})}
-    except Exception as e:  # noqa: BLE001 - unknown below, never blocks
-        _record_codex_probe_unknown(state_dir, route, f"probe failed: {type(e).__name__}")
-        return {"action": "probe-unknown", "route": route}
-    if query_error:
-        _record_codex_probe_unknown(state_dir, route,
-                                    f"probe unavailable: {query_error}")
-    else:
-        _record_codex_probe_unknown(state_dir, route, "probe unavailable: no rate record")
-    return {"action": "probe-unknown", "route": route}
-
-
-def _codex_auth_block(state_dir, request_id: str, rc, out, err) -> dict | None:
-    """Blocked auth result when Codex text shows a missing/rejected login.
-
-    Returns the blocked payload after persisting hard/auth evidence, or
-    None when the output carries no auth marker. Auth never falls back to
-    another route: no other route holds the same login.
-    """
-    try:
-        reason = harnesses.harness_named("codex").auth_failure_reason(out, err)
-    except Exception:
-        reason = None
-    if not reason:
-        return None
-    try:
-        home = policy._codex_home()
-        from pathlib import Path as _P
-        missing = not (_P(os.path.expanduser(str(home))) / "auth.json").is_file()
-    except Exception:
-        missing = False
-    if missing and "auth.json" not in reason.lower():
-        reason = f"{reason} (auth.json missing in CODEX_HOME)"[:160]
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": "codex_dispatch", "rc": rc,
-                             "signal": "hard", "reason": "auth",
-                             "error": reason,
-                             "stderr": (err or "")[:1000],
-                             "stdout": (out or "")[:1000]})
-    _mark_blocked(state_dir, request_id, f"codex_auth_failed: {reason}")
-    return {"action": "blocked", "reason": "codex_auth_failed"}
-
-
 def _record_dispatch_reason(state_dir, request_id: str, prev: str,
                             target: str, reason: str) -> None:
     """Record why the dispatch moved routes, apart from the worker reason.
@@ -589,7 +283,7 @@ def _record_dispatch_reason(state_dir, request_id: str, prev: str,
         core._event(con, request_id, "route_switched",
                     {"from": prev, "to": target, "reason": reason,
                       "scope": "dispatch",
-                      "evidence": "codex_dispatch"})
+                      "evidence": "dispatch"})
         con.execute("COMMIT")
     except Exception:
         try:
@@ -601,248 +295,20 @@ def _record_dispatch_reason(state_dir, request_id: str, prev: str,
         con.close()
 
 
-def _codex_failure_message(out, err, cmd) -> str:
-    """Short redacted last provider message for a dispatch block reason."""
-    try:
-        msg = harnesses.harness_named("codex").last_provider_message(out, err, cmd)
-    except Exception:
-        msg = ""
-    msg = " ".join((msg or "").split())
-    return msg[:200] or "empty provider output"
-
-
-def codex_model_mismatch_reason(requested_model, observed_model) -> str | None:
-    """Block reason when the observed Codex model differs, else None.
-
-    A mismatch is never a capacity signal: unknown on either side never
-    blocks, and the reason names both models.
-    """
-    if isinstance(requested_model, str) and requested_model \
-            and isinstance(observed_model, str) and observed_model:
-        if requested_model != observed_model:
-            return f"model_mismatch: requested={requested_model} observed={observed_model}"
-    return None
-
-
-def _latest_codex_invocation(state_dir, request_id: str, kind: str) -> dict | None:
-    """The just-measured invocation for one Codex kind, or None.
-
-    The latest row by id wins, so prior dispatch/resume rows never shadow
-    the current turn. Fake run_cmd closures leave no invocation rows, which
-    reads as unknown and never blocks. Database failures propagate so the
-    caller blocks safely instead of passing as unknown.
-    """
-    invs = [i for i in core._list_invocations(state_dir, request_id)
-            if i.get("kind") == kind]
-    if not invs:
-        return None
-    try:
-        return max(invs, key=lambda r: int(r.get("id") or 0))
-    except (TypeError, ValueError):
-        return invs[-1]
-
-
-def check_codex_observed_model(state_dir, request_id: str, kind: str,
-                               requested_route: str) -> tuple:
-    """(observed_model, block_reason|None) for one measured Codex turn.
-
-    Compares the invocation row's observed_model with
-    ``policy.ROUTES[requested_route]['model']``. The requested route comes
-    from the invocation when it names a policy route, else from the
-    caller's controller state. Unknown on either side never blocks.
-    Only expected missing rollout cases return unknown; database, policy,
-    or implementation failures propagate so the caller blocks safely.
-    """
-    route_name = requested_route if requested_route in policy.ROUTES else None
-    inv = _latest_codex_invocation(state_dir, request_id, kind)
-    if inv is not None:
-        inv_route = inv.get("requested_route")
-        if isinstance(inv_route, str) and inv_route in policy.ROUTES:
-            route_name = inv_route
-    if not route_name:
-        return None, None
-    requested_model = policy.ROUTES[route_name].get("model")
-    if not isinstance(requested_model, str) or not requested_model:
-        return None, None
-    observed = inv.get("observed_model") if isinstance(inv, dict) else None
-    if not isinstance(observed, str) or not observed:
-        return None, None
-    return observed, codex_model_mismatch_reason(requested_model, observed)
-
-
-def _block_codex_observation_failure(state_dir, request_id: str, kind: str,
-                                     exc: Exception, task_id: str | None = None) -> dict:
-    """Block safely on an unexpected observation failure, with evidence.
-
-    Never retries, falls back, marks capacity, moves routes, or applies an
-    envelope. Expected missing or unreadable rollout cases never reach
-    here; they stay unknown.
-    """
-    try:
-        detail = f"{type(exc).__name__}: {str(exc)[:150]}"
-    except Exception:
-        detail = "observation failed"
-    reason = f"model_observation_failed: {kind} {detail}"[:300]
-    try:
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": kind, "error": detail[:1000]})
-    except Exception:
-        pass
-    _mark_blocked(state_dir, request_id, reason)
-    out = {"action": "blocked", "reason": reason}
-    if task_id is not None:
-        out["codex_task_id"] = task_id
-    return out
-
-
-def _assistant_text_quote(full) -> str:
-    """First 200 characters of an OpenCode summary's assistant text.
-
-    A missing envelope still blocks, but with what Luna actually said
-    instead of a bare "no structured envelope". Redacted first (the
-    text is model-authored and can echo secrets), then collapsed to one
-    line; blank text reports as empty dispatcher output, never empty.
-    """
-    text = full.get("assistant_text") if isinstance(full, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        return "empty dispatcher output"
-    try:
-        text = adapters.redact_text(text)
-    except Exception:
-        pass
-    return " ".join(text.split())[:200] or "empty dispatcher output"
-
-
 def _dispatch_fallback_routes(dispatch_route: str) -> list:
-    """Owned-server dispatch routes after ``dispatch_route``, in policy order."""
-    return [r for r in policy.stage_routes("dispatch") if r != dispatch_route
-            and harnesses.route_uses_owned_server(r)]
-
-
-def _codex_stall_marker(err) -> str | None:
-    """The supervisor's stall marker in Codex stderr, or None.
-
-    The supervisor ends a turn whose stream stays silent past the harness
-    window with ``runner: stalled: ...`` on stderr (rc 4) and records the
-    invocation as signal ``stalled``. The marker is the controller's
-    evidence that this failure is a stall, checked before auth so command
-    output quoting auth-pattern text can never win.
-    """
-    for line in (err or "").splitlines():
-        if "runner: stalled" in line:
-            return line.strip()
-    return None
-
-
-def _codex_dispatch_stalled(state_dir, request_id: str, dispatch_route: str,
-                            prompt: str, run_cmd, out, err, cmd, rc) -> dict | None:
-    """Lateral move when the supervisor ended a Codex dispatch turn silent.
-
-    Records the stall (signal ``stalled``, never ``hard``) and dispatches
-    on the next dispatch route, Luna on OpenCode Go, in the same step
-    without retrying Codex. Returns None when the output carries no stall
-    marker: the caller keeps its auth/exhausted/generic failure handling.
-    """
-    marker = _codex_stall_marker(err)
-    if marker is None:
-        return None
-    try:
-        detail = adapters.redact_text(marker)
-    except Exception:
-        detail = marker
-    detail = " ".join(detail.split())[:200] or "no harness output past the silence window"
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": "codex_dispatch", "rc": rc,
-                             "signal": "stalled",
-                             "evidence": {"source": "stream_silence",
-                                          "detail": detail},
-                             "stderr": (err or "")[-1000:],
-                             "stdout": (out or "")[-1000:]})
-    fallback = _dispatch_fallback_routes(dispatch_route)
-    if not fallback:
-        _mark_blocked(state_dir, request_id,
-                      f"dispatch_stalled: no eligible route after stalled on {dispatch_route}")
-        return {"action": "blocked", "reason": "dispatch_stalled"}
-    _record_dispatch_reason(state_dir, request_id, dispatch_route,
-                            fallback[0], "dispatch_stalled")
-    return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
-                                 reason="dispatch_stalled")
-
-
-def _codex_resume_stalled(state_dir, request_id: str, rc, out, err) -> dict | None:
-    """Blocked stalled result when the supervisor ended a Codex resume silent.
-
-    Records the stall (signal ``stalled``, never ``hard``/``auth``) and
-    blocks with a stalled reason a later resume can retry; a resume has no
-    lateral route. Returns None without a stall marker.
-    """
-    marker = _codex_stall_marker(err)
-    if marker is None:
-        return None
-    try:
-        detail = adapters.redact_text(marker)
-    except Exception:
-        detail = marker
-    detail = " ".join(detail.split())[:200] or "no harness output past the silence window"
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": "codex_resume", "rc": rc,
-                             "signal": "stalled",
-                             "evidence": {"source": "stream_silence",
-                                          "detail": detail},
-                             "stderr": (err or "")[-1000:]})
-    _mark_blocked(state_dir, request_id, f"codex_resume_stalled rc={rc}: {detail}")
-    return {"action": "blocked", "reason": "codex_resume_stalled"}
-
-
-def _dispatch_exhausted(state_dir, request_id: str, dispatch_route: str,
-                        prompt: str, run_cmd, out, err, cmd, rc) -> dict | None:
-    """Fallback when the Codex dispatch answers its usage-limit message.
-
-    Classifies the refusal as ``exhausted`` with the carried reset time,
-    marks the Codex pool exhausted until that reset in the capacity ledger
-    (like the implementation stage), records the route reason, and
-    dispatches on the next dispatch route, Luna on OpenCode Go, in the same
-    step without retrying Codex. Returns None when the output carries no
-    usage-limit shape: the caller keeps its generic failure.
-    """
-    codex_h = harnesses.harness_named("codex")
-    try:
-        signal, evidence = codex_h.dispatch_limit_signal(out, err, cmd, rc)
-    except Exception:
-        signal, evidence = None, None
-    if signal != "exhausted" or not isinstance(evidence, dict):
-        return None
-    reset_at, source = core.reset_at_for_evidence(dispatch_route, evidence, "exhausted")
-    try:
-        core.record_capacity(state_dir, dispatch_route, "exhausted", evidence,
-                             reset_at, reset_source=source)
-    except Exception:
-        pass
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": "codex_dispatch", "rc": rc,
-                             "signal": "exhausted", "evidence": evidence,
-                             "reset_at": reset_at,
-                             "stderr": (err or "")[:1000],
-                             "stdout": (out or "")[:1000]})
-    fallback = _dispatch_fallback_routes(dispatch_route)
-    if not fallback:
-        _mark_blocked(state_dir, request_id,
-                      f"capacity_exhausted: no eligible route after exhausted on {dispatch_route}")
-        return {"action": "blocked", "reason": "capacity_exhausted"}
-    _record_dispatch_reason(state_dir, request_id, dispatch_route,
-                            fallback[0], "dispatch_exhausted")
-    return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
-                                 reason="dispatch_exhausted")
+    """Dispatch routes after ``dispatch_route``, in policy order."""
+    routes = policy.stage_routes("dispatch")
+    if dispatch_route not in routes:
+        return []
+    return routes[routes.index(dispatch_route) + 1:]
 
 
 # ---------------------------------------------------------------------------
 # T3 execution path (toolboxmd/model-router#106)
 #
-# When a job names a planner T3 thread, dispatcher and worker invocations
-# run as T3 child threads of that planner thread, and terminal/question
-# posts go into the planner thread as messages instead of through the
-# harness-specific callback CLIs. Jobs without a planner T3 thread never
-# reach this block: the direct CLI path below applies unchanged.
+# Dispatcher and worker turns run as T3 child threads of the planner
+# thread, and terminal/question posts go into the planner thread as
+# messages (#106, #110).
 # ``t3_client`` is an injectable T3Client (deterministic tests); production
 # resolves it from the job's stored server URL plus token discovery.
 # ---------------------------------------------------------------------------
@@ -968,7 +434,7 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
             planner_thread_id=planner)
     except t3exec.T3Error as e:
         # Create/start failed (auth, validation, unreachable mid-turn):
-        # block loudly, never silently run the direct path.
+        # block loudly with the reason.
         return {"action": "blocked", "reason": "t3_unavailable",
                 "detail": f"t3_unavailable: {e}"}
     if not existing_id:
@@ -1035,9 +501,10 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
     signal = outcome.get("signal")
     if state == "error" and signal == "exhausted" and fallback:
         try:
-            core.record_capacity(state_dir, route, "exhausted",
-                                 {"source": "t3", "message": detail[:500]},
-                                 None, reset_source="assumed")
+            evidence = dict(t3exec.evidence_dict(detail), source="t3")
+            reset_at, source = core.reset_at_for_evidence(route, evidence, "exhausted")
+            core.record_capacity(state_dir, route, "exhausted", evidence,
+                                 reset_at, reset_source=source)
         except Exception:
             pass
         _persist_error_evidence(state_dir, request_id,
@@ -1046,6 +513,9 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
                                  "thread_id": thread_id})
         _record_dispatch_reason(state_dir, request_id, route,
                                 fallback[0], "dispatch_exhausted")
+        claim = _claim_capped_dispatch_route(state_dir, request_id, fallback[0])
+        if claim is not None:
+            return claim
         job = core.get_job(state_dir, request_id)
         outcome2 = _t3_run_turn(state_dir, request_id, job, slot="dispatch",
                                 kind_label="dispatcher", route=fallback[0],
@@ -1076,6 +546,57 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
                      f"t3_dispatch_failed: {detail}"[:500])
 
 
+def _reserve_dispatch_route(state_dir, request_id: str, route: str) -> bool:
+    """Reserve a capped dispatch route in the same write transaction that
+    records the reservation, counting running dispatch jobs inside the
+    transaction. True when reserved, False when the cap is already used."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        if core._dispatch_route_full_locked(con, route, exclude=request_id):
+            con.execute("ROLLBACK")
+            return False
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads(row["controller_state"] or "{}") if row is not None else {}
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        if st.get("dispatch_route") != route:
+            st["dispatch_route"] = route
+            con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                        (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+            core._event(con, request_id, "dispatch_route_reserved", {"route": route})
+        con.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _claim_capped_dispatch_route(state_dir, request_id: str,
+                                 route: str) -> dict | None:
+    """Reserve a capped fallback dispatch route before its thread starts.
+
+    None when the route is uncapped or reserved; a blocked result when
+    its ``max_concurrent`` is already used by another running job.
+    """
+    if policy.route_max_concurrent(route) is None:
+        return None
+    if _reserve_dispatch_route(state_dir, request_id, route):
+        return None
+    return _t3_block(state_dir, request_id,
+                     f"capacity_exhausted: dispatch route {route} at max_concurrent")
+
+
 def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
                      t3_client=None) -> dict:
     """Run the dispatcher turn as a T3 child of the planner thread."""
@@ -1091,7 +612,7 @@ def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
     reason = "initial"
     adopted = _t3_thread_for(job, "dispatch") is not None
     if not adopted:
-        # Preflight mirrors the direct path: a dispatch route the capacity
+        # Preflight: a dispatch route the capacity
         # memory knows as exhausted or resting is skipped before any child
         # starts; later jobs go straight to Luna on OpenCode Go.
         try:
@@ -1112,6 +633,9 @@ def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
             _record_dispatch_reason(state_dir, request_id, dispatch_route,
                                     fallback[0], reason)
             route = fallback[0]
+            claim = _claim_capped_dispatch_route(state_dir, request_id, route)
+            if claim is not None:
+                return claim
     try:
         client = _t3_client_for_job(job, t3_client)
     except t3exec.T3Error as e:
@@ -1197,7 +721,7 @@ def _t3_worker_full(outcome: dict, thread_id: str) -> tuple[dict, int]:
     if signal in ("exhausted", "overloaded", "context"):
         return {"ok": False, "rc": 1, "assistant_text": text,
                 "signal": signal,
-                "signal_evidence": {"message": (outcome.get("reason") or "")[:500]},
+                "signal_evidence": t3exec.evidence_dict(outcome.get("reason")),
                 "error": outcome.get("reason") or f"t3 turn {signal}",
                 "quota": signal == "exhausted",
                 "t3_thread_id": thread_id, "idle_confirmed": True}, 1
@@ -1514,303 +1038,117 @@ def _deliver_terminal_report_via_t3(state_dir, request_id: str,
             "attempts": attempts + 1}
 
 
-def dispatch(state_dir, request_id: str, run_cmd=None, probe=None,
-             t3_client=None) -> dict:
-    """Ensure Codex dispatch; persist the task ID before accepting.
+def _git(workspace: str, *args: str, timeout: int = 120) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(["git", "-C", workspace, *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
-    ``probe`` is an optional on-demand usage probe
-    ``probe(state_dir, request_id, route)`` (for example Codex
-    ``account/rateLimits/read`` before a dispatch). It runs best-effort:
-    a failing or slow probe records unknown and never blocks the
-    dispatch, which stays eligible on error evidence alone. When ``probe``
-    is None the harness default runs when due.
+
+def _baseline_proof_gate(state_dir, request_id: str) -> dict | None:
+    """Run the task's proof once on the base commit before the first dispatch.
+
+    A proof that already fails on the base commit is a packet problem, not
+    the worker's: the job blocks before any thread starts, with the
+    failing tail, so the planner fixes the packet once (#111). The result
+    is recorded, so recovery never reruns it. A clean workspace at its
+    base commit is proved in place, where the project's installed
+    dependencies live; otherwise a scratch detached worktree of the base
+    commit is used and removed afterwards. Skipped (and recorded) without
+    a proof command, a base commit, a Git workspace, or when the task
+    sets ``"baseline_proof": false``. Returns a blocked result or None.
     """
-    run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
-    if t3exec.is_t3_job(job):
-        return _dispatch_via_t3(state_dir, request_id,
-                                _full_luna_prompt(job["task_json"]),
-                                t3_client=t3_client)
-    st = _load_controller_state(job)
-    if job.get("codex_task_id") and st.get("seq"):
-        return {"action": "already-dispatched", "codex_task_id": job["codex_task_id"],
-                "luna_action": st.get("last_action")}
-    # A saved thread without a saved action means the dispatch turn's
-    # result was not collected. Re-entering the same action reuses or
-    # adopts that invocation; it never starts a second dispatch.
+    if isinstance(_load_controller_state(job).get("baseline_proof"), dict):
+        return None
     workspace = job["workspace"]
-    prompt = _full_luna_prompt(job["task_json"])
-    last_path = _last_message_path(state_dir, request_id, "codex-dispatch-last")
-    dispatch_route = policy.stage_routes("dispatch")[0]
-    if probe is not None:
-        try:
-            probe(state_dir, request_id, dispatch_route)
-        except Exception as e:  # noqa: BLE001 - record unknown, never block
-            try:
-                _record_codex_probe_unknown(
-                    state_dir, dispatch_route,
-                    f"probe failed: {type(e).__name__}: {str(e)[:200]}")
-            except Exception:
-                pass
+    base = job.get("base_commit")
+    proof_cmd = _proof_command(job["task_json"])
+    try:
+        task = json.loads(job["task_json"] or "null")
+    except ValueError:
+        task = None
+    skip = None
+    if not proof_cmd:
+        skip = "no proof command"
+    elif isinstance(task, dict) and task.get("baseline_proof") is False:
+        skip = "task sets baseline_proof false"
+    elif not base:
+        skip = "no base commit"
+    if skip is not None:
+        _set_phase(state_dir, request_id, baseline_proof={"skipped": skip})
+        return None
+    rc_head, head = _git(workspace, "rev-parse", "HEAD")
+    rc_dirty, dirty = _git(workspace, "status", "--porcelain")
+    root = store.ensure_state_dir(state_dir)
+    job_dir = store.job_dir_for(root, request_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    scratch = None
+    if rc_head == 0 and head.strip() == base and rc_dirty == 0 and not dirty.strip():
+        where = workspace
     else:
-        try:
-            _default_codex_probe(state_dir, request_id, dispatch_route)
-        except Exception:
-            pass  # probes never block routing
-    # Preflight: a Codex pool the capacity memory knows as exhausted or
-    # resting is skipped before any child starts; later jobs go straight to
-    # Luna on OpenCode Go until the reset revalidates.
+        scratch = str(job_dir / "baseline-worktree")
+        rc_add, out = _git(workspace, "worktree", "add", "--detach", scratch, base)
+        if rc_add != 0:
+            _set_phase(state_dir, request_id,
+                       baseline_proof={"skipped": f"no scratch worktree: {out.strip()[:200]}"})
+            return None
+        where = scratch
     try:
-        _skip = core.exhausted_routes(state_dir) | core.degraded_routes(state_dir)
-    except Exception:
-        _skip = set()
-    if dispatch_route in _skip:
-        _exhausted_now = False
-        try:
-            _exhausted_now = dispatch_route in core.exhausted_routes(state_dir)
-        except Exception:
-            _exhausted_now = dispatch_route in _skip
-        _pre_reason = "preflight_exhausted" if _exhausted_now else "preflight_degraded"
-        _fallback = _dispatch_fallback_routes(dispatch_route)
-        if not _fallback:
-            _mark_blocked(state_dir, request_id,
-                          f"capacity_exhausted: no eligible route before dispatch on {dispatch_route}")
-            return {"action": "blocked", "reason": "capacity_exhausted"}
-        _record_dispatch_reason(state_dir, request_id, dispatch_route,
-                                _fallback[0], _pre_reason)
-        return _dispatch_on_opencode(state_dir, request_id, _fallback[0], prompt, run_cmd,
-                                     reason=_pre_reason)
-    dispatch = policy.ROUTES[dispatch_route]
-    if harnesses.route_uses_owned_server(dispatch_route):
-        return _dispatch_on_opencode(state_dir, request_id, dispatch_route, prompt, run_cmd, "initial")
-    cmd = adapters.build_codex_dispatch_cmd(workspace, prompt, model=dispatch["model"],
-                                             effort=dispatch["variant"],
-                                             last_message_path=last_path)
-    try:
-        rc, out, err = run_cmd(cmd, workspace, None, kind="codex_dispatch",
-                               meta={"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
-    except Exception as e:
-        # A failed measurement (including a failed observed_model write) or
-        # any other turn failure must block safely with evidence, never let
-        # a completion through as unknown.
-        return _block_codex_observation_failure(
-            state_dir, request_id, "codex_dispatch", e)
-    codex_h = harnesses.harness_named("codex")
-    task_id, _skind = codex_h.parse_session("codex_dispatch", out, err, job)
-    _record_child(state_dir, request_id, "codex_dispatch", cmd, rc,
-                  session_id=task_id, output_text=(out or "") + (err or ""))
-    if task_id:
-        # The thread exists even when the turn failed: save it so recovery
-        # resumes it instead of creating a replacement task.
-        _save_codex_task(state_dir, request_id, task_id, model=dispatch["model"],
-                         effort=dispatch["variant"], dispatch_route=dispatch_route)
-    # Observed-model gate before any failure classification, auth or
-    # usage-limit fallback, envelope, or route movement. A known
-    # requested-versus-observed mismatch blocks with model_mismatch naming
-    # both models, with no retry, fallback, capacity mark, or envelope.
-    # Unknown never blocks, and only genuinely missing or unreadable
-    # rollout cases stay unknown inside the rollout reader. Any other
-    # observation failure blocks safely with evidence.
-    # Failed turns gate alike: a mismatched failed
-    # turn beats usage-limit and generic failure handling.
-    try:
-        _obs, _mm_reason = check_codex_observed_model(
-            state_dir, request_id, "codex_dispatch", dispatch_route)
-    except Exception as e:
-        return _block_codex_observation_failure(
-            state_dir, request_id, "codex_dispatch", e, task_id)
-    if _mm_reason is not None:
-        _mark_blocked(state_dir, request_id, _mm_reason)
-        out_blocked = {"action": "blocked", "reason": _mm_reason}
-        if task_id:
-            out_blocked["codex_task_id"] = task_id
-        return out_blocked
-    # A turn that provably never started for a missing runtime blocks
-    # recoverably instead of falling through to signal classification,
-    # the OpenCode fallback, or a sticky dispatch failure.
-    runtime_blocked = _block_runtime_missing(
-        state_dir, request_id, "codex_dispatch", cmd,
-        {"stage": "dispatch", "route": dispatch_route, "reason": "initial"})
-    if runtime_blocked is not None:
-        if task_id:
-            runtime_blocked["codex_task_id"] = task_id
-        return runtime_blocked
-    if not task_id:
-        stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
-                                          prompt, run_cmd, out, err, cmd, rc)
-        if stalled is not None:
-            return stalled
-        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
-        if auth_blocked is not None:
-            return auth_blocked
-        exhausted = _dispatch_exhausted(state_dir, request_id, dispatch_route,
-                                        prompt, run_cmd, out, err, cmd, rc)
-        if exhausted is not None:
-            return exhausted
-        message = _codex_failure_message(out, err, cmd)
-        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "message": message, "stderr": (err or "")[:1000], "stdout": (out or "")[:1000]})
-        # The Codex dispatcher could not start a task at all: try the next
-        # dispatch route once, the same model on OpenCode in plan mode.
-        fallback = _dispatch_fallback_routes(dispatch_route)
-        if fallback:
-            _record_dispatch_reason(state_dir, request_id, dispatch_route,
-                                    fallback[0], f"dispatch_fallback rc={rc}")
-            return _dispatch_on_opencode(state_dir, request_id, fallback[0], prompt, run_cmd,
-                                         reason=f"dispatch_fallback rc={rc}")
-        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: no task ID persisted: {message}")
-        return {"action": "blocked", "reason": "codex_dispatch_failed"}
-    if not codex_h.turn_ok("codex_dispatch", rc, out, cmd):
-        # A stall the supervisor ended for stream silence moves laterally
-        # with signal stalled, before auth is even consulted: command
-        # output quoting auth-pattern text is not error evidence.
-        stalled = _codex_dispatch_stalled(state_dir, request_id, dispatch_route,
-                                          prompt, run_cmd, out, err, cmd, rc)
-        if stalled is not None:
-            stalled["codex_task_id"] = task_id
-            return stalled
-        # A missing or rejected login blocks with its reason: no other
-        # route holds the same login, so there is no fallback.
-        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
-        if auth_blocked is not None:
-            auth_blocked["codex_task_id"] = task_id
-            return auth_blocked
-        # A usage-limit refusal moves to Luna on OpenCode Go with the Codex
-        # pool marked exhausted; it never retries Codex.
-        exhausted = _dispatch_exhausted(state_dir, request_id, dispatch_route,
-                                        prompt, run_cmd, out, err, cmd, rc)
-        if exhausted is not None:
-            return exhausted
-        # A turn counts only with its completion event, as in recovery. A
-        # failure with no recognized signal still blocks, but with the last
-        # provider message in the reason, never a bare "turn not completed".
-        message = _codex_failure_message(out, err, cmd)
-        _persist_error_evidence(state_dir, request_id, {"source": "codex_dispatch", "rc": rc, "message": message, "stderr": (err or "")[:1000]})
-        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: {message}")
-        return {"action": "blocked", "reason": "codex_dispatch_failed", "codex_task_id": task_id}
-    luna_action = codex_h.luna_action("codex_dispatch", out, cmd)
-    # Persist the envelope before any side effect it commands.
-    _persist_envelope(state_dir, request_id, luna_action, "dispatched")
-    if luna_action is None:
-        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
-        return {"action": "blocked", "reason": "luna_missing_action",
-                "codex_task_id": task_id}
-    return {"action": "dispatched", "codex_task_id": task_id, "luna_action": luna_action}
-
-
-def _dispatcher_route(job: dict) -> str:
-    return _load_controller_state(job).get("dispatch_route") or policy.stage_routes("dispatch")[0]
-
-
-def _reserve_dispatch_route(state_dir, request_id: str, route: str) -> bool:
-    """Reserve a capped dispatch route in the same write transaction that
-    records the reservation, counting running dispatch jobs inside the
-    transaction. True when reserved, False when the cap is already used."""
+        rc, out, proof_class, started, ended = _run_proof_command(
+            where, proof_cmd, state_dir=state_dir, request_id=request_id)
+    finally:
+        if scratch is not None:
+            _git(workspace, "worktree", "remove", "--force", scratch)
+            _git(workspace, "worktree", "prune")
+    log = job_dir / "baseline-proof.log"
+    store.secure_write_text(log, adapters.redact_text(
+        f"$ {proof_cmd}\n# base {base} in {'workspace' if scratch is None else 'scratch worktree'}"
+        f"\nexit {rc}\n{out}"))
+    record = {"rc": rc, "class": proof_class, "base_commit": base, "started_at": started,
+              "ended_at": ended, "log": str(log),
+              "where": "workspace" if scratch is None else "scratch"}
+    _set_phase(state_dir, request_id, baseline_proof=record)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
-        _lease_guard(con, request_id)
-        if core._dispatch_route_full_locked(con, route, exclude=request_id):
-            con.execute("ROLLBACK")
-            return False
-        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
-                          (request_id,)).fetchone()
-        try:
-            st = json.loads(row["controller_state"] or "{}") if row is not None else {}
-        except ValueError:
-            st = {}
-        if not isinstance(st, dict):
-            st = {}
-        if st.get("dispatch_route") != route:
-            st["dispatch_route"] = route
-            con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
-                        (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
-            core._event(con, request_id, "dispatch_route_reserved", {"route": route})
+        core._event(con, request_id, "baseline_proof",
+                    {k: record[k] for k in ("rc", "class", "base_commit", "where",
+                                            "started_at", "ended_at")})
         con.execute("COMMIT")
-        return True
     except Exception:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
-        raise
     finally:
         con.close()
+    if rc == 0:
+        return None
+    tail = " ".join(adapters.redact_text(out or "").split())[-600:]
+    _mark_blocked(state_dir, request_id,
+                  f"baseline_proof_failed: rc={rc}: the proof already fails on base "
+                  f"{base[:12]}; fix the packet or main, then resubmit: {tail}"[:1500])
+    return {"action": "blocked", "reason": "baseline_proof_failed"}
 
 
-def _dispatch_on_opencode(state_dir, request_id: str, route: str, prompt: str, run_cmd,
-                          reason: str, session_id: str | None = None,
-                          phase: str = "dispatched") -> dict:
-    """Run one dispatcher turn on an OpenCode-hosted Luna in plan mode.
-
-    The saved OpenCode session is the dispatcher task; a turn that reports
-    another session, or no envelope, blocks like its Codex counterpart.
-    A capped dispatch route (luna-go/max) is reserved atomically before any
-    child starts; a full cap blocks without starting a dispatcher."""
-    if session_id is None and policy.route_max_concurrent(route) is not None:
-        if not _reserve_dispatch_route(state_dir, request_id, route):
-            _mark_blocked(state_dir, request_id,
-                          f"capacity_exhausted: dispatch route {route} at max_concurrent")
-            return {"action": "blocked", "reason": "capacity_exhausted"}
+def dispatch(state_dir, request_id: str, t3_client=None) -> dict:
+    """Run the dispatcher turn as a T3 child thread of the planner thread,
+    after the base-commit proof check on the first dispatch."""
     job = core.get_job(state_dir, request_id)
-    oc_h = harnesses.harness_named("opencode")
-    model, variant, agent = policy.opencode_route_params(route)
-    cmd = adapters.build_opencode_serve_cmd()
-    oc_meta = {"prompt": prompt, "allowance": policy.route_allowance(route),
-               "model": model, "variant": variant, "agent": agent,
-               "session_id": session_id, "seq": _load_controller_state(job).get("seq", 0),
-               "stage": "dispatch", "route": route, "reason": reason}
-    rc, out, err = run_cmd(cmd, job["workspace"], None, kind="opencode_control",
-                           meta=oc_meta)
-    full = oc_h.parse_report("opencode_control", out, cmd) or {}
-    got_session, _skind = oc_h.parse_session("opencode_control", out, err, job)
-    got_session = got_session or full.get("opencode_session_id")
-    _record_child(state_dir, request_id, "opencode_control", cmd, rc, session_id=got_session,
-                  output_text=json.dumps({k: full.get(k) for k in ("ok", "rc", "finish", "actual_model")},
-                                         sort_keys=True))
-    runtime_blocked = _block_runtime_missing(state_dir, request_id, "opencode_control",
-                                             cmd, oc_meta)
-    if runtime_blocked is not None:
-        return runtime_blocked
-    if not got_session:
-        _persist_error_evidence(state_dir, request_id, {"source": route, "rc": rc, "error": full.get("error")})
-        _mark_blocked(state_dir, request_id, f"dispatch_failed rc={rc}: no dispatcher session on {route}")
-        return {"action": "blocked", "reason": "codex_dispatch_failed"}
-    if session_id and not oc_h.identity_ok("opencode_control", got_session, session_id):
-        _mark_blocked(state_dir, request_id,
-                      f"luna_task_mismatch: {route} reported {str(got_session)[:24]}")
-        return {"action": "blocked", "reason": "luna_task_mismatch"}
-    if not session_id:
-        _save_codex_task(state_dir, request_id, got_session, model=model, effort=variant or "default",
-                         adapter="opencode", dispatch_route=route)
-    if rc != 0 or not full.get("ok"):
-        _persist_error_evidence(state_dir, request_id, {"source": route, "rc": rc, "error": full.get("error")})
-        _mark_blocked(state_dir, request_id, f"codex_dispatch_failed rc={rc}: dispatcher turn on {route} failed")
-        return {"action": "blocked", "reason": "codex_dispatch_failed"}
-    luna_action = oc_h.luna_action("opencode_control", out, cmd)
-    _persist_envelope(state_dir, request_id, luna_action, phase,
-                      raw_text=full.get("assistant_text") if isinstance(full, dict) else None)
-    if luna_action is None:
-        quote = _assistant_text_quote(full)
-        _mark_blocked(state_dir, request_id, f"luna_missing_action: {quote}")
-        return {"action": "blocked", "reason": "luna_missing_action", "codex_task_id": got_session}
-    return {"action": "dispatched" if phase == "dispatched" else "resumed",
-            "codex_task_id": got_session, "luna_action": luna_action, "route": route}
+    if _t3_thread_for(job, "dispatch") is None:
+        blocked = _baseline_proof_gate(state_dir, request_id)
+        if blocked is not None:
+            return blocked
+    return _dispatch_via_t3(state_dir, request_id,
+                            _full_luna_prompt(job["task_json"]),
+                            t3_client=t3_client)
 
 
-def _own_invocation_pids(state_dir, request_id: str) -> set:
-    pids = set()
-    for inv in core._list_invocations(state_dir, request_id):
-        if inv.get("state") in core.LIVE_INVOCATION_STATES:
-            for k in ("pid", "supervisor_pid"):
-                if inv.get(k):
-                    pids.add(int(inv[k]))
-    return pids
-
-
-PLANNER_CALLBACK_KINDS = (
-    harnesses.KIND_CLAUDE_CALLBACK, harnesses.KIND_CODEX_CALLBACK,
-    harnesses.KIND_OPENCODE_CALLBACK, harnesses.KIND_GROK_CALLBACK,
-)
+def _dispatcher_route(job: dict) -> str:
+    return _load_controller_state(job).get("dispatch_route") or policy.stage_routes("dispatch")[0]
 
 
 def _planner_question_text(request_id: str, qid: str, prompt: str,
@@ -1828,370 +1166,31 @@ def _planner_question_text(request_id: str, qid: str, prompt: str,
     return question
 
 
-def _planner_meta(qid: str, question: str, route: str | None) -> dict:
-    meta: dict = {"qid": qid, "stage": "planning",
-                 "reason": "planner_question",
-                 "prompt_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest()}
-    if route is not None:
-        meta["route"] = route
-    return meta
+def planner_callback(state_dir, request_id: str, qid: str, prompt: str, t3_client=None) -> dict:
+    """Persist the question, then ask it in the planner's T3 thread.
 
-
-def _record_grok_planner_fallback(state_dir, request_id: str, qid: str,
-                                    resume_error: str | None,
-                                    fallback_session: str | None) -> None:
-    """Explicit ledger event for a Grok planner fallback answer.
-
-    The fallback invocation's own metadata already carries
-    ``grok_resume=fallback`` with the resume error, and its child row
-    records the fresh session; this event keeps the same facts where
-    status and result readers look. Never raises past the caller.
+    The planner is messaged in its own thread, never resumed by a second
+    process. A reply that never comes leaves the question pending for
+    ``answer`` plus ``recover``.
     """
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        _lease_guard(con, request_id)
-        core._event(con, request_id, "grok_planner_fallback",
-                    {"qid": qid,
-                     "resume_error": str(resume_error or "")[:300],
-                     "fallback_session": str(fallback_session or "")[:24]})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-    finally:
-        con.close()
-
-
-def _finish_planner_callback(state_dir, request_id: str, qid: str, kind: str,
-                             cmd, rc: int, err: str,
-                             answer: str | None, ok: bool, error: str | None,
-                             reported_session: str | None,
-                             planner_session: str | None,
-                             check_identity: bool, meta: dict | None = None) -> dict:
-    """Shared tail: stored-answer wins, then fail/mismatch blocks, else
-    persist the answer. ``check_identity`` is false only for a fresh
-    fallback session, which is never a resume. A callback that provably
-    never started for a missing runtime blocks recoverably with its
-    cause and next action instead of an opaque callback failure; the
-    question stays pending for ``answer`` plus ``recover``."""
-    _record_child(state_dir, request_id, kind, cmd, rc,
-                  session_id=reported_session or planner_session,
-                  output_text=(answer or "") + "\n" + (err or "")[-1000:])
-    stored = [q for q in core.list_questions(state_dir, request_id, only_pending=False)
-              if q["qid"] == qid and q["status"] == "answered"]
-    mismatch = check_identity and reported_session != planner_session
-    if stored and (rc != 0 or not ok or mismatch):
-        # Answered publicly while the callback ran: the stored answer wins.
-        return {"action": "answered", "qid": qid}
-    runtime_blocked = _block_runtime_missing(state_dir, request_id, kind, cmd, meta)
-    if runtime_blocked is not None:
-        runtime_blocked["qid"] = qid
-        return runtime_blocked
-    if rc != 0 or not ok:
-        reason = f"planner_callback_failed rc={rc}: {error or 'error'}"
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": kind, "rc": rc,
-                                 "error": error,
-                                 "stderr": (err or "")[:1000]})
-        _mark_blocked(state_dir, request_id, reason)
-        return {"action": "blocked", "reason": "planner_callback_failed"}
-    if mismatch:
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": kind,
-                                 "expected_session": planner_session,
-                                 "reported_session": reported_session})
-        _mark_blocked(state_dir, request_id,
-                      "planner_session_mismatch: resumed result came from another session")
-        return {"action": "blocked", "reason": "planner_session_mismatch"}
-    # Persist the answer before resuming the same Luna task.
-    try:
-        core.answer(state_dir, request_id, qid, answer or "", lease_token=_LEASE["token"])
-    except core.ConflictError:
-        pass  # answered publicly meanwhile: the stored answer wins
-    return {"action": "answered", "qid": qid}
-
-
-def planner_callback(state_dir, request_id: str, qid: str, prompt: str,
-                     run_cmd=None, t3_client=None) -> dict:
-    """Persist question before waking the planner; persist answer before resume.
-
-    The planner wakes automatically in its own harness without human
-    action: Claude, Codex, OpenCode, and Grok Build resume the exact
-    saved session (Grok read-only in the user's own Grok home). Only an
-    unresumable Grok session falls back once to a fresh read-only
-    session, recorded explicitly as a fallback. Never forks a new
-    planner session otherwise. A busy planner, a failed callback, or a
-    resumed result from another session becomes a durable blocked state
-    with a reason; the question stays pending for ``answer`` + recover.
-    """
-    run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
-    planner_session = job.get("planner_session_id")
-    if not planner_session:
-        _mark_blocked(state_dir, request_id, "missing planner session: refusing to fork a new session")
-        return {"action": "blocked", "reason": "missing_planner_session"}
-    harness_name = job.get("planner_harness") or "claude"
-    if t3exec.is_t3_job(job):
-        # T3-hosted planners are messaged in-thread, never resumed by CLI.
-        try:
-            core.post_question(state_dir, request_id, qid, prompt,
-                               lease_token=_LEASE["token"])
-        except core.ConflictError as e:
-            _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
-            return {"action": "blocked", "reason": "question_conflict"}
-        question = _planner_question_text(request_id, qid, prompt, job)
-        return _planner_question_via_t3(state_dir, request_id, qid,
-                                        question, t3_client=t3_client)
-    if harness_name not in ("claude", "codex", "opencode", "grok", "t3"):
-        _mark_blocked(state_dir, request_id,
-                      f"planner_harness_unsupported: {harness_name!r} has no callback")
-        return {"action": "blocked", "reason": "planner_harness_unsupported"}
-    # Persist the planner question before waking the planner.
     try:
-        core.post_question(state_dir, request_id, qid, prompt, lease_token=_LEASE["token"])
+        core.post_question(state_dir, request_id, qid, prompt,
+                           lease_token=_LEASE["token"])
     except core.ConflictError as e:
         _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
         return {"action": "blocked", "reason": "question_conflict"}
-    # An earlier controller may already have asked; that attempt is
-    # adopted through its action key, so the busy checks do not apply.
-    asked = any(i.get("kind") in PLANNER_CALLBACK_KINDS
-                and json.loads(i.get("meta_json") or "{}").get("qid") == qid
-                for i in core._list_invocations(state_dir, request_id)
-                if i.get("state") != "abandoned")
     question = _planner_question_text(request_id, qid, prompt, job)
-    workspace = job["workspace"]
-    if harness_name == "codex":
-        try:
-            cmd = adapters.build_codex_planner_cmd(planner_session, question)
-        except ValueError as e:
-            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
-            return {"action": "blocked", "reason": "planner_resume_refused"}
-        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_CODEX_CALLBACK,
-                               meta=_planner_meta(qid, question, "astra/max"))
-        codex_h = harnesses.harness_named("codex")
-        parsed = codex_h.parsed_planner_result(harnesses.KIND_CODEX_CALLBACK, out)
-        return _finish_planner_callback(
-            state_dir, request_id, qid, harnesses.KIND_CODEX_CALLBACK,
-            cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
-            parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=True, meta=_planner_meta(qid, question, "astra/max"))
-    if harness_name == "opencode":
-        try:
-            cmd = adapters.build_opencode_planner_cmd(planner_session, question, workspace)
-        except ValueError as e:
-            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
-            return {"action": "blocked", "reason": "planner_resume_refused"}
-        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_OPENCODE_CALLBACK,
-                               meta=_planner_meta(qid, question, None))
-        opencode_h = harnesses.harness_named("opencode")
-        parsed = opencode_h.parsed_planner_result(harnesses.KIND_OPENCODE_CALLBACK, out)
-        return _finish_planner_callback(
-            state_dir, request_id, qid, harnesses.KIND_OPENCODE_CALLBACK,
-            cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
-            parsed.get("error"), parsed.get("session_id"), planner_session,
-            check_identity=True, meta=_planner_meta(qid, question, None))
-    if harness_name == "grok":
-        # The Grok planner callback resumes the saved planner session
-        # read-only in the user's own Grok home (never a runner kit),
-        # and the answer counts only from that same session. A resume
-        # the CLI cannot run falls back once to a fresh read-only
-        # session, recorded explicitly as a fallback; a result from
-        # another session never falls back and blocks as a mismatch.
-        try:
-            cmd = adapters.build_grok_planner_cmd(planner_session, question, workspace)
-        except ValueError as e:
-            _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
-            return {"action": "blocked", "reason": "planner_resume_refused"}
-        rc, out, err = run_cmd(cmd, workspace, None, kind=harnesses.KIND_GROK_CALLBACK,
-                               meta=_planner_meta(qid, question, None))
-        grok_h = harnesses.harness_named("grok")
-        parsed = grok_h.parsed_planner_result(harnesses.KIND_GROK_CALLBACK, out)
-        if rc == 0 and parsed.get("ok"):
-            # Success or mismatch alike: the identity check decides, and a
-            # reported mismatch stays a mismatch (no fallback hides it).
-            return _finish_planner_callback(
-                state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
-                cmd, rc, err, parsed.get("text"), True,
-                parsed.get("error"), parsed.get("session_id"), planner_session,
-                check_identity=True, meta=_planner_meta(qid, question, None))
-        resume_error = parsed.get("error") or f"rc={rc}"
-        try:
-            fallback_cmd = adapters.build_grok_planner_fallback_cmd(question, workspace)
-        except ValueError as e:
-            _persist_error_evidence(state_dir, request_id,
-                                    {"source": harnesses.KIND_GROK_CALLBACK,
-                                     "resume_error": resume_error,
-                                     "fallback_error": str(e)[:300]})
-            _mark_blocked(state_dir, request_id,
-                          f"grok_planner_resume_failed: {resume_error}; fallback refused: {e}")
-            return {"action": "blocked", "reason": "grok_planner_resume_failed"}
-        fallback_meta = _planner_meta(qid, question, None)
-        fallback_meta["grok_resume"] = "fallback"
-        fallback_meta["resume_error"] = str(resume_error)[:300]
-        frc, fout, ferr = run_cmd(fallback_cmd, workspace, None,
-                                  kind=harnesses.KIND_GROK_CALLBACK,
-                                  meta=fallback_meta)
-        fparsed = grok_h.parsed_planner_result(harnesses.KIND_GROK_CALLBACK, fout)
-        ftext = fparsed.get("text")
-        if frc == 0 and fparsed.get("ok") and isinstance(ftext, str) and ftext.strip():
-            _record_grok_planner_fallback(state_dir, request_id, qid,
-                                          str(resume_error),
-                                          fparsed.get("session_id"))
-            return _finish_planner_callback(
-                state_dir, request_id, qid, harnesses.KIND_GROK_CALLBACK,
-                fallback_cmd, frc, ferr, ftext.strip(), True,
-                fparsed.get("error"), fparsed.get("session_id"), planner_session,
-                check_identity=False, meta=fallback_meta)
-        fallback_error = fparsed.get("error") or f"rc={frc}"
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": harnesses.KIND_GROK_CALLBACK,
-                                 "resume_error": resume_error,
-                                 "resume_stderr": (err or "")[-500:],
-                                 "fallback_error": fallback_error,
-                                 "stderr": (ferr or "")[:1000]})
-        _mark_blocked(state_dir, request_id,
-                      f"grok_planner_resume_failed: {resume_error}; fallback failed: {fallback_error}")
-        return {"action": "blocked", "reason": "grok_planner_resume_failed"}
-    busy = [] if asked else adapters.planner_session_in_use(
-        planner_session, exclude_pids=_own_invocation_pids(state_dir, request_id))
-    if busy:
-        _mark_blocked(state_dir, request_id,
-                      f"planner_busy: session in use by pid {busy[0]}; answer the question and recover")
-        return {"action": "blocked", "reason": "planner_busy"}
-    if not asked and not adapters.wait_planner_quiet(planner_session):
-        _mark_blocked(state_dir, request_id,
-                      "planner_busy: session transcript is still changing; answer the question and recover")
-        return {"action": "blocked", "reason": "planner_busy"}
-    planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
-    planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
-    try:
-        cmd = adapters.build_claude_cmd(planner_session, question,
-                                         model=planner_model, effort=planner_effort)
-    except ValueError as e:
-        _mark_blocked(state_dir, request_id, f"planner_resume_refused: {e}")
-        return {"action": "blocked", "reason": "planner_resume_refused"}
-    planner_route = "sonnet/medium" if planner_model == adapters.CLAUDE_LIVE_MODEL else "fable-5.1/max"
-    rc, out, err = run_cmd(cmd, workspace, None, kind="claude_callback",
-                           meta=_planner_meta(qid, question, planner_route))
-    claude_h = harnesses.harness_named("claude")
-    parsed = claude_h.parsed_result("claude_callback", out)
-    return _finish_planner_callback(
-        state_dir, request_id, qid, "claude_callback",
-        cmd, rc, err, parsed.get("answer"), bool(parsed.get("ok")),
-        parsed.get("error"), parsed.get("session_id"), planner_session,
-        check_identity=True, meta=_planner_meta(qid, question, planner_route))
+    return _planner_question_via_t3(state_dir, request_id, qid,
+                                    question, t3_client=t3_client)
 
 
-def astra_fallback_prompt(state_dir, request_id: str, qid: str, prompt: str) -> str:
-    """Prompt for the Astra fallback planner in a fresh session, no resume.
-
-    The Codex-harness Astra fallback never resumes the
-    Claude planner session: it answers from the job's durable handoff
-    summary carried before the dispatcher's question. Run it as a fresh
-    Astra turn and persist the answer with ``answer`` plus ``recover``.
-    """
-    job = core.get_job(state_dir, request_id)
-    summary = (job.get("handoff_summary") or "").strip() or "-"
-    return (f"HANDOFF SUMMARY for job {request_id}:\n{summary}\n\n"
-            f"The runner dispatcher asks (question {qid}):\n{prompt}\n\n"
-            "Answer briefly with the decision only. Do not run tools.")
-
-
-def resume_luna(state_dir, request_id: str, prompt: str, run_cmd=None,
+def resume_luna(state_dir, request_id: str, prompt: str,
                 label: str = "CONTEXT", t3_client=None) -> dict:
-    """Resume only the saved Luna task ID with new context (never fork)."""
-    run_cmd = run_cmd or default_run_cmd
-    job = core.get_job(state_dir, request_id)
-    if t3exec.is_t3_job(job):
-        return _resume_luna_via_t3(state_dir, request_id,
-                                   adapters.build_luna_followup(label, prompt),
-                                   t3_client=t3_client)
-    task_id = job.get("codex_task_id")
-    if not task_id:
-        _mark_blocked(state_dir, request_id, "missing saved Codex task ID: refusing to fork")
-        return {"action": "blocked", "reason": "missing_codex_task"}
-    message = adapters.build_luna_followup(label, prompt)
-    active = _dispatcher_route(job)
-    if harnesses.route_uses_owned_server(active):
-        return _dispatch_on_opencode(state_dir, request_id, active, message, run_cmd,
-                                     reason="resume", session_id=task_id, phase="resumed")
-    last_path = _last_message_path(state_dir, request_id,
-                                   "codex-resume-" + _prompt_digest(message))
-    dispatch = policy.ROUTES[active]
-    cmd = adapters.build_codex_resume_cmd(task_id, message, last_message_path=last_path,
-                                          model=dispatch["model"], effort=dispatch["variant"])
-    # Resume uses the saved workspace as cwd; never --cd/--reasoning.
-    try:
-        rc, out, err = run_cmd(cmd, job["workspace"], None, kind="codex_resume",
-                               meta={"stage": "dispatch", "route": active, "reason": "resume"})
-    except Exception as e:
-        return _block_codex_observation_failure(
-            state_dir, request_id, "codex_resume", e)
-    codex_h = harnesses.harness_named("codex")
-    resumed_id, _skind = codex_h.parse_session("codex_resume", out, err, job)
-    _record_child(state_dir, request_id, "codex_resume", cmd, rc,
-                  session_id=resumed_id or task_id, output_text=(out or "") + (err or ""))
-    # Observed-model gate before any failure classification, envelope, or
-    # route movement, like dispatch. A mismatched failed resume beats the
-    # generic failure handling. Only genuinely missing or unreadable rollout
-    # cases stay unknown inside the rollout reader; any other observation
-    # failure blocks safely with evidence.
-    try:
-        _resume_route = active if active in policy.ROUTES else policy.stage_routes("dispatch")[0]
-        _obs, _mm_reason = check_codex_observed_model(
-            state_dir, request_id, "codex_resume", _resume_route)
-    except Exception as e:
-        return _block_codex_observation_failure(
-            state_dir, request_id, "codex_resume", e)
-    if _mm_reason is not None:
-        _mark_blocked(state_dir, request_id, _mm_reason)
-        return {"action": "blocked", "reason": _mm_reason}
-    # A resume that provably never started for a missing runtime blocks
-    # recoverably instead of the sticky turn-not-completed failure.
-    runtime_blocked = _block_runtime_missing(
-        state_dir, request_id, "codex_resume", cmd,
-        {"stage": "dispatch", "route": active, "reason": "resume"})
-    if runtime_blocked is not None:
-        return runtime_blocked
-    if not codex_h.turn_ok("codex_resume", rc, out, cmd):
-        # A stall the supervisor ended for stream silence stays stalled,
-        # never auth: command output quoting auth-pattern text is not
-        # error evidence.
-        stalled = _codex_resume_stalled(state_dir, request_id, rc, out, err)
-        if stalled is not None:
-            return stalled
-        # A missing or rejected login blocks with its reason like dispatch:
-        # no other route holds the same login.
-        auth_blocked = _codex_auth_block(state_dir, request_id, rc, out, err)
-        if auth_blocked is not None:
-            return auth_blocked
-        # A resume that failed by exit code is a failed turn with its error
-        # kept, whatever thread it named or did not reach. Exit code alone
-        # is not a completed turn: the harness's own turn.completed record
-        # decides, before any thread comparison.
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": "codex_resume", "rc": rc,
-                                 "stderr": (err or "")[:1000]})
-        _mark_blocked(state_dir, request_id, f"codex_resume_failed rc={rc}: turn not completed")
-        return {"action": "blocked", "reason": "codex_resume_failed"}
-    if not codex_h.identity_ok("codex_resume", resumed_id, task_id):
-        # A turn on another thread, completed or not, never replaces the saved task.
-        _mark_blocked(state_dir, request_id,
-                      f"luna_task_mismatch: resume reported {str(resumed_id or 'no thread')[:24]}")
-        return {"action": "blocked", "reason": "luna_task_mismatch"}
-    luna_action = codex_h.luna_action("codex_resume", out, cmd)
-    _persist_envelope(state_dir, request_id, luna_action, "resumed")
-    if luna_action is None:
-        _mark_blocked(state_dir, request_id, "luna_missing_action: no structured envelope")
-        return {"action": "blocked", "reason": "luna_missing_action"}
-    return {"action": "resumed", "luna_action": luna_action}
-
-
-def _route_allowance(route: str) -> str:
-    return policy.route_allowance(route) if policy.is_supported(route) else "free"
+    """Resume only the saved dispatcher thread with new context (never fork)."""
+    return _resume_luna_via_t3(state_dir, request_id,
+                               adapters.build_luna_followup(label, prompt),
+                               t3_client=t3_client)
 
 
 WORKER_RULES = (
@@ -2345,8 +1344,8 @@ def _pool_target_in_lane(pool_target: str | None, route: str, lane: str | None) 
 
 def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
                        evidence: dict) -> dict:
-    """Exhaustion: zero retries, the same model on the next pool, else the
-    next family. Overload and stalled: the next family; the route rests for
+    """Exhaustion: zero retries, the whole pool rests, then the same model
+    on the next pool, else the next family. Overload and stalled: the next family; the route rests for
     the documented cooldown. Moves stay inside the job's stored lane and skip
     one-turn routes already used. No eligible route blocks with a reason."""
     job = core.get_job(state_dir, request_id)
@@ -2355,6 +1354,10 @@ def _move_after_signal(state_dir, request_id: str, route: str, signal: str,
     exhausted = core.exhausted_routes(state_dir)
     degraded = core.degraded_routes(state_dir)
     if signal == "exhausted":
+        # The allowance is shared: the whole pool rests, so the move never
+        # lands on another model of the same pool.
+        pool = policy.route_pool(route)
+        exhausted |= {r for r in policy.known_routes() if policy.route_pool(r) == pool}
         exhausted.add(route)
         pool_target = policy.next_pool_route(route)
         if pool_target and (pool_target in exhausted or pool_target in degraded
@@ -2404,15 +1407,21 @@ def _move_after_context(state_dir, request_id: str, route: str, evidence: dict) 
     except ValueError:
         return None
     target = None
-    if stage is not None:
+    try:
         size = policy.route_context_window(route)
+    except ValueError:
+        stage = None  # a snapshot route with no known size cannot compare
+    if stage is not None:
         order = policy.stage_routes(stage)
         for cand in order[order.index(route) + 1:]:
             if cand in exhausted or cand in degraded:
                 continue
             if policy.one_turn_routes_used(cand, turns):
                 continue
-            if policy.route_context_window(cand) <= size:
+            try:
+                if policy.route_context_window(cand) <= size:
+                    continue
+            except ValueError:
                 continue
             if core.route_concurrency_full(state_dir, cand, exclude=request_id):
                 continue
@@ -2552,8 +1561,6 @@ def _preflight_move(state_dir, request_id: str, route: str) -> dict | None:
                          {"source": "capacity_memory", "route": route})
 
 
-
-
 def _record_planner_route_rejection(state_dir, request_id: str,
                                       requested: str, reason: str) -> None:
     """Persist why a dispatcher-requested route was not assigned.
@@ -2590,8 +1597,8 @@ def _apply_planner_directed_route(state_dir, request_id: str,
     ordinary envelope ``route`` field (and any legacy concrete route in
     an older example) is inert: the escalation ladder stays authoritative
     and a repeated default never undoes a correction or recovery move.
-    Anything else (an unknown route, a planner-harness rung that runs in
-    the planner session, or a route with no capacity left) is rejected
+    Anything else (an unknown route, a dispatch route, or a route with
+    no capacity left) is rejected
     with a ``planner_route_rejected`` event and the job keeps its route:
     explicit choices are never silently substituted and models never
     silently swapped. Correction and recovery stage routes are valid
@@ -2611,8 +1618,8 @@ def _apply_planner_directed_route(state_dir, request_id: str,
         _record_planner_route_rejection(
             state_dir, request_id, requested,
             f"route {requested!r} is not dispatcher-assignable: "
-            "planner-harness rungs run in the planner session, and unknown "
-            "routes never substitute a model")
+            "only implementation-lane, correction and recovery routes are "
+            "assignable, and unknown routes never substitute a model")
         return False
     lane = job.get("lane")
     try:
@@ -2657,19 +1664,7 @@ def _apply_planner_directed_route(state_dir, request_id: str,
 def _turns_by_route(state_dir, request_id: str) -> dict:
     """Implementation turns already run per route, for the one-turn rule."""
     counts: dict = {}
-    worker_kinds = harnesses.worker_control_kinds()
-    for inv in core._list_invocations(state_dir, request_id):
-        if inv.get("kind") not in worker_kinds or inv.get("state") == "abandoned":
-            continue
-        try:
-            route = (json.loads(inv.get("meta_json") or "{}") or {}).get("route")
-        except ValueError:
-            route = None
-        if route:
-            counts[route] = counts.get(route, 0) + 1
-    # T3 child-thread turns leave no local invocation rows: they count
-    # from the authoritative t3_threads map instead, so the one-turn rule
-    # holds on the T3 path too.
+    # Worker turns count from the authoritative t3_threads map.
     try:
         threads = _t3_threads_map(core.get_job(state_dir, request_id))
     except Exception:
@@ -2682,20 +1677,17 @@ def _turns_by_route(state_dir, request_id: str) -> dict:
 
 
 def run_implementation(state_dir, request_id: str, artifact: str | None = None,
-                       payload: dict | None = None, run_cmd=None,
+                       payload: dict | None = None,
                        t3_client=None) -> dict:
     """Run one implementation turn for the current dispatcher action.
 
-    The turn runs on the job route's harness through the harness seam:
-    an owned ``opencode serve`` driven by the supervisor, or a headless
-    ``grok -p`` worker process. Capacity signals move routes; other
-    errors end the turn for the escalation ladder.
+    The turn runs as a T3 child thread of the dispatcher thread on the
+    route's provider, model and effort. Capacity signals move routes;
+    other errors end the turn for the escalation ladder.
     """
-    run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
     workspace = job["workspace"]
-    route = job.get("route") or "muse-spark-xhigh-free"
-    harness = harnesses.harness_named(policy.route_spec(route)["harness"])
+    route = job.get("route") or policy.lane_default_route(policy.DEFAULT_LANE)
     state = _load_controller_state(job)
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
@@ -2705,180 +1697,37 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         known_pr = None
     prompt = _implementation_prompt(job["task_json"], artifact, payload,
                                     known_pr_url=known_pr)
-    def _turn_seq(inv):
-        try:
-            return (json.loads(inv.get("meta_json") or "{}") or {}).get("seq")
-        except ValueError:
-            return None
-    prior_tries = [i for i in core._list_invocations(state_dir, request_id)
-                   if i.get("kind") in harnesses.worker_control_kinds() and i.get("state") != "abandoned"
-                   and _turn_seq(i) == seq]
-    # T3 child-thread turns leave no local invocation rows: an existing
-    # slot for this seq counts as an attempt, so preflight never moves a
-    # same-seq T3 retry away (mirroring the direct path's gate).
-    t3_attempted = _t3_thread_for(job, f"impl_{seq}") is not None
-    attempted = bool(prior_tries) or (t3exec.is_t3_job(job) and t3_attempted)
-    if not attempted:
+    # A T3 child thread already saved for this seq counts as an attempt,
+    # so preflight never moves a same-seq retry away.
+    if _t3_thread_for(job, f"impl_{seq}") is None:
         move = _preflight_move(state_dir, request_id, route)
         if move is not None:
             return move
     # Bind a pending recovery decision to this actual attempt start, after
-    # any preflight route move: a preflight move starts no worker
-    # invocation, so it must not consume the pending link or emit a
-    # recovery_next_attempt for a seq that never ran. The link carries the
-    # post-move route, while the decision keeps its pre-move target.
+    # any preflight route move: a preflight move starts no worker turn, so
+    # it must not consume the pending link or emit a recovery_next_attempt
+    # for a seq that never ran. The link carries the post-move route, while
+    # the decision keeps its pre-move target.
     try:
-        _post_move_job = core.get_job(state_dir, request_id)
-        _post_move_route = _post_move_job.get("route") or route
+        job = core.get_job(state_dir, request_id)
+        route = job.get("route") or route
     except Exception:
-        _post_move_route = route
-    _link_recovery_attempt(state_dir, request_id, seq, _post_move_route)
-    # ``try`` numbers repeated worker turns for one dispatcher turn, so a
-    # bounded same-route retry after a stall spawns a new attempt with its
-    # own action identity instead of reusing the stalled turn's record.
-    # Only stalled failures count: a live turn is adopted, a completed turn
-    # is reused, and any other failure is returned as-is (never replayed),
-    # all under the original identity.
-    def _turn_stalled(inv):
-        if inv.get("state") != "failed":
-            return False
-        try:
-            res = json.loads(inv.get("result_json") or "null")
-        except ValueError:
-            return False
-        if not isinstance(res, dict):
-            return False
-        if res.get("signal") == "stalled":
-            return True
-        env = res.get("envelope")
-        return isinstance(env, dict) and env.get("signal") == "stalled"
-    attempt = sum(1 for i in prior_tries if _turn_stalled(i))
-    if t3exec.is_t3_job(job):
-        # T3 execution path (#106): the worker turn runs as a T3 child
-        # thread of the planner thread on the route's provider, model and
-        # effort, then finishes through the shared worker tail.
-        try:
-            job = core.get_job(state_dir, request_id)
-            route = job.get("route") or route
-        except Exception:
-            pass
-        return _run_t3_worker_turn(state_dir, request_id, job, workspace,
-                                   route, prompt, seq, route_reason,
-                                   artifact, attempt, t3_client=t3_client)
-    if harness.owned_server:
-        return _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
-                                  seq, route_reason, run_cmd, artifact, attempt)
-    if harness.headless_worker:
-        return _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
-                              seq, route_reason, run_cmd, artifact, attempt)
-    raise core.RunnerError(f"route {route} runs on {harness.name}, which has no worker turn")
-
-
-def _confirmed_stop_recoverable(state_dir, request_id: str,
-                                  full: dict | None, rc: int | None) -> bool:
-    """True when a stopped turn may return evidence to the dispatcher.
-
-    A supervisor result (an OpenCode rc124 startup failure or an rc143
-    confirmed stop) is recoverable only when every owned process group
-    is proven dead: each recorded worker control invocation (abandoned
-    never-started rows excepted) must read ``dead`` or ``finished``,
-    never live, orphaned, unresolved, or unknown, and every recorded
-    child and supervisor process group must be present and proven dead.
-    A finished row alone proves the record
-    was written, never that the group died: members that ignore SIGTERM
-    can survive the supervisor's leader-only wait, and absent group
-    identities prove nothing at all. Missing results, missing or
-    unknown group identities, live groups, rc125 supervisor loss, and
-    any ambiguous ownership stay sticky-blocked so no second writer
-    starts behind a possible owner. Read-only: never kills anything.
-    """
-    if rc == 125:
-        return False
-    if not isinstance(full, dict) or not full:
-        return False
-    try:
-        invs = [i for i in core._list_invocations(state_dir, request_id)
-                if i.get("kind") in ("opencode_control", "grok_control")]
-    except Exception:
-        return False
-    if not invs:
-        return False
-    try:
-        for inv in invs:
-            if inv.get("state") == "abandoned":
-                continue
-            try:
-                own = core._invocation_ownership(inv)
-            except Exception:
-                return False
-            if own not in ("dead", "finished"):
-                return False
-            for pgid_key in ("pgid", "supervisor_pgid"):
-                pgid = inv.get(pgid_key)
-                if pgid is None:
-                    return False
-                if core._is_pgid_alive(pgid):
-                    return False
-        if core._any_live_invocation(state_dir, request_id):
-            return False
-        if core._any_unresolved_invocation(state_dir, request_id):
-            return False
-    except Exception:
-        return False
-    return True
-
-
-def _run_opencode_turn(state_dir, request_id, job, workspace, route, prompt,
-                       seq, route_reason, run_cmd, artifact=None, attempt=0) -> dict:
-    allowance = _route_allowance(route)
-    model, variant, agent = policy.opencode_route_params(route)
-    saved_session = job.get("opencode_session_id")
-    cmd = adapters.build_opencode_serve_cmd()
-    oc_meta = {"prompt": prompt, "allowance": allowance,
-               "model": model, "variant": variant, "agent": agent,
-               "session_id": saved_session, "seq": seq,
-               "try": attempt,
-               "stage": "implementation", "route": route,
-               "reason": route_reason}
-    rc, out, err = run_cmd(cmd, workspace, None, kind="opencode_control",
-                           meta=oc_meta)
-    # The result line comes from this invocation's own output file, read
-    # through the harness seam.
-    oc_h = harnesses.harness_named("opencode")
-    full = oc_h.parse_report("opencode_control", out, cmd) or {}
-    session_id = full.get("opencode_session_id") or saved_session
-    _record_child(state_dir, request_id, "opencode_control", cmd, rc,
-                  session_id=session_id,
-                  output_text=json.dumps({k: full.get(k) for k in (
-                      "ok", "rc", "quota", "finish", "actual_model")}, sort_keys=True))
-    return _finish_worker_turn(state_dir, request_id, job, route, seq,
-                               artifact, full, session_id, rc,
-                               source="opencode_control", cmd=cmd, meta=oc_meta)
+        pass
+    _link_recovery_attempt(state_dir, request_id, seq, route)
+    return _run_t3_worker_turn(state_dir, request_id, job, workspace,
+                               route, prompt, seq, route_reason,
+                               artifact, t3_client=t3_client)
 
 
 def _finish_worker_turn(state_dir, request_id, job, route, seq, artifact,
-                        full, session_id, rc, source, cmd=None,
-                        meta=None) -> dict:
-    """Shared worker-turn tail: reports, capacity moves, and ladder inputs.
+                        full, session_id, rc, source) -> dict:
+    """Worker-turn tail: reports, capacity moves, and ladder inputs.
 
-    Both the owned-server path and the T3 child-thread path
-    (toolboxmd/model-router#106) finish here from a supervisor-shaped
-    ``full`` dict, so reports, the escalation ladder, and the capacity
-    memory behave identically. T3 turns skip the local runtime-missing
-    check (no local spawn exists server-side); the T3 thread id travels
-    in the worker session field by the existing Grok precedent, with the
-    authoritative ``t3_threads`` map and ``t3_thread`` events alongside.
+    A T3 worker turn (toolboxmd/model-router#106) finishes here from its
+    result dict. The T3 thread id travels in the worker session field,
+    with the authoritative ``t3_threads`` map and ``t3_thread`` events
+    alongside.
     """
-    # A turn that provably never started for a missing runtime blocks
-    # recoverably with its cause and next action, before capacity-signal
-    # handling, the escalation ladder, or a sticky implementation failure
-    # could count an unstarted action as an ordinary provider failure or
-    # move its explicit route.
-    if source != T3_TURN_KIND:
-        runtime_blocked = _block_runtime_missing(state_dir, request_id, source,
-                                                 cmd, meta)
-        if runtime_blocked is not None:
-            return runtime_blocked
     if rc == 0 and full.get("ok"):
         report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
         _set_phase(state_dir, request_id, phase="implemented",
@@ -2951,42 +1800,6 @@ def _finish_worker_turn(state_dir, request_id, job, route, seq, artifact,
         moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
         moved["report"] = move_report
         return moved
-    if not full or rc in (124, 143, 125) or full.get("rc") in (124, 143, 125):
-        # No control result means the supervisor never finished its loop
-        # (a crash, a stop, or supervisor loss); that is an ownership
-        # matter, not a worker failure, and it blocks as before, but the
-        # turn still leaves a report.
-        # The suite is not run for the unfinished turn.
-        # A supervisor result with every owned process group confirmed
-        # dead (an OpenCode rc124 startup failure or an rc143 confirmed
-        # stop) returns its evidence to the dispatcher instead: the turn
-        # counts as failed on the ladder and stays recoverable. Missing
-        # results, rc125, and ambiguous ownership keep the sticky block
-        # so no second writer starts behind a possible owner.
-        if _confirmed_stop_recoverable(state_dir, request_id, full, rc):
-            stop_report = _write_turn_report(
-                state_dir, request_id, job, seq, route, full, session_id,
-                status="failed", error=full.get("error") or f"rc={rc}",
-                run_proof=False, turn_rc=rc, harness_crash=True,
-                proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
-                "not run automatically for a stopped turn; the dispatcher "
-                "requests useful proof of a coherent candidate")
-            _set_phase(state_dir, request_id, phase="implementation_failed",
-                       opencode_session_id=session_id, report_path=stop_report.get("report_path"))
-            return {"action": "implementation_failed", "session": session_id, "rc": rc,
-                    "error": full.get("error"), "report": stop_report,
-                    "output": str(full.get("assistant_text") or "")}
-        crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                          status="failed", error=full.get("error") or f"rc={rc}",
-                                          run_proof=False, turn_rc=rc, harness_crash=True,
-                                          proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
-                                          "not run automatically for a crashed turn; the dispatcher "
-                                          "requests useful proof of a coherent candidate")
-        _set_phase(state_dir, request_id, phase="implementation_failed",
-                   opencode_session_id=session_id, report_path=crash_report.get("report_path"))
-        _mark_blocked(state_dir, request_id,
-                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
-        return {"action": "blocked", "reason": "implementation_failed", "report": crash_report}
     # A hard provider or worker error ends the turn as failed. The
     # dispatcher hears about it and the escalation ladder decides the
     # next route; nothing is retried here. The full suite is not run
@@ -3003,146 +1816,6 @@ def _finish_worker_turn(state_dir, request_id, job, route, seq, artifact,
     return {"action": "implementation_failed", "session": session_id, "rc": rc,
             "error": full.get("error"), "report": report,
             "output": str(full.get("assistant_text") or "")}
-
-
-def _run_grok_turn(state_dir, request_id, job, workspace, route, prompt,
-                   seq, route_reason, run_cmd, artifact=None, attempt=0) -> dict:
-    """One headless Grok Build worker turn for the current dispatcher action.
-
-    The saved Grok session resumes when one exists; a turn that reports a
-    different session never replaces it. Provider signals move routes
-    through the same capacity memory as the owned-server path. The exited
-    process is the turn boundary, so no abort or idle confirmation applies.
-    """
-    grok_h = harnesses.harness_named("grok")
-    model, effort = policy.grok_route_params(route)
-    saved_session = job.get("grok_session_id")
-    # The live turn's kit arrives via the harness spawn_spec (GROK_HOME);
-    # the spec env returned here is the manual-run equivalent.
-    cmd, _grok_kit_env = adapters.build_grok_cmd(prompt, workspace, model, effort, saved_session)
-    grok_meta = {"prompt": prompt, "model": model, "variant": effort,
-                 "session_id": saved_session, "seq": seq,
-                 "try": attempt,
-                 "stage": "implementation", "route": route,
-                 "reason": route_reason}
-    rc, out, err = run_cmd(cmd, workspace, None, kind="grok_control",
-                           meta=grok_meta)
-    # The JSON result comes from this invocation's own output file, read
-    # through the harness seam.
-    full = grok_h.parse_report("grok_control", out, cmd) or {}
-    got_session = full.get("grok_session_id")
-    if saved_session and got_session \
-            and not grok_h.identity_ok("grok_control", got_session, saved_session):
-        # A turn on another session, completed or not, never replaces the saved one.
-        _persist_error_evidence(state_dir, request_id,
-                                {"source": "grok_control", "rc": rc,
-                                 "expected_session": saved_session,
-                                 "reported_session": got_session})
-        _mark_blocked(state_dir, request_id,
-                      f"luna_task_mismatch: grok turn reported {str(got_session)[:24]}")
-        return {"action": "blocked", "reason": "luna_task_mismatch"}
-    session_id = got_session or saved_session
-    _record_child(state_dir, request_id, "grok_control", cmd, rc,
-                  session_id=session_id,
-                  output_text=json.dumps({k: full.get(k) for k in (
-                      "ok", "finish", "signal", "error")}, sort_keys=True))
-    # A turn that provably never started for a missing runtime blocks
-    # recoverably with its cause and next action, before signal handling
-    # or a sticky implementation failure could count an unstarted action
-    # as an ordinary provider failure or move its explicit route.
-    runtime_blocked = _block_runtime_missing(state_dir, request_id, "grok_control",
-                                             cmd, grok_meta)
-    if runtime_blocked is not None:
-        return runtime_blocked
-    if rc == 0 and full.get("ok"):
-        report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id)
-        _set_phase(state_dir, request_id, phase="implemented",
-                   grok_session_id=session_id, artifact=artifact,
-                   report_path=report.get("report_path"),
-                   implementation_output=adapters.redact_text(str(full.get("assistant_text") or ""))[-8000:])
-        # A successful request revalidates the route's exhaustion marks the
-        # same way a healthy probe does (provider marks only past reset).
-        core.record_route_success(state_dir, route)
-        return {"action": "implementation_ok", "session": session_id,
-                "output": str(full.get("assistant_text") or ""),
-                "finish": full.get("finish"), "actual_model": full.get("actual_model"),
-                "report": report}
-    evidence = full.get("signal_evidence")
-    signal = full.get("signal")
-    _persist_error_evidence(state_dir, request_id,
-                            {"source": "grok_control", "rc": rc,
-                             "error": full.get("error"),
-                             "signal": signal, "evidence": evidence,
-                             "finish": full.get("finish"),
-                             "stderr": (err or "")[:1000]})
-    if signal in ("exhausted", "overloaded") and isinstance(evidence, dict):
-        # Every worker turn leaves a report, including capacity moves, so
-        # the dispatcher and the ledger keep the evidence. The suite is
-        # not run automatically for a capacity turn.
-        move_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                         status=signal, error=full.get("error"),
-                                         run_proof=False,
-                                         proof_skipped_reason=f"{signal} turn: the suite is not run "
-                                         "automatically for a capacity turn; the dispatcher requests "
-                                         "useful proof of a coherent candidate")
-        _set_phase(state_dir, request_id, phase=f"{signal}_moved",
-                   grok_session_id=session_id, report_path=move_report.get("report_path"))
-        moved = _move_after_signal(state_dir, request_id, route, signal, evidence)
-        moved["report"] = move_report
-        return moved
-    if rc in (124, 143, 125):
-        # The supervisor exited without a durable terminal result while the
-        # turn never finished: supervisor loss (rc 125, the CLI child still
-        # alive but unsupervised), a stop (143), or a legacy 124 record.
-        # That is an ownership matter, not a worker failure, and it blocks
-        # as before so no new attempt queues behind the unsupervised child;
-        # the turn still leaves a report. No elapsed deadline is restored.
-        # The suite is not run for the unfinished turn. A supervisor result
-        # with every owned process group confirmed dead (rc124 startup
-        # failure or rc143 confirmed stop) returns its evidence to the
-        # dispatcher instead and stays recoverable; rc125 and ambiguous
-        # ownership keep the sticky block.
-        if _confirmed_stop_recoverable(state_dir, request_id, full, rc):
-            stop_report = _write_turn_report(
-                state_dir, request_id, job, seq, route, full, session_id,
-                status="failed", error=full.get("error") or f"rc={rc}",
-                run_proof=False, turn_rc=rc, harness_crash=True,
-                proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
-                "not run automatically for a stopped turn; the dispatcher "
-                "requests useful proof of a coherent candidate")
-            _set_phase(state_dir, request_id, phase="implementation_failed",
-                       grok_session_id=session_id, report_path=stop_report.get("report_path"))
-            return {"action": "implementation_failed", "session": session_id, "rc": rc,
-                    "error": full.get("error"), "report": stop_report,
-                    "output": str(full.get("assistant_text") or "")}
-        crash_report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                          status="failed", error=full.get("error") or f"rc={rc}",
-                                          run_proof=False, turn_rc=rc, harness_crash=True,
-                                          proof_skipped_reason=f"incomplete turn rc={rc}: the suite is "
-                                          "not run automatically for a crashed turn; the dispatcher "
-                                          "requests useful proof of a coherent candidate")
-        _set_phase(state_dir, request_id, phase="implementation_failed",
-                   grok_session_id=session_id, report_path=crash_report.get("report_path"))
-        _mark_blocked(state_dir, request_id,
-                      f"implementation_failed rc={rc}: {str(full.get('error') or '')[:200]}")
-        return {"action": "blocked", "reason": "implementation_failed", "report": crash_report}
-    # A hard provider or worker error ends the turn as failed. The
-    # dispatcher hears about it and the escalation ladder decides the
-    # next route; nothing is retried here. The full suite is not run
-    # automatically for the failed turn: the dispatcher requests useful
-    # proof of a coherent candidate instead.
-    report = _write_turn_report(state_dir, request_id, job, seq, route, full, session_id,
-                                status="failed", error=full.get("error"),
-                                run_proof=False,
-                                proof_skipped_reason="failed turn: the suite is not run "
-                                "automatically for a failed turn; the dispatcher requests "
-                                "useful proof of a coherent candidate")
-    _set_phase(state_dir, request_id, phase="implementation_failed",
-               grok_session_id=session_id, report_path=report.get("report_path"))
-    return {"action": "implementation_failed", "session": session_id, "rc": rc,
-            "error": full.get("error"), "report": report,
-            "output": str(full.get("assistant_text") or "")}
-
 
 
 def _proof_command(task_json: str) -> str | None:
@@ -3370,9 +2043,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
                        full: dict, session_id: str | None, status: str = "ok",
                        error=None, *, run_proof: bool = True,
                        proof_skipped_reason: str | None = None,
-                       proof_timeout: int = 600,
-                       turn_rc: int | None = None,
-                       harness_crash: bool = False) -> dict:
+                       proof_timeout: int = 600) -> dict:
     """Write report.json, proof.log, diff.patch, and worker.txt for one turn.
 
     The runner runs the task's own proof command and records the exit code;
@@ -3443,20 +2114,10 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         signal_name = None
     failure_class = None
     if status != "ok":
-        failure_class = core.failure_class_for(
-            signal=signal_name, proof_class=proof_class, rc=turn_rc)
-        if failure_class == "timeout" and harness_crash and turn_rc == 124:
-            # A supervisor-level rc124 with no proof outcome (an OpenCode
-            # startup failure, a legacy 124 record) is infrastructure,
-            # never a proof timeout: the suite never ran, so nothing
-            # timed out. A proof that ran past its budget carries
-            # proof_class timeout instead and stays timeout.
-            failure_class = "infrastructure"
-        if failure_class == "unknown" and (error or turn_rc not in (None, 0)):
-            # The worker or harness errored without a capacity signal:
-            # a vanished supervisor is infrastructure, a finished worker
-            # that errored is implementation.
-            failure_class = "infrastructure" if harness_crash else "implementation"
+        failure_class = core.failure_class_for(signal=signal_name, proof_class=proof_class)
+        if failure_class == "unknown" and error:
+            # The worker errored without a capacity signal.
+            failure_class = "implementation"
     am = full.get("actual_model") if isinstance(full.get("actual_model"), dict) else {}
     observed = (f"{am.get('providerID')}/{am.get('modelID')}" if am.get("providerID") and am.get("modelID") else None)
     observed_variant = am.get("variant") if isinstance(am.get("variant"), str) else None
@@ -3496,25 +2157,37 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
                 str(report_path), str(proof_log))
         except Exception:
             pass
-    # Link the report to the invocation that produced it.
-    kinds = harnesses.worker_control_kinds()
-    placeholders = ",".join("?" for _ in kinds)
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(f"UPDATE invocations SET report_path=? WHERE request_id=? AND kind IN ({placeholders})"
-                    f" AND invocation_id=(SELECT invocation_id FROM invocations WHERE request_id=?"
-                    f" AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1)",
-                    (str(report_path), request_id, *kinds, request_id, *kinds))
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-    finally:
-        con.close()
     return report
+
+
+def _branch_evidence(job: dict) -> dict:
+    """The job branch as the dispatcher should see it: its name, the
+    commits since the base commit, and an open PR for it (best effort
+    through ``gh``). Finished work on the branch is never mistaken for
+    no work. Unavailable values stay None."""
+    workspace = job.get("workspace") or ""
+    base = job.get("base_commit")
+    out: dict = {"branch": None, "branch_commits": None, "branch_pr": None}
+    rc, branch = _git(workspace, "rev-parse", "--abbrev-ref", "HEAD", timeout=20)
+    if rc != 0:
+        return out
+    out["branch"] = branch.strip() or None
+    if base:
+        rc, log = _git(workspace, "log", "--oneline", "--no-decorate", "-n", "20",
+                       f"{base}..HEAD", timeout=20)
+        if rc == 0:
+            out["branch_commits"] = [line for line in log.splitlines() if line.strip()]
+    if out["branch"] and out["branch"] != "HEAD":
+        try:
+            proc = subprocess.run(["gh", "pr", "view", out["branch"], "--json", "url,state"],
+                                  cwd=workspace, capture_output=True, text=True, timeout=20)
+            if proc.returncode == 0:
+                pr = json.loads(proc.stdout or "{}")
+                if isinstance(pr, dict) and pr.get("url"):
+                    out["branch_pr"] = {"url": pr.get("url"), "state": pr.get("state")}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    return out
 
 
 def _implementation_evidence(job: dict, impl: dict) -> str:
@@ -3561,8 +2234,12 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
         "native_ids": report.get("native_ids"),
         "report": report.get("report_path"), "proof_log": report.get("proof_log"),
         "diff": report.get("diff"), "worker_text": report.get("worker_text"),
+        **_branch_evidence(job),
     }
     return (json.dumps(fields, sort_keys=True) + "\n"
+            "Commits on the job branch or an open branch PR mean the work may "
+            "already be done: verify it and complete with that PR instead of "
+            "reporting no changes. "
             "Consume this exact-candidate evidence (report, proof log, diff) for the "
             "candidate commit above; do not rerun the full suite against it when its "
             "proof already passed. Request implementation again when the turn failed, "
@@ -3581,7 +2258,6 @@ TERMINAL_REPORT_STATUSES = store.TERMINAL_REPORT_STATUSES
 # Bounded busy-planner window: at most this many delivery attempts per
 # terminal state, with a short sleep between busy retries.
 TERMINAL_REPORT_MAX_ATTEMPTS = 5
-TERMINAL_REPORT_RETRY_DELAY_SECS = 2.0
 
 
 def _terminal_report_pr_url(job: dict) -> str | None:
@@ -3754,75 +2430,6 @@ def _save_terminal_report_record(state_dir, request_id: str,
         con.close()
 
 
-# Planner binaries holding a live session per harness, for the
-# terminal-report busy check. Every harness resumes the saved session
-# (Grok read-only since #96), so every one is gated.
-_TERMINAL_BUSY_BINARIES = {"claude": adapters.CLAUDE_BIN,
-                           "codex": adapters.CODEX_BIN,
-                           "opencode": adapters.OPENCODE_BIN,
-                           "grok": adapters.GROK_BIN}
-
-
-def _terminal_report_busy_reason(harness_name: str, planner_session: str,
-                                 exclude_pids) -> str | None:
-    """Busy detail when the planner session is held, else None.
-
-    Every resume-based harness is gated, not just Claude: the argv check
-    sees a live process holding the session (``--resume SID``,
-    ``--session SID``, or the joined ``--session-id=<SID>`` form), and
-    Claude adds the transcript check for a turn still writing. Either
-    means the report must wait for the next retry inside the bounded
-    window.
-    """
-    binary = _TERMINAL_BUSY_BINARIES.get(harness_name)
-    if binary is None:
-        return None
-    try:
-        busy = adapters.planner_process_in_use(binary, planner_session,
-                                               exclude_pids=exclude_pids)
-    except Exception:
-        busy = []
-    if busy:
-        return f"planner_busy: session in use by pid {busy[0]}"
-    if harness_name == "claude":
-        try:
-            quiet = adapters.wait_planner_quiet(planner_session)
-        except Exception:
-            quiet = True
-        if not quiet:
-            return "planner_busy: session transcript is still changing"
-    return None
-
-
-def _terminal_report_invocation(harness_name: str, planner_session: str,
-                                  text: str, workspace: str,
-                                  job: dict) -> tuple[str, list[str]]:
-    """(invocation kind, argv) for one terminal-report turn.
-
-    Reuses the existing planner callback builders: Claude and Codex
-    resume the exact saved session, OpenCode resumes its session, and
-    Grok resumes its saved session read-only (#96). Never forks a new
-    planner session.
-    """
-    if harness_name == "codex":
-        return (harnesses.KIND_CODEX_CALLBACK,
-                adapters.build_codex_planner_cmd(planner_session, text))
-    if harness_name == "opencode":
-        return (harnesses.KIND_OPENCODE_CALLBACK,
-                adapters.build_opencode_planner_cmd(planner_session, text,
-                                                    workspace))
-    if harness_name == "grok":
-        return (harnesses.KIND_GROK_CALLBACK,
-                adapters.build_grok_planner_cmd(planner_session, text,
-                                                workspace))
-    planner_model = job.get("planner_model") or adapters.CLAUDE_MODEL
-    planner_effort = job.get("planner_effort") or adapters.CLAUDE_EFFORT
-    return (harnesses.KIND_CLAUDE_CALLBACK,
-            adapters.build_claude_cmd(planner_session, text,
-                                       model=planner_model,
-                                       effort=planner_effort))
-
-
 def _terminal_event_id(state_dir, request_id: str) -> int:
     """Durable identity of the current terminalization event.
 
@@ -3848,45 +2455,6 @@ def _terminal_event_id(state_dir, request_id: str) -> int:
         return 0
 
 
-def _terminal_report_meta(text: str, event_id: int = 0) -> dict:
-    meta = {"stage": "planning", "reason": "terminal_report",
-            "prompt_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
-    try:
-        meta["terminal_event_id"] = int(event_id)
-    except (TypeError, ValueError):
-        meta["terminal_event_id"] = 0
-    return meta
-
-
-def _parse_terminal_send(harness_name: str, kind: str,
-                         out: str) -> tuple[bool, str | None, str | None, str | None]:
-    """(ok, error, reported_session, answer) from actual send output."""
-    if harness_name == "codex":
-        parsed = harnesses.harness_named("codex").parsed_planner_result(kind, out)
-        return (bool(parsed.get("ok")), parsed.get("error"),
-                parsed.get("session_id"), parsed.get("answer"))
-    if harness_name == "opencode":
-        parsed = harnesses.harness_named("opencode").parsed_planner_result(kind, out)
-        return (bool(parsed.get("ok")), parsed.get("error"),
-                parsed.get("session_id"), parsed.get("answer"))
-    if harness_name == "grok":
-        parsed = harnesses.harness_named("grok").parsed_planner_result(kind, out)
-        return (bool(parsed.get("ok")), parsed.get("error"),
-                parsed.get("session_id"), parsed.get("text"))
-    parsed = harnesses.harness_named("claude").parsed_result(kind, out)
-    return (bool(parsed.get("ok")), parsed.get("error"),
-            parsed.get("session_id"), parsed.get("answer"))
-
-
-def _terminal_report_identity_checked(harness_name: str) -> bool:
-    """Whether the send must come from the exact saved session.
-
-    Every harness resumes the saved planner session (Grok read-only
-    since #96), so every send must answer from the saved one.
-    """
-    return True
-
-
 def _save_report_or_log(state_dir, request_id: str,
                           record: dict) -> str | None:
     """Persist the delivery record; None on success, else error detail.
@@ -3910,311 +2478,21 @@ def _save_report_or_log(state_dir, request_id: str,
         return detail
 
 
-def _is_terminal_report_row(inv: dict, kind: str) -> bool:
-    """True when this invocation row is a terminal-report send of ``kind``.
-
-    The meta reason separates report sends from planner-question
-    callbacks sharing the kind: only the report's own rows are adopted,
-    so a question's answer can never count as a report delivery.
-    """
-    if not isinstance(inv, dict) or inv.get("kind") != kind:
-        return False
-    try:
-        meta = json.loads(inv.get("meta_json") or "{}")
-    except ValueError:
-        return False
-    return isinstance(meta, dict) and meta.get("reason") == "terminal_report"
-
-
-def _read_invocation_text(inv: dict, name: str) -> str | None:
-    try:
-        return Path(inv[name]).read_text(encoding="utf-8", errors="replace")
-    except (OSError, KeyError, TypeError):
-        return None
-
-
-def _record_terminal_send_outcome(state_dir, request_id: str, kind: str,
-                                  harness_name: str, planner_session: str,
-                                  key: dict, status: str, rc: int,
-                                  out: str, attempts: int) -> dict:
-    """Record the outcome of actual send output; never invent delivery.
-
-    ``attempts`` already counts this send. Delivered is returned only
-    after the record persists; otherwise the failure stays visible
-    without changing the job outcome.
-    """
-    ok, error, reported, _answer = _parse_terminal_send(harness_name, kind, out or "")
-    mismatch = _terminal_report_identity_checked(harness_name) \
-        and reported != planner_session
-    if rc == 0 and ok and not mismatch:
-        save_err = _save_report_or_log(
-            state_dir, request_id,
-            {"state": "delivered", "attempts": attempts, "status": status,
-             "delivered_for": key, "last_reason": None,
-             "updated_at": core._utcnow()})
-        if save_err is not None:
-            return {"action": "report-failed", "status": status,
-                    "attempts": attempts,
-                    "reason": f"terminal_report_record_failed: {save_err}"[:300]}
-        return {"action": "reported", "status": status, "attempts": attempts}
-    if mismatch:
-        last_reason = ("planner_session_mismatch: resumed result came "
-                       "from another session")
-    else:
-        last_reason = f"terminal_report_failed rc={rc}: {error or 'error'}"[:500]
-    _save_report_or_log(
-        state_dir, request_id,
-        {"state": "failed", "attempts": attempts, "status": status,
-         "last_reason": last_reason, "updated_at": core._utcnow()})
-    return {"action": "report-failed", "status": status,
-            "attempts": attempts, "reason": last_reason}
-
-
-def _adopt_terminal_send(state_dir, request_id: str, action_key: str,
-                         kind: str, harness_name: str, planner_session: str,
-                         key: dict, status: str, attempts: int) -> dict | None:
-    """Adopt a prior send for this terminal state, or defer to a live one.
-
-    A controller that died after the send but before recording leaves a
-    finished invocation row carrying the planner's actual answer:
-    adopting its output closes the crash window with neither a duplicate
-    send nor a lost report. A send still owned elsewhere defers without
-    duplicating it. Returns a result dict when adopted or deferred, else
-    None to proceed with a fresh send.
-    """
-    rows = [i for i in core._list_invocations(state_dir, request_id)
-            if i.get("action_key") == action_key
-            and i.get("state") != "abandoned"
-            and _is_terminal_report_row(i, kind)]
-    if not rows:
-        return None
-    try:
-        core.consume_finished_invocations(state_dir, request_id)
-    except Exception:
-        pass
-    rows = [i for i in core._list_invocations(state_dir, request_id)
-            if i.get("action_key") == action_key
-            and i.get("state") != "abandoned"
-            and _is_terminal_report_row(i, kind)]
-    # Only terminal rows carry adoptable evidence: a running row is
-    # either live elsewhere (defer below) or never started (the send
-    # path decides, and the durable path abandons plus proceeds).
-    terminal_rows = [i for i in rows
-                     if i.get("state") in ("completed", "failed")]
-    done = [i for i in terminal_rows
-            if i.get("state") == "completed" and i.get("rc") == 0]
-    failed = [i for i in terminal_rows if i not in done]
-    pick = done[-1] if done else (failed[-1] if failed else None)
-    if pick is not None:
-        out = _read_invocation_text(pick, "stdout_path")
-        err = _read_invocation_text(pick, "stderr_path") or ""
-        if out is None:
-            # No evidence on disk yet; the send path decides (the durable
-            # path adopts or respawns by the same key, never duplicates).
-            return None
-        try:
-            core._mark_collected(state_dir, request_id,
-                                 pick["invocation_id"], reused=True)
-        except Exception:
-            pass
-        try:
-            rc = int(pick.get("rc") or 0)
-        except (TypeError, ValueError):
-            rc = 0
-        return _record_terminal_send_outcome(
-            state_dir, request_id, kind, harness_name, planner_session,
-            key, status, rc, out, attempts + 1)
-    live = [i for i in rows
-            if core._invocation_ownership(i) in ("live", "unresolved", "orphaned")]
-    if live:
-        attempts += 1
-        last_reason = ("report deferred: send for this terminal state is "
-                       f"owned elsewhere ({live[0]['invocation_id'][:8]})")
-        save_err = _save_report_or_log(
-            state_dir, request_id,
-            {"state": "pending", "attempts": attempts, "status": status,
-             "last_reason": last_reason, "updated_at": core._utcnow()})
-        if save_err is not None:
-            return {"action": "report-error", "status": status,
-                    "attempts": attempts, "reason": save_err}
-        return {"action": "report-deferred", "status": status,
-                "attempts": attempts, "reason": last_reason}
-    return None
-
-
-def _send_report_turn(run_cmd, cmd, workspace, kind, meta):
-    """(rc, out, err, send_refused) for one terminal-report turn.
-
-    The turn runs through the given ``run_cmd``: the durable closure in
-    production (supervised invocation, adopted by stable action key), a
-    fake in tests. A lost lease or a competing owned invocation comes
-    back as ``send_refused`` so the caller defers without starting a
-    duplicate.
-    """
-    try:
-        rc, out, err = run_cmd(cmd, workspace, None, kind=kind, meta=meta)
-        return rc, out, err, None
-    except core.LeaseLostError as e:
-        return 125, "", f"report deferred: {e}"[:300], "deferred"
-    except core.OwnershipError as e:
-        return 125, "", f"report deferred: {e}"[:300], "deferred"
-    except Exception as e:  # noqa: BLE001 - recorded, never raised
-        return 125, "", f"report spawn failed: {type(e).__name__}: {str(e)[:200]}", "spawn"
-
-
-def deliver_terminal_report(state_dir, request_id: str, run_cmd=None,
+def deliver_terminal_report(state_dir, request_id: str,
                             sleep_fn=None, t3_client=None) -> dict:
-    """Send one end-of-job report to the saved planner session.
+    """Post one end-of-job report into the planner's T3 thread.
 
     Runs after the terminal state is persisted and never changes the
     job's status or result: it only merges the ``terminal_report``
-    delivery record into the controller state. The report travels
-    through the existing planner callback path (Claude resume, Codex
-    ``exec resume``, OpenCode ``run --session``, Grok read-only
-    ``--resume``) and carries the request id, terminal status,
-    PR URL or reason, and handoff summary. The send is a durable
-    invocation under a stable action key: a finished prior send is
-    adopted by its actual output (so a crash between send and record
-    can neither duplicate nor lose the report), a live one defers, and
-    only then does a fresh send start. A busy planner is retried until
-    idle or ``TERMINAL_REPORT_MAX_ATTEMPTS``; recovery and restarted
-    controllers see the delivered record and send no duplicate.
-    Delivered is claimed only after the outcome is durably recorded.
+    delivery record into the controller state. Recovery and restarted
+    controllers see the delivered record and post no duplicate.
     """
-    run_cmd = run_cmd or default_run_cmd
-    sleep_fn = sleep_fn or time.sleep
-    job = core.get_job(state_dir, request_id)
-    status = job.get("status")
-    if status not in TERMINAL_REPORT_STATUSES:
-        # A job that left blocked behind (recovered to running) clears the
-        # previous terminal record, so a later terminal state reports
-        # again; a restarted controller on a still-terminal job keeps it.
-        rec = _terminal_report_record(job)
-        if rec and isinstance(rec.get("delivered_for"), dict) \
-                and rec["delivered_for"].get("status") == "blocked":
-            try:
-                _save_terminal_report_record(state_dir, request_id, {})
-            except Exception:
-                pass
-        return {"action": "noop-not-terminal", "status": status}
-    pr_url = _terminal_report_pr_url(job)
-    reason = _terminal_report_reason(job)
-    event_id = _terminal_event_id(state_dir, request_id)
-    key = {"status": status, "reason": reason, "pr_url": pr_url,
-           "event_id": event_id}
-    rec = _terminal_report_record(job)
-    if rec.get("state") == "delivered" and rec.get("delivered_for") == key:
-        return {"action": "already-reported", "status": status}
-    attempts = 0
-    try:
-        attempts = int(rec.get("attempts") or 0)
-    except (TypeError, ValueError):
-        attempts = 0
-    if attempts >= TERMINAL_REPORT_MAX_ATTEMPTS:
-        return {"action": "report-exhausted", "status": status,
-                "attempts": attempts}
-    planner_session = job.get("planner_session_id")
-    harness_name = job.get("planner_harness") or "claude"
-    if t3exec.is_t3_job(job):
-        # T3-hosted planners get the terminal state as a message in the
-        # planner thread, replacing the harness-specific callback CLIs.
-        return _deliver_terminal_report_via_t3(state_dir, request_id,
-                                               t3_client=t3_client)
-    if not planner_session:
-        record = {"state": "skipped", "attempts": attempts, "status": status,
-                  "last_reason": "missing planner session: refusing to fork a new session",
-                  "updated_at": core._utcnow()}
-        save_err = _save_report_or_log(state_dir, request_id, record)
-        if save_err is not None:
-            return {"action": "report-error", "status": status,
-                    "attempts": attempts, "reason": save_err}
-        return {"action": "report-skipped", "reason": "missing_planner_session",
-                "status": status}
-    if harness_name not in ("claude", "codex", "opencode", "grok", "t3"):
-        record = {"state": "skipped", "attempts": attempts, "status": status,
-                  "last_reason": f"planner_harness_unsupported: {harness_name!r} has no callback",
-                  "updated_at": core._utcnow()}
-        save_err = _save_report_or_log(state_dir, request_id, record)
-        if save_err is not None:
-            return {"action": "report-error", "status": status,
-                    "attempts": attempts, "reason": save_err}
-        return {"action": "report-skipped", "reason": "planner_harness_unsupported",
-                "status": status}
-    text = _terminal_report_text(request_id, status, pr_url, reason,
-                                 job.get("handoff_summary"))
-    workspace = job["workspace"]
-    kind, cmd = _terminal_report_invocation(harness_name, planner_session,
-                                            text, workspace, job)
-    meta = _terminal_report_meta(text, event_id)
-    action_key = harnesses.harness_for(kind).action_key(kind, cmd, meta)
-    # Crash-window adoption first: a controller that died after the send
-    # but before recording leaves a finished row with the planner's
-    # actual answer. Adopting it needs no busy wait and no new spawn.
-    adopted = _adopt_terminal_send(state_dir, request_id, action_key, kind,
-                                   harness_name, planner_session, key,
-                                   status, attempts)
-    if adopted is not None:
-        return adopted
-    own_pids = _own_invocation_pids(state_dir, request_id)
-    while attempts < TERMINAL_REPORT_MAX_ATTEMPTS:
-        busy_reason = _terminal_report_busy_reason(harness_name, planner_session,
-                                                   own_pids)
-        if busy_reason is not None:
-            attempts += 1
-            state = "pending" if attempts < TERMINAL_REPORT_MAX_ATTEMPTS else "failed"
-            save_err = _save_report_or_log(
-                state_dir, request_id,
-                {"state": state, "attempts": attempts, "status": status,
-                 "last_reason": busy_reason, "updated_at": core._utcnow()})
-            if save_err is not None:
-                return {"action": "report-error", "status": status,
-                        "attempts": attempts, "reason": save_err}
-            if attempts >= TERMINAL_REPORT_MAX_ATTEMPTS:
-                return {"action": "report-exhausted", "status": status,
-                        "attempts": attempts, "reason": "planner_busy"}
-            try:
-                sleep_fn(TERMINAL_REPORT_RETRY_DELAY_SECS)
-            except Exception:
-                pass
-            continue
-        rc, out, err, refused = _send_report_turn(run_cmd, cmd, workspace, kind, meta)
-        if refused is not None:
-            # The turn never started (lost lease, competing owner, or a
-            # spawn failure): visible without duplicating it.
-            attempts += 1
-            if refused == "deferred":
-                record = {"state": "pending", "attempts": attempts,
-                          "status": status, "last_reason": err,
-                          "updated_at": core._utcnow()}
-                action = "report-deferred"
-            else:
-                record = {"state": "failed", "attempts": attempts,
-                          "status": status, "last_reason": err,
-                          "updated_at": core._utcnow()}
-                action = "report-failed"
-            save_err = _save_report_or_log(state_dir, request_id, record)
-            if save_err is not None:
-                return {"action": "report-error", "status": status,
-                        "attempts": attempts, "reason": save_err}
-            return {"action": action, "status": status,
-                    "attempts": attempts, "reason": err}
-        _ok, _error, _reported, _answer = _parse_terminal_send(
-            harness_name, kind, out or "")
-        try:
-            _record_child(state_dir, request_id, kind, cmd, rc,
-                          session_id=_reported or planner_session,
-                          output_text=(_answer or "") + "\n" + (err or "")[-1000:])
-        except Exception:
-            pass
-        return _record_terminal_send_outcome(
-            state_dir, request_id, kind, harness_name, planner_session,
-            key, status, rc, out, attempts + 1)
-    return {"action": "report-exhausted", "status": status,
-            "attempts": attempts}
+    del sleep_fn
+    return _deliver_terminal_report_via_t3(state_dir, request_id,
+                                           t3_client=t3_client)
 
 
-def _deliver_terminal_report_best_effort(state_dir, request_id: str,
-                                         run_cmd=None) -> dict:
+def _deliver_terminal_report_best_effort(state_dir, request_id: str) -> dict:
     """Terminal delivery that never raises past its caller.
 
     The terminal persist already committed before this runs; a delivery
@@ -4223,7 +2501,7 @@ def _deliver_terminal_report_best_effort(state_dir, request_id: str,
     errors are swallowed here.
     """
     try:
-        return deliver_terminal_report(state_dir, request_id, run_cmd=run_cmd)
+        return deliver_terminal_report(state_dir, request_id)
     except core.NotFoundError:
         raise
     except Exception:  # noqa: BLE001 - delivery never breaks the caller
@@ -4233,8 +2511,7 @@ def _deliver_terminal_report_best_effort(state_dir, request_id: str,
 def _complete_job(state_dir, request_id: str, token: str | None,
                    output: str, artifact: str | None = None,
                    pr_url: str | None = None,
-                   acceptance_evidence: str | None = None,
-                   run_cmd=None) -> dict:
+                   acceptance_evidence: str | None = None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
     job = core.get_job(state_dir, request_id)
     use_token = token or job.get("owner_token")
@@ -4270,14 +2547,14 @@ def _complete_job(state_dir, request_id: str, token: str | None,
         out = {"action": "completed", "status": done["status"]}
         # The terminal result is persisted above; the end-of-job report
         # follows through the existing callback path without changing it.
-        _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
+        _deliver_terminal_report_best_effort(state_dir, request_id)
         return out
     if use_token:
         try:
             done = core.complete(state_dir, request_id, use_token,
                                  json.dumps(result_payload, sort_keys=True))
             out = {"action": "completed", "status": done["status"]}
-            _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
+            _deliver_terminal_report_best_effort(state_dir, request_id)
             return out
         except (core.OwnershipError, core.TerminalError, core.NotFoundError):
             pass
@@ -4317,7 +2594,7 @@ def _complete_job(state_dir, request_id: str, token: str | None,
         store.append_text(store.output_path_for(root, request_id), "[succeeded]\n")
     except OSError:
         pass
-    _deliver_terminal_report_best_effort(state_dir, request_id, run_cmd)
+    _deliver_terminal_report_best_effort(state_dir, request_id)
     return {"action": "completed", "status": "succeeded"}
 
 
@@ -4371,7 +2648,7 @@ def _record_completion_refusal(state_dir, request_id: str, report: dict,
 
 
 def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
-                               report: dict, reason: str, run_cmd) -> dict:
+                               report: dict, reason: str) -> dict:
     """Refuse a completion envelope while the last turn's proof failed.
 
     The first refusal hands the evidence back to the dispatcher once (a
@@ -4432,7 +2709,7 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
         "Completion is refused: "
         "the last implementation turn's proof failed. Fix the work and "
         "request implementation again; do not complete until the proof passes."))
-    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+    r = resume_luna(state_dir, request_id, evidence,
                     label="COMPLETION REFUSED")
     if r.get("action") == "blocked":
         return r
@@ -4440,8 +2717,7 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
             "reason": "completion_refused"}
 
 
-def _handle_question_action(state_dir, request_id: str, envelope: dict,
-                             run_cmd) -> dict:
+def _handle_question_action(state_dir, request_id: str, envelope: dict) -> dict:
     """Persist question -> wake the saved planner in its own harness ->
     persist answer -> resume exact Luna task. Never forks a session
     (except the explicit recorded fallback for an unresumable Grok
@@ -4462,7 +2738,7 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
                 return {"action": "blocked", "reason": "question_conflict"}
             answer_text = str(q["answer"])
     if answer_text is None:
-        cb = planner_callback(state_dir, request_id, qid, prompt_q, run_cmd=run_cmd)
+        cb = planner_callback(state_dir, request_id, qid, prompt_q)
         if cb.get("action") == "blocked":
             return cb
         for q in core.list_questions(state_dir, request_id, only_pending=False):
@@ -4485,8 +2761,7 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict,
                        planner_recovery_authorized=True)
         except Exception:
             pass
-    r = resume_luna(state_dir, request_id, f"question {qid}: {prompt_q}\nanswer: {answer_text}",
-                    run_cmd=run_cmd, label="PLANNER ANSWER")
+    r = resume_luna(state_dir, request_id, f"question {qid}: {prompt_q}\nanswer: {answer_text}", label="PLANNER ANSWER")
     if r.get("action") == "blocked":
         return r
     return {"action": "question-answered-resumed", "qid": qid,
@@ -4499,8 +2774,8 @@ LADDER_RUNGS = ("initial", "correction", "correction_fresh", "recovery")
 def eligible_directed_routes(state_dir, request_id: str) -> list[str]:
     """Genuinely eligible dispatcher routes for a planner direction.
 
-    A route qualifies when the dispatcher may assign it (owned-server
-    or headless-worker harness, never a planner-harness rung), it sits
+    A route qualifies when the dispatcher may assign it (an
+    implementation-lane, correction, or recovery route), it sits
     in the job lane or on the correction/recovery stage, and it has
     capacity (not exhausted or degraded, one-turn routes unused,
     concurrency cap free). The escalation evidence lists these so a
@@ -4925,8 +3200,6 @@ def _record_turn_outcome(state_dir, request_id: str, impl: dict) -> None:
     seq = _load_controller_state(job).get("seq")
     if seq is None and isinstance(report.get("seq"), int):
         seq = report.get("seq")
-    if seq is None:
-        seq = _latest_invocation_seq(state_dir, request_id)
     ladder = _ladder(job)
     if seq is not None and ladder.get("counted_seq") == seq:
         return
@@ -4981,27 +3254,6 @@ def _record_recovery_result(state_dir, request_id: str, report: dict,
             pass
     finally:
         con.close()
-
-
-def _latest_invocation_seq(state_dir, request_id: str) -> int | None:
-    """Newest worker-turn invocation seq, for a controller whose own state
-    lost its seq but whose turn already started."""
-    worker_kinds = harnesses.worker_control_kinds()
-    try:
-        invs = core._list_invocations(state_dir, request_id)
-    except Exception:
-        return None
-    for inv in reversed(invs):
-        if inv.get("kind") not in worker_kinds:
-            continue
-        try:
-            meta = json.loads(inv.get("meta_json") or "{}")
-        except ValueError:
-            continue
-        seq = meta.get("seq")
-        if isinstance(seq, int):
-            return seq
-    return None
 
 
 def _consume_planner_authorized_attempt(state_dir, request_id: str,
@@ -5088,8 +3340,7 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     return True
 
 
-def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
-                                  run_cmd, token: str | None = None) -> dict:
+def _handle_implementation_action(state_dir, request_id: str, envelope: dict, token: str | None = None) -> dict:
     """One bounded implementation transition: worker turn then Luna resume.
 
     The escalation ladder chooses the rung first and stays authoritative:
@@ -5105,7 +3356,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
     if _consume_planner_authorized_attempt(state_dir, request_id, envelope,
                                            token):
         impl = run_implementation(state_dir, request_id, artifact=artifact,
-                                   payload=payload, run_cmd=run_cmd)
+                                   payload=payload)
         if impl.get("action") not in ("implementation_ok", "implementation_failed"):
             # A preflight route move, pool transfer, stalled retry, or
             # other non-result transition: the authorization stays in
@@ -5134,7 +3385,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
             # authorized attempt ends terminally with evidence.
             job = core.get_job(state_dir, request_id)
             evidence = _implementation_evidence(job, impl)
-            r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+            r = resume_luna(state_dir, request_id, evidence,
                             label="IMPLEMENTATION RESULT")
             if r.get("action") == "blocked":
                 return r
@@ -5144,7 +3395,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
             return exhausted
         job = core.get_job(state_dir, request_id)
         evidence = _implementation_evidence(job, impl)
-        r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+        r = resume_luna(state_dir, request_id, evidence,
                         label="IMPLEMENTATION RESULT")
         if r.get("action") == "blocked":
             return r
@@ -5154,7 +3405,7 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
         return ended
     _apply_planner_directed_route(state_dir, request_id, envelope)
     impl = run_implementation(state_dir, request_id, artifact=artifact,
-                               payload=payload, run_cmd=run_cmd)
+                               payload=payload)
     if impl.get("action") not in ("implementation_ok", "implementation_failed"):
         # transferred_to_go, route_switched, stalled_retry, or blocked: the
         # next step retries on the same or the new route, or stops; never
@@ -5169,16 +3420,15 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
         return exhausted
     job = core.get_job(state_dir, request_id)
     evidence = _implementation_evidence(job, impl)
-    r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+    r = resume_luna(state_dir, request_id, evidence,
                     label="IMPLEMENTATION RESULT")
     if r.get("action") == "blocked":
         return r
     return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
 
 
-def _step_inner(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> dict:
+def _step_inner(state_dir, request_id: str, token: str | None = None) -> dict:
     """Advance exactly one useful bounded controller transition."""
-    run_cmd = run_cmd or default_run_cmd
     job = core.get_job(state_dir, request_id)
     if job["status"] in store.TERMINAL:
         return {"action": "noop-terminal", "status": job["status"]}
@@ -5186,21 +3436,19 @@ def _step_inner(state_dir, request_id: str, run_cmd=None, token: str | None = No
         return {"action": "cancelled", "status": job["status"]}
     if job["status"] == "blocked":
         return {"action": "blocked", "reason": job.get("block_reason")}
-    # The dispatcher identity is the Codex task id on the direct path and
-    # the saved dispatcher child thread on the T3 path (#106).
-    dispatcher_saved = bool(job.get("codex_task_id")) or (
-        t3exec.is_t3_job(job) and _t3_thread_for(job, "dispatch") is not None)
+    # The dispatcher identity is the saved dispatcher child thread.
+    dispatcher_saved = _t3_thread_for(job, "dispatch") is not None
     if not dispatcher_saved or not _load_controller_state(job).get("seq"):
-        return dispatch(state_dir, request_id, run_cmd=run_cmd)
+        return dispatch(state_dir, request_id)
     last = _load_controller_state(job).get("last_action")
     if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:
         _mark_blocked(state_dir, request_id, "luna_missing_action: no saved action to continue")
         return {"action": "blocked", "reason": "luna_missing_action"}
     action_name = last.get("action")
     if action_name == "planner_question":
-        return _handle_question_action(state_dir, request_id, last, run_cmd)
+        return _handle_question_action(state_dir, request_id, last)
     if action_name == "implementation":
-        return _handle_implementation_action(state_dir, request_id, last, run_cmd, token=token)
+        return _handle_implementation_action(state_dir, request_id, last, token=token)
     if action_name == "completion":
         # A job can never succeed while its last implementation turn's
         # proof failed: refuse the envelope, hand the evidence back once,
@@ -5245,18 +3493,17 @@ def _step_inner(state_dir, request_id: str, run_cmd=None, token: str | None = No
         if _refusal is not None:
             return _handle_completion_refusal(state_dir, request_id, last,
                                               _latest if isinstance(_latest, dict) else {},
-                                              _refusal, run_cmd)
+                                              _refusal)
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
                              last.get("artifact"), last.get("pr_url"),
-                             last.get("acceptance_evidence"),
-                             run_cmd=run_cmd)
+                             last.get("acceptance_evidence"))
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}
 
 
-def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> dict:
+def step(state_dir, request_id: str, token: str | None = None) -> dict:
     """Advance one transition, then report a freshly terminal job once.
 
     The inner transition persists the terminal state first; the
@@ -5266,14 +3513,14 @@ def step(state_dir, request_id: str, run_cmd=None, token: str | None = None) -> 
     the job's status, or its result: a restarted controller or recover
     sees the delivered record and sends no duplicate.
     """
-    res = _step_inner(state_dir, request_id, run_cmd=run_cmd, token=token)
+    res = _step_inner(state_dir, request_id, token=token)
     try:
         job = core.get_job(state_dir, request_id)
     except core.NotFoundError:
         return res
     if job.get("status") in TERMINAL_REPORT_STATUSES:
         _deliver_terminal_report_best_effort(
-            state_dir, request_id, run_cmd or default_run_cmd)
+            state_dir, request_id)
     return res
 
 
@@ -5302,7 +3549,7 @@ def _advertise(state_dir: str, request_id: str, token: str) -> None:
     outputs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     pid = os.getpid()
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    from .supervisor import process_start_identity
+    process_start_identity = core._process_start_identity
     payload = json.dumps({"token": token, "pid": pid, "updated": now,
                           "start": process_start_identity(pid)})
     ident = workers_dir / f"{request_id}.json"
@@ -5343,10 +3590,8 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     calls (dispatch -> question -> implementation -> completion),
     stopping on terminal/blocked-awaiting states.
     """
-    import time as _time
-
     import os as _os
-    from .supervisor import process_start_identity as _psi
+    _psi = core._process_start_identity
     lock_fd = core.take_controller_lock(state_dir, request_id)
     if lock_fd is None:
         # Another controller holds the job; give back this launch's lease
@@ -5360,14 +3605,14 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     # Advertise only as the proven lease holder, after the lock.
     _advertise(state_dir, request_id, token)
     _LEASE["token"] = token
-    # Bounded durable loop with built-in adapters (normal submit/start).
-    # Every child spawn is file-backed, supervised, and recorded before
-    # the spawn; a finished action is reused, never rerun.
-    durable_run_cmd = core.make_durable_run_cmd(state_dir, request_id, token)
+    # Bounded durable loop: every turn runs as a T3 thread and every
+    # decision is persisted before its side effect.
+    # An exhausted escalation asks the planner in its thread on the next
+    # step, so the planner wakes without a manual recover.
     continuing = ("dispatched", "question-answered-resumed",
                   "implementation-resumed", "completion-refused-resumed",
                   "transferred_to_go", "route_switched",
-                  "stalled_retry")
+                  "stalled_retry", "recovery-exhausted-question")
     for _ in range(MAX_LOOP_STEPS):
         try:
             total = _count_step(state_dir, request_id)
@@ -5375,7 +3620,10 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
                 _mark_blocked(state_dir, request_id,
                               f"job_step_budget_exhausted after {total} steps across launches")
                 break
-            res = step(state_dir, request_id, run_cmd=durable_run_cmd, token=token)
+            # Eligible models, usage windows and role preferences come from
+            # the T3 snapshot (cached briefly; unknown never blocks).
+            t3snapshot.refresh_for_job(core.get_job(state_dir, request_id))
+            res = step(state_dir, request_id, token=token)
         except core.LeaseLostError:
             return 0  # another controller owns the job; touch nothing
         except Exception as e:  # noqa: BLE001 - persisted, never silent
@@ -5404,7 +3652,7 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     # callback path. The persist above committed first; delivery never
     # changes the job's status or result.
     try:
-        _deliver_terminal_report_best_effort(state_dir, request_id, durable_run_cmd)
+        _deliver_terminal_report_best_effort(state_dir, request_id)
     except Exception:
         pass
     core.release_controller(state_dir, request_id, token)
