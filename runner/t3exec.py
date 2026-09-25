@@ -102,6 +102,7 @@ T3_RUNTIME_MODES = {
     "implementation": {"runtimeMode": "full-access", "interactionMode": "default"},
     "correction": {"runtimeMode": "full-access", "interactionMode": "default"},
     "recovery": {"runtimeMode": "full-access", "interactionMode": "default"},
+    "review": {"runtimeMode": "auto", "interactionMode": "default"},
 }
 
 # Error text -> provider signal. Structured evidence only where the
@@ -286,7 +287,7 @@ def route_model_selection(route: str, role: str | None = None) -> dict:
 
     Options use the canonical ``[{id, value}]`` array with the option id
     the route's T3 adapter reads; OpenCode turns also carry their agent
-    (``plan`` for the dispatcher, ``build`` otherwise). Unknown routes
+    (``plan`` for the dispatcher and reviewer, ``build`` otherwise). Unknown routes
     raise (never a silent substitution).
     """
     driver = route_driver(route)
@@ -297,8 +298,8 @@ def route_model_selection(route: str, role: str | None = None) -> dict:
     if effort:
         options.append({"id": T3_EFFORT_OPTION.get(driver, "effort"), "value": effort})
     if driver == "opencode":
-        is_dispatch = (role or policy.route_spec(route).get("role")) == "dispatch"
-        options.append({"id": "agent", "value": "plan" if is_dispatch else "build"})
+        read_only = (role or policy.route_spec(route).get("role")) in ("dispatch", "review")
+        options.append({"id": "agent", "value": "plan" if read_only else "build"})
     if options:
         selection["options"] = options
     return selection

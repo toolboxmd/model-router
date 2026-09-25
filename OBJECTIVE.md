@@ -9,8 +9,8 @@ The Objective is complete when:
 - A planner in any harness submits through the public CLI, and nothing in
   the runner assumes a planner harness, model or session.
 - Workers commit as they work, and each job ends with one pushed branch and
-  one open PR carrying the proof and the dispatcher's review; only a person
-  merges it.
+  one open PR carrying the proof and an independent reviewer's verdict; only
+  a person merges it.
 - When the dispatcher needs judgment it cannot supply, the runner wakes the
   planner automatically in the planner's own harness; the human is never on
   the critical path and can still answer or steer through the CLI.

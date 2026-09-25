@@ -240,3 +240,22 @@ def use_fake_t3(testcase, sd, rid, replies=None, planner=None, default=None):
     patcher.start()
     testcase.addCleanup(patcher.stop)
     return fake
+
+
+def approve_reviews(testcase):
+    """Approve every review turn (#126) for tests about other gates.
+
+    The review machinery itself is proved in tests/test_issue126.py.
+    """
+    from runner import controller
+
+    def approve(state_dir, request_id, job, head, pr_url, t3_client=None):
+        return {"action": "reviewed", "round": 1, "reviewed_sha": head,
+                "route": "luna/max", "thread_id": "sub.review", "verdict": "approve",
+                "findings": ""}
+
+    for name, value in (("_run_review", approve),
+                        ("PR_REVIEW_WRITER", lambda *a: None)):
+        patcher = mock.patch.object(controller, name, value)
+        patcher.start()
+        testcase.addCleanup(patcher.stop)

@@ -9,6 +9,7 @@ inject a T3 client or point the job at a fake T3 server.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -2645,11 +2646,15 @@ def _deliver_terminal_report_best_effort(state_dir, request_id: str) -> dict:
 def _complete_job(state_dir, request_id: str, token: str | None,
                    output: str, artifact: str | None = None,
                    pr_url: str | None = None,
-                   acceptance_evidence: str | None = None) -> dict:
+                   acceptance_evidence: str | None = None,
+                   review: dict | None = None) -> dict:
     """Persist the terminal result before acknowledgement (lease-held)."""
     job = core.get_job(state_dir, request_id)
     use_token = token or job.get("owner_token")
     result_payload = {"output": output}
+    if review:
+        result_payload["review"] = {k: review.get(k) for k in (
+            "verdict", "reviewed_sha", "round", "route", "thread_id", "pr_body")}
     if artifact:
         result_payload["artifact"] = artifact
     # A valid nonblank PR URL is preserved; otherwise record JSON null
@@ -2730,6 +2735,370 @@ def _complete_job(state_dir, request_id: str, token: str | None,
         pass
     _deliver_terminal_report_best_effort(state_dir, request_id)
     return {"action": "completed", "status": "succeeded"}
+
+
+# ---------------------------------------------------------------------------
+# Independent review turn (toolboxmd/model-router#126)
+#
+# A completion the dispatcher wants first gets one read-only review turn on
+# the candidate's exact head in a reviewer child thread of the dispatcher
+# thread, routed from the review stage (the Prism Reviewer list, else the
+# policy order). Approve completes; request changes records the round and
+# sends the findings to the worker as the next implementation turn, counted
+# as one ladder failure, so the ladder budget bounds the rounds. The slot
+# name carries the round and head, so a restarted controller adopts the
+# same review thread instead of starting a second one.
+# ---------------------------------------------------------------------------
+
+REVIEW_PR_MARKER = "<!-- model-router-review -->"
+
+REVIEW_RULES = (
+    "REVIEWER RULES: you are the independent reviewer for one runner job. "
+    "Review only; do not edit files, commit, push or start other agents. "
+    "Read the diff from the base commit to the reviewed commit, check it "
+    "against the task, and look for correctness, safety (for example "
+    "secrets in logs or evidence) and restart or duplication bugs. End your "
+    "reply with exactly one JSON object: "
+    '{"verdict": "approve" | "request_changes", "findings": "<what must '
+    'change, empty when approving>"}.'
+)
+
+
+def _review_rounds(job: dict) -> list:
+    review = _load_controller_state(job).get("review")
+    rounds = review.get("rounds") if isinstance(review, dict) else None
+    return [r for r in rounds or [] if isinstance(r, dict)]
+
+
+def _approved_review(job: dict, head: str) -> dict | None:
+    """The approving round for exactly ``head``, or None."""
+    rounds = _review_rounds(job)
+    last = rounds[-1] if rounds else None
+    if last and last.get("verdict") == "approve" and last.get("reviewed_sha") == head:
+        return last
+    return None
+
+
+_VERDICT_ALIASES = {"approve": "approve", "approved": "approve", "accept": "approve",
+                    "accepted": "approve", "lgtm": "approve",
+                    "request_changes": "request_changes", "changes_requested": "request_changes",
+                    "request_change": "request_changes", "reject": "request_changes",
+                    "rejected": "request_changes", "changes": "request_changes"}
+
+
+def _normalize_verdict(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    key = "_".join(value.strip().lower().replace("-", " ").split())
+    return _VERDICT_ALIASES.get(key)
+
+
+def _review_verdict_error(text: str) -> str:
+    """Why no verdict parsed: the shape problem, never the reply text."""
+    if "{" not in (text or ""):
+        return "no JSON object in the reply"
+    if '"verdict"' not in text:
+        return "no verdict field in the reply"
+    return "no JSON object with a known verdict value"
+
+
+def parse_review_verdict(text: str) -> dict | None:
+    """The last JSON object in ``text`` carrying a known verdict."""
+    decoder = json.JSONDecoder()
+    found = None
+    text = text or ""
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text, i)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and _normalize_verdict(obj.get("verdict")):
+            found = obj
+    if found is None:
+        return None
+    findings = found.get("findings")
+    if isinstance(findings, list):
+        findings = "\n".join(str(f) for f in findings)
+    return {"verdict": _normalize_verdict(found["verdict"]),
+            "findings": str(findings or "").strip()[:8000]}
+
+
+def _review_prompt(job: dict, head: str, pr_url, round_no: int) -> str:
+    return (f"TASK (complete):\n{_task_summary(job.get('task_json') or '{}')}\n\n"
+            f"Workspace: {job.get('workspace')}\n"
+            f"Base commit: {job.get('base_commit') or 'unknown'}\n"
+            f"Reviewed commit: {head}\n"
+            f"PR: {pr_url or 'none'}\n"
+            f"Review round: {round_no}\n\n" + REVIEW_RULES)
+
+
+def _record_review_round(state_dir, request_id: str, rec: dict,
+                         envelope: dict | None) -> None:
+    """Append one review round and, for request changes, the worker's next
+    implementation envelope plus one ladder failure, in one transaction."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            raise core.NotFoundError(f"unknown request: {request_id}")
+        st = _load_controller_state(dict(row))
+        review = st.get("review") if isinstance(st.get("review"), dict) else {}
+        rounds = [r for r in review.get("rounds") or [] if isinstance(r, dict)]
+        rounds.append(rec)
+        st["review"] = {"rounds": rounds}
+        if envelope is not None:
+            ladder = st.get("ladder") if isinstance(st.get("ladder"), dict) else {}
+            ladder = dict(ladder, failures=int(ladder.get("failures") or 0) + 1,
+                          rung=ladder.get("rung") or "initial")
+            ladder["counted_seq"] = st.get("seq")
+            st["ladder"] = ladder
+            st["phase"] = "review_changes"
+            st["last_action"] = envelope
+            st["last_action_name"] = envelope.get("action")
+            st["seq"] = int(st.get("seq") or 0) + 1
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, "review_verdict",
+                    {"round": rec.get("round"), "verdict": rec.get("verdict"),
+                     "reviewed_sha": rec.get("reviewed_sha"), "route": rec.get("route"),
+                     "thread_id": rec.get("thread_id"),
+                     "findings": adapters.redact_text(rec.get("findings") or "")[:2000]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _review_candidates(state_dir, slot_route: str | None) -> list[str]:
+    """Eligible review routes; empty when every one is exhausted or resting.
+
+    A saved slot's route comes first so an in-flight turn is adopted.
+    """
+    routes = policy.stage_routes("review")
+    try:
+        skip = core.exhausted_routes(state_dir) | core.degraded_routes(state_dir)
+    except Exception:
+        skip = set()
+    out = [r for r in routes if r not in skip]
+    if slot_route:
+        out = [slot_route] + [r for r in out if r != slot_route]
+    return out
+
+
+def _workspace_state(workspace) -> str | None:
+    """Digest of HEAD plus the working tree, or None outside Git."""
+    rc, head = _git(workspace or "", "rev-parse", "HEAD", timeout=20)
+    if rc != 0:
+        return None
+    # Untracked files cannot enter the PR head: HEAD plus tracked changes only.
+    rc2, status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=no",
+                       timeout=30)
+    rc3, diff = _git(workspace, "diff", "HEAD", "--binary", timeout=60)
+    if rc2 != 0 or rc3 != 0:
+        return None
+    return hashlib.sha256("\0".join((head.strip(), status, diff)).encode()).hexdigest()
+
+
+def _review_block(state_dir, request_id: str, reason: str) -> dict:
+    """Block recoverably; the next try starts a fresh review slot."""
+    st = _load_controller_state(core.get_job(state_dir, request_id))
+    _set_phase(state_dir, request_id,
+               review_attempt=int(st.get("review_attempt") or 0) + 1)
+    return _t3_block(state_dir, request_id, reason[:500])
+
+
+def _review_verdict_repair(client, thread_id: str, text: str) -> tuple[dict | None, str]:
+    """Ask the review thread once for the verdict JSON only."""
+    prompt = ("VERDICT REPAIR: your last reply had no parsable verdict "
+              f"({_review_verdict_error(text)}). Reply with exactly one JSON "
+              'object and nothing else: {"verdict": "approve" | "request_changes", '
+              '"findings": "..."}.')
+    try:
+        outcome = t3exec.post_and_watch(client, thread_id, prompt, role="review",
+                                        watch_kwargs=_t3_watch_kwargs())
+    except t3exec.T3Error as e:
+        return None, f"repair post failed: {e}"
+    reply = outcome.get("assistant_text") or ""
+    if outcome.get("state") != "completed":
+        return None, f"repair turn {outcome.get('reason') or outcome.get('state')}"
+    verdict = parse_review_verdict(reply)
+    return verdict, "" if verdict else _review_verdict_error(reply)
+
+
+def _run_review(state_dir, request_id: str, job: dict, head: str,
+                pr_url, t3_client=None) -> dict:
+    """Run (or adopt) the review turn for ``head``; returns a verdict
+    record, or a blocked/retry action."""
+    round_no = len(_review_rounds(job)) + 1
+    st = _load_controller_state(job)
+    attempt = int(st.get("review_attempt") or 0)
+    slot = f"review_{round_no}_{head[:12]}" + (f"_{attempt}" if attempt else "")
+    saved = _t3_thread_for(job, slot)
+    workspace = job.get("workspace")
+    # The reviewer is read-only by instruction; verify it after the fact
+    # against the candidate's workspace as first seen for this head.
+    baseline = st.get("review_baseline") if isinstance(st.get("review_baseline"), dict) else {}
+    if baseline.get("sha") != head or baseline.get("round") != round_no:
+        baseline = {"sha": head, "round": round_no, "state": _workspace_state(workspace)}
+        _set_phase(state_dir, request_id, review_baseline=baseline)
+    if _workspace_state(workspace) != baseline.get("state"):
+        return _review_block(state_dir, request_id,
+                             "review_changed_workspace: the workspace differs from the "
+                             f"reviewed candidate {head[:12]}; restore it, then recover")
+    candidates = _review_candidates(state_dir, (saved or {}).get("route"))
+    if not candidates:
+        return _t3_block(state_dir, request_id,
+                         "review_capacity_wait: every review route is exhausted or "
+                         "resting; recover after a reset")
+    try:
+        client = _t3_client_for_job(job, t3_client)
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    prompt = _review_prompt(job, head, pr_url, round_no)
+    outcome: dict = {}
+    route = None
+    capacity_only = False
+    for route in candidates:
+        outcome = _t3_run_turn(state_dir, request_id, core.get_job(state_dir, request_id),
+                               slot=slot, kind_label=f"reviewer round {round_no}",
+                               route=route, role="review", prompt=prompt,
+                               title=f"model-router {request_id} review {round_no}",
+                               client=client)
+        capacity_only = False
+        if outcome.get("action") in ("blocked", "retry"):
+            break
+        signal = outcome.get("signal")
+        if outcome.get("state") == "error" and signal in ("exhausted", "overloaded"):
+            capacity_only = True
+            if outcome.get("adopted"):
+                # An old turn's error is never re-read as new evidence:
+                # re-marking would push the reset later for other jobs.
+                continue
+            try:
+                evidence = dict(t3exec.evidence_dict(outcome.get("reason")), source="t3")
+                reset_at, source = core.reset_at_for_evidence(route, evidence, signal)
+                core.record_capacity(state_dir, route, signal, evidence,
+                                     reset_at, reset_source=source)
+            except Exception:
+                pass
+            continue
+        break
+    if outcome.get("action") == "blocked":
+        return _t3_block(state_dir, request_id, outcome.get("detail") or "t3_unavailable")
+    if outcome.get("action") == "retry":
+        return outcome
+    if capacity_only:
+        # A fresh slot on recover: never adopt the errored turn again.
+        return _review_block(state_dir, request_id,
+                         "review_capacity_wait: every review route hit a limit; "
+                         "recover after a reset")
+    thread_id = outcome.get("thread_id")
+    if outcome.get("state") == "interrupted":
+        # The server cut the turn (restart): continue once on the same thread.
+        try:
+            second = t3exec.post_and_watch(client, thread_id, prompt, route=route,
+                                           role="review", watch_kwargs=_t3_watch_kwargs())
+        except t3exec.T3Error as e:
+            return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+        second["thread_id"] = thread_id
+        outcome = second
+    text = outcome.get("assistant_text") or ""
+    if outcome.get("state") != "completed":
+        detail = outcome.get("reason") or outcome.get("state") or "unknown"
+        return _review_block(state_dir, request_id, f"review_failed: {detail}")
+    verdict = parse_review_verdict(text)
+    if verdict is None:
+        verdict, why = _review_verdict_repair(client, thread_id, text)
+        if verdict is None:
+            return _review_block(state_dir, request_id, f"review_missing_verdict: {why}")
+    if _workspace_state(workspace) != baseline.get("state"):
+        return _review_block(state_dir, request_id,
+                             "review_changed_workspace: the reviewer changed HEAD or the "
+                             "working tree; its verdict is discarded; restore the "
+                             f"candidate {head[:12]}, then recover")
+    return {"action": "reviewed", "round": round_no, "reviewed_sha": head,
+            "route": route, "thread_id": thread_id, **verdict}
+
+
+def _review_gate(state_dir, request_id: str, job: dict, head: str | None,
+                 pr_url) -> dict:
+    """Approve (``{"action": "approved", "review": rec}``) or another action."""
+    head = head or core._workspace_head(job.get("workspace")) or "unknown"
+    approved = _approved_review(job, head)
+    if approved is not None:
+        return {"action": "approved", "review": approved}
+    res = _run_review(state_dir, request_id, job, head, pr_url)
+    if res.get("action") != "reviewed":
+        return res
+    rec = {k: res.get(k) for k in ("round", "verdict", "findings", "reviewed_sha",
+                                   "route", "thread_id")}
+    rec["at"] = core._utcnow()
+    if rec["verdict"] == "approve":
+        _record_review_round(state_dir, request_id, rec, None)
+        return {"action": "approved", "review": rec}
+    envelope = {"action": "implementation",
+                "payload": {"instructions": (
+                    f"INDEPENDENT REVIEW round {rec['round']} requested changes on "
+                    f"{head}. Fix these findings, commit, and push to the job's "
+                    f"existing PR:\n{rec['findings'] or '(no findings text)'}"),
+                    "review_round": rec["round"]}}
+    _record_review_round(state_dir, request_id, rec, envelope)
+    return {"action": "review-changes-requested", "round": rec["round"],
+            "reviewed_sha": head}
+
+
+REVIEW_PR_END = "<!-- /model-router-review -->"
+
+
+def review_pr_section(review: dict) -> str:
+    verdict = "approve" if review.get("verdict") == "approve" else "request changes"
+    findings = adapters.redact_text(str(review.get("findings") or "")).strip()
+    return (f"{REVIEW_PR_MARKER}\n## Independent review\n\n"
+            f"Verdict: {verdict} (round {review.get('round')}, reviewer "
+            f"`{review.get('route')}`)\nReviewed SHA: `{review.get('reviewed_sha')}`\n"
+            + (f"\n{findings}\n" if findings else "") + REVIEW_PR_END)
+
+
+def replace_review_section(body: str, section: str) -> str:
+    """Swap the marked review section in ``body``, keeping the text around it."""
+    body = body or ""
+    start = body.find(REVIEW_PR_MARKER)
+    end = body.find(REVIEW_PR_END, start) if start >= 0 else -1
+    if start >= 0 and end >= 0:
+        return body[:start] + section + body[end + len(REVIEW_PR_END):]
+    return (body.rstrip() + "\n\n" if body.strip() else "") + section
+
+
+def _attach_review_to_pr(workspace, pr_url: str, review: dict) -> str | None:
+    """Replace the PR body's review section; None on success, else why."""
+    try:
+        proc = subprocess.run(["gh", "pr", "view", pr_url, "--json", "body"],
+                              cwd=workspace, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            return f"gh pr view rc={proc.returncode}"
+        body = str(json.loads(proc.stdout or "{}").get("body") or "")
+        body = replace_review_section(body, review_pr_section(review))
+        proc = subprocess.run(["gh", "pr", "edit", pr_url, "--body-file", "-"],
+                              cwd=workspace, input=body, capture_output=True,
+                              text=True, timeout=30)
+        return None if proc.returncode == 0 else f"gh pr edit rc={proc.returncode}"
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return str(e)[:200]
+
+
+# Tests replace this with a fake; production edits the PR through gh.
+PR_REVIEW_WRITER = _attach_review_to_pr
 
 
 def _record_completion_refusal(state_dir, request_id: str, report: dict,
@@ -3645,10 +4014,22 @@ def _step_inner(state_dir, request_id: str, token: str | None = None) -> dict:
             return _handle_completion_refusal(state_dir, request_id, last,
                                               _latest if isinstance(_latest, dict) else {},
                                               _refusal)
+        # The dispatcher no longer approves its own plan (#126): an
+        # independent review turn on the exact head decides first.
+        _head = _latest.get("head_commit") if isinstance(_latest, dict) else None
+        gate = _review_gate(state_dir, request_id, job, _head, last.get("pr_url"))
+        if gate.get("action") != "approved":
+            return gate
+        review = gate["review"]
+        _pr = last.get("pr_url")
+        if isinstance(_pr, str) and _pr.strip() and core.pr_gate_applies(
+                job.get("job_kind"), job.get("workspace")):
+            failed = PR_REVIEW_WRITER(job.get("workspace"), _pr.strip(), review)
+            review = dict(review, pr_body=failed or "written")
         return _complete_job(state_dir, request_id, token,
                              str(last.get("output") or "done"),
                              last.get("artifact"), last.get("pr_url"),
-                             last.get("acceptance_evidence"))
+                             last.get("acceptance_evidence"), review=review)
     # review/unknown: durable block, never spin.
     _mark_blocked(state_dir, request_id, f"unsupported_luna_action: {action_name}")
     return {"action": "blocked", "reason": "unsupported_luna_action"}
