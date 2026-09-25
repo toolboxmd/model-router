@@ -126,6 +126,17 @@ _HARD_MARKERS = (
 class T3Error(Exception):
     """A T3 orchestration call failed (unreachable server, auth, bad payload)."""
 
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class T3NotFoundError(T3Error):
+    """The T3 server confirmed that the requested resource is absent."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status=404)
+
 
 # ---------------------------------------------------------------------------
 # Job mode and thread identity
@@ -429,7 +440,10 @@ class T3Client:
                 detail = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 detail = ""
-            raise T3Error(f"T3 {method} {path} failed: HTTP {e.code} {detail}") from e
+            message = f"T3 {method} {path} failed: HTTP {e.code} {detail}"
+            if e.code == 404:
+                raise T3NotFoundError(message) from e
+            raise T3Error(message, status=e.code) from e
         except OSError as e:
             raise T3Error(f"T3 {method} {path} unreachable at {self.server_url}: {e}") from e
         try:

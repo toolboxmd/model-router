@@ -487,6 +487,10 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
     except Exception:
         pass
     outcome["slot"] = slot
+    if outcome.get("state") == "unknown":
+        # A failed reconciliation read is recoverable. Do not turn it into a
+        # sticky dispatch or worker failure while the remote state is unknown.
+        outcome["action"] = "retry"
     return outcome
 
 
@@ -684,6 +688,8 @@ def _dispatch_via_t3(state_dir, request_id: str, prompt: str,
     if outcome.get("action") == "blocked":
         return _t3_block(state_dir, request_id,
                          outcome.get("detail") or "t3_unavailable")
+    if outcome.get("action") == "retry":
+        return outcome
     return _t3_dispatch_outcome(state_dir, request_id, prompt, route,
                                 outcome, client,
                                 _dispatch_fallback_routes(route))
@@ -789,6 +795,8 @@ def _run_t3_worker_turn(state_dir, request_id: str, job: dict,
     if outcome.get("action") == "blocked":
         return _t3_block(state_dir, request_id,
                          outcome.get("detail") or "t3_unavailable")
+    if outcome.get("action") == "retry":
+        return outcome
     thread_id = outcome.get("thread_id")
     if outcome.get("state") == "interrupted":
         # The server cut the turn (restart): continue once on the same
