@@ -1911,10 +1911,6 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     state = _load_controller_state(job)
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
-    # Bind a pending recovery decision to this actual attempt start, so
-    # the decision links to the true next seq even when questions or
-    # refusals consumed seq numbers in between.
-    _link_recovery_attempt(state_dir, request_id, seq, route)
     try:
         known_pr = core.known_pr_url(state_dir, request_id)
     except Exception:
@@ -1934,6 +1930,17 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
         move = _preflight_move(state_dir, request_id, route)
         if move is not None:
             return move
+    # Bind a pending recovery decision to this actual attempt start, after
+    # any preflight route move: a preflight move starts no worker
+    # invocation, so it must not consume the pending link or emit a
+    # recovery_next_attempt for a seq that never ran. The link carries the
+    # post-move route, while the decision keeps its pre-move target.
+    try:
+        _post_move_job = core.get_job(state_dir, request_id)
+        _post_move_route = _post_move_job.get("route") or route
+    except Exception:
+        _post_move_route = route
+    _link_recovery_attempt(state_dir, request_id, seq, _post_move_route)
     # ``try`` numbers repeated worker turns for one dispatcher turn, so a
     # bounded same-route retry after a stall spawns a new attempt with its
     # own action identity instead of reusing the stalled turn's record.
@@ -3230,8 +3237,16 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
             try:
                 st_used = _load_controller_state(job).get(
                     "planner_recovery_used")
+                st_flight = _load_controller_state(job).get(
+                    "planner_recovery_in_flight")
             except Exception:
                 st_used = False
+                st_flight = False
+            if st_flight and not st_used:
+                # The planner already answered and its one authorized
+                # attempt is still in flight through a capacity move:
+                # never re-post the question nor fail before it runs.
+                return None
             if st_used:
                 reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
                                                   .glob("turn-*/report.json")))
@@ -3253,8 +3268,16 @@ def _apply_ladder(state_dir, request_id: str, token: str | None = None) -> dict 
         # authorized attempt is used does exhaustion end terminally.
         try:
             st_used = _load_controller_state(job).get("planner_recovery_used")
+            st_flight = _load_controller_state(job).get("planner_recovery_in_flight")
         except Exception:
             st_used = False
+            st_flight = False
+        if st_flight and not st_used:
+            # The planner already answered and its one authorized attempt
+            # is still in flight through a preflight or capacity move:
+            # never re-post the question nor fail before the actual
+            # directed worker attempt runs.
+            return None
         if not st_used:
             return _escalate_recovery_to_planner(state_dir, request_id, token)
         reports = sorted(str(p) for p in (store.job_dir_for(store.ensure_state_dir(state_dir), request_id)
@@ -3499,14 +3522,21 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     After recovery exhaustion the planner's answer permits exactly one
     additional bounded dispatcher-owned attempt: an approach-only answer
     runs once on the current route, while an eligible ``directed_route``
-    switches there with reason ``planner_directed``. Consumes the
-    authorization (single use, never reset by the ladder) and records
-    the recovery decision linking the failed attempt onward. Returns
-    True when the caller should run the turn directly instead of the
-    ordinary ladder path, so the question is never re-posted and no
-    implicit loop forms. A missing authorization or a rejected route
-    returns False so the ladder path applies unchanged: no unlimited
-    retries.
+    switches there with reason ``planner_directed``. The authorization
+    stays reserved (``planner_recovery_in_flight``) through preflight,
+    pool, and other non-terminal capacity or routing transitions, and is
+    consumed (``planner_recovery_used``) only when the authorized
+    dispatcher-owned attempt reaches a genuine ``implementation_ok`` or
+    ``implementation_failed`` outcome, including a real verification
+    failure after the worker turn. A preflight move, pool transfer,
+    stalled retry, or other non-result transition never consumes it.
+    Records the recovery decision once, linking the failed attempt
+    onward; continuing the same authorized attempt after a capacity move
+    never re-posts the planner question nor records a second decision.
+    Returns True when the caller should run the turn directly instead of
+    the ordinary ladder path. A missing authorization, a used
+    authorization, or a rejected route returns False so the ladder path
+    applies unchanged: no unlimited retries.
     """
     try:
         job_now = core.get_job(state_dir, request_id)
@@ -3517,6 +3547,12 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
         return False
     if not isinstance(envelope, dict):
         return False
+    if st.get("planner_recovery_in_flight"):
+        # Continuing the same authorized attempt after a preflight or
+        # capacity move: the decision is already recorded and the pending
+        # link is still reserved for the actual worker invocation. Run
+        # directly without a second decision or question.
+        return True
     directed = envelope.get("directed_route")
     current_route = job_now.get("route")
     if not isinstance(directed, str) or not directed.strip():
@@ -3537,7 +3573,7 @@ def _consume_planner_authorized_attempt(state_dir, request_id: str,
     except Exception:
         ladder = {"failures": 0, "rung": "initial", "escalated": False}
     try:
-        _set_phase(state_dir, request_id, planner_recovery_used=True,
+        _set_phase(state_dir, request_id, planner_recovery_in_flight=True,
                    ladder={**ladder, "rung": "recovery_directed",
                            "escalated": True})
     except core.LeaseLostError:
@@ -3581,8 +3617,38 @@ def _handle_implementation_action(state_dir, request_id: str, envelope: dict,
         impl = run_implementation(state_dir, request_id, artifact=artifact,
                                    payload=payload, run_cmd=run_cmd)
         if impl.get("action") not in ("implementation_ok", "implementation_failed"):
+            # A preflight route move, pool transfer, stalled retry, or
+            # other non-result transition: the authorization stays in
+            # flight for the actual directed attempt, with the same job
+            # and Observer identities and no second planner question or
+            # recovery decision. The next step continues the same attempt.
             return impl
+        # The authorized dispatcher-owned attempt reached a genuine
+        # result (including a real verification failure after the worker
+        # turn): consume the single use now, never before.
+        try:
+            _set_phase(state_dir, request_id, planner_recovery_used=True,
+                       planner_recovery_in_flight=False)
+        except core.LeaseLostError:
+            raise
+        except Exception:
+            pass
         _record_turn_outcome(state_dir, request_id, impl)
+        rep = impl.get("report") if isinstance(impl.get("report"), dict) else {}
+        proof_rc = rep.get("proof_exit_code")
+        failed = impl.get("action") == "implementation_failed" or (
+            proof_rc is not None and proof_rc != 0)
+        if not failed:
+            # A successful directed attempt continues to Luna with its
+            # exact-candidate evidence; only a failure after the one
+            # authorized attempt ends terminally with evidence.
+            job = core.get_job(state_dir, request_id)
+            evidence = _implementation_evidence(job, impl)
+            r = resume_luna(state_dir, request_id, evidence, run_cmd=run_cmd,
+                            label="IMPLEMENTATION RESULT")
+            if r.get("action") == "blocked":
+                return r
+            return {"action": "implementation-resumed", "luna_action": r.get("luna_action")}
         exhausted = _apply_ladder(state_dir, request_id, token)
         if exhausted is not None:
             return exhausted

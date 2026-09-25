@@ -647,17 +647,42 @@ class ExhaustionContent(unittest.TestCase):
         self.assertEqual(answered["action"], "question-answered-resumed")
         st = controller._load_controller_state(core.get_job(sd, "exh2"))
         self.assertTrue(st.get("planner_recovery_authorized"))
-        # The authorized directed attempt runs once on the directed route.
+        # The authorized directed attempt runs once on the directed route:
+        # the authorization stays in flight until a genuine worker result,
+        # so a fake genuine implementation is used here (the stub run_cmd
+        # alone would block without a worker result and must not consume).
         set_controller_state(sd, "exh2", seq=8,
                              last_action={"action": "implementation"},
                              last_action_name="implementation")
-        controller._handle_implementation_action(
-            sd, "exh2",
-            {"action": "implementation",
-             "directed_route": "glm-5.3-flash-go"},
-            run_cmd=lambda *a, **k: (0, "", ""))
+        real_impl = controller.run_implementation
+        real_resume2 = controller.resume_luna
+
+        def fake_impl(state_dir, request_id, artifact=None, payload=None,
+                      run_cmd=None):
+            return {"action": "implementation_ok",
+                    "report": {"seq": 8, "proof_exit_code": 0,
+                               "proof_class": "pass"},
+                    "session": "s"}
+
+        def fake_resume2(state_dir, request_id, prompt, run_cmd=None,
+                         label=""):
+            return {"action": "resumed", "luna_action": {"action": "completion"}}
+
+        controller.run_implementation = fake_impl
+        controller.resume_luna = fake_resume2
+        try:
+            out = controller._handle_implementation_action(
+                sd, "exh2",
+                {"action": "implementation",
+                 "directed_route": "glm-5.3-flash-go"},
+                run_cmd=lambda *a, **k: (0, "", ""))
+        finally:
+            controller.run_implementation = real_impl
+            controller.resume_luna = real_resume2
+        self.assertEqual(out["action"], "implementation-resumed")
         st = controller._load_controller_state(core.get_job(sd, "exh2"))
         self.assertTrue(st.get("planner_recovery_used"))
+        self.assertFalse(st.get("planner_recovery_in_flight"))
         self.assertEqual(core.get_job(sd, "exh2")["route"],
                          "glm-5.3-flash-go")
         con = store.connect(sd)
@@ -704,9 +729,14 @@ class ExhaustionContent(unittest.TestCase):
                          "no second planner question after the used attempt")
 
     def test_approach_only_answer_consumes_one_attempt_without_repeat_question(self):
-        # A planner answer with only an approach (no directed_route) runs
+        # A planner answer with only an approach (no directed_route) reserves
         # exactly one dispatcher-owned attempt on the current route and
-        # never re-posts the recovery question or loops.
+        # never re-posts the recovery question or loops. The reservation
+        # stays in flight through capacity moves and is consumed only when
+        # the authorized attempt reaches a genuine worker result: the old
+        # helper marked used before the turn ran, so a preflight move lost
+        # the authorization without ever running (see the faithful
+        # go-to-build regression below).
         tmp, sd, ws = new_dirs()
         self.addCleanup(tmp.cleanup)
         core.submit(sd, "approach", {"g": 1}, str(ws), "p")
@@ -720,10 +750,12 @@ class ExhaustionContent(unittest.TestCase):
                              last_action_name="implementation")
         consumed = controller._consume_planner_authorized_attempt(
             sd, "approach", {"action": "implementation"})
-        self.assertTrue(consumed, "approach-only answer consumes the authorization")
+        self.assertTrue(consumed, "approach-only answer reserves the authorization")
         self.assertEqual(core.get_job(sd, "approach")["route"], before_route)
         st = controller._load_controller_state(core.get_job(sd, "approach"))
-        self.assertTrue(st.get("planner_recovery_used"))
+        self.assertTrue(st.get("planner_recovery_in_flight"))
+        self.assertFalse(st.get("planner_recovery_used"),
+                         "in flight through capacity moves, consumed only on a genuine result")
         con = store.connect(sd)
         try:
             dec = con.execute("SELECT payload_json FROM events WHERE request_id='approach'"
@@ -738,6 +770,21 @@ class ExhaustionContent(unittest.TestCase):
         self.assertEqual(payload["target"], before_route)
         self.assertEqual(payload["reason"], "planner_directed")
         self.assertEqual(qs, 0, "no repeated planner question for an approach answer")
+        # Continuing the same authorized attempt after a capacity move
+        # reuses the reservation without a second decision or question.
+        continued = controller._consume_planner_authorized_attempt(
+            sd, "approach", {"action": "implementation"})
+        self.assertTrue(continued, "same authorized attempt continues in flight")
+        con = store.connect(sd)
+        try:
+            ndec = con.execute("SELECT COUNT(*) AS n FROM events WHERE request_id='approach'"
+                               " AND kind='recovery_decision'").fetchone()["n"]
+        finally:
+            con.close()
+        self.assertEqual(ndec, 1, "no second recovery decision for the same attempt")
+        # After the genuine result the single use is consumed: no loop.
+        set_controller_state(sd, "approach", planner_recovery_used=True,
+                             planner_recovery_in_flight=False)
         self.assertFalse(controller._consume_planner_authorized_attempt(
             sd, "approach", {"action": "implementation"}),
             "single use only, no implicit loop")
@@ -840,6 +887,161 @@ class ExhaustionContent(unittest.TestCase):
             con.close()
         self.assertEqual(len(res), 1)
         self.assertEqual(json.loads(res[0]["payload_json"])["outcome"], "ok")
+
+
+class PlannerAuthorizedInflight(unittest.TestCase):
+    """Failing-before regression for the planner-authorized consumption fix.
+
+    Old code marked planner_recovery_used before run_implementation, so an
+    approach-only answer on grok-4.6-go (already used, one turn per job)
+    lost its authorization on the preflight move to grok-4.6-build without
+    ever running, and the next step ended exhausted. This test drives the
+    actual controller seam with a deterministic worker fixture and would
+    fail on that code (used True after the first step, zero worker runs,
+    terminal exhaustion next).
+    """
+
+    def test_approach_only_survives_preflight_and_runs_once_on_build(self):
+        tmp, sd, ws = new_dirs()
+        self.addCleanup(tmp.cleanup)
+        rid = "auth-inflight-001"
+        core.submit(sd, rid,
+                    {"goal": "inflight drill", "proof": "true",
+                     "observer_task_id": "model-router-87"},
+                    str(ws), "p")
+        sql(sd, "UPDATE jobs SET codex_task_id='thr', status='running',"
+            " route='grok-4.6-go' WHERE request_id=?", (rid,))
+        # grok-4.6-go already ran its one turn in this job.
+        con = store.connect(sd)
+        try:
+            con.execute(
+                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,"
+                "owner_token,state,rc,stage,requested_route,policy_version,meta_json,"
+                "action_key,started_at,stdout_path,stderr_path) VALUES"
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"go-used-001", rid, "grok_control", "[]", str(ws), "tok",
+                 "completed", 0, "implementation", "grok-4.6-go", "x",
+                 json.dumps({"route": "grok-4.6-go"}), "go-key-001",
+                 core._utcnow(), "/dev/null", "/dev/null"))
+            con.commit()
+        finally:
+            con.close()
+        set_controller_state(sd, rid, seq=5,
+                             ladder={"failures": 4, "rung": "recovery",
+                                     "escalated": True, "counted_seq": 4},
+                             planner_recovery_authorized=True,
+                             last_action={"action": "implementation"},
+                             last_action_name="implementation")
+        envelope = {"action": "implementation"}
+        worker_calls: list = []
+
+        def fake_run(cmd, cwd=None, timeout=None, kind=None, meta=None):
+            if kind == "grok_control":
+                route = (meta or {}).get("route")
+                worker_calls.append({"route": route, "seq": (meta or {}).get("seq")})
+                body = json.dumps({"text": "IMPLEMENTED by fake grok worker",
+                                   "stopReason": "end_turn",
+                                   "sessionId": "ses_grok_inflight_001",
+                                   "num_turns": 1, "model": "grok-4.6"})
+                return 0, body + "\n", ""
+            return 1, "", f"unexpected kind {kind}"
+
+        real_resume = controller.resume_luna
+        controller.resume_luna = lambda *a, **k: {
+            "action": "resumed", "luna_action": {"action": "completion"}}
+        self.addCleanup(setattr, controller, "resume_luna", real_resume)
+        # Step one: approach-only answer hits the preflight one-turn move.
+        # No worker runs yet, so the authorization must stay in flight.
+        first = controller._handle_implementation_action(
+            sd, rid, dict(envelope), run_cmd=fake_run)
+        self.assertIn(first.get("action"), ("route_switched", "transferred_to_go",
+                                            "stalled_retry"))
+        self.assertEqual(core.get_job(sd, rid)["route"], "grok-4.6-build")
+        st = controller._load_controller_state(core.get_job(sd, rid))
+        self.assertTrue(st.get("planner_recovery_in_flight"))
+        self.assertFalse(st.get("planner_recovery_used"),
+                         "preflight must not consume the authorized attempt")
+        self.assertEqual(worker_calls, [],
+                         "preflight starts no worker invocation")
+        self.assertEqual(core.list_questions(sd, rid), [],
+                         "no repeated planner question while in flight")
+        con = store.connect(sd)
+        try:
+            decisions = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='recovery_decision'"
+                " ORDER BY id", (rid,)).fetchall()
+            links = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='recovery_next_attempt'"
+                " ORDER BY id", (rid,)).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(decisions), 1)
+        dec = json.loads(decisions[0]["payload_json"])
+        self.assertEqual((dec["rung"], dec["reason"]),
+                         ("recovery_directed", "planner_directed"))
+        self.assertEqual(dec["target"], "grok-4.6-go")
+        self.assertEqual(dec["failed_seq"], 4)
+        self.assertEqual(links, [], "no next-attempt link before the actual worker starts")
+        # Step two: the same authorized attempt continues and runs once on
+        # the post-move route, with no second question or decision.
+        second = controller._handle_implementation_action(
+            sd, rid, dict(envelope), run_cmd=fake_run)
+        self.assertEqual(second.get("action"), "implementation-resumed")
+        self.assertEqual(len(worker_calls), 1)
+        self.assertEqual(worker_calls[0]["route"], "grok-4.6-build")
+        self.assertEqual(worker_calls[0]["seq"], 5)
+        self.assertEqual(core.get_job(sd, rid)["route"], "grok-4.6-build")
+        st = controller._load_controller_state(core.get_job(sd, rid))
+        self.assertTrue(st.get("planner_recovery_used"),
+                        "consumed only after the genuine worker result")
+        self.assertFalse(st.get("planner_recovery_in_flight"))
+        self.assertEqual(core.list_questions(sd, rid), [],
+                         "no repeated planner question for the same attempt")
+        con = store.connect(sd)
+        try:
+            decisions = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='recovery_decision'"
+                " ORDER BY id", (rid,)).fetchall()
+            links = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='recovery_next_attempt'"
+                " ORDER BY id", (rid,)).fetchall()
+            results = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='recovery_attempt_result'"
+                " ORDER BY id", (rid,)).fetchall()
+            switches = con.execute(
+                "SELECT payload_json FROM events WHERE request_id=? AND kind='route_switched'"
+                " ORDER BY id", (rid,)).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(len(decisions), 1, "no second recovery decision")
+        self.assertEqual(len(links), 1)
+        link = json.loads(links[0]["payload_json"])
+        self.assertEqual(link["failed_seq"], 4)
+        self.assertEqual(link["next_seq"], 5)
+        self.assertEqual(link["route"], "grok-4.6-build")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(json.loads(results[0]["payload_json"])["outcome"], "ok")
+        reasons = [json.loads(r["payload_json"])["reason"] for r in switches]
+        self.assertIn("preflight_one_turn", reasons)
+        self.assertNotIn("planner_directed", reasons,
+                         "approach-only uses no directed switch; the decision carries it")
+        # Identities and provenance stay truthful.
+        job = core.get_job(sd, rid)
+        self.assertEqual(job["request_id"], rid)
+        self.assertEqual(json.loads(job["task_json"]).get("observer_task_id"),
+                         "model-router-87")
+        # Single use: a further consume is refused, and exhaustion after
+        # the used attempt ends terminally with evidence, never a new ask.
+        self.assertFalse(controller._consume_planner_authorized_attempt(
+            sd, rid, dict(envelope)))
+        set_controller_state(sd, rid, ladder={"failures": 5,
+                                              "rung": "recovery_directed",
+                                              "escalated": True,
+                                              "counted_seq": 5})
+        sql(sd, "UPDATE jobs SET status='running' WHERE request_id=?", (rid,))
+        ended = controller._apply_ladder(sd, rid)
+        self.assertEqual((ended["action"], ended["reason"]),
+                         ("failed", "escalation_exhausted"))
 
 
 class PlannerDirectedRoute(unittest.TestCase):
