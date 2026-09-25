@@ -37,8 +37,12 @@ LUNA_ACTION_PROTOCOL = (
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
-    '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>"}}\n'
+    '{"action":"implementation","artifact":"<path or empty>","payload":{"instructions":"<complete worker instructions>","proof":"<the target project\'s documented proof command>"}}\n'
     '{"action":"completion","output":"<final result text>","artifact":"<path or empty>","pr_url":"<opened PR URL>","acceptance_evidence":"<required acceptance evidence when the task names it>"}\n'
+    "On the first implementation action, set payload.proof to the target "
+    "project's own documented proof command (the one you give the worker); "
+    "the runner binds it once and runs it after every worker turn. The "
+    "task's proof wins when it names one.\n"
     "The escalation ladder owns the worker route: an ordinary implementation "
     "envelope carries no route field and never changes the route. Relay an "
     "explicit planner direction only with the optional field "

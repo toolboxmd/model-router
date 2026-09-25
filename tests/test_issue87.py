@@ -37,6 +37,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from runner import adapters, controller, core, store  # noqa: E402
 from tests.fakes import use_fake_t3  # noqa: E402
+from tests.fakes import isolate_t3_env  # noqa: E402
+
+
+def setUpModule():
+    isolate_t3_env()
+
 
 PY = sys.executable
 
