@@ -36,6 +36,8 @@ class ReleaseTests(unittest.TestCase):
         self.api_error = None
         self.create_error = None
         self.valid = True
+        self.hidden_reads_remaining = 0
+        self.created_release_override = None
         self.origin = f"https://github.com/{release.REPOSITORY}"
         self.writes = []
         self.validator_calls = []
@@ -70,6 +72,9 @@ class ReleaseTests(unittest.TestCase):
                 f"repos/{release.REPOSITORY}/releases?per_page=100"))
             # The matching release is on a later page. Tag lookup alone would
             # return 404 for drafts, even with push access.
+            if self.github_release is not None and self.hidden_reads_remaining > 0:
+                self.hidden_reads_remaining -= 1
+                return json.dumps([[self.release_payload(tag_name="v0.1.0")], []])
             return json.dumps([[self.release_payload(tag_name="v0.1.0")],
                                [self.github_release] if self.github_release else []])
         if args[:3] == ("gh", "release", "create"):
@@ -82,7 +87,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("--verify-tag", args)
             self.assertEqual(Path(args[args.index("--notes-file") + 1]).read_text(), self.notes)
             self.assert_remote_identity()
-            self.github_release = self.release_payload()
+            self.github_release = self.release_payload(**(self.created_release_override or {}))
             return self.github_release["html_url"]
         if args[0] == "gh":
             self.fail(f"Unexpected GitHub command: {args}")
@@ -211,6 +216,35 @@ class ReleaseTests(unittest.TestCase):
     def test_recovery_dispatch_on_main_can_complete_publication(self):
         with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch"}):
             self.assertEqual(release.publish("versionctl-fixture")["state"], "released")
+
+    def test_eventually_consistent_release_verifies_on_first_run(self):
+        # The release API may not list a just-created release immediately.
+        # Verification must retry with backoff inside its budget instead of
+        # failing on the first unreadable read.
+        self.hidden_reads_remaining = 2
+        with patch("time.sleep") as mock_sleep:
+            result = release.publish("versionctl-fixture")
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(result["url"], self.github_release["html_url"])
+        self.assertEqual(mock_sleep.call_count, 2)
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        self.assertEqual(delays[0], release.VERIFY_INITIAL_DELAY_SECONDS)
+        for previous, current in zip(delays, delays[1:]):
+            self.assertAlmostEqual(current, min(previous * release.VERIFY_BACKOFF_FACTOR,
+                                                release.VERIFY_MAX_DELAY_SECONDS))
+        self.assertLessEqual(sum(delays), release.VERIFY_BUDGET_SECONDS)
+
+    def test_genuine_verification_failure_reports_missing_field(self):
+        # A release that stays wrong must still fail, naming the exact field.
+        self.created_release_override = {"html_url": ""}
+        with patch("time.sleep") as mock_sleep:
+            with self.assertRaises(RuntimeError) as ctx:
+                release.publish("versionctl-fixture")
+        message = str(ctx.exception)
+        self.assertIn("Release publication could not be verified", message)
+        self.assertIn("html_url", message)
+        # The malformed release fails fast without consuming the retry budget.
+        self.assertEqual(mock_sleep.call_count, 0)
 
 
 class GitHubReadTests(unittest.TestCase):

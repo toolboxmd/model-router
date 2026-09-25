@@ -6,10 +6,20 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "toolboxmd/model-router"
+
+# Post-creation verification budget for the eventually consistent release API.
+# Bounded retries with exponential backoff: never judge a just-created release
+# on its first unreadable read.
+VERIFY_MAX_ATTEMPTS = 6
+VERIFY_INITIAL_DELAY_SECONDS = 1.0
+VERIFY_BACKOFF_FACTOR = 2.0
+VERIFY_MAX_DELAY_SECONDS = 8.0
+VERIFY_BUDGET_SECONDS = 30.0
 
 
 def command(*args):
@@ -31,6 +41,10 @@ def remote_tag(tag, sha):
     return True
 
 
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
 def read_release(tag):
     # Tag lookup excludes drafts. The paginated listing includes them for the
     # workflow's contents-write token, so conflicts are found before any write.
@@ -42,9 +56,70 @@ def read_release(tag):
     if len(matches) != 1:
         raise RuntimeError("More than one release uses the requested tag")
     release = matches[0]
-    if (release.get("tag_name") != tag or release.get("draft") is not False or
-            release.get("prerelease") is not False or not release.get("html_url")):
-        raise RuntimeError("Existing release is not the expected published stable release")
+    problems = []
+    if release.get("tag_name") != tag:
+        problems.append(f"tag_name is {release.get('tag_name')!r}, expected {tag!r}")
+    if release.get("draft") is not False:
+        problems.append(f"draft is {release.get('draft')!r}, expected False")
+    if release.get("prerelease") is not False:
+        problems.append(f"prerelease is {release.get('prerelease')!r}, expected False")
+    if not release.get("html_url"):
+        problems.append("html_url is missing or empty")
+    if problems:
+        raise RuntimeError("Existing release is not the expected published stable release: "
+                           + "; ".join(problems))
+    return release
+
+
+def verify_publication(tag, sha):
+    """Wait for a just-created release to become readable, then verify it.
+
+    The release API is eventually consistent: a release created moments ago
+    may not be listed yet. Retry unreadable reads with exponential backoff
+    inside a fixed budget. Genuine failures (a release with wrong fields, a
+    duplicate tag, a missing remote tag) fail immediately with the exact
+    missing field instead of being retried.
+    """
+    delay = VERIFY_INITIAL_DELAY_SECONDS
+    start = time.monotonic()
+    attempts = 0
+    last_error = None
+    release = None
+    while True:
+        attempts += 1
+        try:
+            release = read_release(tag)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "More than one release" in message or "expected published stable" in message:
+                raise RuntimeError(f"Release publication could not be verified: {exc}") from exc
+            last_error = exc
+            release = None
+        if release is not None:
+            break
+        if attempts >= VERIFY_MAX_ATTEMPTS:
+            break
+        if time.monotonic() - start + delay > VERIFY_BUDGET_SECONDS:
+            break
+        _sleep(delay)
+        delay = min(delay * VERIFY_BACKOFF_FACTOR, VERIFY_MAX_DELAY_SECONDS)
+    if release is None:
+        if last_error is not None:
+            raise RuntimeError(
+                f"Release publication could not be verified: release {tag} not readable "
+                f"after {attempts} attempts within {VERIFY_BUDGET_SECONDS:.0f}s budget: "
+                f"last error: {last_error}") from last_error
+        raise RuntimeError(
+            f"Release publication could not be verified: release {tag} not readable "
+            f"after {attempts} attempts within {VERIFY_BUDGET_SECONDS:.0f}s budget")
+    try:
+        tag_ok = remote_tag(tag, sha)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Release publication could not be verified: {exc}") from exc
+    if not tag_ok:
+        raise RuntimeError(
+            f"Release publication could not be verified: remote tag {tag} "
+            "missing for the validated commit")
     return release
 
 
@@ -90,9 +165,7 @@ def publish(versionctl):
             command("gh", "release", "create", tag, "--repo", REPOSITORY,
                     "--verify-tag", "--target", sha, "--title", tag,
                     "--notes-file", str(notes))
-        release = read_release(tag)
-        if release is None or not remote_tag(tag, sha):
-            raise RuntimeError("Release publication could not be verified")
+        release = verify_publication(tag, sha)
     return {"state": state, "sha": sha, "tag": tag, "version": report["version"],
             "url": release["html_url"], "marketplace": "awaiting-toolybara"}
 
