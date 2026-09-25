@@ -2594,16 +2594,22 @@ def _next_capable_locked(con, current: str, lane: str | None = None,
         stage = policy.lane_of_route(current, lane)
     except ValueError:
         return None
-    if stage is None:
+    if stage is None and current in policy.stage_routes("correction"):
+        # The correction route sits in no lane: fall back into the job's lane.
+        stage = policy.resolve_lane(lane or policy.DEFAULT_LANE)
+        order = [r for r in policy.stage_routes(stage) if r != current]
+    elif stage is None:
         return None
-    order = policy.stage_routes(stage)
-    if current not in order:
-        return None
+    else:
+        order = policy.stage_routes(stage)
+        if current not in order:
+            return None
+        order = order[order.index(current) + 1:]
     counts = _running_counts_locked(con, exclude=exclude)
     exhausted, degraded = _capacity_sets_locked(con)
     skip = exhausted | degraded
     turns_by_route = turns_by_route or {}
-    for route in order[order.index(current) + 1:]:
+    for route in order:
         if route in skip:
             continue
         if policy.one_turn_routes_used(route, turns_by_route):

@@ -1040,9 +1040,110 @@ def _deliver_terminal_report_via_t3(state_dir, request_id: str,
             "attempts": attempts + 1}
 
 
-def dispatch(state_dir, request_id: str, t3_client=None) -> dict:
-    """Run the dispatcher turn as a T3 child thread of the planner thread."""
+def _git(workspace: str, *args: str, timeout: int = 120) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(["git", "-C", workspace, *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def _baseline_proof_gate(state_dir, request_id: str) -> dict | None:
+    """Run the task's proof once on the base commit before the first dispatch.
+
+    A proof that already fails on the base commit is a packet problem, not
+    the worker's: the job blocks before any thread starts, with the
+    failing tail, so the planner fixes the packet once (#111). The result
+    is recorded, so recovery never reruns it. A clean workspace at its
+    base commit is proved in place, where the project's installed
+    dependencies live; otherwise a scratch detached worktree of the base
+    commit is used and removed afterwards. Skipped (and recorded) without
+    a proof command, a base commit, a Git workspace, or when the task
+    sets ``"baseline_proof": false``. Returns a blocked result or None.
+    """
     job = core.get_job(state_dir, request_id)
+    if isinstance(_load_controller_state(job).get("baseline_proof"), dict):
+        return None
+    workspace = job["workspace"]
+    base = job.get("base_commit")
+    proof_cmd = _proof_command(job["task_json"])
+    try:
+        task = json.loads(job["task_json"] or "null")
+    except ValueError:
+        task = None
+    skip = None
+    if not proof_cmd:
+        skip = "no proof command"
+    elif isinstance(task, dict) and task.get("baseline_proof") is False:
+        skip = "task sets baseline_proof false"
+    elif not base:
+        skip = "no base commit"
+    if skip is not None:
+        _set_phase(state_dir, request_id, baseline_proof={"skipped": skip})
+        return None
+    rc_head, head = _git(workspace, "rev-parse", "HEAD")
+    rc_dirty, dirty = _git(workspace, "status", "--porcelain")
+    root = store.ensure_state_dir(state_dir)
+    job_dir = store.job_dir_for(root, request_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    scratch = None
+    if rc_head == 0 and head.strip() == base and rc_dirty == 0 and not dirty.strip():
+        where = workspace
+    else:
+        scratch = str(job_dir / "baseline-worktree")
+        rc_add, out = _git(workspace, "worktree", "add", "--detach", scratch, base)
+        if rc_add != 0:
+            _set_phase(state_dir, request_id,
+                       baseline_proof={"skipped": f"no scratch worktree: {out.strip()[:200]}"})
+            return None
+        where = scratch
+    try:
+        rc, out, proof_class, started, ended = _run_proof_command(
+            where, proof_cmd, state_dir=state_dir, request_id=request_id)
+    finally:
+        if scratch is not None:
+            _git(workspace, "worktree", "remove", "--force", scratch)
+            _git(workspace, "worktree", "prune")
+    log = job_dir / "baseline-proof.log"
+    store.secure_write_text(log, adapters.redact_text(
+        f"$ {proof_cmd}\n# base {base} in {'workspace' if scratch is None else 'scratch worktree'}"
+        f"\nexit {rc}\n{out}"))
+    record = {"rc": rc, "class": proof_class, "base_commit": base, "started_at": started,
+              "ended_at": ended, "log": str(log),
+              "where": "workspace" if scratch is None else "scratch"}
+    _set_phase(state_dir, request_id, baseline_proof=record)
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        core._event(con, request_id, "baseline_proof",
+                    {k: record[k] for k in ("rc", "class", "base_commit", "where",
+                                            "started_at", "ended_at")})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+    finally:
+        con.close()
+    if rc == 0:
+        return None
+    tail = " ".join(adapters.redact_text(out or "").split())[-600:]
+    _mark_blocked(state_dir, request_id,
+                  f"baseline_proof_failed: rc={rc}: the proof already fails on base "
+                  f"{base[:12]}; fix the packet or main, then resubmit: {tail}"[:1500])
+    return {"action": "blocked", "reason": "baseline_proof_failed"}
+
+
+def dispatch(state_dir, request_id: str, t3_client=None) -> dict:
+    """Run the dispatcher turn as a T3 child thread of the planner thread,
+    after the base-commit proof check on the first dispatch."""
+    job = core.get_job(state_dir, request_id)
+    if _t3_thread_for(job, "dispatch") is None:
+        blocked = _baseline_proof_gate(state_dir, request_id)
+        if blocked is not None:
+            return blocked
     return _dispatch_via_t3(state_dir, request_id,
                             _full_luna_prompt(job["task_json"]),
                             t3_client=t3_client)
@@ -2073,6 +2174,36 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
     return report
 
 
+def _branch_evidence(job: dict) -> dict:
+    """The job branch as the dispatcher should see it: its name, the
+    commits since the base commit, and an open PR for it (best effort
+    through ``gh``). Finished work on the branch is never mistaken for
+    no work. Unavailable values stay None."""
+    workspace = job.get("workspace") or ""
+    base = job.get("base_commit")
+    out: dict = {"branch": None, "branch_commits": None, "branch_pr": None}
+    rc, branch = _git(workspace, "rev-parse", "--abbrev-ref", "HEAD", timeout=20)
+    if rc != 0:
+        return out
+    out["branch"] = branch.strip() or None
+    if base:
+        rc, log = _git(workspace, "log", "--oneline", "--no-decorate", "-n", "20",
+                       f"{base}..HEAD", timeout=20)
+        if rc == 0:
+            out["branch_commits"] = [line for line in log.splitlines() if line.strip()]
+    if out["branch"] and out["branch"] != "HEAD":
+        try:
+            proc = subprocess.run(["gh", "pr", "view", out["branch"], "--json", "url,state"],
+                                  cwd=workspace, capture_output=True, text=True, timeout=20)
+            if proc.returncode == 0:
+                pr = json.loads(proc.stdout or "{}")
+                if isinstance(pr, dict) and pr.get("url"):
+                    out["branch_pr"] = {"url": pr.get("url"), "state": pr.get("state")}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    return out
+
+
 def _implementation_evidence(job: dict, impl: dict) -> str:
     """The dispatcher's resume message: paths and structured fields, not prose.
 
@@ -2117,8 +2248,12 @@ def _implementation_evidence(job: dict, impl: dict) -> str:
         "native_ids": report.get("native_ids"),
         "report": report.get("report_path"), "proof_log": report.get("proof_log"),
         "diff": report.get("diff"), "worker_text": report.get("worker_text"),
+        **_branch_evidence(job),
     }
     return (json.dumps(fields, sort_keys=True) + "\n"
+            "Commits on the job branch or an open branch PR mean the work may "
+            "already be done: verify it and complete with that PR instead of "
+            "reporting no changes. "
             "Consume this exact-candidate evidence (report, proof log, diff) for the "
             "candidate commit above; do not rerun the full suite against it when its "
             "proof already passed. Request implementation again when the turn failed, "

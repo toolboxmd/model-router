@@ -425,9 +425,12 @@ def next_family_route(route: str, exhausted=None, degraded=None, lane: str | Non
     """Next route in the job's lane from a different model family that is
     neither exhausted, degraded, nor a one-turn route already used.
     Recovery is same-model across pools, so the recovery stage ignores the
-    family filter and skips any rung the job already used."""
+    family filter and skips any rung the job already used. The correction
+    route sits in no lane: it moves laterally into the job's lane."""
     stage = lane_of_route(route, lane)
     if stage is None:
+        if route in stage_routes("correction"):
+            return lane_fallback_route(route, lane, exhausted, degraded, turns_by_route)
         return None
     skip = set(exhausted or ()) | set(degraded or ())
     order = stage_routes(stage)
