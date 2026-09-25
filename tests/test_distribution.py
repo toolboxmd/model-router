@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -36,7 +35,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("submit", self.command("--help"))
         (self.workspace / "packet.json").write_text(json.dumps({"goal": "offline package acceptance"}))
         result = json.loads(self.command("--state-dir", str(self.state), "submit", "--request-id", "package-test",
-            "--task-file", "packet.json", "--workspace", ".", "--planner-session", "offline-fixture",
+            "--task-file", "packet.json", "--workspace", ".", "--planner-session", "offline-fixture", "--planner-t3-thread", "planner-t3",
             "--no-start"))
         self.assertTrue(result["acknowledged"])
         status = json.loads(self.command("--state-dir", str(self.state), "status", "--request-id", "package-test"))
@@ -57,10 +56,7 @@ class DistributionTests(unittest.TestCase):
         for field in ("skills", "documentation", "requirements", "proof"):
             for relative in record["factSources"][field]:
                 self.assertTrue((self.package / relative).is_file(), relative)
-        skill = self.package / "skills/model-routing/SKILL.md"
-        link = self.root / "native-skill"
-        link.symlink_to(skill.parent, target_is_directory=True)
-        self.assertEqual((link / "SKILL.md").resolve().parents[2], self.package.resolve())
+        self.assertFalse((self.package / "skills").exists())
         for relative in ("bin/model-router", "runner/__main__.py", "runner/cli.py", "runner/core.py"):
             self.assertTrue((self.package / relative).is_file(), relative)
 

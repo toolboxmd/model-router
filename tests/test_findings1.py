@@ -17,7 +17,7 @@ from runner import adapters, controller, core, store  # noqa: E402
 
 
 def _submit(sd: str, rid: str, ws: Path):
-    core.submit(sd, rid, {"goal": "findings1"}, str(ws), "planner")
+    core.submit(sd, rid, {"goal": "findings1"}, str(ws), "planner", planner_t3_thread="planner-t3")
 
 
 class TestFreeTextRedaction(unittest.TestCase):
@@ -89,53 +89,6 @@ class TestStatusViewKeepsEvidence(unittest.TestCase):
         self.assertEqual(float(le.get("retry_next_capped") or 0), 20.0)
         self.assertEqual(int(le.get("overload_retries") or 0), 3)
         self.assertTrue(le.get("idle_confirmed"))
-
-
-class TestLadderSeqFallback(unittest.TestCase):
-    def _job_with_invocation(self, sd: str, ws: Path, seq: int):
-        _submit(sd, "j", ws)
-        con = store.connect(sd)
-        try:
-            con.execute("UPDATE jobs SET codex_task_id='thr', status='running' WHERE request_id='j'")
-            con.execute(
-                "INSERT INTO invocations(invocation_id, request_id, kind, cmd_json, workspace,"
-                " owner_token, stdout_path, stderr_path, started_at, state, meta_json)"
-                " VALUES('inv-seq','j','opencode_control','[]',?,'tok','/dev/null','/dev/null',?,"
-                " 'running',?)",
-                (str(ws), core._utcnow(), json.dumps({"seq": seq})))
-        finally:
-            con.close()
-
-    def test_reused_invocation_with_unset_state_seq_counts_once(self):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
-        base = Path(tmp.name)
-        sd = str(base / "state")
-        ws = base / "ws"
-        ws.mkdir()
-        self._job_with_invocation(sd, ws, 5)
-        # Controller state has no seq (recovered with unset seq); the turn's
-        # own report carries seq 5 from the same invocation.
-        impl = {"action": "implementation_failed",
-                "report": {"proof_exit_code": None, "seq": 5}}
-        controller._record_turn_outcome(sd, "j", impl)
-        self.assertEqual(controller._ladder(core.get_job(sd, "j"))["failures"], 1)
-        controller._record_turn_outcome(sd, "j", impl)
-        self.assertEqual(controller._ladder(core.get_job(sd, "j"))["failures"], 1)
-
-    def test_invocation_seq_covers_missing_report_seq(self):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
-        base = Path(tmp.name)
-        sd = str(base / "state")
-        ws = base / "ws"
-        ws.mkdir()
-        self._job_with_invocation(sd, ws, 7)
-        impl = {"action": "implementation_failed", "report": {}}
-        controller._record_turn_outcome(sd, "j", impl)
-        self.assertEqual(controller._ladder(core.get_job(sd, "j"))["failures"], 1)
-        controller._record_turn_outcome(sd, "j", impl)
-        self.assertEqual(controller._ladder(core.get_job(sd, "j"))["failures"], 1)
 
 
 class TestBlockersForwarding(unittest.TestCase):

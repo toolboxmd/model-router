@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -111,7 +110,7 @@ class TestSubmit(Base):
     def test_persists_before_ack(self):
         rc, out, _ = cli(self.sd, "submit", "--request-id", "r1",
                          "--task", '{"goal":"t"}', "--workspace", self.ws(),
-                         "--planner-session", "claude-1")
+                         "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         self.assertEqual(rc, 0)
         self.assertTrue(out.get("acknowledged"))
         job = core.get_job(self.sd, "r1")
@@ -130,9 +129,9 @@ class TestSubmit(Base):
 
     def test_idempotent_same_payload(self):
         cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-            "--workspace", self.ws(), "--planner-session", "claude-1")
+            "--workspace", self.ws(), "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         rc, out, _ = cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-                         "--workspace", self.ws(), "--planner-session", "claude-1")
+                         "--workspace", self.ws(), "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         self.assertEqual(rc, 0)
         con = store.connect(self.sd)
         try:
@@ -143,23 +142,23 @@ class TestSubmit(Base):
 
     def test_conflicting_reuse_rejected(self):
         cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-            "--workspace", self.ws("w1"), "--planner-session", "claude-1")
+            "--workspace", self.ws("w1"), "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         rc, out, _ = cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":2}',
-                         "--workspace", self.ws("w1"), "--planner-session", "claude-1")
+                         "--workspace", self.ws("w1"), "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         self.assertNotEqual(rc, 0)
 
     def test_workspace_conflict(self):
         w = self.ws()
         rc, _, _ = cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-                       "--workspace", w, "--planner-session", "claude-1")
+                       "--workspace", w, "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3")
         self.assertEqual(rc, 0)
         rc, _, _ = cli(self.sd, "submit", "--request-id", "r2", "--task", '{"a":1}',
-                       "--workspace", w, "--planner-session", "claude-2")
+                       "--workspace", w, "--planner-session", "claude-2", "--planner-t3-thread", "planner-t3")
         self.assertNotEqual(rc, 0)
         # After terminal, the workspace is free.
         cli(self.sd, "cancel", "--request-id", "r1")
         rc, _, _ = cli(self.sd, "submit", "--request-id", "r2", "--task", '{"a":1}',
-                       "--workspace", w, "--planner-session", "claude-2")
+                       "--workspace", w, "--planner-session", "claude-2", "--planner-t3-thread", "planner-t3")
         self.assertEqual(rc, 0)
 
     def test_concurrent_duplicate_submissions(self):
@@ -170,7 +169,7 @@ class TestSubmit(Base):
             procs.append(subprocess.Popen(
                 [PY, "-m", "runner", "--state-dir", self.sd, "submit",
                  "--request-id", "race", "--task", task,
-                 "--workspace", w, "--planner-session", "claude-1"],
+                 "--workspace", w, "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(ROOT)))
         outs = [p.communicate(timeout=20) for p in procs]
         codes = [p.returncode for p in procs]
@@ -184,9 +183,9 @@ class TestSubmit(Base):
 
     def test_missing_session_rejected(self):
         with self.assertRaises(ValueError):
-            core.submit(self.sd, "r1", {"a": 1}, self.ws(), "")
+            core.submit(self.sd, "r1", {"a": 1}, self.ws(), "", planner_t3_thread="planner-t3")
         rc, _, _ = cli(self.sd, "submit", "--request-id", "r1", "--task", '{"a":1}',
-                       "--workspace", self.ws(), "--planner-session", "claude-1",
+                       "--workspace", self.ws(), "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3",
                        "--route", "nope/0")
         self.assertNotEqual(rc, 0)
 
@@ -195,7 +194,7 @@ class TestSubmit(Base):
             policy.validate_route("bogus/9")
         self.assertFalse(policy.is_supported("bogus/9"))
         rc, _, _ = cli(self.sd, "submit", "--request-id", "r1", "--task", 'x',
-                       "--workspace", self.ws(), "--planner-session", "s",
+                       "--workspace", self.ws(), "--planner-session", "s", "--planner-t3-thread", "planner-t3",
                        "--route", "bogus/9")
         self.assertNotEqual(rc, 0)
 
@@ -225,7 +224,7 @@ class TestPolicy(Base):
 
 class TestHygiene(Base):
     def test_perms_wal_redaction(self):
-        core.submit(self.sd, "r1", {"secret_token": "abc"}, self.ws(), "p")
+        core.submit(self.sd, "r1", {"secret_token": "abc"}, self.ws(), "p", planner_t3_thread="planner-t3")
         root = Path(self.sd)
         controller._advertise(self.sd, "r1", "tok-secret")
         self.assertEqual(oct(root.stat().st_mode & 0o777), "0o700")

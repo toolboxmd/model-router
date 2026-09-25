@@ -16,9 +16,9 @@ State:
 
 Examples:
   python -m runner --state-dir /tmp/rr submit --request-id r1 \\
-    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session claude-1 --no-start
+    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session t-1 --planner-t3-thread t-1 --no-start
   python -m runner --state-dir /tmp/rr submit --request-id r1 \\
-    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session claude-1 --start
+    --task '{"goal":"fix typo"}' --workspace /tmp/ws --planner-session t-1 --planner-t3-thread t-1 --start
   python -m runner --state-dir /tmp/rr start --request-id r1
   python -m runner --state-dir /tmp/rr status --request-id r1
   python -m runner --state-dir /tmp/rr recover --all
@@ -52,20 +52,11 @@ def _err(msg, code=1) -> int:
 def _deliver_after_cli(state_dir: str, request_id: str) -> None:
     """Best-effort terminal report after an operator command.
 
-    Uses a durable invocation under the job's current lease (if any),
-    so the send is adopted by stable action key like any controller
-    send: a lost lease or a competing owned invocation defers without
-    duplicating. Never raises past the command.
+    Posts once into the planner thread like a controller would; the
+    delivered record prevents a duplicate. Never raises past the command.
     """
     try:
-        tok = core.get_job(state_dir, request_id).get("owner_token")
-    except core.NotFoundError:
-        return
-    except Exception:
-        return
-    try:
-        run = core.make_durable_run_cmd(state_dir, request_id, tok)
-        controller.deliver_terminal_report(state_dir, request_id, run_cmd=run)
+        controller.deliver_terminal_report(state_dir, request_id)
     except Exception:
         pass
 
@@ -105,15 +96,13 @@ def main(argv=None) -> int:
     p.add_argument("--job-kind", default="ordinary", choices=("ordinary", "experiment", "replay"),
                    help="ordinary work, an experiment, or a replay of an earlier request")
     p.add_argument("--replay-of", default=None, help="request id this replay repeats")
-    p.add_argument("--planner-harness", default="claude", choices=("claude", "codex", "opencode", "grok", "t3"),
-                   help="harness that hosts the planner session (its session id goes in --planner-session)")
+    p.add_argument("--planner-harness", default="t3", choices=("claude", "codex", "opencode", "grok", "t3"),
+                   help="harness running inside the planner's T3 thread (recorded as evidence only)")
     p.add_argument("--planner-t3-thread", default=None,
-                   help="planner T3 thread id: selects the T3 execution path (#106), running "
-                        "dispatcher and worker turns as its child threads and posting the "
-                        "terminal state back into it; without it the direct CLI path applies")
+                   help="required: planner T3 thread id; dispatcher and worker turns run as "
+                        "its child threads, and questions and the terminal state are posted into it")
     p.add_argument("--t3-server-url", default=None,
-                   help="T3 server URL for the T3 path (default: T3_SERVER_URL or "
-                        "http://127.0.0.1:3773); needs --planner-t3-thread")
+                   help="T3 server URL (default: T3_SERVER_URL or http://127.0.0.1:3773)")
     p.add_argument("--handoff-summary", default=None,
                    help="durable handoff summary stored on the job (default: derived from the task packet)")
     p.add_argument("--handoff-summary-file", default=None,

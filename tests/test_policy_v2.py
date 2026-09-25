@@ -1,7 +1,6 @@
 """Policy v2: data consistency, derived skill table, lanes, and signal classes."""
 import json
 import io
-import os
 import sys
 import tempfile
 import unittest
@@ -149,33 +148,6 @@ class PolicyData(unittest.TestCase):
         for route in policy.implementation_routes() + policy.stage_routes("correction"):
             self.assertFalse(policy.route_spec(route).get("manual"))
 
-    def test_route_params_and_pool_moves(self):
-        self.assertEqual(policy.opencode_route_params("glm-5.3-flash-go"),
-                         ("opencode-go/glm-5.3-flash", None, "build"))
-        self.assertEqual(policy.opencode_route_params("grok-4.6-xai"), ("xai/grok-4.6", "medium", "build"))
-        with self.assertRaises(ValueError):
-            policy.opencode_route_params("bogus")
-        with self.assertRaises(ValueError):
-            policy.opencode_route_params("luna/max")
-        self.assertEqual(policy.next_pool_route("muse-spark-xhigh-free"), "muse-spark-xhigh-go")
-        self.assertEqual(policy.next_pool_route("grok-4.6-go"), "grok-4.6-build")
-        self.assertEqual(policy.next_pool_route("grok-4.6-build"), "grok-4.6-xai")
-        self.assertIsNone(policy.next_pool_route("grok-4.6-xai"))
-        self.assertIsNone(policy.next_pool_route("muse-spark-xhigh-go"))
-        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free"), "glm-5.3-flash-go")
-        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free",
-                                                  degraded={"glm-5.3-flash-go", "qwen3.8-flash-go",
-                                                            "deepseek-v4.1-flash-go", "hy3-go"}),
-                         "minimax-m3-go")
-        # The stored lane decides where a shared route moves.
-        self.assertEqual(policy.next_family_route("muse-spark-xhigh-free", lane="hard"),
-                         "glm-5.3-go")
-        self.assertEqual(policy.next_capacity_route("muse-spark-xhigh-go", set(), lane="hard"),
-                         ("glm-5.3-go", None))
-        self.assertEqual(policy.lane_of_route("muse-spark-xhigh-free", "hard"), "implementation_hard")
-        self.assertEqual(policy.lane_of_route("muse-spark-xhigh-free"), "implementation_default")
-        self.assertEqual(policy.validate_route("grok-4.6-xai")["allowance"], "xai-subscription")
-        self.assertEqual(policy.route_allowance("grok-4.6-xai"), "xai-subscription")
 
     def test_correction_advances_to_recovery(self):
         self.assertEqual(policy.next_recovery_route("kimi-k2.7-code-go"), "grok-4.6-go")
@@ -199,50 +171,6 @@ class PolicyData(unittest.TestCase):
         self.assertEqual(policy.next_recovery_route("grok-4.6-build", {}), "grok-4.6-xai")
         self.assertIsNone(policy.next_recovery_route("grok-4.6-build", {"grok-4.6-xai": 1}))
 
-    def test_session_permission_flags(self):
-        rules = {r["permission"]: r["action"]
-                 for r in policy.session_permissions("glm-5.3-flash-go")}
-        self.assertEqual(rules["external_directory"], "allow")
-        self.assertEqual(rules["webfetch"], "allow")
-        self.assertEqual(rules["websearch"], "allow")
-        self.assertEqual(rules["doom_loop"], "allow")
-        self.assertEqual(rules["question"], "deny")
-        self.assertEqual(rules["task"], "deny")
-        # Missing or unknown routes resolve to read-only (least privilege).
-        rules = {r["permission"]: r["action"] for r in policy.session_permissions()}
-        self.assertEqual(rules["external_directory"], "deny")
-        self.assertEqual(rules["task"], "deny")
-        rules = {r["permission"]: r["action"] for r in policy.session_permissions(None)}
-        self.assertEqual(rules["external_directory"], "deny")
-        from runner import adapters
-        self.assertEqual(tuple(adapters.SESSION_PERMISSION_RULES),
-                         tuple(policy.DEFAULT_SESSION_PERMISSIONS))
-
-    def test_harness_defaults_come_from_policy(self):
-        from runner import adapters
-        self.assertEqual(adapters.CODEX_MODEL, policy.ROUTES["luna/max"]["model"])
-        self.assertEqual(adapters.CODEX_EFFORT, policy.ROUTES["luna/max"]["variant"])
-        self.assertEqual(adapters.CLAUDE_MODEL, policy.ROUTES["fable-5.1/max"]["model"])
-        self.assertEqual(adapters.CLAUDE_LIVE_MODEL, policy.ROUTES["sonnet/medium"]["model"])
-        self.assertEqual(adapters.OPENCODE_FREE_MODEL, policy.ROUTES["muse-spark-xhigh-free"]["model"])
-        cmd = adapters.build_codex_dispatch_cmd("/tmp/ws", "p", model="gpt-x", effort="high")
-        self.assertIn("gpt-x", cmd)
-        self.assertIn('model_reasoning_effort="high"', cmd)
-        cmd = adapters.build_codex_resume_cmd("t1", "p", model="gpt-y", effort="low")
-        self.assertIn("gpt-y", cmd)
-        self.assertIn('model_reasoning_effort="low"', cmd)
-        with self.assertRaises(ValueError):
-            policy.lane_of_route("glm-5.3-go", "small")
-        self.assertIsNone(policy.lane_of_route("luna/max", "small"))
-
-    def test_skill_reference_is_generated_from_policy(self):
-        rendered = policy.render_skill_table()
-        on_disk = (ROOT / "skills" / "model-routing" / "references" / "codex.md").read_text()
-        self.assertEqual(on_disk, rendered, "run policy.main(['render-skill']) and commit the result")
-        self.assertNotIn("sol", rendered.lower())
-        self.assertIn("critical", rendered)
-        self.assertIn("<plugin-root>/bin/model-router submit", rendered)
-        self.assertEqual(policy.main(["validate"]), 0)
 
     def test_signal_classes(self):
         free = {"type": "retry", "action": {"reason": "free_tier_limit", "provider": "opencode"}}
@@ -280,12 +208,12 @@ class PolicyData(unittest.TestCase):
             self.assertEqual(cli.main([
                 "--state-dir", state_dir, "submit", "--request-id", "cli-default",
                 "--task", '{"goal":"default"}', "--workspace", str(default_workspace),
-                "--planner-session", "claude-1", "--no-start",
+                "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3", "--no-start",
             ]), 0)
             self.assertEqual(cli.main([
                 "--state-dir", state_dir, "submit", "--request-id", "cli-explicit",
                 "--task", '{"goal":"explicit"}', "--workspace", str(explicit_workspace),
-                "--planner-session", "claude-1", "--planner-model", "custom-model",
+                "--planner-session", "claude-1", "--planner-t3-thread", "planner-t3", "--planner-model", "custom-model",
                 "--planner-effort", "custom-effort", "--no-start",
             ]), 0)
 
@@ -311,22 +239,22 @@ class Lanes(unittest.TestCase):
         return str(d)
 
     def test_lane_selects_first_route_and_records_params(self):
-        job = core.submit(self.sd, "small", {"g": 1}, self.ws("a"), "p", lane="small")
+        job = core.submit(self.sd, "small", {"g": 1}, self.ws("a"), "p", lane="small", planner_t3_thread="planner-t3")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         self.assertEqual((job["model"], job["effort"]), ("opencode/muse-spark-1.3-contributor-free", "xhigh"))
         self.assertEqual(job["lane"], "implementation_small")
         job = core.submit(self.sd, "hard", {"g": 1}, self.ws("b"), "p", lane="hard",
-                          route="glm-5.3-go")
+                          route="glm-5.3-go", planner_t3_thread="planner-t3")
         self.assertEqual((job["route"], job["lane"]), ("glm-5.3-go", "implementation_hard"))
-        job = core.submit(self.sd, "plain", {"g": 1}, self.ws("c"), "p")
+        job = core.submit(self.sd, "plain", {"g": 1}, self.ws("c"), "p", planner_t3_thread="planner-t3")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
         self.assertEqual((job["effort"], job["lane"]), ("xhigh", "implementation_default"))
         with self.assertRaises(ValueError):
             core.submit(self.sd, "mismatch", {"g": 1}, self.ws("g"), "p", lane="small",
-                        route="grok-4.6-go")
+                        route="grok-4.6-go", planner_t3_thread="planner-t3")
 
     def test_sticky_home_spreads_parallel_jobs(self):
-        core.submit(self.sd, "h1", {"g": 1}, self.ws("a"), "p", lane="hard")
+        core.submit(self.sd, "h1", {"g": 1}, self.ws("a"), "p", lane="hard", planner_t3_thread="planner-t3")
         self.assertEqual(core.get_job(self.sd, "h1")["route"], "muse-spark-xhigh-free")
         con = store.connect(self.sd)
         try:
@@ -337,7 +265,7 @@ class Lanes(unittest.TestCase):
         # parallel jobs open parallel Muse free sessions by design, so the
         # second hard job also starts on Muse free (no spread to Muse Go).
         new_ws = self.ws("b")
-        job = core.submit(self.sd, "h2", {"g": 1}, new_ws, "p", lane="hard")
+        job = core.submit(self.sd, "h2", {"g": 1}, new_ws, "p", lane="hard", planner_t3_thread="planner-t3")
         self.assertEqual(job["route"], "muse-spark-xhigh-free")
 
     def test_three_parallel_jobs_all_start_on_muse_free(self):
@@ -346,7 +274,7 @@ class Lanes(unittest.TestCase):
             for i in (1, 2, 3):
                 rid = f"{lane}-{i}"
                 ws = self.ws(f"{lane}-{i}")
-                job = core.submit(self.sd, rid, {"g": i}, ws, "p", lane=lane)
+                job = core.submit(self.sd, rid, {"g": i}, ws, "p", lane=lane, planner_t3_thread="planner-t3")
                 self.assertEqual(job["route"], "muse-spark-xhigh-free", (lane, rid))
                 con = store.connect(self.sd)
                 try:
@@ -367,7 +295,7 @@ class Lanes(unittest.TestCase):
                       if policy.route_max_concurrent(r) is None]:
             core.record_capacity(self.sd, route, "exhausted", {"source": "test"})
         core.submit(self.sd, "cap1", {"g": 1}, self.ws("cap1"), "p",
-                    lane="hard", route="glm-5.3-go")
+                    lane="hard", route="glm-5.3-go", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
         try:
             con.execute("UPDATE jobs SET status='running' WHERE request_id='cap1'")
@@ -382,7 +310,7 @@ class Lanes(unittest.TestCase):
     def test_limit_error_on_muse_free_moves_to_muse_go(self):
         # A provider limit error on Muse free moves the same model to the
         # next pool (Muse on Go), on the small lane as well.
-        core.submit(self.sd, "lim1", {"g": 1}, self.ws("lim1"), "p", lane="small")
+        core.submit(self.sd, "lim1", {"g": 1}, self.ws("lim1"), "p", lane="small", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
         try:
             con.execute("UPDATE jobs SET status='running' WHERE request_id='lim1'")
@@ -401,7 +329,7 @@ class Lanes(unittest.TestCase):
 
     def test_concurrency_cap_excludes_full_routes(self):
         core.submit(self.sd, "h1", {"g": 1}, self.ws("a"), "p", lane="hard",
-                    route="glm-5.3-go")
+                    route="glm-5.3-go", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
         try:
             con.execute("UPDATE jobs SET status='running' WHERE request_id='h1'")
@@ -422,7 +350,7 @@ class Lanes(unittest.TestCase):
             con = store.connect(self.sd)
             try:
                 core.submit(self.sd, "cap-" + route, {"g": 1}, self.ws("ws-" + route),
-                            "p", lane="hard", route=route)
+                            "p", lane="hard", route=route, planner_t3_thread="planner-t3")
                 con2 = store.connect(self.sd)
                 con2.execute("UPDATE jobs SET status='running' WHERE request_id=?",
                              ("cap-" + route,))
@@ -443,22 +371,24 @@ class Lanes(unittest.TestCase):
 
     def test_critical_lane_is_planner_executed(self):
         with self.assertRaises(ValueError) as cm:
-            core.submit(self.sd, "crit", {"g": 1}, self.ws("d"), "p", lane="critical")
+            core.submit(self.sd, "crit", {"g": 1}, self.ws("d"), "p", lane="critical", planner_t3_thread="planner-t3")
         self.assertIn("planner", str(cm.exception))
         with self.assertRaises(ValueError):
-            core.submit(self.sd, "rev", {"g": 1}, self.ws("e"), "p", route="luna/max")
+            core.submit(self.sd, "rev", {"g": 1}, self.ws("e"), "p", route="luna/max", planner_t3_thread="planner-t3")
 
     def test_research_action_is_reserved_and_blocks(self):
-        core.submit(self.sd, "r1", {"g": 1}, self.ws("f"), "p")
+        core.submit(self.sd, "r1", {"g": 1}, self.ws("f"), "p", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
         try:
-            con.execute("UPDATE jobs SET codex_task_id='thread', status='running', controller_state=?"
+            con.execute("UPDATE jobs SET status='running', controller_state=?"
                         " WHERE request_id='r1'",
-                        (json.dumps({"seq": 1, "last_action": {"action": "research", "qid": "x"}}),))
+                        (json.dumps({"seq": 1, "last_action": {"action": "research", "qid": "x"},
+                                     "t3_threads": {"dispatch": {"thread_id": "sub.planner-t3.disp",
+                                                                 "route": "luna/max"}}}),))
         finally:
             con.close()
         self.assertIn("research", policy.VALID_ACTIONS)
-        res = controller.step(self.sd, "r1", run_cmd=lambda *a, **k: (1, "", "unexpected"))
+        res = controller.step(self.sd, "r1")
         self.assertEqual(res["reason"], "unsupported_luna_action")
         self.assertEqual(core.get_job(self.sd, "r1")["status"], "blocked")
 
@@ -476,7 +406,7 @@ class StickyIdempotent(unittest.TestCase):
         return str(d)
 
     def test_identical_resubmission_returns_stored_route(self):
-        first = core.submit(self.sd, "idem", {"g": 1}, self.ws("a"), "p", lane="hard")
+        first = core.submit(self.sd, "idem", {"g": 1}, self.ws("a"), "p", lane="hard", planner_t3_thread="planner-t3")
         self.assertEqual(first["route"], "muse-spark-xhigh-free")
         con = store.connect(self.sd)
         try:
@@ -485,7 +415,7 @@ class StickyIdempotent(unittest.TestCase):
             con.close()
         # Running counts changed (muse-free now occupied); an identical
         # resubmission must still return the stored job, not conflict.
-        second = core.submit(self.sd, "idem", {"g": 1}, self.ws("a"), "p", lane="hard")
+        second = core.submit(self.sd, "idem", {"g": 1}, self.ws("a"), "p", lane="hard", planner_t3_thread="planner-t3")
         self.assertEqual(second["route"], "muse-spark-xhigh-free")
         self.assertEqual(second["request_id"], "idem")
 
@@ -557,62 +487,6 @@ class ValidateFixes(unittest.TestCase):
         self.assertEqual(policy.validate_policy(), [])
 
 
-class SessionPermissionsByRole(unittest.TestCase):
-    def test_implementation_gets_full_access_dispatch_gets_read_only(self):
-        full = {r["permission"]: r["action"]
-                for r in policy.session_permissions("glm-5.3-flash-go")}
-        self.assertEqual(full["external_directory"], "allow")
-        self.assertEqual(full["webfetch"], "allow")
-        self.assertEqual(full["websearch"], "allow")
-        self.assertEqual(full["doom_loop"], "allow")
-        self.assertEqual(full["question"], "deny")
-        self.assertEqual(full["task"], "deny")
-        ro = {r["permission"]: r["action"]
-              for r in policy.session_permissions("luna-go/max")}
-        self.assertEqual(ro["edit"], "deny")
-        self.assertEqual(ro["external_directory"], "deny")
-        self.assertEqual(ro["doom_loop"], "deny")
-        self.assertEqual(ro["question"], "deny")
-        self.assertEqual(ro["task"], "deny")
-        ro_rev = {r["permission"]: r["action"]
-                  for r in policy.session_permissions("luna-go-review")}
-        self.assertEqual(ro_rev["edit"], "deny")
-        self.assertEqual(ro_rev["external_directory"], "deny")
-        rec = {r["permission"]: r["action"]
-               for r in policy.session_permissions("grok-4.6-go")}
-        self.assertEqual(rec["external_directory"], "allow")
-        self.assertEqual(rec["doom_loop"], "allow")
-
-    def test_both_sets_reach_create_session(self):
-        from runner import adapters
-        seen = {}
-
-        def fake_request(method, path, body):
-            base = path.split("?", 1)[0]
-            if method == "POST" and base == "/session":
-                seen[base + str(len(seen))] = list(body.get("permission") or [])
-                sid = f"ses_{len(seen):06d}"
-                return {"id": sid, "directory": "/tmp"}
-            if base == "/global/health":
-                return {"healthy": True}
-            return {}
-
-        for route in ("glm-5.3-flash-go", "luna-go/max"):
-            client = adapters.OpenCodeClient("http://127.0.0.1:9", "pwd",
-                                             directory="/tmp",
-                                             request_func=fake_request)
-            got = client.create_session(title="t",
-                                        permission=policy.session_permissions(route))
-            self.assertTrue(got["id"].startswith("ses_"))
-        perms = list(seen.values())
-        self.assertEqual(len(perms), 2)
-        full = {r["permission"]: r["action"] for r in perms[0]}
-        ro = {r["permission"]: r["action"] for r in perms[1]}
-        self.assertEqual(full["external_directory"], "allow")
-        self.assertEqual(ro["edit"], "deny")
-        self.assertEqual(ro["external_directory"], "deny")
-
-
 class ControllerCapsAndRecovery(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -644,11 +518,11 @@ class ControllerCapsAndRecovery(unittest.TestCase):
 
     def test_preflight_full_capped_route_moves_to_next(self):
         core.submit(self.sd, "j1", {"g": 1}, self.ws("a"), "p", lane="default",
-                    route="qwen3.8-flash-go")
+                    route="qwen3.8-flash-go", planner_t3_thread="planner-t3")
         core.submit(self.sd, "j2", {"g": 1}, self.ws("b"), "p", lane="default",
-                    route="qwen3.8-flash-go")
+                    route="qwen3.8-flash-go", planner_t3_thread="planner-t3")
         core.submit(self.sd, "j3", {"g": 1}, self.ws("c"), "p", lane="default",
-                    route="deepseek-v4.1-flash-go")
+                    route="deepseek-v4.1-flash-go", planner_t3_thread="planner-t3")
         for rid in ("j1", "j2", "j3"):
             self._mark_running(rid)
         # j1 sits on qwen (cap 1, filled by j2); deepseek is also full (j3).
@@ -662,9 +536,9 @@ class ControllerCapsAndRecovery(unittest.TestCase):
     def test_concurrent_reservations_yield_one_winner(self):
         import threading
         core.submit(self.sd, "c1", {"g": 1}, self.ws("a"), "p", lane="default",
-                    route="muse-spark-xhigh-free")
+                    route="muse-spark-xhigh-free", planner_t3_thread="planner-t3")
         core.submit(self.sd, "c2", {"g": 1}, self.ws("b"), "p", lane="default",
-                    route="muse-spark-xhigh-free")
+                    route="muse-spark-xhigh-free", planner_t3_thread="planner-t3")
         self._mark_running("c1")
         self._mark_running("c2")
         # Both target the same capped route; the atomic reservation inside
@@ -696,22 +570,21 @@ class ControllerCapsAndRecovery(unittest.TestCase):
         self.assertLessEqual(counts.get("qwen3.8-flash-go", 0), 1)
 
     def test_dispatch_fallback_respects_cap(self):
-        core.submit(self.sd, "d1", {"g": 1}, self.ws("a"), "p")
-        core.submit(self.sd, "d2", {"g": 1}, self.ws("b"), "p")
+        core.submit(self.sd, "d1", {"g": 1}, self.ws("a"), "p", planner_t3_thread="planner-t3")
+        core.submit(self.sd, "d2", {"g": 1}, self.ws("b"), "p", planner_t3_thread="planner-t3")
         self._mark_running("d1")
         self._mark_running("d2")
         controller._set_phase(self.sd, "d1", dispatch_route="luna-go/max")
         self.assertTrue(core.dispatch_route_full(self.sd, "luna-go/max"))
-        called = []
-
-        def fake_run(cmd, cwd=None, timeout=None, **kw):
-            called.append(cmd)
-            return 0, "", ""
-
-        res = controller._dispatch_on_opencode(self.sd, "d2", "luna-go/max", "prompt",
-                                               fake_run, reason="test")
+        # The capped fallback is refused before any dispatcher thread starts.
+        res = controller._claim_capped_dispatch_route(self.sd, "d2", "luna-go/max")
         self.assertEqual(res["reason"], "capacity_exhausted")
-        self.assertEqual(called, [])
+        self.assertEqual(core.get_job(self.sd, "d2")["status"], "blocked")
+        con = store.connect(self.sd)
+        try:
+            con.execute("UPDATE jobs SET status='running', block_reason=NULL WHERE request_id='d2'")
+        finally:
+            con.close()
         # When free, the reservation succeeds without blocking.
         con = store.connect(self.sd)
         try:
@@ -722,28 +595,24 @@ class ControllerCapsAndRecovery(unittest.TestCase):
         self.assertTrue(controller._reserve_dispatch_route(self.sd, "d2", "luna-go/max"))
 
     def _insert_turn(self, rid, route, seq=0):
-        root = store.ensure_state_dir(self.sd)
-        stdout = root / "outputs" / f"{rid}-{seq}.stdout"
-        stderr = root / "outputs" / f"{rid}-{seq}.stderr"
-        store.secure_write_text(stdout, "")
-        store.secure_write_text(stderr, "")
+        # A worker turn is recorded as its T3 child thread slot.
+        job = core.get_job(self.sd, rid)
+        st = json.loads(job.get("controller_state") or "{}")
+        st.setdefault("t3_threads", {})[f"impl_{seq}"] = {
+            "thread_id": f"sub.planner-t3.{rid}{seq}", "route": route}
         con = store.connect(self.sd)
         try:
-            con.execute(
-                "INSERT INTO invocations(invocation_id,request_id,kind,cmd_json,workspace,owner_token,"
-                "stdout_path,stderr_path,started_at,state,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (f"{rid}-{seq}", rid, "opencode_control", "[]", self.ws("a"), "tok",
-                 str(stdout), str(stderr), core._utcnow(), "completed",
-                 json.dumps({"route": route, "seq": seq})))
+            con.execute("UPDATE jobs SET controller_state=? WHERE request_id=?",
+                        (json.dumps(st, sort_keys=True), rid))
         finally:
             con.close()
 
     def test_recovery_after_used_rung_for_small_lane(self):
-        core.submit(self.sd, "s1", {"g": 1}, self.ws("a"), "p", lane="small")
+        core.submit(self.sd, "s1", {"g": 1}, self.ws("a"), "p", lane="small", planner_t3_thread="planner-t3")
         self._mark_running("s1")
         con = store.connect(self.sd)
         try:
-            con.execute("UPDATE jobs SET codex_task_id='th' WHERE request_id='s1'")
+            con.execute("UPDATE jobs SET controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')) WHERE request_id='s1'")
             con.execute("UPDATE jobs SET controller_state=? WHERE request_id='s1'",
                         (json.dumps({"ladder": {"failures": 3, "rung": "correction_fresh"}}),))
         finally:
@@ -757,11 +626,11 @@ class ControllerCapsAndRecovery(unittest.TestCase):
         self.assertEqual(core.get_job(self.sd, "s1")["route"], "grok-4.6-build")
 
     def test_overload_move_during_recovery(self):
-        core.submit(self.sd, "r1", {"g": 1}, self.ws("a"), "p", lane="small")
+        core.submit(self.sd, "r1", {"g": 1}, self.ws("a"), "p", lane="small", planner_t3_thread="planner-t3")
         con = store.connect(self.sd)
         try:
             con.execute("UPDATE jobs SET route='grok-4.6-go', lane='implementation_small',"
-                        " status='running', codex_task_id='th' WHERE request_id='r1'")
+                        " status='running', controller_state=json_set(COALESCE(controller_state,'{}'),'$.t3_threads.dispatch',json_object('thread_id','sub.planner-t3.disp','route','luna/max')) WHERE request_id='r1'")
         finally:
             con.close()
         # Overload on the recovery rung must move inside recovery, never raise.

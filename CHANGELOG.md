@@ -6,6 +6,12 @@
 
 - T3 path: a job's threads form a tree. The dispatcher thread stays a child of the planner thread, and worker, correction and recovery threads are children of the dispatcher thread (`sub.<dispatcher>.<suffix>`, plus `parentThreadId`), so the planner's Agents panel shows one dispatcher per job. Questions and the terminal report still go to the planner thread, and every child's first message still links the planner thread (#113)
 
+## [0.35.0] - 2026-09-25
+
+### Added
+
+- T3 is the only execution path; models and limits from the T3 snapshot; model-routing skill removed
+
 ## [0.34.0] - 2026-09-25
 
 ### Added

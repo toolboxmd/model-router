@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.34.0",
+  "version": "0.35.0",
   "description": "Route authorized software work through one durable, capacity-aware subscription policy.",
   "author": {
     "name": "toolboxmd",
@@ -9,11 +9,10 @@
   "homepage": "https://github.com/toolboxmd/model-router",
   "repository": "https://github.com/toolboxmd/model-router",
   "license": "MIT",
-  "skills": "./skills/",
   "interface": {
     "displayName": "Model Router",
     "shortDescription": "Route software work through available subscription capacity.",
-    "longDescription": "Use one shared routing Skill and bundled runner across supported harnesses. Planners run in any harness; policy selects dispatch, worker, and review routes.",
+    "longDescription": "The bundled Prism runtime behind Chromeria's Prism tools: a planner thread in T3 submits a job, and one durable runner routes its dispatcher and workers as T3 threads to one open PR.",
     "developerName": "toolboxmd",
     "category": "Developer Tools",
     "capabilities": [

@@ -29,7 +29,6 @@ import time
 from pathlib import Path
 
 from . import adapters
-from . import harnesses
 from . import policy
 from . import runtime
 from . import store
@@ -203,28 +202,6 @@ def _pgid_for_pid(pid: int | None) -> int | None:
         return None
 
 
-def _process_start_time(pid: int | None) -> int | None:
-    """Best-effort process start identity (stdlib-only, seconds since epoch).
-
-    Used together with PID/PGID to reduce reuse collisions. Returns None
-    when unavailable without adding non-stdlib dependencies.
-    """
-    if pid is None:
-        return None
-    try:
-        pid = int(pid)
-    except (ValueError, OverflowError):
-        return None
-    # /proc/<pid>/stat starttime is Linux-only and not stdlib-friendly.
-    # Use the executable's stat-based birth time approximation on platforms
-    # where /proc/<pid> exists; otherwise fall back to None.
-    try:
-        st = os.stat(f"/proc/{pid}")
-        return int(st.st_mtime)
-    except (OSError, ValueError):
-        return None
-
-
 def _heartbeat_fresh(updated: str | None) -> bool:
     ts = _parse_ts(updated)
     if ts is None:
@@ -253,22 +230,23 @@ RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
 MAX_JOB_STEPS = 48
 LAUNCH_ACK_GRACE_SECS = 60.0
 
-INVOCATION_KINDS = harnesses.INVOCATION_KINDS
-LIVE_INVOCATION_STATES = ("running", "cancelling")
-
-
-def _infer_invocation_kind(cmd: list[str]) -> str:
-    """Infer the invocation kind from a built-in adapter command."""
-    return harnesses.kind_for_cmd(cmd)
-
-
-def _is_dispatch_row(inv: dict) -> bool:
-    """A ledger row that ran the dispatcher, on whichever harness."""
-    return inv.get("stage") == "dispatch" or harnesses.harness_for(inv.get("kind")).is_dispatch(inv.get("kind"))
 
 def _process_start_identity(pid: int | None) -> str | None:
-    from .supervisor import process_start_identity
-    return process_start_identity(pid)
+    """Best-effort start identity. None when the platform cannot provide it."""
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            text=True, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return (out or "").strip() or None
+    except Exception:
+        return None
 
 
 class LeaseLostError(OwnershipError):
@@ -337,718 +315,6 @@ def _signal_group(pgid, leader_pid, recorded: str | None, sig) -> None:
         pass
 
 
-def _supervisor_state(inv: dict) -> str:
-    return _identity_state(inv.get("supervisor_pid"), inv.get("supervisor_start"))
-
-
-def _supervisor_alive(inv: dict) -> bool:
-    return _supervisor_state(inv) in ("match", "unknown")
-
-
-NEVER_STARTED_GRACE_SECS = 60.0
-
-
-def _with_child_record(inv: dict) -> dict:
-    """Fill an uncommitted child PID from the supervisor's private side
-    record, written right after spawn and before the database commit."""
-    if inv.get("pid") is not None or inv.get("supervisor_pid") is None \
-            or inv.get("state") not in LIVE_INVOCATION_STATES:
-        return inv
-    from .supervisor import child_record_path
-    try:
-        rec = json.loads(Path(child_record_path(inv["stdout_path"])).read_text())
-    except (OSError, ValueError, KeyError, TypeError):
-        return inv
-    if not isinstance(rec, dict) or not rec.get("pid"):
-        return inv
-    return dict(inv, pid=rec["pid"], pgid=rec.get("pgid") or rec["pid"],
-                process_start=rec.get("start"))
-
-
-def _invocation_ownership(inv: dict) -> str:
-    """Classify a recorded invocation.
-
-    ``finished``: state recorded. ``live``: the child or its supervisor
-    still runs (or cannot be proven gone). ``orphaned``: an owned OpenCode
-    server outlived its supervisor; only its task-owned group may be
-    stopped. ``dead``: both are gone and output can be consumed once.
-    ``never_started``: no supervisor ever claimed the row. ``unresolved``:
-    a child PID was never recorded while its supervisor is gone, or the
-    child's identity cannot be proven; never treated as death.
-    """
-    state = inv.get("state")
-    if state not in LIVE_INVOCATION_STATES:
-        return "finished"
-    inv = _with_child_record(inv)
-    pid = inv.get("pid")
-    pgid = inv.get("pgid")
-    if pid is None or pgid is None:
-        if inv.get("supervisor_pid") is None:
-            started = _parse_ts(inv.get("started_at"))
-            if started is not None and time.time() - started > NEVER_STARTED_GRACE_SECS:
-                return "never_started"
-            return "unresolved"
-        # The supervisor claimed the row and records the child next.
-        if _supervisor_alive(inv):
-            return "live"
-        # The child writes its side record before exec, so a dead
-        # supervisor without one after the grace never started a child.
-        started = _parse_ts(inv.get("started_at"))
-        if started is not None and time.time() - started > NEVER_STARTED_GRACE_SECS:
-            return "never_started"
-        return "unresolved"
-    child = _identity_state(pid, inv.get("process_start"))
-    if child == "unknown":
-        return "unresolved" if not _supervisor_alive(inv) else "live"
-    if child == "match" or (child == "mismatch" and _is_pgid_alive(pgid)
-                            and not _is_pid_alive_as_leader(pid, pgid)):
-        if harnesses.harness_for(inv.get("kind")).owned_server \
-                and inv.get("supervisor_pid") and _supervisor_state(inv) in ("dead", "mismatch"):
-            return "orphaned"
-        return "live"
-    if child == "dead" and _is_pgid_alive(pgid):
-        # The leader exited but group members remain.
-        if harnesses.harness_for(inv.get("kind")).owned_server \
-                and _supervisor_state(inv) in ("dead", "mismatch"):
-            return "orphaned"
-        return "live"
-    if _supervisor_alive(inv):
-        return "live"
-    return "dead"
-
-
-def _is_pid_alive_as_leader(pid, pgid) -> bool:
-    """True when ``pid`` currently leads ``pgid`` (a reused PID usually does not)."""
-    try:
-        return os.getpgid(int(pid)) == int(pgid)
-    except (ProcessLookupError, PermissionError, ValueError, OSError):
-        return False
-
-
-def _abandon_never_started(state_dir, request_id: str, lock_holder: bool = False) -> int:
-    """Close invocation rows that never got a child.
-
-    A row counts when no supervisor claimed it within the grace, or when its
-    supervisor is proven dead and the child never wrote its side record
-    (the child writes it before exec). Rows are left alone while another
-    process holds the controller lock: that controller may still start
-    them. The update is guarded on ``pid IS NULL`` under the write lock.
-    """
-    if not lock_holder and controller_lock_held(state_dir, request_id):
-        return 0
-    n = 0
-    for inv in _list_invocations(state_dir, request_id):
-        if _invocation_ownership(inv) != "never_started":
-            continue
-        con = store.connect(state_dir)
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            cur = con.execute(
-                "UPDATE invocations SET state='abandoned', rc=125, ended_at=?, consumed_at=?"
-                " WHERE invocation_id=? AND pid IS NULL AND state IN ('running','cancelling')"
-                " AND (supervisor_pid IS NULL OR supervisor_pid=?)",
-                (_utcnow(), _utcnow(), inv["invocation_id"], inv.get("supervisor_pid")))
-            if cur.rowcount:
-                n += 1
-                _event(con, request_id, "invocation_never_started",
-                       {"invocation_id": inv["invocation_id"][:16]})
-            con.execute("COMMIT")
-        except Exception:
-            try:
-                con.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            con.close()
-    return n
-
-
-def _stop_orphaned_invocations(state_dir, request_id: str) -> int:
-    """Stop owned OpenCode servers whose supervisor died.
-
-    Their password existed only in the dead supervisor, so no process can
-    observe or abort the session; the recorded group is task-owned.
-    """
-    stopped = 0
-    for inv in _list_invocations(state_dir, request_id):
-        if _invocation_ownership(inv) != "orphaned":
-            continue
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            _signal_group(inv["pgid"], inv.get("pid"), inv.get("process_start"), sig)
-            end = time.monotonic() + 5.0
-            while time.monotonic() < end and _is_pgid_alive(inv["pgid"]):
-                time.sleep(0.1)
-            if not _is_pgid_alive(inv["pgid"]):
-                break
-        dead = not _is_pgid_alive(inv["pgid"])
-        stopped += 1 if dead else 0
-        con = store.connect(state_dir)
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            _event(con, request_id,
-                   "orphaned_server_stopped" if dead else "orphaned_server_stop_failed",
-                   {"invocation_id": inv["invocation_id"][:16]})
-            con.execute("COMMIT")
-        finally:
-            con.close()
-    return stopped
-
-
-def _invocation_output_paths(root: Path, request_id: str, invocation_id: str) -> tuple[Path, Path]:
-    return (
-        root / "outputs" / f"{request_id}.{invocation_id}.stdout",
-        root / "outputs" / f"{request_id}.{invocation_id}.stderr",
-    )
-
-
-def _parse_session_from_output(kind: str, stdout: str, stderr: str,
-                               job: dict | None = None) -> tuple[str | None, str | None]:
-    """(session_id, session_kind) as the harness behind ``kind`` reports it."""
-    return harnesses.harness_for(kind).parse_session(kind, stdout, stderr, job)
-
-def _redact_cmd(cmd: list[str]) -> list[str]:
-    return [
-        ("<redacted>" if any(s in str(c).lower() for s in ("password", "bearer", "token=")) else c)
-        for c in cmd
-    ]
-
-
-# A failed model turn is never replayed automatically: the job blocks
-# with its reason. Replaying could fork a task or repeat a side effect.
-MAX_FAILED_ATTEMPTS_PER_ACTION = 1
-
-
-def _redact_meta(meta: dict) -> dict:
-    """Key redaction plus free-text secret shapes, without truncation.
-
-    The supervisor re-reads the prompt from this ledger row, so the
-    value stays complete while credentials are masked.
-    """
-    redacted = store.redact_for_log(dict(meta or {}))
-
-    def _walk(obj):
-        if isinstance(obj, dict):
-            return {k: _walk(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_walk(v) for v in obj]
-        if isinstance(obj, str):
-            return adapters.redact_text(obj)
-        return obj
-
-    return _walk(redacted)
-
-
-def _action_key(kind: str, cmd: list[str], meta: dict | None) -> str:
-    """Identity of one logical side effect, stable across controllers.
-
-    The harness behind ``kind`` decides what is stable: volatile values
-    such as a saved session learned by an earlier attempt are excluded
-    so a restarted controller finds the same key.
-    ``try`` numbers repeated worker turns for one dispatcher turn (seq),
-    so a bounded same-route retry after a stall is a new attempt, never a
-    silent reuse and never a duplicate writer. Only stalled failures take a
-    new number; every other outcome reuses its original identity.
-    """
-    return harnesses.harness_for(kind).action_key(kind, cmd, meta)
-
-
-def _read_invocation_output(inv: dict) -> tuple[str, str]:
-    out = err = ""
-    try:
-        out = Path(inv["stdout_path"]).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    try:
-        err = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    return out, err
-
-
-def _mark_collected(state_dir, request_id: str, invocation_id: str, reused: bool) -> None:
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "UPDATE invocations SET consumed_at=COALESCE(consumed_at, ?) WHERE invocation_id=?",
-            (_utcnow(), invocation_id))
-        if reused:
-            _event(con, request_id, "invocation_reused",
-                   {"invocation_id": invocation_id[:16]})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-
-def _prior_action_result(state_dir, request_id: str, key: str):
-    """Return (rc, out, err) of a finished attempt to reuse, else None.
-
-    Raises OwnershipError while an attempt for the same action is live,
-    orphaned, or unresolved: a second copy would be a duplicate writer.
-    Rows with explicit never-started runtime-missing evidence are skipped:
-    the installed runtime repairs exactly that cause, so the same action
-    is made fresh instead of memoized. Every other failed row keeps its
-    memoization; live, successful, and uncertain actions are never replayed.
-    """
-    prior = [i for i in _list_invocations(state_dir, request_id)
-             if i.get("action_key") == key and i.get("state") != "abandoned"
-             and not runtime.is_runtime_missing_row(i)]
-    if not prior:
-        return None
-    if any(_invocation_ownership(i) == "never_started" for i in prior):
-        _abandon_never_started(state_dir, request_id, lock_holder=True)
-        prior = [i for i in _list_invocations(state_dir, request_id)
-                 if i.get("action_key") == key and i.get("state") != "abandoned"
-                 and not runtime.is_runtime_missing_row(i)]
-        if not prior:
-            return None
-    for inv in prior:
-        own = _invocation_ownership(inv)
-        if own == "live":
-            # Adopt: the same action is already running under its own
-            # supervisor. Wait for its durable result instead of copying it.
-            # No elapsed deadline (#88): a productive turn stays running
-            # regardless of age, so adoption waits until ownership leaves
-            # live, or until cancellation/terminal state ends the wait.
-            while True:
-                cur = [i for i in _list_invocations(state_dir, request_id)
-                       if i["invocation_id"] == inv["invocation_id"]]
-                if not cur or _invocation_ownership(cur[0]) != "live":
-                    break
-                try:
-                    _job = get_job(state_dir, request_id)
-                except NotFoundError:
-                    break
-                if _job.get("cancel_requested") or _job.get("status") in store.TERMINAL:
-                    break
-                time.sleep(0.2)
-            own = _invocation_ownership(
-                [i for i in _list_invocations(state_dir, request_id)
-                 if i["invocation_id"] == inv["invocation_id"]][0])
-        if own in ("live", "orphaned", "unresolved"):
-            raise OwnershipError(
-                f"action already owned by invocation {inv['invocation_id'][:8]} ({own}); "
-                "refusing duplicate")
-    if any(i.get("state") in LIVE_INVOCATION_STATES for i in prior):
-        consume_finished_invocations(state_dir, request_id)
-        prior = [i for i in _list_invocations(state_dir, request_id)
-                 if i.get("action_key") == key and i.get("state") != "abandoned"
-                 and not runtime.is_runtime_missing_row(i)]
-    done = [i for i in prior if i.get("state") == "completed" and i.get("rc") == 0]
-    failed = [i for i in prior if i.get("state") != "completed" or i.get("rc") != 0]
-    pick = done[-1] if done else (
-        failed[-1] if len(failed) >= MAX_FAILED_ATTEMPTS_PER_ACTION else None)
-    if pick is None:
-        return None
-    out, err = _read_invocation_output(pick)
-    _mark_collected(state_dir, request_id, pick["invocation_id"], reused=True)
-    rc = pick.get("rc")
-    return (int(rc) if rc is not None else 1), out, err
-
-
-def _wait_other_invocations(state_dir, request_id: str, key: str) -> None:
-    for inv in _list_invocations(state_dir, request_id):
-        if inv.get("action_key") == key or inv.get("state") not in LIVE_INVOCATION_STATES:
-            continue
-        # No elapsed deadline (#88): wait until the other action's
-        # ownership leaves live, or until cancellation/terminal state.
-        # A productive turn stays running regardless of age; only
-        # unresolvable ownership still refuses the duplicate.
-        own = _invocation_ownership(inv)
-        while own == "live":
-            time.sleep(0.2)
-            cur = [i for i in _list_invocations(state_dir, request_id)
-                   if i["invocation_id"] == inv["invocation_id"]]
-            own = _invocation_ownership(cur[0]) if cur else "finished"
-            if own == "live":
-                try:
-                    _job = get_job(state_dir, request_id)
-                except NotFoundError:
-                    break
-                if _job.get("cancel_requested") or _job.get("status") in store.TERMINAL:
-                    break
-        if own in ("live", "unresolved", "orphaned", "never_started"):
-            raise OwnershipError(
-                f"job {request_id}: invocation {inv['invocation_id'][:8]} is {own}; run recover")
-    consume_finished_invocations(state_dir, request_id)
-
-
-def _durable_run(state_dir, request_id: str, owner_token: str, kind: str,
-                 cmd: list[str], cwd: str | None = None,
-                 timeout: int | None = None, meta: dict | None = None) -> tuple[int, str, str]:
-    """Persist spawn intent, then hand the child to an independent supervisor.
-
-    The invocation row is committed with NULL pid/pgid before any Popen.
-    That window is unresolved ownership, never proof of death. The
-    supervisor process group is detached from the controller so killing
-    only the controller cannot destroy output, IDs, or completion. A
-    finished attempt of the same action is reused, never rerun.
-
-    ``timeout`` is a legacy compatibility slot and is never enforced:
-    since #88 agent turns carry no elapsed deadline, so the value (when
-    given) is only recorded on the row for readability of pre-#88
-    ledgers. New rows store NULL (no deadline). Explicit cancellation,
-    real terminal failures, process ownership, and stream-stall handling
-    are the only ends for an active turn.
-    """
-    if (kind or "") in harnesses.HISTORICAL_INVOCATION_KINDS:
-        raise RunnerError(
-            f"historical invocation kind {kind!r} is readable but never creatable")
-    harness = harnesses.harness_for(kind)
-    if timeout is not None:
-        try:
-            timeout = int(timeout)
-        except (TypeError, ValueError):
-            timeout = None
-    stage_name = (meta or {}).get("stage") or harness.stage_for(kind)
-    route_name = (meta or {}).get("route")
-    if route_name:
-        blocker = harnesses.route_capability_blocker(route_name, stage_name)
-        if blocker:
-            raise RunnerError(f"route_capability_mismatch: {blocker}")
-    key = _action_key(kind, cmd, meta)
-    reused = _prior_action_result(state_dir, request_id, key)
-    if reused is not None:
-        return reused
-    root = store.ensure_state_dir(state_dir)
-    invocation_id = secrets.token_hex(8)
-    stdout_path, stderr_path = _invocation_output_paths(root, request_id, invocation_id)
-    store.secure_write_text(stdout_path, "")
-    store.secure_write_text(stderr_path, "")
-
-    job = get_job(state_dir, request_id)
-    workspace = cwd or job["workspace"]
-    # Direction supply through the harness seam (ISSUE_30, ISSUE_52): the
-    # installed AgentsMD loader owns the block. On the owned OpenCode
-    # server the route's kit decides: a kit naming
-    # agentsmd-project-direction records hook with the block hash and no
-    # duplicate block; a kit without it gets the verbatim block (runner).
-    # Hook hosts (Codex, Claude, Grok) record the hash without duplication;
-    # a missing/failed loader records none with its reason and the job
-    # continues. Every loader call uses a unique session_id
-    # (model-router-<request>-<invocation>-<uuid>) so the loader's
-    # per-session hook cache never suppresses a block; the loader is still
-    # called exactly once per invocation here. Computed before the insert
-    # so every invocation row carries kit, supply, and hashes; the action
-    # key above stays on the original prompt (direction fields are extra
-    # keys the harness seam ignores), so retries keep one identity.
-    _dir_info: dict = {"ok": False, "block": None, "status": "gap",
-                       "reason": "loader missing"}
-    _dir_supply = "none"
-    _dir_hash: str | None = None
-    _kit_name: str | None = None
-    _kit_hash: str | None = None
-    _kit_skills: list = []
-    _dir_session_id: str | None = None
-    try:
-        from . import direction as _direction
-        _harness_name = getattr(harness, "name", None) or "opencode"
-        _kit_name, _kit_hash, _kit_skills = _direction.kit_for_invocation(
-            route_name or (meta or {}).get("route"), stage_name)
-        try:
-            import secrets as _secrets
-            _dir_session_id = (
-                f"model-router-{request_id}-{invocation_id}-{_secrets.token_hex(4)}")
-        except Exception:
-            _dir_session_id = f"model-router-{request_id}-{invocation_id}"
-        try:
-            _dir_info = _direction.load_direction(
-                workspace, host=_harness_name, session_id=_dir_session_id)
-        except Exception:
-            _dir_info = {"ok": False, "block": None, "status": "gap",
-                         "reason": "loader failed: exception",
-                         "session_id": _dir_session_id}
-        _dir_supply = _direction.supply_for_harness(
-            _harness_name, bool(_dir_info.get("ok")), _kit_name)
-        if bool(_dir_info.get("ok")) and _dir_info.get("block"):
-            _dir_hash = _direction.block_hash(_dir_info.get("block"))
-    except Exception:
-        pass
-    _meta_store = dict(meta or {})
-    # Supervisor re-reads the prompt plus the verbatim block from this row;
-    # the block stays in the private database (0600), never in public logs.
-    try:
-        if _dir_info.get("block"):
-            _meta_store["direction_block"] = _dir_info.get("block")
-    except Exception:
-        pass
-    _meta_store["direction_supply"] = _dir_supply
-    if _dir_hash:
-        _meta_store["direction_hash"] = _dir_hash
-    if _dir_info.get("status"):
-        _meta_store["direction_status"] = _dir_info.get("status")
-    if _dir_info.get("reason"):
-        _meta_store["direction_reason"] = _dir_info.get("reason")
-    if _kit_name:
-        _meta_store["kit"] = _kit_name
-    if _kit_hash:
-        _meta_store["kit_hash"] = _kit_hash
-    if _dir_session_id:
-        _meta_store["direction_session_id"] = _dir_session_id
-    # Runtime provenance travels on every invocation so recovery can name
-    # the runtime that actually ran before a transfer. It is added after
-    # the action key is computed, so retries keep one identity.
-    try:
-        _meta_store["runtime"] = runtime.installed_runtime()
-    except Exception:
-        pass
-    # Key redaction cannot see inside free-text values (for example a
-    # credential in the task prompt), so mask secret shapes as well. No
-    # truncation: the supervisor re-reads this prompt from the ledger.
-    meta_json = json.dumps(_redact_meta(_meta_store), sort_keys=True)
-    # One writer per job: any other live child (a different action from a
-    # previous controller) is adopted by waiting, never run beside.
-    _wait_other_invocations(state_dir, request_id, key)
-    started_at = _utcnow()
-
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        # Lease and action identity are rechecked under the write lock: a
-        # controller that lost its lease, or lost a race for the same
-        # action, never spawns.
-        cur = con.execute("SELECT owner_token, status, cancel_requested FROM jobs"
-                          " WHERE request_id=?", (request_id,)).fetchone()
-        if cur is None or cur["owner_token"] != owner_token:
-            con.execute("ROLLBACK")
-            raise LeaseLostError(f"job {request_id}: controller no longer holds the lease")
-        if cur["cancel_requested"] or cur["status"] in store.TERMINAL:
-            if not (harnesses.is_terminal_report_send(kind, meta)
-                    and cur["status"] in store.TERMINAL_REPORT_STATUSES):
-                con.execute("ROLLBACK")
-                raise LeaseLostError(f"job {request_id}: cancelled or terminal")
-        other = con.execute(
-            "SELECT invocation_id FROM invocations WHERE request_id=? AND state IN ('running','cancelling')"
-            " AND (action_key IS NULL OR action_key != ?)", (request_id, key)).fetchone()
-        if other is not None:
-            con.execute("ROLLBACK")
-            raise OwnershipError(f"job {request_id}: invocation {other['invocation_id'][:8]} still owns the job")
-        rows = con.execute("SELECT invocation_id, result_json FROM invocations"
-                           " WHERE request_id=? AND action_key=? AND state != 'abandoned'",
-                           (request_id, key)).fetchall()
-        live_rows = [r for r in rows
-                     if not runtime.is_runtime_missing_row({"result_json": r["result_json"]})]
-        if live_rows:
-            con.execute("ROLLBACK")
-            reused = _prior_action_result(state_dir, request_id, key)
-            if reused is not None:
-                return reused
-            raise OwnershipError(f"job {request_id}: action already has an attempt; run recover")
-        # Only never-started runtime-missing rows remain for this action:
-        # the installed runtime repairs exactly that cause, so this
-        # controller makes the action fresh under the write lock. The
-        # check and the insert below are one atomic transaction, so two
-        # controllers cannot both pass it.
-        try:
-            _skills_json = json.dumps(_kit_skills, sort_keys=True)
-        except Exception:
-            _skills_json = "[]"
-        con.execute(
-            "INSERT INTO invocations("
-            " invocation_id, request_id, kind, cmd_json, workspace, owner_token,"
-            " pid, pgid, process_start, stdout_path, stderr_path, started_at,"
-            " state, task_json, timeout_secs, meta_json, action_key,"
-            " stage, requested_route, policy_version, reason, harness_version, schema_version,"
-            " kit, kit_hash, direction_supply, direction_reason, direction_hash,"
-            " direction_status, skills_json, tools_json"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,'running',?,?,?,?,?,?,?,?,?,?,"
-            "?,?,?,?,?,?,?,?)",
-            (invocation_id, request_id, kind, json.dumps(list(cmd)),
-             workspace, owner_token, str(stdout_path), str(stderr_path),
-             started_at, job.get("task_json"), timeout, meta_json, key,
-             (meta or {}).get("stage") or harness.stage_for(kind),
-             (meta or {}).get("route") or harness.default_route(kind, job),
-             policy.POLICY_VERSION, (meta or {}).get("reason") or "initial",
-             harness.version(), store.SCHEMA_VERSION,
-             _kit_name, _kit_hash, _dir_supply,
-             str(_dir_info.get("reason") or "") or None,
-             _dir_hash, str(_dir_info.get("status") or "gap"),
-             _skills_json, "[]"),
-        )
-        _event(con, request_id, "invocation_attempting",
-               {"invocation_id": invocation_id[:16], "kind": kind})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-    sup_cmd = [sys.executable, "-m", "runner.supervisor",
-               "--state-dir", str(root),
-               "--request-id", request_id,
-               "--invocation-id", invocation_id]
-    try:
-        sup = subprocess.Popen(
-            sup_cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True, cwd=_PKG_ROOT,
-        )
-    except OSError as e:
-        # Popen raised before any supervisor or child existed: this action
-        # provably never started. Only a missing runtime root is repairable
-        # (recovery continues on the installed runtime); every other spawn
-        # error keeps the existing sticky semantics. The evidence on the row
-        # decides, never empty output.
-        diag = runtime.diagnose_spawn_error(e)
-        now = _utcnow()
-        payload = {"never_started": True,
-                   "runtime_missing": bool(diag.get("runtime_missing")),
-                   "error": diag.get("cause"),
-                   "runtime": runtime.installed_runtime()}
-        detail = {"invocation_id": invocation_id[:16], "kind": kind,
-                  "never_started": True,
-                  "runtime_missing": bool(diag.get("runtime_missing")),
-                  "cause": diag.get("cause"),
-                  "next_action": "recover"}
-        con = store.connect(state_dir)
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            con.execute(
-                "UPDATE invocations SET state='failed', rc=127, ended_at=?, consumed_at=?,"
-                " result_json=? WHERE invocation_id=?",
-                (now, now, json.dumps(payload, sort_keys=True), invocation_id),
-            )
-            _event(con, request_id, "supervisor_spawn_failed", detail)
-            con.execute("COMMIT")
-        finally:
-            con.close()
-        _measure_invocation(state_dir, request_id, invocation_id)
-        if diag.get("runtime_missing"):
-            return 127, "", (f"runtime_missing: {diag.get('cause')}; run recover "
-                             "on the installed runtime (do not restore cache directories)")
-        return 127, "", f"supervisor spawn failed: {e}"
-
-    # The supervisor records its own PID and start identity when it claims
-    # the row; the controller never writes them, so an unclaimed row stays
-    # recognizable as never started.
-
-    # The supervisor owns the turn's end (completion, stall, explicit
-    # cancellation, or real failure) and records the result; the
-    # controller adopts that durable result with no elapsed deadline
-    # (#88). A productive turn stays running regardless of age. The
-    # supervisor reap below (10s) and the drain/cleanup bounds elsewhere
-    # are purpose-specific limits, not agent deadlines.
-    rc = 125
-    while True:
-        invs = [i for i in _list_invocations(state_dir, request_id)
-                if i["invocation_id"] == invocation_id]
-        if invs and invs[0].get("state") not in LIVE_INVOCATION_STATES:
-            try:
-                rc = int(invs[0]["rc"]) if invs[0].get("rc") is not None else 125
-            except (TypeError, ValueError):
-                rc = 0
-            break
-        if sup.poll() is not None:
-            # Supervisor exited; consume whatever it persisted.
-            time.sleep(0.05)
-            invs = [i for i in _list_invocations(state_dir, request_id)
-                    if i["invocation_id"] == invocation_id]
-            if invs and invs[0].get("state") not in LIVE_INVOCATION_STATES:
-                try:
-                    rc = int(invs[0]["rc"]) if invs[0].get("rc") is not None else 125
-                except (TypeError, ValueError):
-                    rc = 0
-            else:
-                consume_finished_invocations(state_dir, request_id)
-                invs = [i for i in _list_invocations(state_dir, request_id)
-                        if i["invocation_id"] == invocation_id]
-                if invs and invs[0].get("state") not in LIVE_INVOCATION_STATES:
-                    try:
-                        rc = int(invs[0]["rc"]) if invs[0].get("rc") is not None else 125
-                    except (TypeError, ValueError):
-                        rc = 125
-            break
-        time.sleep(0.05)
-
-    stdout_text = ""
-    stderr_text = ""
-    try:
-        stdout_text = Path(stdout_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    try:
-        stderr_text = Path(stderr_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-
-    try:
-        sup.wait(timeout=10)  # reap the finished supervisor
-    except Exception:
-        pass
-    _mark_collected(state_dir, request_id, invocation_id, reused=False)
-    _measure_invocation(state_dir, request_id, invocation_id)
-    try:
-        log = store.output_path_for(root, request_id)
-        store.append_text(log, f"[{kind} invocation={invocation_id[:8]} rc={rc}]\n")
-    except OSError:
-        pass
-
-    return rc, stdout_text, stderr_text
-
-
-def make_durable_run_cmd(state_dir: str, request_id: str, owner_token: str):
-    """Factory for a run_cmd closure that creates durable invocations.
-
-    The returned callable matches the (cmd, cwd, timeout) -> (rc, out, err)
-    signature used by controller.dispatch and friends.
-    """
-    def run_cmd(cmd: list[str], cwd: str | None = None, timeout: int | None = None,
-                kind: str | None = None, meta: dict | None = None):
-        kind = kind or _infer_invocation_kind(cmd)
-        return _durable_run(state_dir, request_id, owner_token, kind,
-                            cmd, cwd=cwd, timeout=timeout, meta=meta)
-    return run_cmd
-
-
-def runtime_missing_for_action(state_dir, request_id: str, kind: str,
-                               cmd: list[str], meta: dict | None) -> dict | None:
-    """Never-started runtime-missing evidence for one action, if still current.
-
-    Recomputes the action key exactly as :func:`_durable_run` did and
-    returns the newest matching row's persisted ``{"cause": ...}`` detail,
-    but only when that newest non-abandoned row itself carries explicit
-    runtime-missing evidence. An older missing-runtime row never wins
-    after a newer attempt for the same action completed, failed
-    otherwise, or otherwise superseded it: the repaired retry must not
-    be reblocked by the stale row it already repaired. Callers use it
-    to trade an opaque sticky failure for a recoverable
-    ``runtime_missing`` block. Rows without the explicit marker never
-    count, however empty their output is.
-    """
-    try:
-        key = _action_key(kind, cmd, meta)
-    except Exception:
-        return None
-    matches = [i for i in _list_invocations(state_dir, request_id)
-               if i.get("action_key") == key and i.get("state") != "abandoned"]
-    if not matches:
-        return None
-    row = matches[-1]
-    if not runtime.is_runtime_missing_row(row):
-        return None
-    try:
-        obj = json.loads(row.get("result_json") or "null")
-    except ValueError:
-        obj = None
-    detail = dict(obj) if isinstance(obj, dict) else {}
-    if not detail.get("cause"):
-        detail["cause"] = detail.get("error") or \
-            "old runtime path is gone; no supervisor or child started"
-    return detail
-
-
 def _list_invocations(state_dir, request_id: str,
                       state: str | None = None) -> list[dict]:
     con = store.connect(state_dir)
@@ -1068,657 +334,18 @@ def _list_invocations(state_dir, request_id: str,
         con.close()
 
 
-def _reconcile_dead_invocations(state_dir, request_id: str) -> list[dict]:
-    """Inspect recorded identity. Never treat NULL pid/pgid as death."""
-    now = _utcnow()
-    dead = []
-    unresolved = 0
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        placeholders = ",".join("?" for _ in LIVE_INVOCATION_STATES)
-        rows = con.execute(
-            f"SELECT * FROM invocations WHERE request_id=? AND state IN ({placeholders})",
-            (request_id, *LIVE_INVOCATION_STATES),
-        ).fetchall()
-        for r in rows:
-            inv = dict(r)
-            own = _invocation_ownership(inv)
-            if own == "unresolved":
-                unresolved += 1
-                continue
-            if own == "dead":
-                # Leave state running so consume_finished_invocations can
-                # apply durable output exactly once; only stamp ended_at.
-                if not inv.get("ended_at"):
-                    con.execute(
-                        "UPDATE invocations SET ended_at=? WHERE invocation_id=? AND ended_at IS NULL",
-                        (now, inv["invocation_id"]),
-                    )
-                dead.append(inv)
-        _event(con, request_id, "invocations_reconciled",
-               {"reconciled_dead": len(dead), "unresolved": unresolved})
-        con.execute("COMMIT")
-        return dead
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-
-def _any_live_invocation(state_dir, request_id: str) -> list[dict]:
-    """Return invocations whose recorded child or supervisor is still live."""
-    live = []
-    for inv in _list_invocations(state_dir, request_id):
-        if _invocation_ownership(inv) in ("live", "orphaned"):
-            live.append(inv)
-    return live
-
-
-def _any_unresolved_invocation(state_dir, request_id: str) -> list[dict]:
-    return [inv for inv in _list_invocations(state_dir, request_id)
-            if _invocation_ownership(inv) == "unresolved"]
-
-
-def consume_finished_invocations(state_dir, request_id: str) -> list[dict]:
-    """Consume durable child output exactly once after the child has exited.
-
-    If the child finished while the controller was dead, persist
-    rc/session/action/result from the file-backed output and do not
-    rerun completed work.
-    """
-    applied = []
-    job = None
-    try:
-        job = get_job(state_dir, request_id)
-    except NotFoundError:
-        return applied
-    for inv in _list_invocations(state_dir, request_id):
-        if inv.get("consumed_at"):
-            continue
-        own = _invocation_ownership(inv)
-        if own in ("live", "unresolved", "orphaned", "never_started"):
-            continue
-        applied.append(_consume_one_invocation(state_dir, request_id, inv, job))
-        try:
-            job = get_job(state_dir, request_id)
-        except NotFoundError:
-            break
-    return [a for a in applied if a]
-
-
-def _consume_one_invocation(state_dir, request_id: str, inv: dict, job: dict) -> dict:
-    stdout_text = ""
-    stderr_text = ""
-    try:
-        stdout_text = Path(inv["stdout_path"]).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    try:
-        stderr_text = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        pass
-    kind = inv.get("kind") or ""
-    sid, skind = _parse_session_from_output(kind, stdout_text, stderr_text, job)
-    head_commit = _workspace_head(job.get("workspace"))  # before the write lock
-    try:
-        inv_cmd = json.loads(inv.get("cmd_json") or "[]")
-    except ValueError:
-        inv_cmd = []
-    harness = harnesses.harness_for(kind)
-    try:
-        inv_meta = json.loads(inv.get("meta_json") or "{}") or {}
-    except ValueError:
-        inv_meta = {}
-    # Only the harness's own final record can carry the dispatcher's action.
-    envelope = harness.parse_report(kind, stdout_text, inv_cmd) if inv.get("stage") == "dispatch" \
-        or harness.is_dispatch(kind) else None
-    if envelope is not None and not (isinstance(envelope, dict) and envelope.get("action") in policy.VALID_ACTIONS):
-        # An OpenCode summary carries the Luna envelope in its assistant
-        # text; the harness seam extracts it so callers never parse
-        # harness output directly.
-        envelope = harness.luna_action(kind, stdout_text, inv_cmd) \
-            if isinstance(envelope, dict) else None
-    planner_answer = None
-    result_obj = None
-    if inv.get("result_json"):
-        try:
-            result_obj = json.loads(inv["result_json"])
-        except ValueError:
-            result_obj = None
-    rc = inv.get("rc")
-    if rc is None:
-        # Child and supervisor are dead: the harness's own record decides
-        # whether the turn counts, including the last-message file fallback.
-        rc = harness.infer_rc(kind, stdout_text, inv_cmd)
-    # Completion gates that need no write lock (files, git, the live PR
-    # read): the bound proof, named acceptance, PR presence and identity,
-    # and the PR's live state. Computed here so the transaction below
-    # only persists; a completion the live path would refuse refuses
-    # here too instead of succeeding through recovery.
-    pre_refusal = None
-    if isinstance(envelope, dict) and envelope.get("action") == "completion" \
-            and job.get("status") not in store.TERMINAL \
-            and not job.get("cancel_requested"):
-        _latest0 = latest_turn_report(state_dir, request_id)
-        pre_refusal = completion_refusal_reason(_latest0)
-        if pre_refusal is None:
-            pre_refusal = incomplete_proof_reason(
-                job.get("task_json"), _latest0, job.get("workspace"))
-        if pre_refusal is None:
-            pre_refusal = incomplete_acceptance_reason(job.get("task_json"), envelope)
-        if pre_refusal is None:
-            pre_refusal = missing_pr_url_reason(
-                job.get("job_kind"), envelope, job.get("workspace"))
-        if pre_refusal is None and pr_gate_applies(job.get("job_kind"),
-                                                   job.get("workspace")):
-            _cur0 = envelope.get("pr_url")
-            if isinstance(_cur0, str) and _cur0.strip():
-                pre_refusal = duplicate_pr_reason(
-                    known_pr_url(state_dir, request_id), envelope)
-                if pre_refusal is None:
-                    _head0 = _latest0.get("head_commit") \
-                        if isinstance(_latest0, dict) else None
-                    pre_refusal = verify_pr_for_completion(
-                        job.get("workspace"), _cur0.strip(), _head0,
-                        job.get("task_json"))
-    if rc == 0:
-        planner_answer = harness.planner_answer(kind, stdout_text, inv_meta, job)
-    state = "completed" if rc == 0 else "failed"
-    now = _utcnow()
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        # Re-check consumed under the write lock.
-        row = con.execute(
-            "SELECT consumed_at FROM invocations WHERE invocation_id=?",
-            (inv["invocation_id"],),
-        ).fetchone()
-        if row is not None and row["consumed_at"]:
-            con.execute("ROLLBACK")
-            return {"action": "already-consumed", "invocation_id": inv["invocation_id"]}
-        payload = result_obj if isinstance(result_obj, dict) else {}
-        payload = dict(payload)
-        payload["rc"] = rc
-        if envelope is not None:
-            payload["envelope"] = envelope
-        if sid:
-            payload["session_id"] = sid
-            payload["session_kind"] = skind
-        con.execute(
-            "UPDATE invocations SET rc=?, state=?, ended_at=COALESCE(ended_at, ?),"
-            " consumed_at=?, result_json=?, session_id=COALESCE(?, session_id),"
-            " session_kind=COALESCE(?, session_kind) WHERE invocation_id=?",
-            (rc, state, now, now, json.dumps(payload, sort_keys=True),
-             sid, skind, inv["invocation_id"]),
-        )
-        if sid:
-            harness.record_session(con, request_id, sid, skind, kind, job, inv_meta, now)
-        job_row = con.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
-        job_status = job_row["status"] if job_row else None
-        applied = "consumed"
-        cancelled = bool(job_row is not None and job_row["cancel_requested"])
-        is_dispatch = inv.get("stage") == "dispatch" or harness.is_dispatch(kind)
-        turn_ok = harness.turn_ok(kind, rc, stdout_text, inv_cmd)
-        # A dispatcher turn counts only from the saved task: a resume that
-        # reports another thread, or none, is never applied.
-        thread_ok = True
-        if is_dispatch:
-            saved_thread = job_row["codex_task_id"] if job_row is not None else None
-            thread_ok = harness.identity_ok(kind, sid, saved_thread)
-        live_job = job_row is not None and job_status not in store.TERMINAL and not cancelled
-        # Full measurement in this same transaction, before any planner or
-        # envelope application, for every recovered invocation kind. A
-        # measurement failure blocks safely here and skips all envelope
-        # effects, so no completed event, completion envelope, or
-        # successful result can commit. Unknown never blocks, and only
-        # genuinely missing or unreadable rollout cases stay unknown
-        # inside the rollout reader's file-read boundary. Any other
-        # observation or measurement failure (kit lookup, parser logic,
-        # database write) blocks safely with evidence.
-        _measured_observed = None
-        measure_failed = False
-        model_gate_applied = False
-        try:
-            _m_full = _compute_invocation_measurement(
-                state_dir, request_id, inv["invocation_id"], kind,
-                stdout_text, stderr_text, inv_meta,
-                inv.get("started_at"), inv.get("ended_at") or now,
-                rc, payload, crashed=inv.get("rc") is None)
-            _write_invocation_measurement(con, inv["invocation_id"], _m_full)
-            _obs = _m_full["observed"]
-            if not (isinstance(_obs, str) and _obs):
-                _obs = None
-            _measured_observed = _obs
-        except Exception as e:
-            measure_failed = True
-            model_gate_applied = True
-            if live_job:
-                try:
-                    _detail = f"{type(e).__name__}: {str(e)[:150]}"
-                except Exception:
-                    _detail = "measurement failed"
-                _is_codex = getattr(harness, "name", None) == "codex"
-                _prefix = "model_observation_failed" if _is_codex else "measurement_failed"
-                _mreason = f"{_prefix}: {kind} {_detail}"[:300]
-                con.execute(
-                    "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
-                    " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
-                    (_mreason, now, request_id))
-                _event(con, request_id, "blocked", {"reason": _mreason[:120]})
-                applied = "blocked"
-        if not measure_failed and planner_answer and job_row is not None \
-                and job_status not in store.TERMINAL \
-                and not job_row["cancel_requested"]:
-            qid, text = planner_answer
-            upd = con.execute(
-                "UPDATE questions SET status='answered', answer=?, answered_at=?"
-                " WHERE request_id=? AND qid=? AND status='pending'",
-                (text, now, request_id, qid))
-            if upd.rowcount:
-                _event(con, request_id, "answer_persisted", {"qid": qid, "via": "consumed-invocation"})
-                left = con.execute(
-                    "SELECT COUNT(*) AS n FROM questions WHERE request_id=? AND status='pending'",
-                    (request_id,)).fetchone()["n"]
-                if left == 0 and (job_status == "question_pending" or (
-                        job_status == "blocked"
-                        and str(job_row["block_reason"] or "").startswith("planner_"))):
-                    con.execute("UPDATE jobs SET status='running', updated_at=? WHERE request_id=?",
-                                (now, request_id))
-                    job_status = "running"
-                applied = "answer-persisted"
-        # Observed-model gate for Codex dispatch turns in recovery, before
-        # any failure classification or envelope, using the measured
-        # observed_model above consistently. A known mismatch blocks with
-        # model_mismatch and no envelope. Failed turns gate alike, beating
-        # the generic failure handling below.
-        if not measure_failed and live_job and is_dispatch \
-                and getattr(harness, "name", None) == "codex":
-            try:
-                _m_observed = _measured_observed
-                _req_route = inv.get("requested_route")
-                if not (isinstance(_req_route, str) and _req_route in policy.ROUTES):
-                    _meta_route = inv_meta.get("route")
-                    if isinstance(_meta_route, str) and _meta_route in policy.ROUTES:
-                        _req_route = _meta_route
-                    else:
-                        try:
-                            _st = json.loads(job_row["controller_state"] or "{}") \
-                                if job_row is not None else {}
-                        except ValueError:
-                            _st = {}
-                        _dr = _st.get("dispatch_route") if isinstance(_st, dict) else None
-                        if isinstance(_dr, str) and _dr in policy.ROUTES:
-                            _req_route = _dr
-                        else:
-                            _req_route = None
-                _req_model = policy.ROUTES[_req_route].get("model") if _req_route else None
-                _obs_model = _m_observed
-                if isinstance(_req_model, str) and _req_model \
-                        and isinstance(_obs_model, str) and _obs_model:
-                    if _req_model != _obs_model:
-                        _mm = f"model_mismatch: requested={_req_model} observed={_obs_model}"
-                        con.execute(
-                            "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
-                            " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
-                            (_mm, now, request_id))
-                        _event(con, request_id, "blocked", {"reason": _mm[:120]})
-                        applied = "blocked"
-                        model_gate_applied = True
-            except Exception as e:
-                try:
-                    _detail = f"{type(e).__name__}: {str(e)[:150]}"
-                except Exception:
-                    _detail = "observation failed"
-                _oreason = f"model_observation_failed: {kind} {_detail}"[:300]
-                con.execute(
-                    "UPDATE jobs SET status='blocked', block_reason=?, updated_at=?"
-                    " WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
-                    (_oreason, now, request_id))
-                _event(con, request_id, "blocked", {"reason": _oreason[:120]})
-                applied = "blocked"
-                model_gate_applied = True
-        planner_reason = None
-        if not measure_failed and live_job and inv_meta.get("qid") is not None:
-            # A planner turn matters only while its question is still open;
-            # a question answered meanwhile (public `answer`) wins.
-            cb_qid = inv_meta.get("qid")
-            still_open = con.execute(
-                "SELECT 1 FROM questions WHERE request_id=? AND qid=? AND status='pending'",
-                (request_id, cb_qid)).fetchone() is not None
-            if still_open and not planner_answer:
-                planner_reason = harness.callback_failure_reason(
-                    kind, rc, stdout_text, dict(job_row), inv_meta)
-        if planner_reason:
-            con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
-                        " AND status NOT IN ('succeeded','failed','cancelled')",
-                        (planner_reason, now, request_id))
-            _event(con, request_id, "blocked", {"reason": planner_reason[:120]})
-            applied = "blocked"
-        elif not model_gate_applied and live_job and is_dispatch and (not turn_ok or not thread_ok) \
-                and not runtime.is_runtime_missing_row(inv):
-            # The controller would have blocked on this result; recovery
-            # records the same durable, sticky reason instead of leaving
-            # the job running without an owner. Muse turns are left to the
-            # restarted controller, which may switch routes on evidence.
-            # A row with explicit never-started runtime-missing evidence is
-            # exempt: the restarted controller remakes that action fresh on
-            # the installed runtime instead of inheriting a sticky block.
-            reason = (f"luna_task_mismatch: consumed {kind} reported {str(sid or 'no thread')[:24]}"
-                      if turn_ok and not thread_ok else f"{kind}_failed rc={rc} (consumed by recovery)")
-            con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
-                        " AND status NOT IN ('succeeded','failed','cancelled')", (reason, now, request_id))
-            _event(con, request_id, "blocked", {"reason": reason[:120]})
-            applied = "blocked"
-        if not model_gate_applied and job_row is not None and job_status not in store.TERMINAL \
-                and isinstance(envelope, dict) and turn_ok and thread_ok and not cancelled:
-            action_name = envelope.get("action")
-            # Persist the Luna envelope before any completion effect.
-            st = {}
-            if job_row["controller_state"]:
-                try:
-                    st = json.loads(job_row["controller_state"]) or {}
-                except ValueError:
-                    st = {}
-            st["phase"] = "consumed-invocation"
-            st["last_action"] = envelope
-            st["last_action_name"] = action_name
-            st["seq"] = int(st.get("seq") or 0) + 1
-            # One job owns one PR: the envelope's identity is preserved
-            # here only after the live check passed (pre_refusal is None
-            # covers the bound proof, acceptance, PR presence, identity,
-            # and live-PR gates computed above), so an invalid first URL
-            # never poisons the job and a corrected URL is accepted
-            # instead of refused as a duplicate. Correction and recovery
-            # update the existing PR instead of opening another.
-            _cur = envelope.get("pr_url") if isinstance(envelope, dict) else None
-            if action_name == "completion" and pre_refusal is None \
-                    and isinstance(_cur, str) and _cur.strip() and not (
-                    isinstance(st.get("pr_url"), str) and st["pr_url"].strip()):
-                st["pr_url"] = _cur.strip()
-                _event(con, request_id, "pr_identity_preserved",
-                       {"pr_url": _cur.strip()[:200]})
-            con.execute(
-                "UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
-                (json.dumps(st, sort_keys=True), now, request_id),
-            )
-            _event(con, request_id, "luna_action",
-                   {"action": str(action_name or "unknown")[:64], "phase": "consumed-invocation"})
-            if action_name == "completion":
-                # A job can never succeed while its last implementation
-                # turn's proof failed: refuse the envelope, record the
-                # refusal, and block with its reason. The same bound-proof,
-                # acceptance, PR-presence, PR-identity, and live-PR gates
-                # as the live path apply here (precomputed above without
-                # the write lock); without a remote the job succeeds as
-                # before, and experiment and replay jobs skip the PR gate.
-                _refusal = pre_refusal
-                if _refusal is not None:
-                    con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
-                                " AND status NOT IN ('succeeded','failed','cancelled')",
-                                (_refusal, now, request_id))
-                    _event(con, request_id, "completion_refused",
-                           {"reason": _refusal[:200], "via": "consumed-invocation"})
-                    _event(con, request_id, "blocked", {"reason": _refusal[:120]})
-                    applied = "blocked"
-                else:
-                    output = str(envelope.get("output") or "done")
-                    _pr = (envelope.get("pr_url") if isinstance(envelope, dict) else None)
-                    _pr_norm = _pr if isinstance(_pr, str) and _pr.strip() else None
-                    _acc = (envelope.get("acceptance_evidence")
-                            if isinstance(envelope, dict) else None)
-                    _acc_norm = _acc if isinstance(_acc, str) and _acc.strip() else None
-                    result = {"ok": True, "output": json.dumps({"output": output,
-                                                                "artifact": envelope.get("artifact"),
-                                                                "pr_url": _pr_norm,
-                                                                "acceptance_evidence": _acc_norm,
-                                                                "head_commit": head_commit},
-                                                               sort_keys=True)}
-                    con.execute(
-                        "UPDATE jobs SET status='succeeded', result_json=?, error_class=NULL,"
-                        " head_commit=?, updated_at=? WHERE request_id=?",
-                        (json.dumps(result), head_commit, now, request_id),
-                    )
-                    _event(con, request_id, "completed", {"via": "consumed-invocation"})
-                    applied = "completed"
-            elif action_name == "planner_question":
-                qid = str(envelope.get("qid") or envelope.get("question_id") or "q1")
-                prompt = str(envelope.get("prompt") or envelope.get("question") or
-                             envelope.get("text") or "Planner input requested.")
-                existing_q = con.execute(
-                    "SELECT qid, prompt FROM questions WHERE request_id=? AND qid=?",
-                    (request_id, qid),
-                ).fetchone()
-                if existing_q is not None and (existing_q["prompt"] or "") != prompt:
-                    # A reused qid with a different prompt is a conflict, on
-                    # the live path and in recovery alike: block with the
-                    # documented reason instead of accepting the new prompt.
-                    # Clear it with `questions --clear QID` or use a new qid.
-                    reason = (f"planner_question_conflict: {qid} was stored for a different prompt; "
-                              f"clear it with `questions --clear {qid}` or use a new qid")
-                    con.execute("UPDATE jobs SET status='blocked', block_reason=?, updated_at=? WHERE request_id=?"
-                                " AND status NOT IN ('succeeded','failed','cancelled')",
-                                (reason, now, request_id))
-                    _event(con, request_id, "blocked", {"reason": reason[:120]})
-                    applied = "blocked"
-                else:
-                    if existing_q is None:
-                        con.execute(
-                            "INSERT INTO questions(request_id,qid,prompt,status,created_at)"
-                            " VALUES(?,?,?,'pending',?)",
-                            (request_id, qid, prompt, now),
-                        )
-                    if job_status != "question_pending":
-                        con.execute(
-                            "UPDATE jobs SET status='question_pending', updated_at=? WHERE request_id=?",
-                            (now, request_id),
-                        )
-                    _event(con, request_id, "question_posted", {"qid": qid, "via": "consumed-invocation"})
-                    applied = "question-persisted"
-        _event(con, request_id, "invocation_consumed",
-               {"invocation_id": inv["invocation_id"][:16], "applied": applied, "rc": rc})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    # Recovery measurement already ran inside the transaction above: no
-    # post-commit repeat. A measurement failure blocks in-transaction
-    # before any envelope, so no completion can commit.
-    if applied == "completed":
-        try:
-            root = store.ensure_state_dir(state_dir)
-            _mpr = (envelope or {}).get("pr_url") if isinstance(envelope, dict) else None
-            _mpr_norm = _mpr if isinstance(_mpr, str) and _mpr.strip() else None
-            _macc = (envelope or {}).get("acceptance_evidence") \
-                if isinstance(envelope, dict) else None
-            _macc_norm = _macc if isinstance(_macc, str) and _macc.strip() else None
-            _mirror_result(state_dir, request_id,
-                json.dumps({"request_id": request_id, "status": "succeeded",
-                            "result": {"ok": True, "output": (envelope or {}).get("output"),
-                                       "artifact": (envelope or {}).get("artifact"),
-                                       "pr_url": _mpr_norm,
-                                       "acceptance_evidence": _macc_norm,
-                                       "head_commit": head_commit}}),
-            )
-        except OSError:
-            pass
-    return {"action": applied, "invocation_id": inv["invocation_id"], "rc": rc}
-
-
-def _capture_invocation_sessions(state_dir, request_id: str,
-                                 invocations: list[dict] | None = None) -> bool:
-    """Read durable output files of live invocations and persist any IDs found."""
-    if invocations is None:
-        invocations = _any_live_invocation(state_dir, request_id)
-    if not invocations:
-        return False
-    # Also scan cancelling invocations that may have emitted IDs before being stopped.
-    seen_ids = {inv["invocation_id"] for inv in invocations}
-    cancelling = [
-        inv for inv in _list_invocations(state_dir, request_id, state="cancelling")
-        if inv["invocation_id"] not in seen_ids
-    ]
-    invocations = invocations + cancelling
-    job = get_job(state_dir, request_id)
-    captured = False
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        for inv in invocations:
-            if inv.get("session_id"):
-                captured = True
-                continue
-            try:
-                stdout = Path(inv["stdout_path"]).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                stdout = ""
-            try:
-                stderr = Path(inv["stderr_path"]).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                stderr = ""
-            sid, skind = _parse_session_from_output(inv["kind"], stdout, stderr, job)
-            if sid:
-                captured = True
-                con.execute(
-                    "UPDATE invocations SET session_id=?, session_kind=? WHERE invocation_id=?",
-                    (sid, skind, inv["invocation_id"]),
-                )
-                try:
-                    cap_meta = json.loads(inv.get("meta_json") or "{}") or {}
-                except ValueError:
-                    cap_meta = {}
-                harnesses.harness_for(inv["kind"]).record_session(
-                    con, request_id, sid, skind, inv["kind"], job, cap_meta, _utcnow())
-                _event(con, request_id, "invocation_session_reconciled",
-                       {"invocation_id": inv["invocation_id"][:16],
-                        "session_kind": skind, "session": sid[:24]})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-    return captured
-
-
-def _mark_invocations_cancelling(state_dir, request_id: str) -> None:
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "UPDATE invocations SET state='cancelling' WHERE request_id=? AND state='running'",
-            (request_id,),
-        )
-        _event(con, request_id, "invocations_cancelling", {})
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-
-def _terminate_invocations(state_dir, request_id: str,
-                           owner=None, signal_no: int = signal.SIGTERM) -> None:
-    """Signal every owned child and supervisor group, and the lease holder.
-
-    Every target is checked against its recorded start identity first, so
-    a reused PID of an unrelated process is never signalled.
-    """
-    for inv in _list_invocations(state_dir, request_id):
-        if inv.get("state") not in LIVE_INVOCATION_STATES:
-            continue
-        inv = _with_child_record(inv)
-        _signal_group(inv.get("pgid"), inv.get("pid"), inv.get("process_start"), signal_no)
-        _signal_group(inv.get("supervisor_pgid"), inv.get("supervisor_pid"),
-                      inv.get("supervisor_start"), signal_no)
-        _signal_pid(inv.get("pid"), inv.get("process_start"), signal_no)
-        _signal_pid(inv.get("supervisor_pid"), inv.get("supervisor_start"), signal_no)
-    if owner is not None:
-        _signal_pid(owner.get("owner_pid"), owner.get("owner_start"), signal_no)
-
-
-def _wait_invocations_dead(state_dir, request_id: str, timeout: float = 10.0) -> bool:
-    """Wait until all owned child process groups are confirmed stopped."""
-    end = time.monotonic() + max(0.0, timeout)
-    while time.monotonic() < end:
-        _reconcile_dead_invocations(state_dir, request_id)
-        live = _any_live_invocation(state_dir, request_id)
-        unresolved = _any_unresolved_invocation(state_dir, request_id)
-        if not live and not unresolved:
-            consume_finished_invocations(state_dir, request_id)
-            return True
-        time.sleep(0.1)
-    return False
-
-
-def _raise_if_unowned_invocation(state_dir, request_id: str) -> None:
-    """Block a new controller only when ownership cannot be established.
-
-    A live supervised child is adopted by the next controller, which
-    waits for that action's durable result instead of starting a copy.
-    Unresolved or orphaned ownership still blocks; run recover.
-    """
-    for inv in _list_invocations(state_dir, request_id):
-        own = _invocation_ownership(inv)
-        if own in ("unresolved", "orphaned", "never_started"):
-            raise OwnershipError(
-                f"job {request_id} has {own} invocation {inv['invocation_id']}; run recover")
-
-
-def _raise_if_live_invocation(state_dir, request_id: str) -> None:
-    """Block duplicate launches while any owned child process group lives.
-
-    Read-only with respect to durable metadata: it must not start a write
-    transaction because callers already hold the main lease transaction.
-    Unresolved NULL-pid ownership also blocks; it is never treated as death.
-    """
-    unresolved = _any_unresolved_invocation(state_dir, request_id)
-    if unresolved:
-        raise OwnershipError(
-            f"job {request_id} has unresolved invocation {unresolved[0]['invocation_id']}; run recover")
-    live = _any_live_invocation(state_dir, request_id)
-    if not live:
-        return
-    has_session = any(inv.get("session_id") for inv in live)
-    if has_session:
-        raise OwnershipError(
-            f"job {request_id} has live invocation {live[0]['invocation_id']}; refusing duplicate launch")
-    raise OwnershipError(
-        f"job {request_id} has live invocation without handshake; run recover")
-
-
 def _drain_owned_children(state_dir, request_id: str, owner=None) -> bool:
-    """Signal and wait for all owned child process groups to stop.
+    """Signal the controller lease holder to stop.
 
-    Returns True only after every owned process group is confirmed dead.
+    Turns run as T3 threads on the server, so the controller is the only
+    owned process besides the proof group (drained separately). The
+    signal is checked against the recorded start identity first, so a
+    reused PID of an unrelated process is never signalled.
     """
-    _mark_invocations_cancelling(state_dir, request_id)
-    _terminate_invocations(state_dir, request_id, owner, signal.SIGTERM)
-    if _wait_invocations_dead(state_dir, request_id, timeout=10.0):
-        return True
-    _terminate_invocations(state_dir, request_id, owner, signal.SIGKILL)
-    if _wait_invocations_dead(state_dir, request_id, timeout=5.0):
-        return True
-    _reconcile_dead_invocations(state_dir, request_id)
-    consume_finished_invocations(state_dir, request_id)
-    return (not _any_live_invocation(state_dir, request_id)
-            and not _any_unresolved_invocation(state_dir, request_id))
+    del state_dir, request_id
+    if owner is not None:
+        _signal_pid(owner.get("owner_pid"), owner.get("owner_start"), signal.SIGTERM)
+    return True
 
 
 def get_job(state_dir, request_id: str) -> dict:
@@ -2098,20 +725,15 @@ def exhaustion_context(state_dir, request_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 JOB_KINDS = ("ordinary", "experiment", "replay")
-# The planner callback resumes the saved planner session in its own
-# harness (Claude --resume, Codex exec resume, OpenCode run --session,
-# Grok Build --resume read-only in the user's own Grok home); only an
-# explicit recorded fallback for an unresumable Grok session answers
-# from a fresh read-only session seeded with the stored handoff summary.
+# The harness running inside the planner's T3 thread, recorded for
+# evidence only: questions and the terminal report go to the T3 thread.
 PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok", "t3")
+T3_THREAD_REQUIRED = "submit requires --planner-t3-thread: jobs run as T3 threads"
 
 
 def _dispatcher_saved(job) -> bool:
-    """A saved dispatcher to continue: the Codex task id on the direct
-    path, or the dispatcher child thread on the T3 path (#106)."""
+    """A saved dispatcher child thread to continue (#106)."""
     try:
-        if job["codex_task_id"]:
-            return True
         planner_thread = job["planner_t3_thread"]
         state = json.loads(job["controller_state"] or "{}")
     except (KeyError, IndexError, TypeError, ValueError):
@@ -2135,10 +757,6 @@ def _workspace_head(workspace: str | None) -> str | None:
     sha = (out.stdout or "").strip()
     return sha if out.returncode == 0 and len(sha) >= 7 else None
 
-
-def harness_version_for(kind: str) -> str | None:
-    """``<binary> --version`` once per process for the harness behind a kind."""
-    return harnesses.harness_for(kind).version()
 
 def terminal_class_for(rc, result_obj, crashed: bool = False,
                        cancel_requested: bool = False) -> str:
@@ -2256,178 +874,11 @@ def failure_class_for(signal=None, proof_class=None, rc=None,
     return "unknown"
 
 
-def _runner_result_line(stdout: str) -> dict:
-    found = {}
-    for line in (stdout or "").splitlines():
-        if line.startswith("RUNNER_RESULT "):
-            try:
-                found = json.loads(line[len("RUNNER_RESULT "):])
-            except ValueError:
-                continue
-    return found if isinstance(found, dict) else {}
-
-
-def measure_output(kind: str, stdout: str, stderr: str, meta: dict | None = None,
-                   inv_ctx: dict | None = None) -> tuple:
-    """(usage, observed_model, observed_variant, native_ids) from the harness.
-
-    Counters are copied verbatim under a ``source`` label and never folded;
-    a harness that reports nothing leaves usage None. Model and variant stay
-    separate; the harness seam is the single place that knows them.
-    ``inv_ctx`` carries request/invocation identity (request_id,
-    invocation_id, state_dir) for harnesses that read their own records
-    (Codex rollouts); it never enters public measurement fields."""
-    measured = harnesses.harness_for(kind).measure(kind, stdout, stderr, meta or {}, inv_ctx)
-    if len(measured) == 3:
-        usage, observed, ids = measured
-        return usage, observed, None, ids
-    return measured
-
-def _compute_invocation_measurement(state_dir, request_id: str, invocation_id: str,
-                                     kind: str, stdout: str, stderr: str,
-                                     meta: dict, started_at, ended_at,
-                                     rc, result_obj, crashed: bool = False) -> dict:
-    """Full measurement values for one finished invocation, without any write.
-
-    Shared by the live ``_measure_invocation`` path and recovery, so both
-    persist the same fields: elapsed time, terminal class, usage, observed
-    model and variant, native identities, longest silence, tools, and
-    skills. Expected missing or unreadable rollout cases stay unknown
-    inside the harness file-read boundary; any other observation failure
-    propagates so the caller blocks safely.
-    """
-    inv_ctx = {"state_dir": state_dir, "request_id": request_id,
-               "invocation_id": invocation_id}
-    usage, observed, variant, ids = measure_output(kind or "", stdout, stderr, meta or {},
-                                                   inv_ctx)
-    started = _parse_ts(started_at)
-    ended = _parse_ts(ended_at) or time.time()
-    elapsed = round(max(0.0, ended - started), 3) if started is not None else None
-    try:
-        _cancel_intent = bool(get_job(state_dir, request_id).get("cancel_requested"))
-    except Exception:
-        _cancel_intent = False
-    tclass = terminal_class_for(rc, result_obj, crashed=crashed,
-                                cancel_requested=_cancel_intent)
-    longest = None
-    if isinstance(result_obj, dict):
-        # Owned-server turns nest the drive result under ``envelope``; CLI
-        # turns carry it top-level. Either way the longest observed silence
-        # lands on the invocation row for window tuning.
-        raw_longest = result_obj.get("longest_silence_secs")
-        if raw_longest is None and isinstance(result_obj.get("envelope"), dict):
-            raw_longest = result_obj["envelope"].get("longest_silence_secs")
-        try:
-            longest = float(raw_longest) if raw_longest is not None else None
-        except (TypeError, ValueError):
-            longest = None
-        if longest is not None and longest < 0:
-            longest = None
-    tools: list = []
-    try:
-        if isinstance(result_obj, dict):
-            for container in (result_obj,
-                              result_obj.get("envelope") if isinstance(result_obj.get("envelope"), dict) else {}):
-                if not isinstance(container, dict):
-                    continue
-                for key in ("tools_called", "tools"):
-                    val = container.get(key)
-                    if isinstance(val, list) and all(isinstance(v, str) for v in val):
-                        tools = sorted(set(tools) | set(val))
-                        break
-    except Exception:
-        pass
-    try:
-        tools_json = json.dumps(tools, sort_keys=True)
-    except Exception:
-        tools_json = "[]"
-    try:
-        from . import kits as _kits_meas
-        _observed = _kits_meas.observed_skills_for_invocation(
-            state_dir, request_id, invocation_id)
-    except Exception:
-        _observed = None
-    try:
-        _skills_json = json.dumps(_observed, sort_keys=True) if isinstance(_observed, list) else None
-    except Exception:
-        _skills_json = None
-    return {"elapsed": elapsed, "terminal_class": tclass, "usage": usage,
-            "observed": observed, "variant": variant, "ids": ids,
-            "longest": longest, "tools_json": tools_json,
-            "skills_json": _skills_json}
-
-
-def _write_invocation_measurement(con, invocation_id: str, m: dict) -> None:
-    """Persist a computed measurement on an open connection, no commit."""
-    con.execute(
-        "UPDATE invocations SET elapsed_secs=?, terminal_class=?, usage_json=?,"
-        " observed_model=COALESCE(?, observed_model),"
-        " observed_variant=COALESCE(?, observed_variant),"
-        " native_ids_json=?, schema_version=?,"
-        " longest_silence_secs=COALESCE(?, longest_silence_secs),"
-        " tools_json=COALESCE(NULLIF(tools_json,'[]'), ?)"
-        " WHERE invocation_id=?",
-        (m["elapsed"], m["terminal_class"],
-         json.dumps(m["usage"], sort_keys=True) if m["usage"] is not None else None,
-         m["observed"], m["variant"],
-         json.dumps(m["ids"], sort_keys=True) if m["ids"] else None,
-         store.SCHEMA_VERSION, m["longest"], m["tools_json"], invocation_id))
-    if m["skills_json"] is not None:
-        con.execute(
-            "UPDATE invocations SET skills_json=? WHERE invocation_id=?",
-            (m["skills_json"], invocation_id))
-    # First measurement wins for tools when the row still holds the
-    # insert-time empty list; later measures keep observed tools.
-    con.execute(
-        "UPDATE invocations SET tools_json=? WHERE invocation_id=?"
-        " AND (tools_json IS NULL OR tools_json='[]')",
-        (m["tools_json"], invocation_id))
-
-
-def _measure_invocation(state_dir, request_id: str, invocation_id: str, crashed: bool = False) -> None:
-    """Fill elapsed time, terminal class, usage, observed model and variant,
-    and native identities on a finished invocation from its own files."""
-    rows = [i for i in _list_invocations(state_dir, request_id) if i["invocation_id"] == invocation_id]
-    if not rows:
-        return
-    inv = rows[0]
-    stdout, stderr = _read_invocation_output(inv)
-    try:
-        result_obj = json.loads(inv.get("result_json") or "null")
-    except ValueError:
-        result_obj = None
-    try:
-        meta = json.loads(inv.get("meta_json") or "{}") or {}
-    except ValueError:
-        meta = {}
-    m = _compute_invocation_measurement(
-        state_dir, request_id, invocation_id, inv.get("kind") or "",
-        stdout, stderr, meta, inv.get("started_at"), inv.get("ended_at"),
-        inv.get("rc"), result_obj, crashed=crashed)
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        _write_invocation_measurement(con, invocation_id, m)
-        con.execute("COMMIT")
-    except Exception:
-        # A failed observed_model write must never read as unknown and let a
-        # completion through: roll back and propagate so the live controller
-        # and recovery paths block with evidence before any envelope.
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        con.close()
-
-
 def invocation_measurements(state_dir, request_id: str) -> list[dict]:
     """Per-invocation measurements for ``status`` and ``result``.
 
-    Agent Observer mapping: kit identity and hash, supply mechanism
-    (hook, runner, none), hash of the supplied block, skills loaded, and
-    tools called, alongside the existing route, model, and usage fields.
+    Agent Observer mapping: route, stage, timing, class, and usage per
+    recorded row (verification attempts, and older rows as stored).
     """
     out = []
     for inv in _list_invocations(state_dir, request_id):
@@ -2444,60 +895,13 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
         except ValueError:
             skills = None
         if not isinstance(skills, list):
-            # Backfill from the kit row when the invocation predates the
-            # skills column: the kit's skills are what the session loaded.
-            skills = None
-            try:
-                from . import direction as _direction
-                _kn, _kh, _sk = _direction.kit_for_invocation(
-                    inv.get("requested_route"), inv.get("stage"))
-                skills = _sk
-            except Exception:
-                skills = []
-        # Observed wins when a materialized kit recorded it: the ledger
-        # reports what the session could actually invoke (the kit dir's
-        # skills/*/SKILL.md names plus OpenCode's built-in on the owned
-        # server), not the policy list.
-        try:
-            from . import kits as _kits_obs
-            _obs = _kits_obs.observed_skills_for_invocation(
-                state_dir, request_id, inv.get("invocation_id") or "")
-            if isinstance(_obs, list):
-                skills = _obs
-        except Exception:
-            pass
+            skills = []
         try:
             tools = json.loads(inv.get("tools_json") or "null")
         except ValueError:
             tools = None
         if not isinstance(tools, list):
             tools = []
-        try:
-            from . import kits as _kits
-            _kit_contents = None
-            _kit_auth = {"linked": [], "missing": []}
-            try:
-                _dirs = _kits.kit_dirs_for_invocation(
-                    state_dir, request_id, inv.get("invocation_id") or "")
-            except Exception:
-                _dirs = []
-            for _d in _dirs or []:
-                try:
-                    _c = _kits.kit_contents_for_ledger(_d)
-                except Exception:
-                    _c = None
-                if isinstance(_c, dict):
-                    _kit_contents = _c
-                    _auth = _c.get("auth")
-                    if isinstance(_auth, dict):
-                        _kit_auth = {"linked": [v for v in (_auth.get("linked") or [])
-                                                if isinstance(v, str)],
-                                     "missing": [v for v in (_auth.get("missing") or [])
-                                                 if isinstance(v, str)]}
-                    break
-        except Exception:
-            _kit_contents = None
-            _kit_auth = {"linked": [], "missing": []}
         out.append({"invocation": inv["invocation_id"][:8], "kind": inv.get("kind"),
                     "stage": inv.get("stage"), "requested_route": inv.get("requested_route"),
                     "policy_version": inv.get("policy_version"), "reason": inv.get("reason"),
@@ -2515,8 +919,7 @@ def invocation_measurements(state_dir, request_id: str) -> list[dict]:
                     "supply_reason": inv.get("direction_reason"),
                     "direction_hash": inv.get("direction_hash"),
                     "direction_status": inv.get("direction_status"),
-                    "skills_loaded": skills, "tools_called": tools,
-                    "kit_contents": _kit_contents, "kit_auth": _kit_auth})
+                    "skills_loaded": skills, "tools_called": tools})
     return out
 
 
@@ -2576,29 +979,24 @@ def submit(state_dir, request_id: str, task, workspace: str,
            planner_effort: str | None = None,
            lane: str | None = None,
            job_kind: str = "ordinary", replay_of: str | None = None,
-           planner_harness: str = "claude",
+           planner_harness: str = "t3",
            handoff_summary: str | None = None,
            planner_t3_thread: str | None = None,
            t3_server_url: str | None = None) -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
-    Built-in defaults mean no executor/callback commands are required:
-    only the prepared task, workspace, stable request ID, and original
-    planner session ID are needed. The planner session may live in any
-    supported harness (claude, codex, opencode, grok, t3); its harness and
-    session ID are recorded so dispatcher questions wake it there.
-    Planner model/effort default to the policy's planning route and may
-    be overridden explicitly. The handoff summary is stored on the job
-    (explicit argument wins, else derived from the task packet) so a
-    callback prompt can carry it. Planner callbacks run in the job
-    workspace. ``timeout_secs`` is a legacy compatibility slot, recorded
-    but never enforced: jobs carry no age deadline since #88.
+    Only the prepared task, workspace, stable request ID, planner session
+    ID, and planner T3 thread are needed. Jobs run as T3 threads
+    (toolboxmd/model-router#106, #110): dispatcher and worker turns run as
+    T3 child threads under ``planner_t3_thread``, and questions and the
+    terminal state are posted into it as messages. The planner harness
+    (the harness inside that thread) is recorded for evidence only. The
+    handoff summary is stored on the job (explicit argument wins, else
+    derived from the task packet) so the questions can carry it.
+    ``timeout_secs`` is a legacy compatibility slot, recorded but never
+    enforced: jobs carry no age deadline since #88.
 
-    ``planner_t3_thread`` selects the T3 execution path
-    (toolboxmd/model-router#106): dispatcher and worker invocations run
-    as T3 child threads of that planner thread, and the terminal state
-    is posted back into it as a message, replacing the harness-specific
-    callback CLIs. ``t3_server_url`` optionally pins the T3 server;
+    ``t3_server_url`` optionally pins the T3 server;
     otherwise discovery applies (explicit flag, T3_SERVER_URL, default).
     The bearer token never lands in the ledger: it comes from
     T3_SERVER_TOKEN or ``t3 auth session issue`` at turn time.
@@ -2649,17 +1047,16 @@ def submit(state_dir, request_id: str, task, workspace: str,
         raise ValueError("replay_of applies to replay jobs only")
     if planner_harness not in PLANNER_HARNESSES:
         raise ValueError(f"planner_harness must be one of {', '.join(PLANNER_HARNESSES)}")
-    # T3 execution path (toolboxmd/model-router#106): naming a planner T3
-    # thread selects it. The token never lands in the ledger.
-    if planner_t3_thread is not None:
-        planner_t3_thread = t3exec.validate_thread_id(planner_t3_thread)
+    # Jobs run as T3 threads of the planner thread (#110). The token never
+    # lands in the ledger.
+    if not planner_t3_thread:
+        raise ValueError(T3_THREAD_REQUIRED)
+    planner_t3_thread = t3exec.validate_thread_id(planner_t3_thread)
     t3_url = None
     if t3_server_url is not None:
         t3_url = t3_server_url.strip().rstrip("/")
         if not t3_url:
             raise ValueError("t3_server_url must not be blank")
-    if t3_url is not None and planner_t3_thread is None:
-        raise ValueError("t3_server_url needs --planner-t3-thread: it pins the T3 server only")
     # Planner defaults come from the first route in the policy's planning
     # stage; explicit overrides are preserved verbatim. Never fork a new
     # session implicitly.
@@ -2813,16 +1210,6 @@ def submit(state_dir, request_id: str, task, workspace: str,
             if _paths_overlap(other["workspace"], ws):
                 clash = other
                 break
-        if clash is None:
-            for other in con.execute(
-                    "SELECT DISTINCT i.request_id, j.workspace FROM invocations i"
-                    " JOIN jobs j ON j.request_id=i.request_id"
-                    " WHERE i.state IN ('running','cancelling')").fetchall():
-                if _paths_overlap(other["workspace"], ws) and any(
-                        _invocation_ownership(inv) in ("live", "unresolved", "orphaned")
-                        for inv in _list_invocations(state_dir, other["request_id"])):
-                    clash = other
-                    break
         if clash is not None:
             con.execute("ROLLBACK")
             raise WorkspaceConflictError(
@@ -2897,7 +1284,7 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      launcher=None, spawn=None,
                      lane: str | None = None,
                      job_kind: str = "ordinary", replay_of: str | None = None,
-                     planner_harness: str = "claude",
+                     planner_harness: str = "t3",
                      handoff_summary: str | None = None,
                      planner_t3_thread: str | None = None,
                      t3_server_url: str | None = None) -> dict:
@@ -2928,7 +1315,6 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
     # A repeated submission returns the existing job; it never forces a
     # second launch (use recover for ownership reconciliation).
     try:
-        _raise_if_unowned_invocation(state_dir, request_id)
         start_controller(state_dir, request_id, launcher=launcher, spawn=spawn)
     except (OwnershipError, BlockedError, TerminalError):
         pass  # the persisted job is the answer; recover reconciles ownership
@@ -2947,7 +1333,6 @@ def start_controller(state_dir, request_id: str, launcher=None, spawn=None) -> d
     if launcher is not None and spawn is None:
         return dict(launcher(state_dir, request_id))
     root = store.ensure_state_dir(state_dir)
-    _abandon_never_started(state_dir, request_id)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -2964,13 +1349,6 @@ def start_controller(state_dir, request_id: str, launcher=None, spawn=None) -> d
         if job["status"] == "blocked":
             con.execute("ROLLBACK")
             raise BlockedError(f"job {request_id} blocked: {job['block_reason']}")
-        # Durable child ownership: never launch while ownership of a prior
-        # child is unknown. A live supervised child is adopted, not copied.
-        try:
-            _raise_if_unowned_invocation(state_dir, request_id)
-        except OwnershipError:
-            con.execute("ROLLBACK")
-            raise
         if job["owner_token"]:
             ident = store.read_worker_identity(root, request_id)
             if ident and ident.get("token") == job["owner_token"] \
@@ -3356,15 +1734,6 @@ def answer(state_dir, request_id: str, qid: str, answer_text: str,
         con2.close()
 
 
-def _terminate_pid(pid: int | None) -> None:
-    if pid is None:
-        return
-    try:
-        os.kill(int(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, ValueError, OSError):
-        return
-
-
 def cancel(state_dir, request_id: str) -> dict:
     con = store.connect(state_dir)
     try:
@@ -3538,8 +1907,6 @@ def fail(state_dir, request_id: str, token: str, error, output: str | None = Non
     return _complete_with_token(state_dir, request_id, token, False, output, error)
 
 
-
-
 def _known_tokens(con: sqlite3.Connection, request_id: str) -> set[str]:
     rows = con.execute(
         "SELECT start_token FROM launches WHERE request_id=?", (request_id,)
@@ -3553,14 +1920,13 @@ def _assess_runtime(state_dir, request_id: str) -> tuple[bool, str, dict | None,
     Returns (compatible, reason, old_runtime, new_runtime) and records a
     ``runtime_assessed`` event with the actual runtime and policy used
     before and after. ``old_runtime`` is the newest provenance recorded
-    by submit or an invocation, or None when nothing recorded one:
+    by submit or a recovery, or None when nothing recorded one:
     reported as unknown, never invented. Only NotFoundError propagates;
     any other assessment failure is reported as incompatibility so the
     work is retained instead of migrated.
     """
     new = runtime.installed_runtime()
     job = get_job(state_dir, request_id)
-    invs = _list_invocations(state_dir, request_id)
     con = store.connect(state_dir)
     try:
         events = [dict(r) for r in con.execute(
@@ -3569,9 +1935,9 @@ def _assess_runtime(state_dir, request_id: str) -> tuple[bool, str, dict | None,
             (request_id,)).fetchall()]
     finally:
         con.close()
-    old = runtime.latest_provenance(invs, events)
+    old = runtime.latest_provenance(events)
     try:
-        ok, reason = runtime.check_compatible(dict(job), invs)
+        ok, reason = runtime.check_compatible(dict(job))
     except Exception as e:  # noqa: BLE001 - retain work, never migrate blind
         ok, reason = False, (f"compatibility_check_failed: {type(e).__name__}: {e}; "
                              "retaining work, refusing to migrate")
@@ -3592,99 +1958,24 @@ def _assess_runtime(state_dir, request_id: str) -> tuple[bool, str, dict | None,
     return ok, reason, old, new
 
 
-def _record_runtime_recovered(state_dir, request_id: str, old, new, trigger: str) -> None:
-    """Record a runtime transfer: provenance before and after, identities kept."""
-    try:
-        job = get_job(state_dir, request_id)
-    except NotFoundError:
-        return
-    payload = {"trigger": trigger, "old_runtime": old, "new_runtime": new,
-               "preserved": {"route": job.get("route"), "policy_id": job.get("policy_id"),
-                             "task_hash": job.get("task_hash"),
-                             "codex_task_id": bool(job.get("codex_task_id")),
-                             "opencode_session_id": bool(job.get("opencode_session_id")),
-                             "grok_session_id": bool(job.get("grok_session_id"))}}
-    con = store.connect(state_dir)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        _event(con, request_id, "runtime_recovered", payload)
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-    finally:
-        con.close()
-
-
-def _has_runtime_missing_failure(state_dir, request_id: str) -> bool:
-    """A dispatch action whose newest attempt never started for a missing runtime.
-
-    Grouped per action key: only the newest non-abandoned row decides.
-    An older missing-runtime row never counts after a newer attempt for
-    the same action completed or otherwise superseded it, so a repaired
-    retry stops reporting recovery once it succeeds (no false
-    ``runtime_recovered`` events on later recoveries).
-    """
-    by_key: dict[str, list[dict]] = {}
-    for i in _list_invocations(state_dir, request_id):
-        if i.get("state") == "abandoned" or not i.get("action_key"):
-            continue
-        by_key.setdefault(i["action_key"], []).append(i)
-    for rows in by_key.values():
-        newest = rows[-1]
-        if (_is_dispatch_row(newest) and newest.get("state") == "failed"
-                and runtime.is_runtime_missing_row(newest)):
-            return True
-    return False
-
-
 def recover_one(state_dir, request_id: str) -> dict:
     """Reconcile durable records with live ownership; resume only when safe."""
     root = store.ensure_state_dir(state_dir)
-    # Reconcile identity, then consume finished child output exactly once
-    # before considering the controller lease gone. A completed child must
-    # not be rerun. An owned server without its supervisor is unusable
-    # (its password died with the supervisor) and is stopped first.
-    _stop_orphaned_invocations(state_dir, request_id)
-    _abandon_never_started(state_dir, request_id)
-    _reconcile_dead_invocations(state_dir, request_id)
     # Terminal jobs are never resurrected and never assessed: recover
-    # --all must not add runtime_assessed noise to finished jobs. Rows
-    # that finished after the job ended are still consumed once, so
-    # their measurements (classified outcome, timestamps) land on the
-    # ledger; consumption never changes a terminal status.
+    # --all must not add runtime_assessed noise to finished jobs.
     terminal_status = get_job(state_dir, request_id)["status"]
     if terminal_status in store.TERMINAL:
-        try:
-            late = consume_finished_invocations(state_dir, request_id)
-        except Exception as e:  # noqa: BLE001 - reported, never resurrected
-            return {"request_id": request_id, "action": "noop-terminal",
-                    "status": terminal_status, "consume_error": str(e)[:200]}
         return {"request_id": request_id, "action": "noop-terminal",
-                "status": terminal_status, "consumed": len(late)}
+                "status": terminal_status}
     # Runtime recovery assessment for live jobs only: resolve the
     # currently installed runtime, decide explicitly whether it can read
-    # the stored job and invocation state as is, and record the actual
-    # runtime and policy before and after. It runs before output is
-    # consumed because measurement during consume stamps current schema
-    # markers: the check must see the stored rows as they are. The
-    # compatibility decision itself only gates execution handoffs
-    # (starting a replacement controller) further down; healthy owned
-    # work adopted there is never interrupted merely because an update
-    # occurred.
+    # the stored job state as is, and record the actual runtime and
+    # policy before and after. The compatibility decision only gates
+    # execution handoffs (starting a replacement controller) further
+    # down; healthy owned work is never interrupted merely because an
+    # update occurred.
     compat_ok, compat_reason, old_runtime, new_runtime = _assess_runtime(
         state_dir, request_id)
-    # Consume finished child output exactly once before considering the
-    # controller lease gone. A completed child must not be rerun.
-    consumed = consume_finished_invocations(state_dir, request_id)
-    if any(c.get("action") == "completed" for c in consumed):
-        return {"request_id": request_id, "action": "consumed-completion",
-                "status": get_job(state_dir, request_id)["status"]}
-    live_invocations = _any_live_invocation(state_dir, request_id)
-    if live_invocations:
-        _capture_invocation_sessions(state_dir, request_id, live_invocations)
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -3735,36 +2026,6 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.execute("ROLLBACK")
             return {"request_id": request_id, "action": "blocked-sticky",
                     "status": "blocked", "reason": job["block_reason"]}
-        # A dispatch whose supervisor could not spawn was closed as failed by
-        # the controller; if that controller died before blocking the job,
-        # the job would sit running without an owner. Block it here, unless
-        # every failed dispatch row carries explicit never-started
-        # runtime-missing evidence: the installed runtime repairs exactly
-        # that cause, so recovery falls through and restarts the controller
-        # to remake the action fresh. Any other failure keeps its sticky
-        # block; live, successful, and uncertain actions are never replayed.
-        if status in ("pending", "running") and not job["codex_task_id"]:
-            failed_dispatch = [inv for inv in _list_invocations(state_dir, request_id)
-                               if _is_dispatch_row(inv) and inv.get("state") == "failed"]
-            live_or_open = [inv for inv in _list_invocations(state_dir, request_id)
-                            if inv.get("state") in LIVE_INVOCATION_STATES]
-            if failed_dispatch and not live_or_open:
-                retryable = bool(failed_dispatch) and all(
-                    runtime.is_runtime_missing_row(i) for i in failed_dispatch)
-                if not retryable:
-                    mark_blocked(f"codex_dispatch_failed rc={failed_dispatch[-1].get('rc')} "
-                                 "(consumed by recovery): the dispatch never started")
-                    con.execute("COMMIT")
-                    return {"request_id": request_id, "action": "blocked-failed-dispatch",
-                            "status": "blocked"}
-        orphans_left = [inv for inv in _list_invocations(state_dir, request_id)
-                        if _invocation_ownership(inv) == "orphaned"]
-        if orphans_left:
-            mark_blocked(f"orphaned server {orphans_left[0]['invocation_id'][:8]} did not stop; "
-                         "refusing duplicate")
-            con.execute("COMMIT")
-            return {"request_id": request_id, "action": "blocked-orphaned-server",
-                    "status": "blocked"}
         lease_token = job["owner_token"]
         lease_pid = job["owner_pid"]
         known = _known_tokens(con, request_id)
@@ -3802,80 +2063,6 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.execute("ROLLBACK")
             return {"request_id": request_id, "action": "launch-in-progress", "status": status}
         controller_alive = lease_alive or ident_holds_lease or lock_held
-
-        # If any owned child process group is still alive, the workspace stays
-        # claimed. NULL pid/pgid is unresolved ownership, never death.
-        unresolved_now = [
-            inv for inv in _list_invocations(state_dir, request_id)
-            if _invocation_ownership(inv) == "unresolved"
-        ]
-        starting = [inv for inv in unresolved_now
-                    if inv.get("supervisor_pid") is None and inv.get("pid") is None]
-        if unresolved_now and controller_alive and len(starting) == len(unresolved_now):
-            # A live controller just inserted a row its supervisor has not
-            # claimed yet: normal startup, not unknown ownership.
-            con.execute("ROLLBACK")
-            return {"request_id": request_id, "action": "invocation-starting", "status": status}
-        if unresolved_now:
-            mark_blocked(
-                f"unresolved invocation {unresolved_now[0]['invocation_id'][:8]}... "
-                f"(NULL pid/pgid or start-identity mismatch); refusing duplicate")
-            con.execute("COMMIT")
-            return {"request_id": request_id, "action": "blocked-unresolved-invocation",
-                    "status": "blocked"}
-        live_invocations = [
-            inv for inv in _list_invocations(state_dir, request_id)
-            if _invocation_ownership(inv) == "live"
-        ]
-        if live_invocations:
-            lease_pid_alive = controller_alive
-            if job["status"] == "blocked":
-                con.execute(
-                    "UPDATE jobs SET status='running', block_reason=NULL, updated_at=? WHERE request_id=?",
-                    (_utcnow(), request_id),
-                )
-            if not lease_pid_alive:
-                if job["owner_token"]:
-                    con.execute(
-                        "UPDATE launches SET state='dead' WHERE request_id=? AND start_token=?"
-                        " AND state IN ('attempting','acknowledged')",
-                        (request_id, job["owner_token"]))
-                con.execute(
-                    "UPDATE jobs SET owner_token=NULL, owner_pid=NULL, owner_start=NULL, updated_at=? WHERE request_id=?",
-                    (_utcnow(), request_id))
-            _event(con, request_id, "recovered-adopted-live-invocation",
-                   {"invocation_id": live_invocations[0]["invocation_id"][:16],
-                    "kind": live_invocations[0].get("kind", "")})
-            con.execute("COMMIT")
-            out = {"request_id": request_id, "action": "adopted-live-invocation"}
-            if not lease_pid_alive and (job["codex_task_id"] or any(
-                    _is_dispatch_row(i) for i in live_invocations)):
-                # A new controller waits for the live child's durable
-                # result through the same action identity. The
-                # compatibility decision gates this handoff like every
-                # other replacement-controller start: healthy owned work
-                # was adopted above and is never interrupted, but an
-                # unsupported state starts no controller on unreadable
-                # rows. The live child finishes on its own; its output is
-                # consumed once, and the next recovery blocks with the
-                # specific incompatibility instead of executing blind.
-                if not compat_ok:
-                    con.execute("BEGIN IMMEDIATE")
-                    _event(con, request_id, "runtime_incompatible_deferred",
-                           {"reason": compat_reason,
-                            "invocation_id": live_invocations[0]["invocation_id"][:16]})
-                    con.execute("COMMIT")
-                    out["resume_error"] = (
-                        f"runtime_incompatible: {compat_reason} (no replacement "
-                        "controller started while the adopted live child runs)")
-                    out["status"] = get_job(state_dir, request_id)["status"]
-                    return out
-                try:
-                    out["pid"] = start_controller(state_dir, request_id).get("pid")
-                except (OwnershipError, TerminalError, BlockedError, RunnerError) as e:
-                    out["resume_error"] = str(e)[:200]
-            out["status"] = get_job(state_dir, request_id)["status"]
-            return out
 
         # Case: unknown ownership. A live worker advertises a token that is
         # neither the lease nor any known launch: stop, never duplicate.
@@ -4039,11 +2226,7 @@ def recover_one(state_dir, request_id: str) -> dict:
             # A dispatch that provably never started for a missing runtime
             # is resumed as well: its rows prove no child ran, so the new
             # controller remakes the action fresh without duplicating.
-            should_resume = _dispatcher_saved(job) or any(
-                _is_dispatch_row(i) and i.get("state") == "completed"
-                for i in _list_invocations(state_dir, request_id))
-            runtime_recovery = _has_runtime_missing_failure(state_dir, request_id)
-            should_resume = should_resume or runtime_recovery
+            should_resume = _dispatcher_saved(job)
             # Same-session recovery within budget: clear lease, keep planner
             # and executor session IDs, keep partial log. When a public
             # answer is waiting on a saved Luna task, recover resumes a
@@ -4079,9 +2262,6 @@ def recover_one(state_dir, request_id: str) -> dict:
             _event(con, request_id, "recovered-worker-dead", {"partial_preserved": True})
             con.execute("COMMIT")
             if should_resume:
-                if runtime_recovery:
-                    _record_runtime_recovered(state_dir, request_id, old_runtime,
-                                              new_runtime, "worker-dead")
                 try:
                     info = start_controller(state_dir, request_id)
                     return {"request_id": request_id, "action": "resumed-controller",
