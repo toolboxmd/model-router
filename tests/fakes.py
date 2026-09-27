@@ -11,7 +11,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from runner import store, t3exec
+from runner import policy, store, t3exec, t3snapshot
 
 PLANNER = "planner-1"
 PROJECT = "proj-1"
@@ -117,7 +117,7 @@ class FakeT3Client:
         self.default_child_reply = None
         # Prism provider snapshot served to the router (None: an older
         # server without the endpoint, answered with HTTP 404).
-        self.prism = None
+        self.prism = default_prism()
         self.prism_reads = []
 
     def dispatch(self, command):
@@ -262,3 +262,136 @@ def approve_reviews(testcase):
         patcher = mock.patch.object(controller, name, value)
         patcher.start()
         testcase.addCleanup(patcher.stop)
+
+
+# ---------------------------------------------------------------------------
+# Prism fixture (#133). The policy names no models; tests route through a
+# Prism snapshot built from this table, the former policy defaults. The
+# named routes keep their caps (next_pool, one_turn_per_job,
+# max_concurrent, context_window) so the controller's handling of them
+# stays covered.
+# ---------------------------------------------------------------------------
+
+PRISM_ROUTES = {
+    "luna/max": {"instance": "codex", "model": "gpt-5.6-luna", "effort": "max",
+                 "role": "dispatch", "family": "gpt", "pool": "codex",
+                 "context_window": 400_000},
+    "luna-go/max": {"instance": "opencode", "model": "opencode-go/gpt-5.6-luna",
+                    "effort": None, "role": "dispatch", "family": "gpt", "pool": "go",
+                    "one_turn_per_job": True, "max_concurrent": 1,
+                    "context_window": 400_000},
+    "muse-spark-xhigh-free": {"instance": "opencode",
+                              "model": "opencode/muse-spark-1.3-contributor-free",
+                              "effort": "xhigh", "role": "implementation", "family": "muse",
+                              "pool": "zen-free", "next_pool": "muse-spark-xhigh-go",
+                              "context_window": 200_000},
+    "muse-spark-xhigh-go": {"instance": "opencode",
+                            "model": "opencode-go/muse-spark-1.3-contributor",
+                            "effort": "xhigh", "role": "implementation", "family": "muse",
+                            "pool": "go", "context_window": 200_000},
+    "glm-5.3-go": {"instance": "opencode", "model": "opencode-go/glm-5.3", "effort": None,
+                   "role": "implementation", "family": "glm", "pool": "go",
+                   "one_turn_per_job": True, "max_concurrent": 1, "context_window": 128_000},
+    "deepseek-v4-pro-go": {"instance": "opencode", "model": "opencode-go/deepseek-v4-pro",
+                           "effort": None, "role": "implementation", "family": "deepseek",
+                           "pool": "go", "one_turn_per_job": True, "max_concurrent": 1,
+                           "context_window": 128_000},
+    "kimi-k2.7-code-go": {"instance": "opencode", "model": "opencode-go/kimi-k2.7-code",
+                          "effort": None, "role": "correction", "family": "kimi", "pool": "go",
+                          "context_window": 256_000},
+    "glm-5.3-flash-go": {"instance": "opencode", "model": "opencode-go/glm-5.3-flash",
+                         "effort": None, "role": "implementation", "family": "glm", "pool": "go",
+                         "context_window": 256_000},
+    "qwen3.8-flash-go": {"instance": "opencode", "model": "opencode-go/qwen3.8-flash",
+                         "effort": None, "role": "implementation", "family": "qwen", "pool": "go",
+                         "max_concurrent": 1, "context_window": 256_000},
+    "deepseek-v4.1-flash-go": {"instance": "opencode", "model": "opencode-go/deepseek-v4.1-flash",
+                               "effort": None, "role": "implementation", "family": "deepseek",
+                               "pool": "go", "one_turn_per_job": True, "max_concurrent": 1,
+                               "context_window": 128_000},
+    "hy3-go": {"instance": "opencode", "model": "opencode-go/hy3", "effort": None,
+               "role": "implementation", "family": "hy", "pool": "go",
+               "context_window": 200_000},
+    "minimax-m3-go": {"instance": "opencode", "model": "opencode-go/minimax-m3", "effort": None,
+                      "role": "implementation", "family": "minimax", "pool": "go",
+                      "context_window": 200_000},
+    "mimo-v2.5-go": {"instance": "opencode", "model": "opencode-go/mimo-v2.5", "effort": None,
+                     "role": "implementation", "family": "mimo", "pool": "go",
+                     "context_window": 200_000},
+    "minimax-m2.7-go": {"instance": "opencode", "model": "opencode-go/minimax-m2.7",
+                        "effort": None, "role": "implementation", "family": "minimax",
+                        "pool": "go", "context_window": 256_000},
+    "longcat-2.0-go": {"instance": "opencode", "model": "opencode-go/longcat-2.0",
+                       "effort": None, "role": "implementation", "family": "longcat",
+                       "pool": "go", "context_window": 256_000},
+    "glm-5.2-go": {"instance": "opencode", "model": "opencode-go/glm-5.2", "effort": None,
+                   "role": "implementation", "family": "glm", "pool": "go",
+                   "context_window": 200_000},
+    "kimi-k2.6-go": {"instance": "opencode", "model": "opencode-go/kimi-k2.6", "effort": None,
+                     "role": "implementation", "family": "kimi", "pool": "go",
+                     "context_window": 256_000},
+    "glm-5.1-go": {"instance": "opencode", "model": "opencode-go/glm-5.1", "effort": None,
+                   "role": "implementation", "family": "glm", "pool": "go",
+                   "context_window": 200_000},
+    "grok-4.6-go": {"instance": "opencode", "model": "opencode-go/grok-4.6", "effort": "medium",
+                    "role": "recovery", "family": "grok", "pool": "go",
+                    "next_pool": "grok-4.6-build", "one_turn_per_job": True,
+                    "max_concurrent": 1, "context_window": 2_000_000},
+    "grok-4.6-build": {"instance": "grok", "model": "grok-4.6", "effort": "medium",
+                       "role": "recovery", "family": "grok", "pool": "xai",
+                       "next_pool": "grok-4.6-xai", "context_window": 2_000_000},
+    "grok-4.6-xai": {"instance": "opencode", "model": "xai/grok-4.6", "effort": "medium",
+                     "role": "recovery", "family": "grok", "pool": "xai",
+                     "context_window": 2_000_000},
+}
+
+PRISM_WORKERS = ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-flash-go",
+                 "qwen3.8-flash-go", "deepseek-v4.1-flash-go", "hy3-go", "minimax-m3-go",
+                 "mimo-v2.5-go", "minimax-m2.7-go", "longcat-2.0-go", "glm-5.2-go",
+                 "kimi-k2.6-go", "glm-5.1-go"]
+
+PRISM_STAGES = {
+    "dispatch": ["luna/max", "luna-go/max"],
+    "implementation_default": list(PRISM_WORKERS),
+    "implementation_small": list(PRISM_WORKERS),
+    "implementation_hard": ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go",
+                            "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-build",
+                            "grok-4.6-xai"],
+    "correction": ["kimi-k2.7-code-go"],
+    "recovery": ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"],
+    "review": ["luna/max", "luna-go/max"],
+}
+
+
+def _prism_entries(routes):
+    return [{"instanceId": PRISM_ROUTES[r]["instance"], "model": PRISM_ROUTES[r]["model"],
+             **({"effort": PRISM_ROUTES[r]["effort"]} if PRISM_ROUTES[r].get("effort") else {})}
+            for r in routes]
+
+
+def default_prism():
+    """The fixture snapshot: every fixture model offered, role lists as
+    ``PRISM_STAGES``."""
+    by_instance = {}
+    for spec in PRISM_ROUTES.values():
+        by_instance.setdefault(spec["instance"], []).append(spec["model"])
+    providers = [prism_provider(i, sorted(set(m))) for i, m in by_instance.items()]
+    lanes = {"worker": {"easy": _prism_entries(PRISM_STAGES["implementation_small"]),
+                        "medium": _prism_entries(PRISM_STAGES["implementation_default"]),
+                        "hard": _prism_entries(PRISM_STAGES["implementation_hard"])}}
+    kits = {role: {"models": _prism_entries(PRISM_STAGES[stage])}
+            for role, stage in (("dispatcher", "dispatch"), ("reviewer", "review"),
+                                ("correction", "correction"), ("recovery", "recovery"))}
+    return prism_snapshot(providers, lanes=lanes, kits=kits)
+
+
+def install_prism(lane=None):
+    """Register the fixture routes and apply the fixture snapshot, as a
+    job whose Prism reads would see. Tests that reset ``t3snapshot``
+    restore it with ``addCleanup(install_prism)``."""
+    policy.ROUTES.update(copy.deepcopy(PRISM_ROUTES))
+    t3snapshot.reset()
+    t3snapshot.apply(default_prism(), lane)
+
+
+install_prism()

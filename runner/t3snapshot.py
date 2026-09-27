@@ -8,8 +8,8 @@ the project. The router reads it before choosing a route:
 - Eligible route = its role preference whose T3 instance is enabled and
   whose model the instance offers. Turning a model off in T3 removes it
   from routing.
-- A non-empty Prism list replaces the policy's order for that stage;
-  entries without a policy route run as ``t3:`` routes. The worker has
+- A stage's routes are its Prism list, run as ``t3:`` routes; the
+  policy has no defaults (toolboxmd/model-router#133). The worker has
   one list per lane; every other role has one ``models`` list
   (toolboxmd/model-router#127). Older snapshots without ``models`` still
   work through the role's entry for the job's lane.
@@ -22,9 +22,10 @@ the project. The router reads it before choosing a route:
   driver named in ``policy.POOLS`` (all Go routes share OpenCode's one
   account meter; Zen free has no reader and keeps its error marks).
 
-A snapshot that cannot be read (older server, unreachable, bad body) is
-``unknown``: nothing is filtered and the policy defaults plus error marks
-apply, so routing never depends on the endpoint existing.
+A snapshot that cannot be read (older server, unreachable, no token, bad
+body) is ``unknown``: no stage has routes, and the controller stops the
+job with ``Prism unreadable: <cause>`` before it starts a thread
+(:func:`blocked_reason`); the planner then does the work itself.
 """
 from __future__ import annotations
 
@@ -229,7 +230,7 @@ def refresh(client, project_id: str | None = None, lane_stage: str | None = None
 
 def refresh_for_job(job: dict, client=None, force: bool = False) -> dict | None:
     """Refresh for a job's T3 server and planner project. Never raises:
-    any failure leaves the snapshot unknown (no filtering)."""
+    any failure leaves the snapshot unknown (no routes)."""
     try:
         client = client or t3exec.client_for_job(job)
         project = None
@@ -240,10 +241,66 @@ def refresh_for_job(job: dict, client=None, force: bool = False) -> dict | None:
             except (t3exec.T3Error, ValueError):
                 project = None
         return refresh(client, project, (job or {}).get("lane"), force=force)
-    except Exception as e:  # noqa: BLE001 - unknown, never blocks routing
+    except Exception as e:  # noqa: BLE001 - unknown: blocked_reason reports it
         _CACHE.update(key=None, at=0.0, snapshot=None, error=str(e)[:300])
         apply(None, (job or {}).get("lane"))
         return None
+
+
+def prime_for_submit(t3_server_url: str | None, planner_t3_thread: str | None,
+                     lane: str | None = None) -> dict | None:
+    """Apply the snapshot before a submit picks the job's first route.
+
+    Only a readable snapshot is applied; on failure the stage orders stay
+    as they are and the job is stored without a route, so the controller
+    reports the cause (:func:`blocked_reason`). Never raises.
+    """
+    try:
+        client = t3exec.client_for_job({"t3_server_url": t3_server_url})
+        project = None
+        if planner_t3_thread:
+            try:
+                project = t3exec.project_id_for_thread(client, planner_t3_thread)
+            except (t3exec.T3Error, ValueError):
+                project = None
+        snap = read(client, project)
+        if snap is not None:
+            apply(snap, policy.resolve_lane(lane) if lane else None)
+    except Exception as e:  # noqa: BLE001 - the controller reports it
+        _CACHE.update(error=str(e)[:300])
+        return None
+    return snap
+
+
+# Stage -> how a report names its Prism list.
+_STAGE_NAMES = {"dispatch": "Dispatcher", "review": "Reviewer",
+                "correction": "Retry", "recovery": "Escalation"}
+
+
+def blocked_reason(snapshot: dict | None, lane: str | None = None) -> str | None:
+    """Why a job cannot route, or None.
+
+    ``Prism unreadable: <cause>`` when the snapshot is unknown; otherwise
+    the first list the job needs that is empty in Prism: Dispatcher,
+    the job's Worker lane, Reviewer, and Retry and Escalation while they
+    are switched on.
+    """
+    if not isinstance(snapshot, dict):
+        return f"Prism unreadable: {_CACHE.get('error') or 'no snapshot'}"
+    try:
+        stage = policy.resolve_lane(lane or policy.DEFAULT_LANE)
+    except ValueError:
+        stage = policy.DEFAULT_LANE
+    if stage not in policy.IMPLEMENTATION_LANES:
+        stage = policy.DEFAULT_LANE
+    on = ladder_enabled(snapshot)
+    for needed in ("dispatch", stage, "review", "correction", "recovery"):
+        if not on.get(needed, True) or policy.stage_routes(needed):
+            continue
+        if needed in policy.PRISM_LANE_OF:
+            return f"Prism Worker {policy.PRISM_LANE_OF[needed]} lane is empty"
+        return f"Prism {_STAGE_NAMES[needed]} list is empty"
+    return None
 
 
 def current_states(now: float | None = None) -> dict[str, tuple[str, str]]:
@@ -263,13 +320,15 @@ def skip_sets(now: float | None = None) -> tuple[set[str], set[str]]:
 
 
 def view() -> dict:
-    """Operator view for ``capacity``: snapshot status and route states."""
+    """Operator view for ``capacity``: snapshot status, route states, and
+    ``blocked`` (why a job would stop now, or None)."""
     snap = _CACHE.get("applied")
+    blocked = blocked_reason(snap, _CACHE.get("lane"))
     if not isinstance(snap, dict):
-        return {"snapshot": "unknown", "error": _CACHE.get("error"),
+        return {"snapshot": "unknown", "error": _CACHE.get("error"), "blocked": blocked,
                 "stage_overrides": dict(policy.STAGE_OVERRIDES)}
     return {"snapshot": "read", "generated_at": snap.get("generatedAt"),
-            "project_id": snap.get("projectId"),
+            "project_id": snap.get("projectId"), "blocked": blocked,
             "stage_overrides": dict(policy.STAGE_OVERRIDES),
             "ladder_enabled": ladder_enabled(snap),
             "routes": {r: {"state": s, "reason": why}

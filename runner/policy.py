@@ -1,12 +1,10 @@
 """Versioned routing policy for the durable local runner (policy v2).
 
-Policy is data. This module names the routes the runner dispatches as T3
-threads (provider instance, model, effort), the stages (lanes) that order
-them as the default role preferences, the provider signal classes, and
-the policy's provenance. Chromeria's Prism settings may replace a
-stage's order with the role's preferred models for that lane, and the T3
-provider snapshot decides which routes are enabled and within their
-usage windows (``runner/t3snapshot.py``). Behavior lives in the
+Policy is data. This module names the stages (lanes) the runner routes,
+the subscription pools, the provider signal classes, and the policy's
+provenance. It names no models: each stage's routes are the role's list
+in Chromeria's Prism, and the T3 provider snapshot decides which routes
+are enabled and within their usage windows (``runner/t3snapshot.py``). Behavior lives in the
 controller; project workflow, authority, proof, and review stay with
 AgentsMD and the target project.
 """
@@ -18,7 +16,7 @@ import sys
 import time
 
 POLICY_ID = "durable-runner-policy-v2"
-POLICY_VERSION = "2.10.0"
+POLICY_VERSION = "2.11.0"
 # Provenance: who decided this policy and where the evidence lives.
 POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19), "
                  "#12, #26 (Go plan, 2026-09-20), "
@@ -27,7 +25,9 @@ POLICY_SOURCE = ("human decision, toolboxmd/model-router#10 (amended 2026-09-19)
                  "and #115/#116 (routes are T3 model selections; models, limits and role "
                  "preferences come from the T3 provider snapshot, human direction, 2026-09-25), "
                  "and #126 (an independent review turn before a job completes, human "
-                 "direction, 2026-09-25)")
+                 "direction, 2026-09-25), "
+                 "and #133 (route only from Prism; no model defaults, human direction, "
+                 "2026-09-27)")
 POLICY_EVIDENCE = "https://github.com/toolboxmd/model-router/issues/115"
 
 # Subscription pools only. No Zen balance overflow, no pay-per-token APIs.
@@ -61,121 +61,38 @@ POOLS = {
 # one_turn_per_job, max_concurrent (running jobs allowed on the route),
 # context_window (input tokens, a routing hint for context-overflow moves).
 # OpenCode turns run the ``plan`` agent for the dispatcher and ``build``
-# otherwise. A Prism preference with no route here runs as a ``t3:`` route
-# (see :func:`preference_route`).
-ROUTES = {
-    "luna/max": {"instance": "codex", "model": "gpt-5.6-luna", "effort": "max",
-                 "role": "dispatch", "family": "gpt", "pool": "codex",
-                 "context_window": 400_000},
-    "luna-go/max": {"instance": "opencode", "model": "opencode-go/gpt-5.6-luna",
-                    "effort": None, "role": "dispatch", "family": "gpt", "pool": "go",
-                    "one_turn_per_job": True, "max_concurrent": 1,
-                    "context_window": 400_000},
-    "muse-spark-xhigh-free": {"instance": "opencode",
-                              "model": "opencode/muse-spark-1.3-contributor-free",
-                              "effort": "xhigh", "role": "implementation", "family": "muse",
-                              "pool": "zen-free", "next_pool": "muse-spark-xhigh-go",
-                              "context_window": 200_000},
-    "muse-spark-xhigh-go": {"instance": "opencode",
-                            "model": "opencode-go/muse-spark-1.3-contributor",
-                            "effort": "xhigh", "role": "implementation", "family": "muse",
-                            "pool": "go", "context_window": 200_000},
-    "glm-5.3-go": {"instance": "opencode", "model": "opencode-go/glm-5.3", "effort": None,
-                   "role": "implementation", "family": "glm", "pool": "go",
-                   "one_turn_per_job": True, "max_concurrent": 1, "context_window": 128_000},
-    "deepseek-v4-pro-go": {"instance": "opencode", "model": "opencode-go/deepseek-v4-pro",
-                           "effort": None, "role": "implementation", "family": "deepseek",
-                           "pool": "go", "one_turn_per_job": True, "max_concurrent": 1,
-                           "context_window": 128_000},
-    "kimi-k2.7-code-go": {"instance": "opencode", "model": "opencode-go/kimi-k2.7-code",
-                          "effort": None, "role": "correction", "family": "kimi", "pool": "go",
-                          "context_window": 256_000},
-    "glm-5.3-flash-go": {"instance": "opencode", "model": "opencode-go/glm-5.3-flash",
-                         "effort": None, "role": "implementation", "family": "glm", "pool": "go",
-                         "context_window": 256_000},
-    "qwen3.8-flash-go": {"instance": "opencode", "model": "opencode-go/qwen3.8-flash",
-                         "effort": None, "role": "implementation", "family": "qwen", "pool": "go",
-                         "max_concurrent": 1, "context_window": 256_000},
-    "deepseek-v4.1-flash-go": {"instance": "opencode", "model": "opencode-go/deepseek-v4.1-flash",
-                               "effort": None, "role": "implementation", "family": "deepseek",
-                               "pool": "go", "one_turn_per_job": True, "max_concurrent": 1,
-                               "context_window": 128_000},
-    "hy3-go": {"instance": "opencode", "model": "opencode-go/hy3", "effort": None,
-               "role": "implementation", "family": "hy", "pool": "go",
-               "context_window": 200_000},
-    "minimax-m3-go": {"instance": "opencode", "model": "opencode-go/minimax-m3", "effort": None,
-                      "role": "implementation", "family": "minimax", "pool": "go",
-                      "context_window": 200_000},
-    "mimo-v2.5-go": {"instance": "opencode", "model": "opencode-go/mimo-v2.5", "effort": None,
-                     "role": "implementation", "family": "mimo", "pool": "go",
-                     "context_window": 200_000},
-    "minimax-m2.7-go": {"instance": "opencode", "model": "opencode-go/minimax-m2.7",
-                        "effort": None, "role": "implementation", "family": "minimax",
-                        "pool": "go", "context_window": 256_000},
-    "longcat-2.0-go": {"instance": "opencode", "model": "opencode-go/longcat-2.0",
-                       "effort": None, "role": "implementation", "family": "longcat",
-                       "pool": "go", "context_window": 256_000},
-    "glm-5.2-go": {"instance": "opencode", "model": "opencode-go/glm-5.2", "effort": None,
-                   "role": "implementation", "family": "glm", "pool": "go",
-                   "context_window": 200_000},
-    "kimi-k2.6-go": {"instance": "opencode", "model": "opencode-go/kimi-k2.6", "effort": None,
-                     "role": "implementation", "family": "kimi", "pool": "go",
-                     "context_window": 256_000},
-    "glm-5.1-go": {"instance": "opencode", "model": "opencode-go/glm-5.1", "effort": None,
-                   "role": "implementation", "family": "glm", "pool": "go",
-                   "context_window": 200_000},
-    "grok-4.6-go": {"instance": "opencode", "model": "opencode-go/grok-4.6", "effort": "medium",
-                    "role": "recovery", "family": "grok", "pool": "go",
-                    "next_pool": "grok-4.6-build", "one_turn_per_job": True,
-                    "max_concurrent": 1, "context_window": 2_000_000},
-    "grok-4.6-build": {"instance": "grok", "model": "grok-4.6", "effort": "medium",
-                       "role": "recovery", "family": "grok", "pool": "xai",
-                       "next_pool": "grok-4.6-xai", "context_window": 2_000_000},
-    "grok-4.6-xai": {"instance": "opencode", "model": "xai/grok-4.6", "effort": "medium",
-                     "role": "recovery", "family": "grok", "pool": "xai",
-                     "context_window": 2_000_000},
-}
+# otherwise. The policy names no models (toolboxmd/model-router#133):
+# every route comes from a Prism preference and runs as a ``t3:`` route
+# (see :func:`preference_route`). ``ROUTES`` stays the registry for named
+# routes carrying per-route caps; it is empty.
+ROUTES: dict[str, dict] = {}
 
-_IMPLEMENTERS = ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-flash-go",
-                 "qwen3.8-flash-go", "deepseek-v4.1-flash-go", "hy3-go", "minimax-m3-go",
-                 "mimo-v2.5-go", "minimax-m2.7-go", "longcat-2.0-go", "glm-5.2-go",
-                 "kimi-k2.6-go", "glm-5.1-go"]
-
-# Stages in flow order: the default role preferences. executor: runner
-# (dispatched by the runner as T3 threads) or planner (done by the planner
-# itself, never dispatched).
+# Stages in flow order. executor: runner (dispatched by the runner as T3
+# threads) or planner (done by the planner itself, never dispatched). A
+# stage's routes are its Prism list only (``STAGE_OVERRIDES``); there are
+# no defaults, so an unreadable snapshot or an empty list stops the job
+# (``t3snapshot.blocked_reason``).
 STAGES = {
     "dispatch": {"executor": "runner", "role": "dispatcher",
-                 "routes": ["luna/max", "luna-go/max"],
-                 "note": "Luna max on Codex first; the same model on Go in OpenCode plan "
-                         "mode when Codex cannot run it"},
+                 "note": "the Prism Dispatcher list, in order"},
     "implementation_default": {"executor": "runner", "role": "worker", "prism_lane": "medium",
-                               "routes": list(_IMPLEMENTERS),
-                               "note": "every new job starts on Muse free (no concurrency "
-                                       "cap, parallel sessions by design), then Go"},
+                               "note": "the Prism Worker medium lane"},
     "implementation_small": {"executor": "runner", "role": "worker", "prism_lane": "easy",
-                             "routes": list(_IMPLEMENTERS),
-                             "note": "small bounded edits"},
+                             "note": "small bounded edits: the Prism Worker easy lane"},
     "implementation_hard": {"executor": "runner", "role": "worker", "prism_lane": "hard",
-                            "routes": ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
-                                       "glm-5.3-go", "deepseek-v4-pro-go", "grok-4.6-go",
-                                       "grok-4.6-build", "grok-4.6-xai"],
-                            "note": "$15 Go models get one turn per job; Grok 4.6 closes "
-                                    "the lane on Go, then Grok Build, then OpenCode's xAI"},
-    "critical": {"executor": "planner", "routes": [],
+                            "note": "the Prism Worker hard lane"},
+    "critical": {"executor": "planner",
                  "note": "a load-bearing step is done by the planner itself before "
                          "submission; the runner never dispatches it"},
-    "correction": {"executor": "runner", "role": "correction", "routes": ["kimi-k2.7-code-go"],
+    "correction": {"executor": "runner", "role": "correction",
                    "note": "Retry: once per job; the same worker thread is tried first; a capacity "
                            "signal moves on into the job's lane"},
     "recovery": {"executor": "runner", "role": "recovery",
-                 "routes": ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"],
                  "note": "Escalation: one per job; pool moves are not second escalations; "
                          "then the planner decides through a planner question"},
     "review": {"executor": "runner", "role": "reviewer",
-               "routes": ["luna/max", "luna-go/max"],
                "note": "one read-only review turn on the candidate's exact head before "
-                       "a job completes; Luna max on Codex, then the same model on Go"},
+                       "a job completes: the Prism Reviewer list"},
 }
 IMPLEMENTATION_LANES = ["implementation_default", "implementation_small", "implementation_hard"]
 LANE_ALIASES = {"default": "implementation_default", "small": "implementation_small",
@@ -186,7 +103,8 @@ PRISM_LANE_OF = {"implementation_small": "easy", "implementation_default": "medi
                  "implementation_hard": "hard"}
 
 # Stage orders taken from the T3 snapshot's role preferences for the job
-# being routed (set by ``t3snapshot.apply``); empty means policy defaults.
+# being routed (set by ``t3snapshot.apply``); a stage absent here has no
+# routes.
 STAGE_OVERRIDES: dict[str, list[str]] = {}
 
 # Provider signal classes. Definitions only; the controller applies them.
@@ -316,8 +234,7 @@ def pool_meter(pool: str) -> str | None:
 def stage_routes(stage: str) -> list[str]:
     if stage not in STAGES:
         raise ValueError(f"unsupported stage: {stage!r}")
-    override = STAGE_OVERRIDES.get(stage)
-    return list(override) if override else list(STAGES[stage]["routes"])
+    return list(STAGE_OVERRIDES.get(stage) or [])
 
 
 def known_routes() -> list[str]:
@@ -354,7 +271,10 @@ def lane_default_route(lane: str) -> str:
             "session, then submit the remaining work")
     if stage not in IMPLEMENTATION_LANES:
         raise ValueError(f"lane {lane!r} is not an implementation lane")
-    return stage_routes(stage)[0]
+    routes = stage_routes(stage)
+    if not routes:
+        raise ValueError(f"Prism Worker {PRISM_LANE_OF[stage]} lane is empty")
+    return routes[0]
 
 
 def lane_of_route(route: str, lane: str | None = None) -> str | None:
@@ -691,14 +611,6 @@ def validate_policy() -> list[str]:
         if not isinstance(spec, dict) or spec.get("action") not in (
                 "next_pool", "next_family", "next_larger_context", "implementation_failed"):
             problems.append(f"signal class {cls}: unknown action")
-    if ROUTES.get("muse-spark-xhigh-free", {}).get("max_concurrent") is not None:
-        problems.append("muse-spark-xhigh-free: must carry no concurrency cap "
-                        "(parallel Muse free sessions by design)")
-    for lane in IMPLEMENTATION_LANES:
-        routes = STAGES[lane]["routes"]
-        if not routes or routes[0] != "muse-spark-xhigh-free":
-            problems.append(f"stage {lane}: first route must be muse-spark-xhigh-free "
-                            "(Muse free takes every new job)")
     for name, spec in ROUTES.items():
         if not spec.get("instance") or not spec.get("model"):
             problems.append(f"{name}: needs a T3 instance and model")
@@ -724,13 +636,8 @@ def validate_policy() -> list[str]:
                 problems.append(f"{name}: next_pool {nxt} is not the same model on a later pool "
                                 "or the same pool through another instance")
     for stage, spec in STAGES.items():
-        for r in spec["routes"]:
-            if r not in ROUTES:
-                problems.append(f"stage {stage}: unknown route {r}")
-        if spec["executor"] == "planner" and spec["routes"]:
-            problems.append(f"stage {stage}: planner-executed stage lists routes")
-        if stage in IMPLEMENTATION_LANES and not spec["routes"]:
-            problems.append(f"stage {stage}: empty implementation lane")
+        if "routes" in spec:
+            problems.append(f"stage {stage}: routes come from Prism, not the policy")
     return problems
 
 

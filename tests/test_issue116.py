@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, store, t3snapshot  # noqa: E402
-from tests.fakes import use_fake_t3  # noqa: E402
+from tests.fakes import install_prism, use_fake_t3  # noqa: E402
 
 PLANNER = "planner-t3"
 GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
@@ -37,7 +37,8 @@ def git(ws, *args):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        t3snapshot.reset()
+        install_prism()
+        self.addCleanup(install_prism)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)

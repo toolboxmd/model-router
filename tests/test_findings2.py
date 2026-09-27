@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import core, store  # noqa: E402
+from tests import fakes  # noqa: E402,F401 - installs the Prism fixture (#133)
 
 
 class TestClearCapacityPK(unittest.TestCase):

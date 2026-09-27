@@ -1718,10 +1718,8 @@ def _apply_planner_directed_route(state_dir, request_id: str,
         stage = policy.lane_of_route(requested, lane)
     except ValueError:
         stage = None
-    if stage is None and requested not in policy.STAGES.get(
-            "correction", {}).get("routes", ()) \
-            and requested not in policy.STAGES.get(
-                "recovery", {}).get("routes", ()):
+    if stage is None and requested not in policy.stage_routes("correction") \
+            and requested not in policy.stage_routes("recovery"):
         _record_planner_route_rejection(
             state_dir, request_id, requested,
             f"route {requested!r} is not in lane {lane!r}; keeping the job route")
@@ -1779,7 +1777,13 @@ def run_implementation(state_dir, request_id: str, artifact: str | None = None,
     """
     job = core.get_job(state_dir, request_id)
     workspace = job["workspace"]
-    route = job.get("route") or policy.lane_default_route(policy.DEFAULT_LANE)
+    route = job.get("route")
+    if not route:
+        # Submitted while Prism was unreadable (#133): start on the job
+        # lane's first Prism route now that the snapshot reads.
+        return _switch_route(state_dir, request_id,
+                             policy.lane_default_route(job.get("lane") or policy.DEFAULT_LANE),
+                             "prism_first_route")
     state = _load_controller_state(job)
     seq = state.get("seq", 0)
     route_reason = state.get("route_reason") or "initial"
@@ -3362,10 +3366,8 @@ def eligible_directed_routes(state_dir, request_id: str) -> list[str]:
             stage = policy.lane_of_route(route, lane)
         except ValueError:
             stage = None
-        if stage is None and route not in policy.STAGES.get(
-                "correction", {}).get("routes", ()) \
-                and route not in policy.STAGES.get(
-                    "recovery", {}).get("routes", ()):
+        if stage is None and route not in policy.stage_routes("correction") \
+                and route not in policy.stage_routes("recovery"):
             continue
         if route in exhausted or route in degraded:
             continue
@@ -4174,6 +4176,43 @@ def _advertise(state_dir: str, request_id: str, token: str) -> None:
         pass
 
 
+# A failed Prism read is retried with backoff for this long before the job
+# blocks: a T3 restart or a token renewal mid-job must not end it (#133).
+PRISM_UNREADABLE_WAIT_SECS = 300.0
+PRISM_RETRY_FIRST_SECS = 5.0
+PRISM_RETRY_MAX_SECS = 60.0
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def _await_prism(state_dir, request_id: str, token: str | None) -> str | None:
+    """Refresh the snapshot for the job; the reason to block, or None.
+
+    An unreadable snapshot is reread with backoff for up to
+    ``PRISM_UNREADABLE_WAIT_SECS``. While it is unreadable no stage has
+    routes, so nothing launches and the last snapshot is never reused.
+    An empty list in a readable snapshot is the user's setting and blocks
+    at once.
+    """
+    job = core.get_job(state_dir, request_id)
+    start = _clock()
+    delay = PRISM_RETRY_FIRST_SECS
+    snap = t3snapshot.refresh_for_job(job)
+    while snap is None:
+        waited = _clock() - start
+        if waited >= PRISM_UNREADABLE_WAIT_SECS:
+            reason = t3snapshot.blocked_reason(None)
+            return f"{reason} (still unreadable after retrying for {int(waited)}s)"
+        _sleep(min(delay, PRISM_UNREADABLE_WAIT_SECS - waited))
+        delay = min(delay * 2, PRISM_RETRY_MAX_SECS)
+        try:
+            _advertise(state_dir, request_id, token)
+        except Exception:
+            pass
+        snap = t3snapshot.refresh_for_job(job, force=True)
+    return t3snapshot.blocked_reason(snap, job.get("lane"))
+
+
 def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     """Detached controller entry point (stdlib only, no secrets logged).
 
@@ -4213,8 +4252,13 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
                               f"job_step_budget_exhausted after {total} steps across launches")
                 break
             # Eligible models, usage windows and role preferences come from
-            # the T3 snapshot (cached briefly; unknown never blocks).
-            t3snapshot.refresh_for_job(core.get_job(state_dir, request_id))
+            # the T3 snapshot (cached briefly). An unreadable snapshot or an
+            # empty list the job needs stops the job before any thread
+            # starts; the terminal report below tells the planner (#133).
+            prism_block = _await_prism(state_dir, request_id, token)
+            if prism_block is not None:
+                _mark_blocked(state_dir, request_id, prism_block)
+                break
             res = step(state_dir, request_id, token=token)
         except core.LeaseLostError:
             return 0  # another controller owns the job; touch nothing

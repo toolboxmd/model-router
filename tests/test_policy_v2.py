@@ -11,6 +11,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from runner import cli, controller, core, policy, store  # noqa: E402
+from runner import t3snapshot  # noqa: E402
+from tests import fakes  # noqa: E402
 from tests.fakes import isolate_t3_env  # noqa: E402
 
 
@@ -53,33 +55,30 @@ class PolicyData(unittest.TestCase):
                                                   turns_by_route={"glm-5.3-go": 1}),
                          "deepseek-v4-pro-go")
 
-    def test_stage_table_matches_parent_decision(self):
+    def test_policy_names_no_models(self):
+        # Routes come only from Prism (#133): no stage lists routes, the
+        # route registry is empty, and the source names no model.
         s = policy.STAGES
-        self.assertEqual(s["implementation_default"]["routes"],
-                         ["muse-spark-xhigh-free", "muse-spark-xhigh-go",
-                          "glm-5.3-flash-go", "qwen3.8-flash-go", "deepseek-v4.1-flash-go",
-                          "hy3-go", "minimax-m3-go", "mimo-v2.5-go", "minimax-m2.7-go",
-                          "longcat-2.0-go", "glm-5.2-go", "kimi-k2.6-go", "glm-5.1-go"])
-        # small: Muse free first, then Muse Go, then from GLM 5.3 Flash onward.
-        self.assertEqual(s["implementation_small"]["routes"],
-                         ["muse-spark-xhigh-free", "muse-spark-xhigh-go"] +
-                         s["implementation_default"]["routes"][2:])
-        # hard: Muse free, Muse Go, GLM-5.3, DeepSeek V4 Pro, Grok 4.6 Go, Build, xAI.
-        self.assertEqual(s["implementation_hard"]["routes"],
-                         ["muse-spark-xhigh-free", "muse-spark-xhigh-go", "glm-5.3-go",
-                          "deepseek-v4-pro-go", "grok-4.6-go", "grok-4.6-build",
-                          "grok-4.6-xai"])
-        self.assertEqual(s["implementation_hard"]["routes"][-2:], ["grok-4.6-build", "grok-4.6-xai"])
-        self.assertEqual(s["correction"]["routes"], ["kimi-k2.7-code-go"])
-        self.assertEqual(s["recovery"]["routes"], ["grok-4.6-go", "grok-4.6-build", "grok-4.6-xai"])
-        self.assertEqual(s["dispatch"]["routes"], ["luna/max", "luna-go/max"])
+        for stage, spec in s.items():
+            self.assertNotIn("routes", spec, stage)
         self.assertNotIn("manual", s["dispatch"])
         # Planning and review are the planner's own; the runner lists none.
         for gone in ("planning", "planner_rungs", "review_ticket", "review_final"):
             self.assertNotIn(gone, s)
         self.assertEqual(s["critical"]["executor"], "planner")
-        self.assertEqual(s["critical"]["routes"], [])
-        self.assertEqual(policy.ROUTES["luna/max"]["instance"], "codex")
+        source = Path(policy.__file__).read_text(encoding="utf-8")
+        self.assertIn("ROUTES: dict[str, dict] = {}", source)
+        for name, spec in fakes.PRISM_ROUTES.items():
+            self.assertNotIn(name, source)
+            self.assertNotIn(spec["model"].split("/")[-1], source)
+
+    def test_without_prism_no_stage_has_routes(self):
+        t3snapshot.reset()
+        self.addCleanup(fakes.install_prism)
+        for stage in policy.STAGES:
+            self.assertEqual(policy.stage_routes(stage), [], stage)
+        with self.assertRaisesRegex(ValueError, "Prism Worker medium lane is empty"):
+            policy.lane_default_route("default")
 
     def test_planner_chosen_rungs_are_not_implementation_lanes(self):
         for stage in policy.IMPLEMENTATION_LANES:
@@ -335,29 +334,15 @@ class StickyIdempotent(unittest.TestCase):
 
 
 class ValidateFixes(unittest.TestCase):
-    def test_muse_free_first_and_uncapped(self):
-        # Every implementation lane starts on Muse free, which carries no cap.
-        for lane in policy.IMPLEMENTATION_LANES:
-            self.assertEqual(policy.STAGES[lane]["routes"][0], "muse-spark-xhigh-free", lane)
-        self.assertIsNone(policy.route_max_concurrent("muse-spark-xhigh-free"))
-        orig = dict(policy.ROUTES["muse-spark-xhigh-free"])
-        try:
-            policy.ROUTES["muse-spark-xhigh-free"]["max_concurrent"] = 1
-            problems = policy.validate_policy()
-            self.assertTrue(any("muse-spark-xhigh-free" in p and "no concurrency cap" in p
-                                for p in problems), problems)
-        finally:
-            policy.ROUTES["muse-spark-xhigh-free"].clear()
-            policy.ROUTES["muse-spark-xhigh-free"].update(orig)
-        orig_routes = list(policy.STAGES["implementation_small"]["routes"])
-        try:
-            policy.STAGES["implementation_small"]["routes"] = orig_routes[1:]
-            problems = policy.validate_policy()
-            self.assertTrue(any("implementation_small" in p and "muse-spark-xhigh-free" in p
-                                for p in problems), problems)
-        finally:
-            policy.STAGES["implementation_small"]["routes"] = orig_routes
+    def test_stage_routes_in_the_policy_are_rejected(self):
         self.assertEqual(policy.validate_policy(), [])
+        policy.STAGES["implementation_small"]["routes"] = ["muse-spark-xhigh-free"]
+        try:
+            problems = policy.validate_policy()
+        finally:
+            del policy.STAGES["implementation_small"]["routes"]
+        self.assertTrue(any("implementation_small" in p and "Prism" in p for p in problems),
+                        problems)
 
 
 class ControllerCapsAndRecovery(unittest.TestCase):
