@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from runner import controller, core, policy, store, t3exec, t3snapshot  # noqa: E402
-from tests.fakes import (isolate_t3_env, prism_provider, prism_snapshot,  # noqa: E402
+from tests.fakes import (install_prism, isolate_t3_env, prism_provider, prism_snapshot,  # noqa: E402
                          snap, use_fake_t3)
 
 
@@ -63,8 +63,8 @@ def creates(fake):
 
 class ReviewTurn(unittest.TestCase):
     def setUp(self):
-        t3snapshot.reset()
-        self.addCleanup(t3snapshot.reset)
+        install_prism()
+        self.addCleanup(install_prism)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)

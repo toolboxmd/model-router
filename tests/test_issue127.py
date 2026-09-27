@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, policy, t3snapshot  # noqa: E402
-from tests.fakes import prism_provider, prism_snapshot  # noqa: E402
+from tests.fakes import default_prism, install_prism, prism_provider, prism_snapshot  # noqa: E402
 from tests import test_escalation as esc  # noqa: E402
 from tests.test_t3snapshot import full_providers  # noqa: E402
 
@@ -33,8 +33,8 @@ def providers():
 
 class SingleLists(unittest.TestCase):
     def setUp(self):
-        t3snapshot.reset()
-        self.addCleanup(t3snapshot.reset)
+        install_prism()
+        self.addCleanup(install_prism)
 
     def test_non_worker_roles_read_models_and_the_worker_keeps_lanes(self):
         snap = prism_snapshot(
@@ -50,7 +50,7 @@ class SingleLists(unittest.TestCase):
         self.assertEqual(got["implementation_hard"], [OPUS_ROUTE])
         self.assertNotIn("implementation_default", got)
 
-    def test_empty_models_keeps_the_policy_order(self):
+    def test_empty_models_leaves_the_stage_without_routes(self):
         snap = prism_snapshot(providers(), lanes={"recovery": {"medium": [OPUS]}},
                               kits={"recovery": {"models": []}})
         self.assertNotIn("recovery", t3snapshot.stage_preferences(snap, None))
@@ -83,12 +83,14 @@ class Switches(unittest.TestCase):
 
     def setUp(self):
         esc.Ladder.setUp(self)
-        t3snapshot.reset()
-        self.addCleanup(t3snapshot.reset)
+        install_prism()
+        self.addCleanup(install_prism)
 
     def switch(self, **enabled):
-        t3snapshot.apply(prism_snapshot(
-            providers(), kits={role: {"enabled": on} for role, on in enabled.items()}))
+        snap = default_prism()
+        for role, on in enabled.items():
+            snap["roles"][role]["enabled"] = on
+        t3snapshot.apply(snap)
 
     def rung_after(self, failures, **prior):
         esc._set_state(self.sd, "j", ladder={"failures": failures, **prior})

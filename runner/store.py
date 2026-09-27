@@ -358,7 +358,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
                 _window = _d.get("window")
                 if (_pool is None or _model is None) and _cap_policy is not None:
                     try:
-                        _spec = _cap_policy.ROUTES.get(_route) or {}
+                        _spec = _cap_policy.route_spec(_route)
                     except Exception:
                         _spec = {}
                     _pool = _pool or _spec.get("pool") or "unknown"

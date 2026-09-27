@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import core, policy, store  # noqa: E402
+from tests import fakes  # noqa: E402,F401 - installs the Prism fixture (#133)
 from tests.fakes import isolate_t3_env  # noqa: E402
 
 
@@ -124,7 +125,9 @@ class TestPublicDefaults(Base):
         # The planner runs in its own T3 thread: nothing is chosen for it.
         self.assertIsNone(job["planner_model"])
         self.assertIsNone(job["planner_effort"])
-        self.assertEqual(job["route"], "muse-spark-xhigh-free")
+        # No T3 here, so no Prism: the job waits without a route and the
+        # controller reports why before any thread starts (#133).
+        self.assertEqual(job["route"], "")
         self.assertEqual(job["attempts"], 0)
         self.assertIsNone(job["owner_token"])
 

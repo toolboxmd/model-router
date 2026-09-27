@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.38.0] - 2026-09-27
+
+### Changed
+
+- Route only from Prism: no model defaults; a Prism that stays unreadable for 5 minutes stops the job and tells the planner (#133)
+
 ## [0.37.0] - 2026-09-26
 
 ### Added

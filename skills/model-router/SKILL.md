@@ -18,5 +18,7 @@ model-router submit --request-id <id> --task-file <task.json> \
 
 Follow the job with `status`, `questions`, `answer`, `result`, `cancel` and
 `recover`; `capacity` shows route marks and the T3 snapshot view. Chromeria's
-Prism picks models and limits; do not choose them here. `RUNNER.md` in the
-plugin root is the full reference.
+Prism picks models and limits; do not choose them here. The runner routes only
+from Prism: when a job blocks with `Prism unreadable: <cause>` or an empty
+Prism list, do that work yourself through direct `spawn_thread`. `RUNNER.md`
+in the plugin root is the full reference.

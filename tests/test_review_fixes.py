@@ -183,8 +183,9 @@ class TestCapacityMemory(Base):
         self.assertIn("free_tier_limit", rows[0]["evidence_json"])
         rc, out = cli(self.sd, "capacity")
         self.assertEqual(out["capacity"][0]["route"], "muse-spark-xhigh-free")
-        rc, out = cli(self.sd, "capacity", "--clear", "muse-spark-xhigh-free")
-        self.assertEqual(rc, 0)
+        # The fixture route exists only in this process (#133), so the
+        # operator's clear runs here rather than through a CLI subprocess.
+        self.assertTrue(core.clear_capacity(self.sd, "muse-spark-xhigh-free")["cleared"])
         self.assertEqual(core.exhausted_routes(self.sd), set())
 
 

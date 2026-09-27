@@ -1,7 +1,7 @@
 # Durable local runner
 
 The runner behind Prism (Model Router). A planner in a T3 thread hands a
-prepared task to the runner; a dispatcher (Luna) owns the job from then on.
+prepared task to the runner; a dispatcher owns the job from then on.
 Every dispatcher and worker turn runs as a T3 child thread of the planner
 thread, so every agent a job starts is visible and reachable in T3. Python
 standard library only; the runner talks to one T3 server over HTTP and opens
@@ -64,11 +64,13 @@ variants, and firmlink aliases on macOS are the same workspace.
 nothing: agent turns and jobs carry no elapsed deadline (#88).
 
 `--lane` picks an implementation lane: `small`, `default`, `hard` (Prism's
-easy, medium, hard). `--route` names one implementation route directly.
-Without either the default lane applies. Every policy lane starts on Muse on
-Zen free, which carries no concurrency cap, so parallel jobs open parallel
-Muse free threads by design; the `fewest running jobs` spread applies only
-among routes with a `max_concurrent` cap. The `critical` lane is
+easy, medium, hard). `--route` names one implementation route directly and
+needs a readable Prism snapshot. Without either the default lane applies.
+`submit` reads the Prism snapshot and starts the job on the lane's first
+eligible Prism route; when the snapshot cannot be read the job is stored
+without a route and the controller stops it with the cause (see
+[Prism unreadable](#prism-unreadable)). The `fewest running jobs` spread
+applies only among routes with a `max_concurrent` cap. The `critical` lane is
 planner-executed and `submit` rejects it: do that step in the planner
 thread, then submit the remainder. `--start` launches a detached controller
 after the commit.
@@ -86,16 +88,17 @@ the task packet.
 `capacity` lists the error marks with their original provider evidence and
 the T3 snapshot view (per route: eligible, ineligible with the reason, or
 exhausted and degraded with the window and until when; `unknown` when the
-snapshot cannot be read). `--clear ROUTE` forgets a route's marks after the
+snapshot cannot be read) with `blocked`: the reason a job would stop now
+(`Prism unreadable: <cause>` or an empty list), or null. `--clear ROUTE` forgets a route's marks after the
 operator checked the provider allowance.
 
 ## Routing: policy, Prism preferences, and the T3 snapshot
 
-`runner/policy.py` names each route as a T3 model selection (provider
-instance, model, effort) with its family, pool, caps, and context window,
-and orders them per stage: `dispatch`, the three implementation lanes,
-`correction` (Retry), `recovery` (Escalation), and `review`. These orders are
-the default role preferences. The internal keys `correction` and `recovery`
+`runner/policy.py` names the stages, `dispatch`, the three implementation
+lanes, `correction` (Retry), `recovery` (Escalation), and `review`, plus the
+pools and signal classes. It names no models and holds no default routes
+(toolboxmd/model-router#133): every stage's routes are the role's Prism
+list. The internal keys `correction` and `recovery`
 stay in the policy and the snapshot contract; user-facing text says Retry
 and Escalation, and recovery alone means controller recovery.
 
@@ -106,14 +109,13 @@ token (toolboxmd/t3code#19; `runner/t3snapshot.py`, cached for 30 seconds):
 - **Eligibility.** A route is eligible when its T3 instance is present and
   enabled and offers the route's model. Turning a model off in T3 Providers
   removes it from routing.
-- **Role preferences.** A non-empty Prism list replaces the policy order
-  for that stage: `worker` easy, medium and hard for the small, default and
+- **Role preferences.** The Prism list is the stage's route order: `worker` easy, medium and hard for the small, default and
   hard lanes; `dispatcher`, `reviewer`, `correction` (Retry) and `recovery`
   (Escalation) each read one list, `models` (toolboxmd/model-router#127). A
   snapshot without `models` (older fork) falls back to the role's entry for
   the job's lane. The first entry is the primary, the rest are
-  fallbacks. An entry that matches a policy route keeps its caps; any other
-  runs as `t3:<instance>:<model>@<effort>`.
+  fallbacks. Every entry runs as `t3:<instance>:<model>@<effort>`; its pool
+  and family derive from the instance and model.
 - **Limits.** A pool's meter is one T3 driver's usage windows (`go` is
   OpenCode's single account meter, `codex`, `claude` and `xai` their own
   providers; Zen free has no reader). A window at 100 percent with a future
@@ -121,8 +123,32 @@ token (toolboxmd/t3code#19; `runner/t3snapshot.py`, cached for 30 seconds):
   without `resetsAt` it rests until a later read says otherwise; at 80
   percent or more the route is degraded; a passed `resetsAt` is eligible.
 - **Unknown.** A snapshot that cannot be read (an older server without the
-  endpoint, unreachable, a bad body) filters nothing: the policy defaults
-  and the error marks apply.
+  endpoint, unreachable, no T3 token, a bad body) leaves every stage
+  without routes. The runner never falls back to other models.
+
+### Prism unreadable
+
+Before every controller step, the runner checks that it can route the job.
+If it cannot, the job blocks before any thread starts, and the blocked
+terminal report tells the planner in its thread (and in `status` and
+`result`):
+
+- `Prism unreadable: <cause> (still unreadable after retrying for 300s)`
+  when the snapshot stays unreadable, for example `no T3 bearer token: ...`
+  or `T3 GET /api/prism/snapshot failed: HTTP 404`. A failed read is retried
+  with backoff (5, 10, 20, 40, then 60 seconds) for up to
+  `PRISM_UNREADABLE_WAIT_SECS` (300 seconds), so a T3 restart or a token
+  renewal mid-job does not end the job. While it waits no thread starts
+  and the last snapshot's routes are not reused; a read that recovers
+  continues the job. An empty list in a readable snapshot blocks at once.
+- `Prism Dispatcher list is empty`, `Prism Worker <easy|medium|hard> lane is
+  empty` (the job's lane only), `Prism Reviewer list is empty`, or
+  `Prism Retry list is empty` or `Prism Escalation list is empty` while that
+  step is switched on.
+
+On this report the planner does that work itself through direct
+`spawn_thread` (naming the model and effort) instead of waiting for the
+runner. The block is not recover-owned, so the job stays blocked.
 
 Error marks come from turn errors. An exhaustion error rests its whole pool
 (a Go limit never moves laterally to another Go model) until the reset the
@@ -134,7 +160,8 @@ assumed marks on its pool. Overload and stalls rest the one route for the
 15-minute cooldown.
 
 Signal classes: `exhausted` moves the same model to the next pool
-(`next_pool`, for example Muse free to Muse Go) or else the next family;
+(`next_pool`, set only on named routes; Prism routes have none) or else the
+next family;
 `overloaded` and `stalled` move to the next family in the lane; `context`
 moves to a larger-context route in the lane; `hard` ends the turn as failed.
 Moves stay inside the job's lane and skip exhausted, degraded, one-turn
@@ -186,13 +213,12 @@ thread; Grok turns are re-sent by the router.
    recorded, without a proof command, a base commit, a Git workspace, or
    with `"baseline_proof": false`.
 2. **Dispatch.** The dispatcher thread starts on the first eligible
-   dispatch route (Luna max on Codex, then Luna on Go in OpenCode plan
-   mode). A dispatch route known exhausted or resting is skipped before the
+   route in the Prism Dispatcher list. A dispatch route known exhausted or resting is skipped before the
    thread starts; a capped fallback route is reserved first
    (`max_concurrent`) or blocks as `capacity_exhausted`. An exhaustion
    error on the first dispatch marks the pool and moves to the fallback in
    the same step.
-3. **Envelope.** Luna replies with one envelope: `planner_question`,
+3. **Envelope.** The dispatcher replies with one envelope: `planner_question`,
    `implementation`, or `completion` (`research` is reserved and blocks).
    The action is the last complete JSON object of the turn's last assistant
    message (prose then envelope, optionally fenced; a tail missing at most
@@ -235,8 +261,7 @@ thread; Grok turns are re-sent by the router.
    **Review turn (#126).** A completion that passes these checks first gets
    one read-only review turn on the candidate's exact head, in a reviewer
    child thread of the dispatcher thread, on the review stage's first
-   eligible route (the Prism Reviewer list, else Luna max on Codex, then
-   Luna on Go in plan mode); an exhaustion or overload error marks the route
+   eligible route in the Prism Reviewer list; an exhaustion or overload error marks the route
    and moves to the next in the same step. With every review route exhausted
    or resting the job blocks as `review_capacity_wait` instead of running
    one anyway. The reviewer ends its reply with

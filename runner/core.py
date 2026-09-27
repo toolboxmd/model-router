@@ -1057,10 +1057,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
     # given; the critical lane is planner-executed and raises here so the
     # planner keeps that step.
     explicit_route = route
-    if lane:
-        lane_route = policy.lane_default_route(lane)
-    else:
-        lane_route = None
+    if lane and policy.resolve_lane(lane) not in policy.IMPLEMENTATION_LANES:
+        policy.lane_default_route(lane)  # raises: not a runner-dispatched lane
     if explicit_route is not None:
         policy.validate_implementation_route(explicit_route)
         # The job remembers its lane: Muse sits in two lanes, so later moves
@@ -1070,7 +1068,7 @@ def submit(state_dir, request_id: str, task, workspace: str,
         if lane is not None:
             req_stage = policy.resolve_lane(lane)
             if req_stage in policy.IMPLEMENTATION_LANES \
-                    and explicit_route not in policy.STAGES[req_stage]["routes"]:
+                    and explicit_route not in policy.stage_routes(req_stage):
                 raise ValueError(f"route {explicit_route!r} is not in lane {lane!r}")
             explicit_lane_stage = req_stage
         else:
@@ -1222,15 +1220,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
             # spread applies only among capped routes. A job walks the lane
             # only on evidence. A new job never starts
             # in recovery, even for dual-listed Grok rungs.
-            if lane:
-                route = _sticky_home_locked(con, lane) or lane_route
-                lane_stage = policy.resolve_lane(lane)
-            else:
-                route = _sticky_home_locked(con, policy.DEFAULT_LANE) \
-                    or policy.lane_default_route(policy.DEFAULT_LANE)
-                lane_stage = policy.resolve_lane(policy.DEFAULT_LANE)
-            route = route or policy.lane_default_route(policy.DEFAULT_LANE)
-            policy.validate_implementation_route(route)
+            # Without Prism routes (unreadable at submit) the job is stored
+            # with no route; the controller reports why before any thread
+            # starts, or takes the lane's first Prism route (#133).
+            lane_stage = policy.resolve_lane(lane or policy.DEFAULT_LANE)
+            route = _sticky_home_locked(con, lane_stage) \
+                or next(iter(policy.stage_routes(lane_stage)), "")
+            if route:
+                policy.validate_implementation_route(route)
         try:
             _canonical_workspace(ws)  # a new job needs an existing workspace
         except ValueError:
@@ -1280,8 +1277,9 @@ def submit(state_dir, request_id: str, task, workspace: str,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
              planner_model, planner_effort, "controller",
-              policy.worker_model_variant(route)[0],
-              policy.worker_model_variant(route)[1] or "default", pcwd, lane_stage,
+              policy.worker_model_variant(route)[0] if route else "",
+              (policy.worker_model_variant(route)[1] if route else None) or "default",
+              pcwd, lane_stage,
              job_kind, replay_of, planner_harness, base_commit, summary,
              planner_t3_thread, t3_url),
         )

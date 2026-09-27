@@ -165,6 +165,11 @@ def main(argv=None) -> int:
             if args.handoff_summary_file:
                 with open(args.handoff_summary_file, encoding="utf-8") as f:
                     handoff_summary = f.read()
+            # The first route comes from Prism: read the snapshot for the
+            # planner's project. Unreadable leaves the job without a route
+            # and the controller reports why (#133).
+            t3snapshot.prime_for_submit(args.t3_server_url, args.planner_t3_thread,
+                                        args.lane)
             # Persist first; launch only when explicitly requested with
             # built-in adapters. --no-start wins so deterministic tests
             # stay offline. Default (neither flag) only persists, which

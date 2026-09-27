@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runner import controller, core, policy, t3exec, t3snapshot  # noqa: E402
-from tests.fakes import (FakeT3Client, prism_provider, prism_snapshot,  # noqa: E402
+from tests.fakes import (default_prism, install_prism, FakeT3Client, prism_provider, prism_snapshot,  # noqa: E402
                          use_fake_t3)
 
 PLANNER = "planner-t3"
@@ -59,8 +59,8 @@ def full_providers(go_windows=None, opencode_models=None, grok_enabled=True):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        t3snapshot.reset()
-        self.addCleanup(t3snapshot.reset)
+        install_prism()
+        self.addCleanup(install_prism)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
@@ -71,7 +71,15 @@ class Base(unittest.TestCase):
         d.mkdir(exist_ok=True)
         return str(d)
 
-    def apply(self, snapshot, lane="implementation_default"):
+    def apply(self, snapshot, lane="implementation_default", fill=True):
+        """Serve ``snapshot`` and refresh. With ``fill``, role lists the
+        snapshot leaves empty take the fixture's lists (the policy has
+        no defaults, #133)."""
+        if fill and isinstance(snapshot, dict):
+            fixture = default_prism()["roles"]
+            for role, kit in snapshot["roles"].items():
+                if not kit.get("models") and not any(kit["lanes"].values()):
+                    snapshot["roles"][role] = fixture[role]
         fake = FakeT3Client(planner=PLANNER)
         fake.prism = snapshot
         t3snapshot.refresh(fake, "proj-1", lane, force=True)
@@ -106,17 +114,23 @@ class Eligibility(Base):
         # The dispatch preflight falls back to Luna on Go.
         self.assertEqual(controller._dispatch_fallback_routes("luna/max"), ["luna-go/max"])
 
-    def test_unknown_snapshot_filters_nothing(self):
+    def test_unknown_snapshot_leaves_no_routes(self):
         fake = self.apply(None)
         self.assertEqual(fake.prism_reads, ["proj-1"])
         self.assertEqual(core.exhausted_routes(self.sd), set())
         self.assertEqual(core.degraded_routes(self.sd), set())
-        self.assertEqual(t3snapshot.view()["snapshot"], "unknown")
-        self.assertEqual(core.sticky_home_route(self.sd, "default"), "muse-spark-xhigh-free")
+        view = t3snapshot.view()
+        self.assertEqual(view["snapshot"], "unknown")
+        self.assertEqual(view["stage_overrides"], {})
+        self.assertTrue(view["blocked"].startswith("Prism unreadable: "), view["blocked"])
+        self.assertIn("HTTP 404", view["blocked"])
+        for stage in policy.STAGES:
+            self.assertEqual(policy.stage_routes(stage), [], stage)
+        self.assertIsNone(core.sticky_home_route(self.sd, "default"))
 
 
 class RolePreferences(Base):
-    def test_lane_lists_replace_the_policy_order(self):
+    def test_lane_lists_are_the_stage_order(self):
         lanes = {"worker": {"medium": [
             {"instanceId": "opencode", "model": "opencode-go/muse-spark-1.3-contributor",
              "effort": "xhigh"},
@@ -124,12 +138,12 @@ class RolePreferences(Base):
             "recovery": {"medium": [{"instanceId": "grok", "model": "grok-4.6",
                                      "effort": "medium"}]}}
         providers = full_providers() + [prism_provider("claudeAgent", ["claude-opus-5-5"])]
-        self.apply(prism_snapshot(providers, lanes), lane="implementation_default")
+        self.apply(prism_snapshot(providers, lanes), lane="implementation_default", fill=False)
         order = policy.stage_routes("implementation_default")
         self.assertEqual(order, ["muse-spark-xhigh-go", "t3:claudeAgent:claude-opus-5-5@medium"])
         self.assertEqual(policy.stage_routes("recovery"), ["grok-4.6-build"])
-        # Lanes without a list keep the policy default.
-        self.assertEqual(policy.stage_routes("implementation_hard")[0], "muse-spark-xhigh-free")
+        # Lanes without a Prism list have no routes: the policy has no defaults.
+        self.assertEqual(policy.stage_routes("implementation_hard"), [])
         self.assertEqual(core.sticky_home_route(self.sd, "default"), "muse-spark-xhigh-go")
         # A snapshot route is a T3 selection with the Claude effort option.
         sel = t3exec.route_model_selection("t3:claudeAgent:claude-opus-5-5@medium")
@@ -277,8 +291,8 @@ class ControllerRefresh(Base):
 
 class Wire(unittest.TestCase):
     def setUp(self):
-        t3snapshot.reset()
-        self.addCleanup(t3snapshot.reset)
+        install_prism()
+        self.addCleanup(install_prism)
 
     def serve(self, status, body):
         seen = []
