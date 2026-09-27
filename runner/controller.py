@@ -23,6 +23,14 @@ from pathlib import Path
 from . import adapters, core, policy, store, t3exec, t3snapshot
 
 MAX_LOOP_STEPS = 12
+# The controller keeps stepping while the job has one of these statuses.
+# ``question_pending`` is active: the next step asks the planner in its T3
+# thread, and a question left without a reply blocks the job
+# (``planner_question_pending``), which is the "waiting on the planner" stop.
+ACTIVE_STEP_STATUSES = ("pending", "running", "question_pending")
+# Step actions that mean "stop here"; with the job still active they block
+# it as ``controller_exit_unhandled`` instead of orphaning it (#132).
+STOP_STEP_ACTIONS = ("blocked", "cancelled", "noop-terminal")
 
 # Lease token of the controller process that owns this job. Every durable
 # controller write checks it under the write lock; tests and helpers that
@@ -341,8 +349,13 @@ def _t3_thread_for(job: dict, slot: str) -> dict | None:
 def _save_t3_thread(state_dir, request_id: str, slot: str,
                     thread_id: str, route: str | None = None,
                     created: bool | None = None,
-                    turn_started: bool | None = None) -> None:
-    """Record a T3 child thread id for adoption by later controllers."""
+                    turn_started: bool | None = None,
+                    turn_state: str | None = None) -> None:
+    """Record a T3 child thread id for adoption by later controllers.
+
+    ``turn_state`` is the last known state of the thread's latest turn
+    (``running``, or a terminal ``completed``/``error``/``interrupted``):
+    cancel reads it when T3 is unreachable (#132)."""
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -363,12 +376,17 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
             threads = {}
         previous = threads.get(slot) if isinstance(threads.get(slot), dict) else {}
         record = dict(previous)
-        record.update({"thread_id": thread_id, "route": route,
-                       "updated_at": core._utcnow()})
+        record.update({"thread_id": thread_id, "updated_at": core._utcnow()})
+        if route is not None or "route" not in record:
+            record["route"] = route
         if created is not None:
             record["created"] = bool(created)
         if turn_started is not None:
             record["turn_started"] = bool(turn_started)
+        if turn_started:
+            record["turn_state"] = "running"
+        if turn_state is not None:
+            record["turn_state"] = turn_state
         threads[slot] = record
         st["t3_threads"] = threads
         con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
@@ -385,6 +403,46 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
         raise
     finally:
         con.close()
+
+
+def _note_t3_turn(state_dir, request_id: str, slot: str, thread_id: str | None,
+                  route: str | None, outcome: dict) -> None:
+    """Record a watched turn's end: its last known state on the saved
+    thread, and its stream statistics (max silence, time to first token)
+    in the ledger. Best effort: evidence never blocks the job."""
+    state = outcome.get("state")
+    if not thread_id:
+        return
+    try:
+        _save_t3_thread(state_dir, request_id, slot, thread_id, route,
+                        turn_state=state if state in t3exec.TURN_TERMINAL_STATES
+                        else "running")
+    except Exception:
+        pass
+    stream = outcome.get("stream")
+    if isinstance(stream, dict):
+        try:
+            core._record_t3_interrupt_event(
+                state_dir, request_id, "t3_turn_stream",
+                {"slot": str(slot)[:48], "route": str(route or "")[:64],
+                 "state": str(state or "")[:16],
+                 **{k: stream.get(k) for k in ("max_silence", "first_token_secs",
+                                               "window", "slept")}})
+        except Exception:
+            pass
+
+
+def _t3_post_and_watch(state_dir, request_id: str, slot: str, client,
+                       thread_id: str, text: str, route: str | None = None,
+                       **kwargs) -> dict:
+    """``t3exec.post_and_watch`` on a saved thread, keeping its last known
+    turn state current (running before the post, the outcome after)."""
+    _save_t3_thread(state_dir, request_id, slot, thread_id, route,
+                    turn_state="running")
+    outcome = t3exec.post_and_watch(client, thread_id, text, route=route,
+                                    **kwargs)
+    _note_t3_turn(state_dir, request_id, slot, thread_id, route, outcome)
+    return outcome
 
 
 def _check_t3_start_lease(state_dir, request_id: str) -> None:
@@ -446,9 +504,9 @@ def _t3_repair_envelope(state_dir, request_id: str, *, thread_id: str,
               "only: exactly one JSON object whose action is "
               "planner_question, implementation or completion, and nothing else.")
     try:
-        outcome = t3exec.post_and_watch(client, thread_id, prompt,
-                                        role="dispatch",
-                                        watch_kwargs=_t3_watch_kwargs())
+        outcome = _t3_post_and_watch(state_dir, request_id, "dispatch", client,
+                                     thread_id, prompt, role="dispatch",
+                                     watch_kwargs=_t3_watch_kwargs())
     except t3exec.T3Error as e:
         _mark_blocked(state_dir, request_id, f"t3_unavailable: {e}")
         return None
@@ -533,6 +591,8 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
     except Exception:
         pass
     outcome["slot"] = slot
+    _note_t3_turn(state_dir, request_id, slot, outcome.get("thread_id"), route,
+                  outcome)
     if outcome.get("state") == "unknown":
         # A failed reconciliation read is recoverable. Do not turn it into a
         # sticky dispatch or worker failure while the remote state is unknown.
@@ -565,9 +625,10 @@ def _t3_dispatch_outcome(state_dir, request_id: str, prompt: str,
         # thread, then accept whatever that watch reports.
         job = core.get_job(state_dir, request_id)
         try:
-            second = t3exec.post_and_watch(client, thread_id, prompt, route=route,
-                                           role="dispatch",
-                                           watch_kwargs=_t3_watch_kwargs())
+            second = _t3_post_and_watch(state_dir, request_id, "dispatch",
+                                        client, thread_id, prompt, route=route,
+                                        role="dispatch",
+                                        watch_kwargs=_t3_watch_kwargs())
         except t3exec.T3Error as e:
             return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
         second["thread_id"] = thread_id
@@ -755,8 +816,9 @@ def _resume_luna_via_t3(state_dir, request_id: str, message: str,
     route = saved.get("route") or _dispatcher_route(job)
     try:
         client = _t3_client_for_job(job, t3_client)
-        outcome = t3exec.post_and_watch(client, thread_id, message, role="dispatch",
-                                        watch_kwargs=_t3_watch_kwargs())
+        outcome = _t3_post_and_watch(state_dir, request_id, "dispatch", client,
+                                     thread_id, message, role="dispatch",
+                                     watch_kwargs=_t3_watch_kwargs())
     except t3exec.T3Error as e:
         return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
     try:
@@ -852,34 +914,37 @@ def _run_t3_worker_turn(state_dir, request_id: str, job: dict,
         # The server cut the turn (restart): continue once on the same
         # thread like the dispatcher path, then accept the second watch.
         try:
-            second = t3exec.post_and_watch(client, thread_id, prompt,
-                                           route=route, role=role,
-                                           watch_kwargs=_t3_watch_kwargs())
+            second = _t3_post_and_watch(state_dir, request_id, slot, client,
+                                        thread_id, prompt, route=route, role=role,
+                                        watch_kwargs=_t3_watch_kwargs())
             second["thread_id"] = thread_id
             outcome = second
         except t3exec.T3Error as e:
             return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
     if outcome.get("state") == "stalled":
         # Never start a second writer behind a possibly live server-side
-        # turn: interrupt first, then confirm idle before the shared
-        # stall path may move routes.
-        try:
-            client.dispatch({"type": "thread.turn.interrupt",
-                             "commandId": f"cmd-{request_id}-seq{seq}-{secrets.token_hex(4)}",
-                             "threadId": thread_id,
-                             "createdAt": t3exec._utcnow_iso()})
-        except Exception:
-            pass
-        try:
-            snap = client.thread_snapshot(thread_id)
-            ev = t3exec.evaluate_turn(snap, now=time.time(),
-                                      silence_secs=t3exec.T3_SILENCE_SECS)
-            outcome["idle_confirmed"] = ev.get("state") in (
-                "completed", "error", "interrupted")
-            if ev.get("state") == "completed" and not outcome.get("assistant_text"):
-                outcome["assistant_text"] = t3exec.latest_assistant_text(snap)
-        except Exception:
-            outcome["idle_confirmed"] = False
+        # turn: interrupt first, then poll until the turn settles (T3
+        # applies the interrupt asynchronously) before the shared stall
+        # path may move routes.
+        settle = t3exec.interrupt_and_settle(
+            client, thread_id,
+            command={"type": "thread.turn.interrupt",
+                     "commandId": f"cmd-{request_id}-seq{seq}-{secrets.token_hex(4)}",
+                     "threadId": thread_id,
+                     "createdAt": t3exec._utcnow_iso()})
+        outcome["idle_confirmed"] = settle["settled"]
+        if settle["settled"]:
+            try:
+                _save_t3_thread(state_dir, request_id, slot, thread_id, route,
+                                turn_state=(settle["state"]
+                                            if settle["state"] in t3exec.TURN_TERMINAL_STATES
+                                            else "interrupted"))
+            except core.LeaseLostError:
+                raise
+            except Exception:
+                pass
+        if settle["state"] == "completed" and not outcome.get("assistant_text"):
+            outcome["assistant_text"] = t3exec.latest_assistant_text(settle["snapshot"])
     full, rc = _t3_worker_full(outcome, thread_id)
     return _finish_worker_turn(state_dir, request_id, job, route, seq,
                                artifact, full, thread_id, rc,
@@ -2924,15 +2989,17 @@ def _review_block(state_dir, request_id: str, reason: str) -> dict:
     return _t3_block(state_dir, request_id, reason[:500])
 
 
-def _review_verdict_repair(client, thread_id: str, text: str) -> tuple[dict | None, str]:
+def _review_verdict_repair(state_dir, request_id: str, slot: str, client,
+                           thread_id: str, text: str) -> tuple[dict | None, str]:
     """Ask the review thread once for the verdict JSON only."""
     prompt = ("VERDICT REPAIR: your last reply had no parsable verdict "
               f"({_review_verdict_error(text)}). Reply with exactly one JSON "
               'object and nothing else: {"verdict": "approve" | "request_changes", '
               '"findings": "..."}.')
     try:
-        outcome = t3exec.post_and_watch(client, thread_id, prompt, role="review",
-                                        watch_kwargs=_t3_watch_kwargs())
+        outcome = _t3_post_and_watch(state_dir, request_id, slot, client, thread_id,
+                                     prompt, role="review",
+                                     watch_kwargs=_t3_watch_kwargs())
     except t3exec.T3Error as e:
         return None, f"repair post failed: {e}"
     reply = outcome.get("assistant_text") or ""
@@ -3013,8 +3080,9 @@ def _run_review(state_dir, request_id: str, job: dict, head: str,
     if outcome.get("state") == "interrupted":
         # The server cut the turn (restart): continue once on the same thread.
         try:
-            second = t3exec.post_and_watch(client, thread_id, prompt, route=route,
-                                           role="review", watch_kwargs=_t3_watch_kwargs())
+            second = _t3_post_and_watch(state_dir, request_id, slot, client,
+                                        thread_id, prompt, route=route,
+                                        role="review", watch_kwargs=_t3_watch_kwargs())
         except t3exec.T3Error as e:
             return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
         second["thread_id"] = thread_id
@@ -3025,7 +3093,8 @@ def _run_review(state_dir, request_id: str, job: dict, head: str,
         return _review_block(state_dir, request_id, f"review_failed: {detail}")
     verdict = parse_review_verdict(text)
     if verdict is None:
-        verdict, why = _review_verdict_repair(client, thread_id, text)
+        verdict, why = _review_verdict_repair(state_dir, request_id, slot,
+                                              client, thread_id, text)
         if verdict is None:
             return _review_block(state_dir, request_id, f"review_missing_verdict: {why}")
     if _workspace_state(workspace) != baseline.get("state"):
@@ -4306,12 +4375,11 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
     _LEASE["token"] = token
     # Bounded durable loop: every turn runs as a T3 thread and every
     # decision is persisted before its side effect.
-    # An exhausted escalation asks the planner in its thread on the next
-    # step, so the planner wakes without a manual recover.
-    continuing = ("dispatched", "question-answered-resumed",
-                  "implementation-resumed", "completion-refused-resumed",
-                  "transferred_to_go", "route_switched",
-                  "stalled_retry", "recovery-exhausted-question")
+    # Continuation follows the job's status, never a list of step actions
+    # (#132): the loop runs while the job is active and stops once it is
+    # terminal, blocked (including waiting on the planner) or cancelling.
+    # A step that reports a stop while the job is still active blocks it
+    # with a named reason, so the planner is always woken.
     for _ in range(MAX_LOOP_STEPS):
         try:
             total = _count_step(state_dir, request_id)
@@ -4342,7 +4410,25 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
             _advertise(state_dir, request_id, token)
         except Exception:
             pass
-        if (res or {}).get("action") not in continuing:
+        try:
+            job = core.get_job(state_dir, request_id)
+            if job["status"] not in ACTIVE_STEP_STATUSES or job.get("cancel_requested"):
+                break
+            action = (res or {}).get("action")
+            if not action or action in STOP_STEP_ACTIONS:
+                why = (res or {}).get("reason")
+                _mark_blocked(state_dir, request_id,
+                              f"controller_exit_unhandled: {action}"
+                              + (f" ({why})" if why else ""))
+                break
+        except core.LeaseLostError:
+            return 0
+        except Exception as e:  # noqa: BLE001 - persisted, never silent
+            try:
+                _mark_blocked(state_dir, request_id,
+                              f"controller_error: {type(e).__name__}: {str(e)[:300]}")
+            except Exception:
+                pass
             break
     else:
         try:

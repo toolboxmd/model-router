@@ -214,10 +214,12 @@ class CapacityTurns(Base):
         self.assertEqual(policy.next_capacity_route("glm-5.1-go", set()), (None, None))
 
 
-def _continuing():
-    import inspect
-    src = inspect.getsource(controller.run_controller_process)
-    return src[src.index("continuing = ("):src.index(")", src.index("continuing = ("))]
+def _loop_continues(sd, request_id, res):
+    """The controller loop's own continuation rule (status-based, #132)."""
+    job = core.get_job(sd, request_id)
+    return (job["status"] in controller.ACTIVE_STEP_STATUSES
+            and not job.get("cancel_requested")
+            and res.get("action") not in controller.STOP_STEP_ACTIONS)
 
 
 class EscalationThroughT3(Base):
@@ -245,7 +247,7 @@ class EscalationThroughT3(Base):
             if res.get("action") == "recovery-exhausted-question":
                 # The controller loop continues into the next step, which
                 # asks the planner in its thread; no manual recover.
-                self.assertIn('"recovery-exhausted-question"', _continuing())
+                self.assertTrue(_loop_continues(self.sd, "esc", res))
                 controller.step(self.sd, "esc")
                 break
         job = core.get_job(self.sd, "esc")

@@ -20,13 +20,14 @@ worker, correction and recovery threads are children of the dispatcher
 thread. Every child's first message names the job and links the planner
 thread.
 
-Liveness is activity-based, never a fixed silence window: a turn is
-healthy while assistant tokens stream (message ``updatedAt`` advances)
-or a ``tool.*`` / ``task.*`` call is still open. Silence with no running tool past
-``T3_SILENCE_SECS`` (≈ a minute) is flagged and probed immediately
-with a fresh snapshot read; explicit provider errors act at once. A
-long test run holds a running tool activity, so it is never mistaken
-for a stall.
+Liveness is activity-based: a turn is healthy while assistant tokens
+stream (message ``updatedAt`` advances) or a ``tool.*`` / ``task.*`` call
+is still open. Silence with no running tool past the driver's measured
+window (:data:`T3_SILENCE_SECS_BY_DRIVER`) is flagged and probed
+immediately with a fresh snapshot read; explicit provider errors act at
+once. A long test run holds a running tool activity, so it is never
+mistaken for a stall. Time the host spent asleep never counts as
+silence (#132).
 
 Restart: after a T3 server restart with
 ``continueThreadsAfterServerUpdate`` on, interrupted Claude, Codex and
@@ -70,8 +71,32 @@ PRISM_SNAPSHOT_PATH = "/api/prism/snapshot"
 T3_PLANNER_HARNESS = "t3"
 
 # Activity-based liveness: silence with no running tool is flagged past
-# this window (about a minute) and probed immediately with a fresh read.
-T3_SILENCE_SECS = 60.0
+# the driver's window and probed immediately with a fresh read (#132).
+# Interim until T3 exposes its stream clock (toolboxmd/t3code#55): each
+# window is the largest healthy gap observed for that driver, times 1.25,
+# rounded up to 30 s. Gaps come from completed T3 turns
+# (``projection_thread_messages`` updatedAt and activity createdAt, open
+# tools excluded, host sleep excluded via ``pmset -g log``), 2026-09-21
+# to 2026-09-27, plus the earlier issue evidence:
+# - codex: 232 s (gpt-6-astra context compaction, n=102 turns); max-effort
+#   reasoning silent 181 s (#73). 232 * 1.25 -> 300 s.
+# - opencode: 96 s in T3 (Muse on Go, n=10); healthy sessions up to 161 s
+#   in OpenCode's own database (#33). 161 * 1.25 -> 210 s.
+# - claudeAgent: 54 s before the first token (n=545). 54 * 1.25 -> 90 s.
+# Drivers without measurements (grok, unknown) take the largest window.
+# Replace these with per-route thresholds from T3's per-turn stream
+# statistics once t3code#55 lands; ``silence_window`` is the only reader.
+T3_SILENCE_SECS_BY_DRIVER = {"codex": 300.0, "opencode": 210.0,
+                             "claudeAgent": 90.0}
+T3_SILENCE_SECS = max(T3_SILENCE_SECS_BY_DRIVER.values())
+# A wall-clock step this much larger than the monotonic step between two
+# polls means the host slept (macOS and Linux monotonic clocks stop
+# during suspend); that time is not silence.
+T3_SLEEP_TOLERANCE_SECS = 2.0
+# After an interrupt, poll this often until the turn settles, at most
+# this long (T3 applies interrupts asynchronously: 58 ms on #132 job -2).
+T3_SETTLE_POLL_SECS = 0.5
+T3_SETTLE_MAX_SECS = 15.0
 # Poll interval while watching a T3 turn.
 T3_POLL_SECS = 2.0
 # Recovery must not watch an already-saved child forever when its turn was
@@ -718,18 +743,113 @@ def error_evidence(snapshot: dict, turn_id: str | None = None) -> str | None:
     return None
 
 
+def snapshot_driver(snapshot: dict) -> str | None:
+    """T3 driver of the thread's model selection (``codex``, ``opencode``...)."""
+    thread = snapshot_thread(snapshot)
+    selection = thread.get("modelSelection")
+    instance = selection.get("instanceId") if isinstance(selection, dict) else None
+    if not isinstance(instance, str) or not instance:
+        session = thread.get("session")
+        instance = session.get("providerInstanceId") if isinstance(session, dict) else None
+    if not isinstance(instance, str) or not instance:
+        return None
+    return next((d for d in T3_EFFORT_OPTION if instance.startswith(d)), instance)
+
+
+def silence_window(driver: str | None) -> float:
+    """Silence (no running tool) after which a turn of ``driver`` is flagged."""
+    return T3_SILENCE_SECS_BY_DRIVER.get(driver or "", T3_SILENCE_SECS)
+
+
+def awake_secs(start: float, end: float, sleeps=()) -> float:
+    """Seconds in ``[start, end]`` the host was awake (``sleeps``: wall intervals)."""
+    asleep = sum(max(0.0, min(end, b) - max(start, a)) for a, b in sleeps)
+    return max(0.0, end - start - asleep)
+
+
+TURN_TERMINAL_STATES = ("completed", "error", "interrupted")
+
+
+def turn_settled(snapshot: dict) -> bool:
+    """True when the thread has no live turn: the session names no active
+    turn, and the latest turn is completed, errored or interrupted, there
+    is none, or the session is stopped."""
+    thread = snapshot_thread(snapshot)
+    if not thread or "latestTurn" not in thread:
+        return False
+    session = thread.get("session")
+    if isinstance(session, dict) and session.get("activeTurnId"):
+        # The session still runs a turn, whatever latestTurn says (live T3
+        # clears activeTurnId once a turn ends).
+        return False
+    latest = thread.get("latestTurn")
+    if latest is None:
+        return True
+    if isinstance(latest, dict) and latest.get("state") in TURN_TERMINAL_STATES:
+        return True
+    return isinstance(session, dict) and session.get("status") == "stopped"
+
+
+
+def interrupt_and_settle(client: "T3Client", thread_id: str, *,
+                         command: dict | None = None,
+                         poll_secs: float = T3_SETTLE_POLL_SECS,
+                         max_secs: float = T3_SETTLE_MAX_SECS,
+                         now_fn=None, sleep_fn=None) -> dict:
+    """Interrupt the thread's turn and poll until it settles (#132).
+
+    T3 applies ``thread.turn.interrupt`` asynchronously, so one read right
+    after the dispatch can still show the live turn. Returns ``settled``,
+    the latest turn ``state``, the last ``snapshot`` read (or None), and
+    ``error`` when the dispatch or a read failed.
+    """
+    now_fn = now_fn or time.monotonic
+    sleep_fn = sleep_fn or time.sleep
+    out: dict = {"settled": False, "state": None, "snapshot": None}
+    try:
+        out["result"] = client.dispatch(command or turn_interrupt_command(thread_id))
+    except Exception as e:  # noqa: BLE001 - reported, then the reads decide
+        out["error"] = f"interrupt dispatch failed: {e}"[:300]
+    deadline = now_fn() + max_secs
+    while True:
+        try:
+            snapshot = client.thread_snapshot(thread_id)
+        except T3Error as e:
+            out["error"] = f"t3 snapshot failed: {e}"[:300]
+            return out
+        latest = snapshot_thread(snapshot).get("latestTurn")
+        out.update(snapshot=snapshot,
+                   state=latest.get("state") if isinstance(latest, dict) else None)
+        if turn_settled(snapshot):
+            out["settled"] = True
+            return out
+        if now_fn() >= deadline:
+            return out
+        sleep_fn(poll_secs)
+
+
 def evaluate_turn(snapshot: dict, *, now: float,
                   last_known_activity: float | None = None,
-                  silence_secs: float = T3_SILENCE_SECS) -> dict:
+                  silence_secs: float | None = None,
+                  sleeps=()) -> dict:
     """Activity-based liveness of one T3 turn.
 
     Returns ``state`` ``running`` (tokens streaming or a tool running),
     ``completed`` (with ``assistant_text``), ``error`` (with ``reason``),
     ``interrupted`` (server restart cut the turn), or ``stalled``
-    (silence past ``silence_secs`` with no running tool, with
-    ``silence`` age and ``last_part`` evidence). ``last_activity_ts``
+    (silence past the window with no running tool, with ``silence`` age
+    and ``last_part`` evidence). ``silence_secs`` defaults to the
+    thread's driver window; ``sleeps`` lists wall-clock intervals the
+    host slept, which never count as silence. ``last_activity_ts``
     carries the newest observed activity for the caller's next poll.
+
+    Seam for toolboxmd/t3code#55: once T3 serves ``lastStreamAt`` and
+    ``openTool``, they replace the anchor and the tool check below, and
+    ``silence_window`` reads per-route thresholds from T3's per-turn
+    stream statistics.
     """
+    if silence_secs is None:
+        silence_secs = silence_window(snapshot_driver(snapshot))
     thread = snapshot_thread(snapshot)
     latest = thread.get("latestTurn")
     latest_state = latest.get("state") if isinstance(latest, dict) else None
@@ -784,9 +904,10 @@ def evaluate_turn(snapshot: dict, *, now: float,
         # Nothing observed yet: the turn just started, not a stall.
         return {"state": "running", "reason": "awaiting first activity",
                 "last_activity_ts": None}
-    silence = max(0.0, now - anchor)
+    silence = awake_secs(anchor, now, sleeps)
     if silence >= silence_secs:
         return {"state": "stalled", "silence": silence,
+                "window": silence_secs, "slept": max(0.0, now - anchor) - silence,
                 "last_part": _last_part_kind(snapshot),
                 "last_activity_ts": anchor}
     return {"state": "running", "reason": "within silence window",
@@ -835,10 +956,30 @@ def _session_error_since(snapshot: dict, since: float) -> str | None:
         else "provider turn error"
 
 
+def first_token_secs(snapshot: dict) -> float | None:
+    """Seconds from the latest turn's start to its first non-user message
+    or activity, or None before any."""
+    thread = snapshot_thread(snapshot)
+    latest = thread.get("latestTurn")
+    if not isinstance(latest, dict):
+        return None
+    turn = latest.get("turnId")
+    start = _parse_ts(latest.get("startedAt")) or _parse_ts(latest.get("requestedAt"))
+    if start is None:
+        return None
+    firsts = [_parse_ts(m.get("createdAt")) for m in (thread.get("messages") or [])
+              if isinstance(m, dict) and m.get("role") != "user"
+              and m.get("turnId") == turn]
+    firsts += [_parse_ts(a.get("createdAt")) for a in (thread.get("activities") or [])
+               if isinstance(a, dict) and a.get("turnId") == turn]
+    firsts = [t for t in firsts if t is not None and t >= start]
+    return round(min(firsts) - start, 3) if firsts else None
+
+
 def watch_turn(client: T3Client, thread_id: str, *,
-               now_fn=None, sleep_fn=None,
+               now_fn=None, sleep_fn=None, mono_fn=None,
                poll_secs: float = T3_POLL_SECS,
-               silence_secs: float = T3_SILENCE_SECS,
+               silence_secs: float | None = None,
                timeout_secs: float | None = None,
                on_snapshot=None,
                prior_turn_id: str | None = None,
@@ -853,22 +994,51 @@ def watch_turn(client: T3Client, thread_id: str, *,
     long as the turn stays active. Explicit provider errors return at
     once.
     """
+    # Host sleep shows as a wall-clock step larger than the monotonic step
+    # (#132: a 99 s clamshell sleep read as 105.7 s of silence). An injected
+    # wall clock without a monotonic one disables the detection.
+    if mono_fn is None:
+        mono_fn = time.monotonic if now_fn is None else now_fn
     now_fn = now_fn or time.time
     sleep_fn = sleep_fn or time.sleep
     started = now_fn()
     deadline = (started + timeout_secs) if timeout_secs else None
     last_activity: float | None = None
     probation: dict | None = None
+    sleeps: list[tuple[float, float]] = []
+    clocks = (started, mono_fn())
+    stats = {"max_silence": 0.0}
+
+    def _done(ev: dict, snapshot: dict | None = None) -> dict:
+        stream = dict(stats, slept=round(sum(b - a for a, b in sleeps), 3))
+        stream["max_silence"] = round(stream["max_silence"], 3)
+        if snapshot is not None:
+            stream["window"] = (silence_secs if silence_secs is not None
+                                else silence_window(snapshot_driver(snapshot)))
+            stream["first_token_secs"] = first_token_secs(snapshot)
+        ev["stream"] = stream
+        return ev
+
+    def _observe(ev: dict) -> dict:
+        if isinstance(ev.get("silence"), (int, float)):
+            stats["max_silence"] = max(stats["max_silence"], float(ev["silence"]))
+        return ev
+
     while True:
         now = now_fn()
+        mono = mono_fn()
+        jump = (now - clocks[0]) - (mono - clocks[1])
+        if jump > T3_SLEEP_TOLERANCE_SECS:
+            sleeps.append((now - jump, now))
+        clocks = (now, mono)
         if deadline is not None and now >= deadline:
-            return {"state": "timeout", "reason": "watch timed out",
-                    "last_activity_ts": last_activity}
+            return _done({"state": "timeout", "reason": "watch timed out",
+                          "last_activity_ts": last_activity})
         try:
             snapshot = client.thread_snapshot(thread_id)
         except T3Error as e:
-            return {"state": "error", "reason": f"t3 snapshot failed: {e}",
-                    "signal": None, "last_activity_ts": last_activity}
+            return _done({"state": "error", "reason": f"t3 snapshot failed: {e}",
+                          "signal": None, "last_activity_ts": last_activity})
         if on_snapshot is not None:
             try:
                 on_snapshot(snapshot)
@@ -890,22 +1060,26 @@ def watch_turn(client: T3Client, thread_id: str, *,
             # once. A turn that never starts goes silent like any other.
             refused = _session_error_since(snapshot, started - 2.0)
             if refused is not None:
-                return {"state": "error", "reason": refused,
-                        "signal": classify_provider_error(refused),
-                        "last_activity_ts": last_activity}
-            if now - started >= silence_secs:
-                return {"state": "stalled", "silence": now - started,
-                        "last_part": "turn never started", "probed": True,
-                        "last_activity_ts": last_activity}
+                return _done({"state": "error", "reason": refused,
+                              "signal": classify_provider_error(refused),
+                              "last_activity_ts": last_activity})
+            waited = awake_secs(started, now, sleeps)
+            window = (silence_secs if silence_secs is not None
+                      else silence_window(snapshot_driver(snapshot)))
+            if waited >= window:
+                return _done({"state": "stalled", "silence": waited,
+                              "window": window,
+                              "last_part": "turn never started", "probed": True,
+                              "last_activity_ts": last_activity})
             sleep_fn(poll_secs)
             continue
-        ev = evaluate_turn(snapshot, now=now,
-                           last_known_activity=last_activity,
-                           silence_secs=silence_secs)
+        ev = _observe(evaluate_turn(snapshot, now=now,
+                                    last_known_activity=last_activity,
+                                    silence_secs=silence_secs, sleeps=sleeps))
         last_activity = ev.get("last_activity_ts", last_activity)
         state = ev.get("state")
         if state in ("completed", "error", "interrupted"):
-            return ev
+            return _done(ev, snapshot)
         if state == "stalled":
             if probation is None:
                 # Flagged: probe immediately with a fresh read before it counts.
@@ -913,27 +1087,28 @@ def watch_turn(client: T3Client, thread_id: str, *,
                 try:
                     snapshot = client.thread_snapshot(thread_id)
                 except T3Error as e:
-                    return {"state": "error",
-                            "reason": f"t3 probe failed: {e}",
-                            "signal": None, "last_activity_ts": last_activity}
+                    return _done({"state": "error",
+                                  "reason": f"t3 probe failed: {e}",
+                                  "signal": None, "last_activity_ts": last_activity})
                 if on_snapshot is not None:
                     try:
                         on_snapshot(snapshot)
                     except Exception:
                         pass
-                second = evaluate_turn(snapshot, now=now_fn(),
-                                       last_known_activity=last_activity,
-                                       silence_secs=silence_secs)
+                second = _observe(evaluate_turn(snapshot, now=now_fn(),
+                                                last_known_activity=last_activity,
+                                                silence_secs=silence_secs,
+                                                sleeps=sleeps))
                 last_activity = second.get("last_activity_ts", last_activity)
                 if second.get("state") == "running":
                     probation = None
                     ev = second
                 else:
                     second["probed"] = True
-                    return second
+                    return _done(second, snapshot)
             else:
                 ev["probed"] = True
-                return ev
+                return _done(ev, snapshot)
         else:
             probation = None
         sleep_fn(poll_secs)
@@ -947,8 +1122,7 @@ def post_restart_action(harness_name: str | None, snapshot: dict) -> dict:
     turn); Grok turns are re-sent by the router with the same message.
     A still-running turn is simply watched on.
     """
-    ev_state = evaluate_turn(snapshot, now=time.time(),
-                             silence_secs=T3_SILENCE_SECS).get("state")
+    ev_state = evaluate_turn(snapshot, now=time.time()).get("state")
     if ev_state not in ("interrupted", "error", "stalled"):
         return {"action": "continue", "reason": f"turn {ev_state} after restart"}
     if (harness_name or "") == "grok":

@@ -14,7 +14,7 @@ Canonical terms for Model Router. One term per concept; avoid the synonyms.
 | Route | One dispatchable choice: a T3 provider instance, model, and effort, with its pool and family. A Prism preference with no policy route runs as `t3:<instance>:<model>@<effort>`. | model (alone) |
 | Pool | A subscription allowance a route draws from: Zen free, Go, xAI, Codex, Claude. Its meter is one T3 provider's usage windows (Go is one OpenCode account meter); Zen free has none. An exhaustion error rests the whole pool. | provider, account |
 | Signal class | How provider evidence is classified: exhausted, overloaded, stalled, context, hard. | error type |
-| Stall | A T3 turn with no streaming tokens and no running tool call past about a minute (`T3_SILENCE_SECS`), confirmed by a fresh snapshot read. | hang |
+| Stall | A T3 turn with no streaming tokens and no running tool call past its driver's measured window (`T3_SILENCE_SECS_BY_DRIVER`) of awake time, confirmed by a fresh snapshot read. | hang |
 | Assumed reset | The reset of a limit error that names none: one 5-hour window, flagged as assumed rather than provider-reported. | guessed reset |
 | Context window | A route's input context in tokens as policy data; a context-overflow turn moves to a larger one in its lane. | context size |
 | Retry | The automatic re-attempt of a failed worker turn: first in the same worker thread, then fresh on the Retry route. Its stage and Prism role keep the internal key `correction` so the snapshot contract stays stable. Prism can switch it off (`enabled: false`), which drops both rungs. | correction (in user-facing text) |

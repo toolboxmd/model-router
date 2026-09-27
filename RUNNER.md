@@ -204,10 +204,15 @@ Liveness is activity-based: a turn is healthy while assistant tokens stream
 (`tool.started` until `tool.completed`/`tool.denied`, `task.started` until
 `task.completed`), so a long test run is never a stall. A tool held behind
 an unresolved approval or user-input request is not running. Silence with
-no running tool past about a minute (`T3_SILENCE_SECS`, 60) is probed at
-once with a fresh snapshot read; explicit provider errors act at once. A
-message posted onto an existing thread is watched only through the turn it
-starts. A stalled worker turn is interrupted and confirmed idle before any
+no running tool past the thread driver's window is probed at once with a
+fresh snapshot read; explicit provider errors act at once. The windows come
+from the largest healthy gaps measured per driver, times 1.25: Codex 300 s,
+OpenCode 210 s, Claude 90 s, anything else 300 s
+(`T3_SILENCE_SECS_BY_DRIVER`). Time the host spends asleep never counts as
+silence. Every watched turn records its longest silence and time to first
+token as a `t3_turn_stream` event. A message posted onto an existing thread
+is watched only through the turn it starts. A stalled worker turn is
+interrupted, then polled until T3 reports the turn settled, before any
 route move. After a T3 server restart with `continueThreadsAfterServerUpdate`
 on, interrupted Claude, Codex and OpenCode turns continue on the same
 thread; Grok turns are re-sent by the router.
@@ -384,7 +389,12 @@ to the database, events, or logs; worker text, proof output, and error
 evidence are redacted before they are persisted or forwarded.
 
 States: `pending -> running <-> question_pending -> succeeded | failed |
-cancelled`, with `cancelling` while the controller and proof group stop.
+cancelled`, with `cancelling` while the controller, proof group and saved
+T3 turns stop. When T3 cannot be reached, a saved turn whose last known
+state is completed, errored or interrupted needs no T3 call; otherwise the
+reason names T3 unreachability. The controller keeps stepping while the job
+is `pending`, `running` or `question_pending`; a step that stops with the
+job still active blocks it as `controller_exit_unhandled: <action>`.
 `blocked` always has a reason. `recover` re-evaluates only its own blocks
 (a dead controller, a pending launch, step budgets, unresolved proof
 ownership); any other block stays until the planner answers or resubmits.
