@@ -922,6 +922,9 @@ class Wire(unittest.TestCase):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
+                if self.path == "/api/prism/liveness?threadId=worker-1":
+                    self.wfile.write(b'{"stale":false,"silenceMs":900000}')
+                    return
                 payload = {"snapshotSequence": 3,
                            "thread": {"id": "planner-1",
                                       "projectId": "proj-1", "messages": [],
@@ -952,6 +955,9 @@ class Wire(unittest.TestCase):
         self.assertEqual(seen["get_path"],
                          "/api/orchestration/threads/planner-1")
         self.assertEqual(snap_["thread"]["projectId"], "proj-1")
+        self.assertEqual(client.prism_liveness("worker-1"),
+                         {"stale": False, "silenceMs": 900000})
+        self.assertEqual(seen["get_path"], "/api/prism/liveness?threadId=worker-1")
         bad = t3exec.T3Client(url, "wrong")
         with self.assertRaises(t3exec.T3Error):
             bad.thread_snapshot("planner-1")

@@ -1805,8 +1805,9 @@ def cancel(state_dir, request_id: str) -> dict:
     # children confirm dead.
     children_dead = _drain_owned_children(state_dir, request_id, owner)
     proof_dead = _drain_proof_group(state_dir, request_id)
-    remote_settled = (_interrupt_saved_t3_threads(state_dir, request_id, dict(job))
-                      if children_dead and proof_dead else False)
+    remote_settled, remote_detail = (
+        _interrupt_saved_t3_threads(state_dir, request_id, dict(job))
+        if children_dead and proof_dead else (False, ""))
     all_dead = bool(children_dead and proof_dead and remote_settled)
 
     # Best-effort stop of the legacy owned worker PID when ownership proven.
@@ -1821,71 +1822,71 @@ def cancel(state_dir, request_id: str) -> dict:
 
     _finalize_stopped(state_dir, request_id, all_dead, remote_settled,
                       local_settled=bool(children_dead and proof_dead),
-                      controller_fenced=children_dead)
+                      controller_fenced=children_dead,
+                      remote_detail=remote_detail)
     return get_job(state_dir, request_id)
 
 
-def _interrupt_saved_t3_threads(state_dir, request_id: str, job: dict) -> bool:
-    """Interrupt and confirm every saved T3 child turn is settled."""
+def _interrupt_saved_t3_threads(state_dir, request_id: str, job: dict) -> tuple[bool, str]:
+    """Interrupt every saved T3 child turn and confirm it settled.
+
+    Returns ``(settled, detail)``; ``detail`` names why a turn is not
+    confirmed stopped. When T3 cannot be reached, a turn whose last known
+    state (recorded by the controller) is terminal needs no T3 call (#132).
+    """
     try:
         state = json.loads(job.get("controller_state") or "{}")
         threads = state.get("t3_threads") if isinstance(state, dict) else {}
     except (ValueError, TypeError):
         threads = {}
     if not isinstance(threads, dict) or not threads:
-        return True
+        return True, ""
     try:
         client = t3exec.client_for_job(job)
-    except t3exec.T3Error:
-        _record_t3_interrupt_event(
-            state_dir, request_id, "t3_turn_interrupt_failed",
-            {"error": "T3 client unavailable"})
-        return False
-    settled = True
+        unreachable = ""
+    except t3exec.T3Error as e:
+        client = None
+        unreachable = f"T3 unreachable: {e}"[:300]
+    settled, detail = True, ""
     for slot, record in threads.items():
         thread_id = record.get("thread_id") if isinstance(record, dict) else None
         if not thread_id:
             continue
+        last_known = record.get("turn_state")
         try:
+            if client is None:
+                raise t3exec.T3Error(unreachable)
             snapshot = client.thread_snapshot(thread_id)
-            thread = t3exec.snapshot_thread(snapshot)
-            if not thread or "latestTurn" not in thread:
-                settled = False
+            if t3exec.turn_settled(snapshot):
                 continue
-            latest = thread.get("latestTurn")
-            state = latest.get("state") if isinstance(latest, dict) else None
-            if latest is None or state in ("completed", "error", "interrupted"):
-                continue
-            result = client.dispatch(t3exec.turn_interrupt_command(thread_id))
-            confirmed = client.thread_snapshot(thread_id)
-            confirmed_thread = t3exec.snapshot_thread(confirmed)
-            if not confirmed_thread or "latestTurn" not in confirmed_thread:
-                settled = False
-                continue
-            confirmed_latest = confirmed_thread.get("latestTurn")
-            confirmed_state = (confirmed_latest.get("state")
-                               if isinstance(confirmed_latest, dict) else None)
-            if (confirmed_latest is not None
-                    and confirmed_state not in ("completed", "error", "interrupted")):
-                settled = False
+            res = t3exec.interrupt_and_settle(client, thread_id)
             _record_t3_interrupt_event(
                 state_dir, request_id, "t3_turn_interrupt",
                 {"slot": slot, "thread_id": thread_id,
-                 "result": result if isinstance(result, dict) else {},
-                 "settled": confirmed_latest is None or confirmed_state in (
-                     "completed", "error", "interrupted"),
-                 "state": confirmed_state})
+                 "result": res.get("result") if isinstance(res.get("result"), dict) else {},
+                 "settled": res["settled"], "state": res["state"],
+                 **({"error": res["error"]} if res.get("error") else {})})
+            if not res["settled"]:
+                settled = False
+                detail = detail or ("T3 turn not confirmed stopped after interrupt"
+                                    + (f": {res['error']}" if res.get("error") else ""))
         except t3exec.T3NotFoundError:
             # After the controller exits, a typed 404 means this child was
             # never observed remotely. Connection errors are not absence.
             continue
         except Exception as e:  # best effort; local cancellation still proceeds
+            if last_known in t3exec.TURN_TERMINAL_STATES:
+                continue
             settled = False
+            reason = (f"{e}" if isinstance(e, t3exec.T3Error) else
+                      f"{type(e).__name__}: {e}")[:300]
+            detail = detail or (reason if reason.startswith("T3 unreachable")
+                                else f"T3 unreachable: {reason}")
             _record_t3_interrupt_event(
                 state_dir, request_id, "t3_turn_interrupt_failed",
-                {"slot": slot, "thread_id": thread_id,
-                 "error": str(e)[:300]})
-    return settled
+                {"slot": slot, "thread_id": thread_id, "error": reason,
+                 "last_known_state": last_known})
+    return settled, detail
 
 
 def _record_t3_interrupt_event(state_dir, request_id: str, kind: str,
@@ -1907,7 +1908,8 @@ def _record_t3_interrupt_event(state_dir, request_id: str, kind: str,
 def _finalize_stopped(state_dir, request_id: str, all_dead: bool,
                       remote_settled: bool = True,
                       local_settled: bool = True,
-                      controller_fenced: bool = True) -> None:
+                      controller_fenced: bool = True,
+                      remote_detail: str = "") -> None:
     """Finish a cancel or timeout drain in one guarded statement.
 
     The outcome follows the intent stored at commit time (cancel=1 wins
@@ -1923,12 +1925,15 @@ def _finalize_stopped(state_dir, request_id: str, all_dead: bool,
             status = ("cancelling"
                       if not controller_fenced
                       or (not remote_settled and local_settled) else "blocked")
+            # Name what is actually still live: a local process group, or
+            # a T3 turn that could not be confirmed stopped (#132).
+            what = ("live child process group remains" if not local_settled
+                    else remote_detail or "T3 turn not confirmed stopped")
             cur = con.execute(
                 "UPDATE jobs SET status=?, block_reason=CASE WHEN cancel_requested=2"
-                " THEN 'timeout_pending: live child process group remains'"
-                " ELSE 'cancellation_pending: live child process group remains' END,"
+                " THEN 'timeout_pending: ' || ? ELSE 'cancellation_pending: ' || ? END,"
                 " updated_at=? WHERE request_id=? AND status NOT IN ('succeeded','failed','cancelled')",
-                (status, now, request_id))
+                (status, what, what, now, request_id))
             if cur.rowcount:
                 _event(con, request_id, "blocked", {"reason": "stop_pending"})
             con.execute("COMMIT")
@@ -2120,13 +2125,14 @@ def recover_one(state_dir, request_id: str) -> dict:
             con.close()
             children_dead = _drain_owned_children(state_dir, request_id, dict(job))
             proof_dead = _drain_proof_group(state_dir, request_id)
-            remote_settled = (_interrupt_saved_t3_threads(
-                state_dir, request_id, dict(job))
-                if children_dead and proof_dead else False)
+            remote_settled, remote_detail = (
+                _interrupt_saved_t3_threads(state_dir, request_id, dict(job))
+                if children_dead and proof_dead else (False, ""))
             all_dead = bool(children_dead and proof_dead and remote_settled)
             _finalize_stopped(state_dir, request_id, all_dead, remote_settled,
                               local_settled=bool(children_dead and proof_dead),
-                              controller_fenced=children_dead)
+                              controller_fenced=children_dead,
+                              remote_detail=remote_detail)
             fin = get_job(state_dir, request_id)
             return {"request_id": request_id,
                     "action": "timeout" if fin["error_class"] == "timeout" else "cancelled",

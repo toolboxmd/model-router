@@ -121,6 +121,8 @@ class FakeT3Client:
         # server without the endpoint, answered with HTTP 404).
         self.prism = default_prism()
         self.prism_reads = []
+        self.liveness = {}
+        self.liveness_reads = []
 
     def dispatch(self, command):
         self.commands.append(copy.deepcopy(command))
@@ -183,6 +185,12 @@ class FakeT3Client:
         if self.prism is None:
             raise t3exec.T3Error("T3 GET /api/prism/snapshot failed: HTTP 404")
         return copy.deepcopy(self.prism)
+
+    def prism_liveness(self, thread_id):
+        self.liveness_reads.append(thread_id)
+        if isinstance(self.liveness, Exception):
+            raise self.liveness
+        return copy.deepcopy(self.liveness)
 
     def complete(self, thread_id, text):
         self.scripts[thread_id] = snap(thread_id, state="completed",

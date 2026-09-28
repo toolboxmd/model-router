@@ -199,16 +199,35 @@ Grok, `effort` for Claude, `variant` for OpenCode). The thread ids are saved
 before the watch, so a restarted controller adopts a live turn instead of
 starting a second writer.
 
-Liveness is activity-based: a turn is healthy while assistant tokens stream
-(the message's `updatedAt` advances) or a tool or task call is open
-(`tool.started` until `tool.completed`/`tool.denied`, `task.started` until
-`task.completed`), so a long test run is never a stall. A tool held behind
-an unresolved approval or user-input request is not running. Silence with
-no running tool past about a minute (`T3_SILENCE_SECS`, 60) is probed at
-once with a fresh snapshot read; explicit provider errors act at once. A
-message posted onto an existing thread is watched only through the turn it
-starts. A stalled worker turn is interrupted and confirmed idle before any
-route move. After a T3 server restart with `continueThreadsAfterServerUpdate`
+Router polls `GET /api/prism/liveness?threadId=` every second. T3 owns the
+stale decision, including stream clocks, running tools, thresholds and host
+sleep. `stale: true` enters the stalled path immediately; `stale: false`
+keeps the turn alive regardless of elapsed silence. Router adds no timeout
+or confirming probe to that decision.
+
+Only when the route is unavailable or lacks a boolean `stale` field does
+Router use its interim activity-based check: streaming message updates or
+an open tool keep the turn alive, and silence past the driver's measured
+window is confirmed with a fresh snapshot. The fallback windows are Codex
+300 s, OpenCode 210 s, Claude 90 s, and other drivers 300 s. Host sleep does
+not count as silence. Every watched turn records its longest observed
+silence and time to first token as a `t3_turn_stream` event.
+
+Before interrupting a stale turn, Router saves the current turn's assistant
+text and named artifacts in the job's `stale-*` directory, records a
+`t3_turn_stale` event with `silenceMs`, `thresholdMs`, `thresholdSource` and
+`reason`, and posts the evidence to `planner_t3_thread`. A failed post is
+recorded as `t3_stale_notification` with `posted: false`. The evidence also
+travels in the eventual terminal report, including after a successful retry.
+Salvage copies up to 16 named regular text artifacts (`.txt`, `.log`, `.md`,
+`.json`, `.patch`, `.diff`) from the workspace or host temporary directories,
+up to 64 KiB each, with credential redaction. Other references and read errors
+remain explicit. Reports include text and artifact excerpts with saved paths.
+
+A message posted onto an existing thread is watched only through the turn
+it starts. A stale worker is interrupted and polled until T3 reports it
+settled before moving to the next route. The fallback retains its bounded
+same-route retries. After a T3 server restart with `continueThreadsAfterServerUpdate`
 on, interrupted Claude, Codex and OpenCode turns continue on the same
 thread; Grok turns are re-sent by the router.
 
@@ -384,7 +403,12 @@ to the database, events, or logs; worker text, proof output, and error
 evidence are redacted before they are persisted or forwarded.
 
 States: `pending -> running <-> question_pending -> succeeded | failed |
-cancelled`, with `cancelling` while the controller and proof group stop.
+cancelled`, with `cancelling` while the controller, proof group and saved
+T3 turns stop. When T3 cannot be reached, a saved turn whose last known
+state is completed, errored or interrupted needs no T3 call; otherwise the
+reason names T3 unreachability. The controller keeps stepping while the job
+is `pending`, `running` or `question_pending`; a step that stops with the
+job still active blocks it as `controller_exit_unhandled: <action>`.
 `blocked` always has a reason. `recover` re-evaluates only its own blocks
 (a dead controller, a pending launch, step budgets, unresolved proof
 ownership); any other block stays until the planner answers or resubmits.
