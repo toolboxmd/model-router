@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.40.0] - 2026-09-28
+
+### Changed
+
+- A job waiting for T3 starts Chromeria after 60 seconds without an answer, and again every 5 minutes (`launching_t3` in `status`; `T3_LAUNCH_CMD` overrides the command, empty turns it off) (#140)
+
 ## [0.39.0] - 2026-09-28
 
 ### Changed

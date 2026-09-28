@@ -24,10 +24,12 @@ def isolate_t3_env():
     Some tests reach T3 discovery without a fake client; inside a runner
     job ``T3_SERVER_URL``/``T3_SERVER_TOKEN`` name the live server, and
     without them the default URL and ``t3 auth`` do. Point both at a
-    closed port for the module and restore them afterwards.
+    closed port for the module and restore them afterwards, and turn off
+    starting T3 (#140).
     """
     patcher = mock.patch.dict("os.environ", {"T3_SERVER_URL": "http://127.0.0.1:9",
-                                             "T3_SERVER_TOKEN": "test-token"})
+                                             "T3_SERVER_TOKEN": "test-token",
+                                             "T3_LAUNCH_CMD": ""})
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
 

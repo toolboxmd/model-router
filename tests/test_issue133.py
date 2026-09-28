@@ -44,7 +44,8 @@ class Base(unittest.TestCase):
         ``prism``; returns the fake. ``reads`` scripts the first snapshot
         reads (None fails like an unreachable server, an exception is
         raised as is); ``step`` replaces
-        the controller step. Waits run on a fake clock (``self.slept``)."""
+        the controller step. Waits run on a fake clock (``self.slept``);
+        T3 launches go to a fake (``self.launched``)."""
         fake = use_fake_t3(self, self.sd, rid)
         fake.prism = prism
         if reads is not None:
@@ -72,6 +73,15 @@ class Base(unittest.TestCase):
             patcher = mock.patch.object(controller, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Never start the real T3 (#140); record what would launch.
+        self.launched = []
+
+        def launch(command):
+            self.launched.append((now[0], command))
+            return self.launch_result(command) if hasattr(self, "launch_result") else "ok"
+        patcher = mock.patch.object(controller, "_launch_t3", launch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         if step is not None:
             patcher = mock.patch.object(controller, "step", step)
             patcher.start()
