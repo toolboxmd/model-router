@@ -53,3 +53,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py --versionctl "$GITHUB_WORKSPACE/release-tools/bin/versionctl"
+
+      # Wake Marketplace promotion now instead of waiting for its schedule.
+      # The tag is an untrusted hint; Marketplace resolves its own candidate.
+      - name: Mint Marketplace-only Toolybara token
+        id: toolybara-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.TOOLYBARA_CLIENT_ID }}
+          private-key: ${{ secrets.TOOLYBARA_PRIVATE_KEY }}
+          owner: toolboxmd
+          repositories: marketplace
+          permission-contents: write
+
+      - name: Dispatch Marketplace reconciliation wake-up
+        env:
+          GH_TOKEN: ${{ steps.toolybara-token.outputs.token }}
+        run: |
+          tag="v$(tr -d '[:space:]' < VERSION)"
+          payload=$(jq -cn --arg tag "$tag" \
+            '{event_type: "module_release_published", client_payload: {release_tag: $tag}}')
+          if ! gh api --method POST repos/toolboxmd/marketplace/dispatches --input - <<<"$payload"; then
+            echo "::error title=Marketplace wake-up failed::Could not dispatch module_release_published for $tag"
+            exit 1
+          fi
