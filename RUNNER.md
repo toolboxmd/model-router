@@ -133,14 +133,20 @@ If it cannot, the job blocks before any thread starts, and the blocked
 terminal report tells the planner in its thread (and in `status` and
 `result`):
 
-- `Prism unreadable: <cause> (still unreadable after retrying for 300s)`
-  when the snapshot stays unreadable, for example `no T3 bearer token: ...`
-  or `T3 GET /api/prism/snapshot failed: HTTP 404`. A failed read is retried
-  with backoff (5, 10, 20, 40, then 60 seconds) for up to
-  `PRISM_UNREADABLE_WAIT_SECS` (300 seconds), so a T3 restart or a token
-  renewal mid-job does not end the job. While it waits no thread starts
-  and the last snapshot's routes are not reused; a read that recovers
-  continues the job. An empty list in a readable snapshot blocks at once.
+- `Prism unreadable: <cause>` at once when T3 answers but Prism is broken:
+  for example `no T3 bearer token: ...`, `T3 GET /api/prism/snapshot
+  failed: HTTP 401` (token rejected) or `HTTP 404` (older server), or a
+  body that does not parse.
+- `Prism unreadable: T3 unreachable for 24h (<cause>)` when T3 does not
+  answer at all (connection refused or reset, timeout) for
+  `T3_UNREACHABLE_WAIT_SECS` (24 hours). Until then the job waits for T3
+  (Chromeria quit, restarting, or installing a rebuild), rereading with
+  backoff (5, 10, 20, 40, then 60 seconds). The wait begins with a
+  `waiting_for_t3` event in `status` carrying `since` and `cause`. While
+  it waits no thread starts and the last snapshot's routes are not
+  reused; a read that recovers continues the job, and a cancel ends the
+  wait at the next reread. An empty list in a readable snapshot blocks at
+  once.
 - `Prism Dispatcher list is empty`, `Prism Worker <easy|medium|hard> lane is
   empty` (the job's lane only), `Prism Reviewer list is empty`, or
   `Prism Retry list is empty` or `Prism Escalation list is empty` while that

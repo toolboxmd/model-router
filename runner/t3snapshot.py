@@ -23,9 +23,11 @@ the project. The router reads it before choosing a route:
   account meter; Zen free has no reader and keeps its error marks).
 
 A snapshot that cannot be read (older server, unreachable, no token, bad
-body) is ``unknown``: no stage has routes, and the controller stops the
-job with ``Prism unreadable: <cause>`` before it starts a thread
-(:func:`blocked_reason`); the planner then does the work itself.
+body) is ``unknown``: no stage has routes, and no thread starts. While T3
+is unreachable (:func:`unreachable`) the controller waits for it
+(toolboxmd/model-router#136); otherwise it stops the job with
+``Prism unreadable: <cause>`` (:func:`blocked_reason`) and the planner
+then does the work itself.
 """
 from __future__ import annotations
 
@@ -46,7 +48,7 @@ ROLE_STAGES = {"dispatcher": "dispatch", "correction": "correction",
                "recovery": "recovery", "reviewer": "review"}
 
 _CACHE: dict = {"key": None, "at": 0.0, "snapshot": None, "error": None,
-                "lane": None}
+                "unreachable": False, "lane": None}
 
 
 def _ts(value) -> float | None:
@@ -202,13 +204,19 @@ def read(client, project_id: str | None = None, force: bool = False) -> dict | N
         return _CACHE["snapshot"]
     try:
         snap = client.prism_snapshot(project_id)
-        error = None
+        error, down = None, False
         if not isinstance(snap, dict) or not isinstance(snap.get("providers"), list):
             snap, error = None, "snapshot body carries no providers"
     except (t3exec.T3Error, OSError, ValueError, AttributeError) as e:
         snap, error = None, str(e)[:300]
-    _CACHE.update(key=key, at=now, snapshot=snap, error=error)
+        down = bool(getattr(e, "unreachable", False)) or isinstance(e, OSError)
+    _CACHE.update(key=key, at=now, snapshot=snap, error=error, unreachable=down)
     return snap
+
+
+def unreachable() -> bool:
+    """Whether the last read failed because T3 did not answer at all."""
+    return bool(_CACHE.get("unreachable"))
 
 
 def apply(snapshot: dict | None, lane_stage: str | None = None) -> None:
@@ -242,7 +250,8 @@ def refresh_for_job(job: dict, client=None, force: bool = False) -> dict | None:
                 project = None
         return refresh(client, project, (job or {}).get("lane"), force=force)
     except Exception as e:  # noqa: BLE001 - unknown: blocked_reason reports it
-        _CACHE.update(key=None, at=0.0, snapshot=None, error=str(e)[:300])
+        _CACHE.update(key=None, at=0.0, snapshot=None, error=str(e)[:300],
+                      unreachable=False)
         apply(None, (job or {}).get("lane"))
         return None
 
@@ -337,5 +346,6 @@ def view() -> dict:
 
 def reset() -> None:
     """Forget the cached snapshot and overrides (tests and new jobs)."""
-    _CACHE.update(key=None, at=0.0, snapshot=None, error=None, lane=None, applied=None)
+    _CACHE.update(key=None, at=0.0, snapshot=None, error=None, unreachable=False,
+                  lane=None, applied=None)
     policy.STAGE_OVERRIDES.clear()
