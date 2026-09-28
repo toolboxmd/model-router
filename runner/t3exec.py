@@ -1073,6 +1073,11 @@ def watch_turn(client: T3Client, thread_id: str, *,
                 pass
         liveness, fallback_reason = _liveness()
         if await_new_turn and _awaiting_new_turn(snapshot, prior_turn_id):
+            if liveness is not None and liveness["stale"]:
+                # A queued message cannot keep its stale predecessor alive.
+                return _done({"state": "stalled", "liveness": liveness,
+                              "reason": liveness.get("reason"),
+                              "last_activity_ts": last_activity}, snapshot)
             latest = snapshot_thread(snapshot).get("latestTurn")
             if isinstance(latest, dict) and latest.get("state") == "running":
                 # The thread is still busy with an earlier turn (a planner
@@ -1094,12 +1099,7 @@ def watch_turn(client: T3Client, thread_id: str, *,
             waited = awake_secs(started, now, sleeps)
             window = (silence_secs if silence_secs is not None
                       else silence_window(snapshot_driver(snapshot)))
-            if liveness is not None:
-                if liveness["stale"]:
-                    return _done({"state": "stalled", "liveness": liveness,
-                                  "reason": liveness.get("reason"),
-                                  "last_activity_ts": last_activity}, snapshot)
-            elif waited >= window:
+            if liveness is None and waited >= window:
                 return _done({"state": "stalled", "silence": waited,
                               "window": window,
                               "last_part": "turn never started", "probed": True,

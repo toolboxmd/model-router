@@ -452,6 +452,21 @@ class StreamLiveness(unittest.TestCase):
                                        sleep_fn=lambda _: fake.complete("w", "done"))
         self.assertEqual(result["state"], "completed")
 
+    def test_stale_prior_turn_does_not_hide_behind_a_queued_message(self):
+        fake = FakeT3Client(planner=PLANNER)
+        fake.liveness = {"stale": True, "reason": "provider stopped"}
+        fake.scripts["w"] = snap("w", state="running", turn="prior")
+        naps = []
+
+        def nap(seconds):
+            naps.append(seconds)
+            fake.scripts["w"] = snap("w", state="completed", turn="new")
+
+        result = t3exec.watch_turn(fake, "w", now_fn=lambda: NOW.timestamp(),
+                                   sleep_fn=nap, prior_turn_id="prior", await_new_turn=True)
+        self.assertEqual(result["state"], "stalled")
+        self.assertEqual(naps, [])
+
 
 class StaleEvidence(unittest.TestCase):
     def setUp(self):

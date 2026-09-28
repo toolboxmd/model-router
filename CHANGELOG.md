@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.41.0] - 2026-09-28
+
+### Added
+
+- Consume T3 stream staleness, preserve worker findings, and keep Prism jobs advancing (#132)
+- Poll T3 liveness every second, honor its stale decision, retain sleep-aware driver windows only as fallback, and notify the planner with salvaged text and artifacts before interruption.
+- Continue after review changes and recovered envelopes, wait for interrupts to settle, and finalize cancelled jobs with known finished turns when T3 is unreachable.
+
 ## [0.40.0] - 2026-09-28
 
 ### Changed

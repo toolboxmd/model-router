@@ -409,7 +409,8 @@ def _note_t3_turn(state_dir, request_id: str, slot: str, thread_id: str | None,
                   route: str | None, outcome: dict, client=None) -> None:
     """Record a watched turn's end: its last known state on the saved
     thread, and its stream statistics (max silence, time to first token)
-    in the ledger. Best effort: evidence never blocks the job."""
+    in the ledger. Save stale evidence before interruption; the other
+    turn notes are best effort."""
     state = outcome.get("state")
     if not thread_id:
         return
