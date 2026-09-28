@@ -142,7 +142,14 @@ terminal report tells the planner in its thread (and in `status` and
   `T3_UNREACHABLE_WAIT_SECS` (24 hours). Until then the job waits for T3
   (Chromeria quit, restarting, or installing a rebuild), rereading with
   backoff (5, 10, 20, 40, then 60 seconds). The wait begins with a
-  `waiting_for_t3` event in `status` carrying `since` and `cause`. While
+  `waiting_for_t3` event in `status` carrying `since` and `cause`. After
+  60 seconds without an answer the job starts T3 itself, and again every
+  5 minutes while it stays down, each launch a `launching_t3` event in
+  `status` carrying `at`, `command` and `result` (`ok` or the failure; a
+  failed launch never ends the wait). The command is `T3_LAUNCH_CMD`,
+  run without a shell with a 15 second timeout; it defaults to
+  `/usr/bin/open -g -a Chromeria` on macOS and to off elsewhere, and an
+  empty value turns launching off. While
   it waits no thread starts and the last snapshot's routes are not
   reused; a read that recovers continues the job, and a cancel ends the
   wait at the next reread. An empty list in a readable snapshot blocks at

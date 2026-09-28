@@ -14,7 +14,9 @@ import json
 import os
 import signal
 import secrets
+import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -4182,18 +4184,48 @@ def _advertise(state_dir: str, request_id: str, token: str) -> None:
 T3_UNREACHABLE_WAIT_SECS = 24 * 3600.0
 PRISM_RETRY_FIRST_SECS = 5.0
 PRISM_RETRY_MAX_SECS = 60.0
+# After this long unreachable the job starts T3 itself, and again every
+# T3_RELAUNCH_EVERY_SECS while it stays down (#140). T3_LAUNCH_CMD
+# overrides the command; an empty value turns launching off.
+T3_LAUNCH_AFTER_SECS = 60.0
+T3_RELAUNCH_EVERY_SECS = 300.0
+T3_LAUNCH_TIMEOUT_SECS = 15.0
+T3_LAUNCH_DEFAULT = "/usr/bin/open -g -a Chromeria"
 _clock = time.monotonic
 _sleep = time.sleep
 
 
-def _record_t3_wait(state_dir, request_id: str, cause: str) -> None:
-    """Ledger event ``waiting_for_t3`` so ``status`` shows the wait."""
+def _t3_launch_command() -> str:
+    """The command that starts T3, or "" when launching is off."""
+    command = os.environ.get("T3_LAUNCH_CMD")
+    if command is None:
+        command = T3_LAUNCH_DEFAULT if sys.platform == "darwin" else ""
+    return command.strip()
+
+
+def _launch_t3(command: str) -> str:
+    """Run ``command`` once without a shell; "ok" or why it failed."""
+    try:
+        done = subprocess.run(shlex.split(command), stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              timeout=T3_LAUNCH_TIMEOUT_SECS, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return f"{type(e).__name__}: {e}"[:300]
+    if done.returncode:
+        err = done.stderr.decode(errors="replace").strip()
+        return f"exit {done.returncode}: {err}"[:300]
+    return "ok"
+
+
+def _record_t3_wait(state_dir, request_id: str, cause: str,
+                    kind: str = "waiting_for_t3", payload: dict | None = None) -> None:
+    """Ledger event ``waiting_for_t3`` (or ``kind``) so ``status`` shows the wait."""
     con = store.connect(state_dir)
     try:
         con.execute("BEGIN IMMEDIATE")
         _lease_guard(con, request_id)
-        core._event(con, request_id, "waiting_for_t3",
-                    {"since": core._utcnow(), "cause": cause[:300]})
+        core._event(con, request_id, kind,
+                    payload or {"since": core._utcnow(), "cause": cause[:300]})
         con.execute("COMMIT")
     except Exception:
         try:
@@ -4210,13 +4242,16 @@ def _await_prism(state_dir, request_id: str, token: str | None) -> str | None:
 
     While T3 is unreachable the snapshot is reread with backoff for up
     to ``T3_UNREACHABLE_WAIT_SECS``; no stage has routes meanwhile, so
-    nothing launches and the last snapshot is never reused. A cancel
-    ends the wait at the next reread. Any other unreadable snapshot, or
-    an empty list the job needs, blocks at once.
+    nothing launches and the last snapshot is never reused. After
+    ``T3_LAUNCH_AFTER_SECS`` it starts T3 itself, and again every
+    ``T3_RELAUNCH_EVERY_SECS``; a failed launch is recorded and the
+    wait goes on. A cancel ends the wait at the next reread. Any other
+    unreadable snapshot, or an empty list the job needs, blocks at once.
     """
     job = core.get_job(state_dir, request_id)
     start = _clock()
     delay = PRISM_RETRY_FIRST_SECS
+    launched = None
     snap = t3snapshot.refresh_for_job(job)
     if snap is None and t3snapshot.unreachable():
         _record_t3_wait(state_dir, request_id, t3snapshot._CACHE.get("error") or "")
@@ -4226,6 +4261,14 @@ def _await_prism(state_dir, request_id: str, token: str | None) -> str | None:
             hours = int(T3_UNREACHABLE_WAIT_SECS // 3600)
             return (f"Prism unreadable: T3 unreachable for {hours}h "
                     f"({t3snapshot._CACHE.get('error') or 'no answer'})")
+        command = _t3_launch_command()
+        if command and waited >= T3_LAUNCH_AFTER_SECS and (
+                launched is None or waited - launched >= T3_RELAUNCH_EVERY_SECS):
+            launched = waited
+            result = _launch_t3(command)
+            _record_t3_wait(state_dir, request_id, "", "launching_t3",
+                            {"at": core._utcnow(), "command": command[:300],
+                             "result": result})
         _sleep(min(delay, T3_UNREACHABLE_WAIT_SECS - waited))
         delay = min(delay * 2, PRISM_RETRY_MAX_SECS)
         if core.get_job(state_dir, request_id)["cancel_requested"]:
