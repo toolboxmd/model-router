@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapters, core, policy, store, t3exec, t3snapshot
+from . import adapters, core, policy, store, t3exec, t3salvage, t3snapshot
 
 MAX_LOOP_STEPS = 12
 # The controller keeps stepping while the job has one of these statuses.
@@ -406,13 +406,15 @@ def _save_t3_thread(state_dir, request_id: str, slot: str,
 
 
 def _note_t3_turn(state_dir, request_id: str, slot: str, thread_id: str | None,
-                  route: str | None, outcome: dict) -> None:
+                  route: str | None, outcome: dict, client=None) -> None:
     """Record a watched turn's end: its last known state on the saved
     thread, and its stream statistics (max silence, time to first token)
     in the ledger. Best effort: evidence never blocks the job."""
     state = outcome.get("state")
     if not thread_id:
         return
+    if state == "stalled":
+        _record_t3_stale(state_dir, request_id, slot, thread_id, route, outcome, client)
     try:
         _save_t3_thread(state_dir, request_id, slot, thread_id, route,
                         turn_state=state if state in t3exec.TURN_TERMINAL_STATES
@@ -432,6 +434,45 @@ def _note_t3_turn(state_dir, request_id: str, slot: str, thread_id: str | None,
             pass
 
 
+def _record_t3_stale(state_dir, request_id: str, slot: str, thread_id: str,
+                     route: str | None, outcome: dict, client) -> None:
+    """Persist partial work and tell the planner before any interrupt."""
+    job = core.get_job(state_dir, request_id)
+    directory = store.job_dir_for(store.ensure_state_dir(state_dir), request_id) / (
+        f"stale-{secrets.token_hex(8)}")
+    evidence = outcome.get("liveness") or {}
+    rec = {"slot": slot, "thread_id": thread_id, "route": route,
+           "path": str(directory / "report.json"),
+           **{k: evidence.get(k) for k in ("silenceMs", "thresholdMs", "thresholdSource",
+                                         "reason", "staleSince")}}
+    if isinstance(rec["reason"], str):
+        rec["reason"] = adapters.redact_text(rec["reason"])
+    try:
+        rec["salvage"] = t3salvage.capture(
+            outcome.get("snapshot") or {}, outcome.get("assistant_text") or "",
+            job["workspace"], directory)
+    except (OSError, ValueError) as e:
+        rec["salvage_error"] = adapters.redact_text(str(e))
+        rec["salvage"] = {"text": adapters.redact_text(outcome.get("assistant_text") or "")}
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    store.secure_write_text(directory / "report.json", json.dumps(rec, indent=2))
+    previous = _load_controller_state(job).get("stale_events") or []
+    _set_phase(state_dir, request_id, stale_events=[*previous, rec])
+    core._record_t3_interrupt_event(
+        state_dir, request_id, "t3_turn_stale",
+        {k: v for k, v in rec.items() if k != "salvage"})
+    outcome["salvage_path"] = rec["path"]
+    message = (f"Job {request_id}: stale turn on {thread_id} ({route}).\n"
+               f"silenceMs={rec['silenceMs']}; thresholdMs={rec['thresholdMs']}; "
+               f"thresholdSource={rec['thresholdSource']}; reason={rec['reason']}\n"
+               "The controller is handling this stale turn; partial evidence follows.\n"
+               + t3salvage.report([rec]))
+    posted, detail = _post_planner_text_via_t3(
+        state_dir, request_id, message, "t3_stale_post", ["t3", "stale-post", thread_id], client)
+    core._record_t3_interrupt_event(state_dir, request_id, "t3_stale_notification",
+                                    {"thread_id": thread_id, "posted": posted, "detail": detail})
+
+
 def _t3_post_and_watch(state_dir, request_id: str, slot: str, client,
                        thread_id: str, text: str, route: str | None = None,
                        **kwargs) -> dict:
@@ -441,7 +482,7 @@ def _t3_post_and_watch(state_dir, request_id: str, slot: str, client,
                     turn_state="running")
     outcome = t3exec.post_and_watch(client, thread_id, text, route=route,
                                     **kwargs)
-    _note_t3_turn(state_dir, request_id, slot, thread_id, route, outcome)
+    _note_t3_turn(state_dir, request_id, slot, thread_id, route, outcome, client)
     return outcome
 
 
@@ -592,7 +633,7 @@ def _t3_run_turn(state_dir, request_id: str, job: dict, *, slot: str,
         pass
     outcome["slot"] = slot
     _note_t3_turn(state_dir, request_id, slot, outcome.get("thread_id"), route,
-                  outcome)
+                  outcome, client)
     if outcome.get("state") == "unknown":
         # A failed reconciliation read is recoverable. Do not turn it into a
         # sticky dispatch or worker failure while the remote state is unknown.
@@ -863,7 +904,9 @@ def _t3_worker_full(outcome: dict, thread_id: str) -> tuple[dict, int]:
                 "signal": "stalled",
                 "signal_evidence": {"silence": outcome.get("silence"),
                                     "last_part": outcome.get("last_part"),
-                                    "probed": outcome.get("probed", True)},
+                                    "probed": outcome.get("probed", True),
+                                    **(outcome.get("liveness") or {})},
+                "salvage_path": outcome.get("salvage_path"),
                 "error": outcome.get("reason") or "t3 turn stalled",
                 "t3_thread_id": thread_id,
                 "idle_confirmed": bool(outcome.get("idle_confirmed", False))}, 1
@@ -1171,6 +1214,7 @@ def _deliver_terminal_report_via_t3(state_dir, request_id: str,
                 "attempts": attempts + 1}
     text = _terminal_report_text(request_id, status, pr_url, reason,
                                  job.get("handoff_summary"))
+    text += t3salvage.report(_load_controller_state(job).get("stale_events") or [])
     posted, detail = _post_planner_text_via_t3(
         state_dir, request_id, text, T3_TERMINAL_POST_KIND,
         ["t3", "terminal-post", event_id], t3_client)
@@ -1662,6 +1706,12 @@ def _handle_stalled(state_dir, request_id: str, job: dict, seq: int, route: str,
     if probe_signal == "overloaded":
         moved = _move_after_signal(state_dir, request_id, route, "overloaded",
                                    _stall_reset_evidence(evidence))
+        moved["report"] = stall_report
+        return moved
+    if evidence.get("stale") is True and evidence.get("thresholdSource") != "router-fallback":
+        # T3 has already confirmed the stale turn. Move to the next route
+        # without the interim fallback's same-route probation retries.
+        moved = _move_after_signal(state_dir, request_id, route, "stalled", evidence)
         moved["report"] = stall_report
         return moved
     spec = policy.SIGNAL_CLASSES["stalled"]
@@ -2344,6 +2394,7 @@ def _write_turn_report(state_dir, request_id: str, job: dict, seq: int, route: s
         "proof_started_at": proof_started_at, "proof_ended_at": proof_ended_at,
         "proof_log": str(proof_log), "diff": str(turn_dir / "diff.patch"),
         "worker_text": str(turn_dir / "worker.txt"), "worker_summary": worker_text[:1500],
+        "salvage_path": full.get("salvage_path"),
         "blockers": adapters.redact_nested(blockers_raw),
         "tokens": full.get("usage"), "native_ids": full.get("native_ids"),
         "longest_silence_secs": full.get("longest_silence_secs"),

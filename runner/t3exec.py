@@ -20,14 +20,11 @@ worker, correction and recovery threads are children of the dispatcher
 thread. Every child's first message names the job and links the planner
 thread.
 
-Liveness is activity-based: a turn is healthy while assistant tokens
-stream (message ``updatedAt`` advances) or a ``tool.*`` / ``task.*`` call
-is still open. Silence with no running tool past the driver's measured
-window (:data:`T3_SILENCE_SECS_BY_DRIVER`) is flagged and probed
-immediately with a fresh snapshot read; explicit provider errors act at
-once. A long test run holds a running tool activity, so it is never
-mistaken for a stall. Time the host spent asleep never counts as
-silence (#132).
+T3 owns liveness: its Prism liveness route is polled every second and
+``stale`` is consumed directly, without a Router timeout or confirmation.
+Only unavailable liveness falls back to activity-based driver windows and
+a confirming snapshot. Time the host spent asleep never counts as silence
+(#132); T3 handles it for its decision, Router for the fallback.
 
 Restart: after a T3 server restart with
 ``continueThreadsAfterServerUpdate`` on, interrupted Claude, Codex and
@@ -72,7 +69,7 @@ T3_PLANNER_HARNESS = "t3"
 
 # Activity-based liveness: silence with no running tool is flagged past
 # the driver's window and probed immediately with a fresh read (#132).
-# Interim until T3 exposes its stream clock (toolboxmd/t3code#55): each
+# Fallback for a missing stale field or unavailable liveness route: each
 # window is the largest healthy gap observed for that driver, times 1.25,
 # rounded up to 30 s. Gaps come from completed T3 turns
 # (``projection_thread_messages`` updatedAt and activity createdAt, open
@@ -84,8 +81,7 @@ T3_PLANNER_HARNESS = "t3"
 #   in OpenCode's own database (#33). 161 * 1.25 -> 210 s.
 # - claudeAgent: 54 s before the first token (n=545). 54 * 1.25 -> 90 s.
 # Drivers without measurements (grok, unknown) take the largest window.
-# Replace these with per-route thresholds from T3's per-turn stream
-# statistics once t3code#55 lands; ``silence_window`` is the only reader.
+# T3's stale decision (toolboxmd/chromeria#62) supersedes these windows.
 T3_SILENCE_SECS_BY_DRIVER = {"codex": 300.0, "opencode": 210.0,
                              "claudeAgent": 90.0}
 T3_SILENCE_SECS = max(T3_SILENCE_SECS_BY_DRIVER.values())
@@ -98,7 +94,7 @@ T3_SLEEP_TOLERANCE_SECS = 2.0
 T3_SETTLE_POLL_SECS = 0.5
 T3_SETTLE_MAX_SECS = 15.0
 # Poll interval while watching a T3 turn.
-T3_POLL_SECS = 2.0
+T3_POLL_SECS = 1.0
 # Recovery must not watch an already-saved child forever when its turn was
 # never started or the server lost the turn state.
 T3_RECOVERY_WATCH_SECS = 120.0
@@ -512,6 +508,11 @@ class T3Client:
             path += "?projectId=" + urllib.parse.quote(project_id, safe="")
         return self._request("GET", path)
 
+    def prism_liveness(self, thread_id: str) -> dict:
+        """T3 owns the stale decision, including thresholds and host sleep."""
+        tid = urllib.parse.quote(validate_thread_id(thread_id), safe="")
+        return self._request("GET", f"/api/prism/liveness?threadId={tid}")
+
     def create_child(self, child_id: str, parent_thread_id: str,
                      project_id: str, title: str, route: str,
                      role: str = "implementation") -> dict:
@@ -831,7 +832,7 @@ def interrupt_and_settle(client: "T3Client", thread_id: str, *,
 def evaluate_turn(snapshot: dict, *, now: float,
                   last_known_activity: float | None = None,
                   silence_secs: float | None = None,
-                  sleeps=()) -> dict:
+                  sleeps=(), liveness: dict | None = None) -> dict:
     """Activity-based liveness of one T3 turn.
 
     Returns ``state`` ``running`` (tokens streaming or a tool running),
@@ -843,10 +844,8 @@ def evaluate_turn(snapshot: dict, *, now: float,
     host slept, which never count as silence. ``last_activity_ts``
     carries the newest observed activity for the caller's next poll.
 
-    Seam for toolboxmd/t3code#55: once T3 serves ``lastStreamAt`` and
-    ``openTool``, they replace the anchor and the tool check below, and
-    ``silence_window`` reads per-route thresholds from T3's per-turn
-    stream statistics.
+    A boolean ``liveness.stale`` from T3 overrides local silence checks.
+    The driver window is only a fallback for unavailable liveness.
     """
     if silence_secs is None:
         silence_secs = silence_window(snapshot_driver(snapshot))
@@ -879,6 +878,13 @@ def evaluate_turn(snapshot: dict, *, now: float,
                 "last_activity_ts": last_activity_ts(snapshot) or last_known_activity}
     if latest_state == "interrupted":
         return {"state": "interrupted",
+                "last_activity_ts": last_activity_ts(snapshot) or last_known_activity}
+
+    if isinstance(liveness, dict) and isinstance(liveness.get("stale"), bool):
+        silence_ms = liveness.get("silenceMs")
+        return {"state": "stalled" if liveness["stale"] else "running",
+                "reason": liveness.get("reason"), "liveness": liveness,
+                "silence": silence_ms / 1000 if isinstance(silence_ms, (int, float)) else None,
                 "last_activity_ts": last_activity_ts(snapshot) or last_known_activity}
 
     # Silence runs from the newest of: any message or activity, the turn's
@@ -986,9 +992,9 @@ def watch_turn(client: T3Client, thread_id: str, *,
                await_new_turn: bool = False) -> dict:
     """Poll a T3 turn to its end. Returns the terminal evaluation.
 
-    A stalled read is probed immediately with a fresh snapshot before it
-    counts: a turn that produced activity between the two reads stays
-    running. ``timeout_secs`` bounds only the watch (tests and operator
+    T3's boolean stale decision is final. Only fallback silence is probed
+    with a fresh snapshot: a turn that produced activity between those
+    reads stays running. ``timeout_secs`` bounds only the watch (tests and operator
     tools); production watches carry no elapsed deadline (no per-turn
     deadline since #88): pass None to wait as
     long as the turn stays active. Explicit provider errors return at
@@ -1015,7 +1021,18 @@ def watch_turn(client: T3Client, thread_id: str, *,
         if snapshot is not None:
             stream["window"] = (silence_secs if silence_secs is not None
                                 else silence_window(snapshot_driver(snapshot)))
+            if isinstance(ev.get("liveness"), dict):
+                threshold = ev["liveness"].get("thresholdMs")
+                stream["window"] = threshold / 1000 if isinstance(threshold, (int, float)) else None
             stream["first_token_secs"] = first_token_secs(snapshot)
+            if ev.get("state") == "stalled":
+                ev["snapshot"] = snapshot
+                ev["assistant_text"] = latest_assistant_text(snapshot, latest_turn_id(snapshot))
+        if ev.get("state") == "stalled" and "liveness" not in ev:
+            ev["liveness"] = {
+                "stale": True, "silenceMs": ev.get("silence", 0) * 1000,
+                "thresholdMs": ev.get("window", T3_SILENCE_SECS) * 1000,
+                "thresholdSource": "router-fallback", "reason": fallback_reason}
         ev["stream"] = stream
         return ev
 
@@ -1024,6 +1041,16 @@ def watch_turn(client: T3Client, thread_id: str, *,
             stats["max_silence"] = max(stats["max_silence"], float(ev["silence"]))
         return ev
 
+    def _liveness() -> tuple[dict | None, str]:
+        try:
+            live = client.prism_liveness(thread_id)
+        except T3Error as e:
+            return None, f"liveness unavailable: {e}"
+        if isinstance(live, dict) and isinstance(live.get("stale"), bool):
+            return live, ""
+        return None, "liveness response lacks a boolean stale field"
+
+    fallback_reason = "liveness unavailable"
     while True:
         now = now_fn()
         mono = mono_fn()
@@ -1044,6 +1071,7 @@ def watch_turn(client: T3Client, thread_id: str, *,
                 on_snapshot(snapshot)
             except Exception:
                 pass
+        liveness, fallback_reason = _liveness()
         if await_new_turn and _awaiting_new_turn(snapshot, prior_turn_id):
             latest = snapshot_thread(snapshot).get("latestTurn")
             if isinstance(latest, dict) and latest.get("state") == "running":
@@ -1066,21 +1094,30 @@ def watch_turn(client: T3Client, thread_id: str, *,
             waited = awake_secs(started, now, sleeps)
             window = (silence_secs if silence_secs is not None
                       else silence_window(snapshot_driver(snapshot)))
-            if waited >= window:
+            if liveness is not None:
+                if liveness["stale"]:
+                    return _done({"state": "stalled", "liveness": liveness,
+                                  "reason": liveness.get("reason"),
+                                  "last_activity_ts": last_activity}, snapshot)
+            elif waited >= window:
                 return _done({"state": "stalled", "silence": waited,
                               "window": window,
                               "last_part": "turn never started", "probed": True,
-                              "last_activity_ts": last_activity})
+                              "last_activity_ts": last_activity}, snapshot)
             sleep_fn(poll_secs)
             continue
         ev = _observe(evaluate_turn(snapshot, now=now,
                                     last_known_activity=last_activity,
-                                    silence_secs=silence_secs, sleeps=sleeps))
+                                    silence_secs=silence_secs, sleeps=sleeps,
+                                    liveness=liveness))
         last_activity = ev.get("last_activity_ts", last_activity)
         state = ev.get("state")
         if state in ("completed", "error", "interrupted"):
             return _done(ev, snapshot)
         if state == "stalled":
+            if liveness is not None:
+                # T3 already confirmed staleness. No Router timer or probe.
+                return _done(ev, snapshot)
             if probation is None:
                 # Flagged: probe immediately with a fresh read before it counts.
                 probation = ev
@@ -1095,10 +1132,11 @@ def watch_turn(client: T3Client, thread_id: str, *,
                         on_snapshot(snapshot)
                     except Exception:
                         pass
+                liveness, fallback_reason = _liveness()
                 second = _observe(evaluate_turn(snapshot, now=now_fn(),
                                                 last_known_activity=last_activity,
                                                 silence_secs=silence_secs,
-                                                sleeps=sleeps))
+                                                sleeps=sleeps, liveness=liveness))
                 last_activity = second.get("last_activity_ts", last_activity)
                 if second.get("state") == "running":
                     probation = None

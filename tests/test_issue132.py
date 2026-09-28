@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from runner import controller, core, store, t3exec, t3snapshot  # noqa: E402
+from runner import controller, core, store, t3exec, t3salvage, t3snapshot  # noqa: E402
 from tests.fakes import (NOW, FakeT3Client, isolate_t3_env, snap,  # noqa: E402
                          use_fake_t3)
 
@@ -371,6 +371,193 @@ class Liveness(unittest.TestCase):
     def test_awake_secs_subtracts_only_overlap(self):
         self.assertEqual(t3exec.awake_secs(0, 100, [(50, 149)]), 50)
         self.assertEqual(t3exec.awake_secs(0, 100, [(-50, -10)]), 100)
+
+
+class StreamLiveness(unittest.TestCase):
+    running = Liveness.running
+    def watch(self, liveness, age=1):
+        fake = FakeT3Client(planner=PLANNER)
+        fake.liveness = liveness
+        fake.scripts["w"] = self.running("codex", age)
+        clock = [NOW.timestamp()]
+        naps = []
+
+        def nap(seconds):
+            naps.append(seconds)
+            clock[0] += seconds
+            if len(naps) == 3:
+                fake.scripts["w"] = snap("w", state="completed", text="done")
+
+        result = t3exec.watch_turn(fake, "w", now_fn=lambda: clock[0], sleep_fn=nap)
+        return result, fake, naps
+
+    def test_stale_true_returns_in_one_poll_without_router_confirmation(self):
+        evidence = {"stale": True, "staleSince": NOW.isoformat(),
+                    "silenceMs": 20000, "thresholdMs": 18000,
+                    "thresholdSource": "measured", "reason": "stream silent"}
+        result, fake, naps = self.watch(evidence)
+        self.assertEqual(result["state"], "stalled")
+        self.assertEqual(result["liveness"], evidence)
+        self.assertEqual(fake.liveness_reads, ["w"])
+        self.assertEqual(fake.reads["w"], 1)
+        self.assertEqual(naps, [])
+
+    def test_stale_false_never_uses_router_silence_window(self):
+        result, fake, naps = self.watch({"stale": False, "silenceMs": 3600000}, age=3600)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(naps, [1.0, 1.0, 1.0])
+        self.assertGreaterEqual(len(fake.liveness_reads), 3)
+
+    def test_missing_field_and_unreachable_route_use_driver_fallback(self):
+        for liveness in ({"silenceMs": 3600000},
+                         t3exec.T3Error("offline", unreachable=True)):
+            with self.subTest(liveness=liveness):
+                result, fake, naps = self.watch(liveness, age=301)
+                self.assertEqual(result["state"], "stalled")
+                self.assertEqual(result["window"], 300.0)
+                self.assertEqual(result["liveness"]["thresholdMs"], 300000)
+                self.assertEqual(result["liveness"]["thresholdSource"], "router-fallback")
+                self.assertTrue(result["probed"])
+                self.assertEqual(naps, [])
+
+    def test_client_gets_liveness_for_the_worker_thread(self):
+        client = t3exec.T3Client("http://127.0.0.1:9", "fake")
+        with mock.patch.object(client, "_request", return_value={"stale": False}) as request:
+            self.assertEqual(client.prism_liveness("sub.p.w"), {"stale": False})
+        request.assert_called_once_with("GET", "/api/prism/liveness?threadId=sub.p.w")
+
+    def test_stale_false_while_waiting_for_new_turn_does_not_use_local_deadline(self):
+        fake = FakeT3Client(planner=PLANNER)
+        fake.liveness = {"stale": False}
+        fake.scripts["w"] = snap("w", state="completed", text="old", turn="old")
+        clock = [NOW.timestamp()]
+        naps = []
+
+        def nap(seconds):
+            clock[0] += 3600
+            naps.append(seconds)
+            if len(naps) == 2:
+                fake.scripts["w"] = snap("w", state="completed", text="new", turn="new")
+
+        result = t3exec.watch_turn(fake, "w", now_fn=lambda: clock[0], sleep_fn=nap,
+                                   prior_turn_id="old", await_new_turn=True)
+        self.assertEqual(result["assistant_text"], "new")
+        self.assertEqual(naps, [1.0, 1.0])
+
+    def test_route_healthy_at_fallback_confirmation_cancels_stall(self):
+        fake = FakeT3Client(planner=PLANNER)
+        fake.scripts["w"] = self.running("codex", 3600)
+        with mock.patch.object(fake, "prism_liveness", side_effect=[{}, {"stale": False}, {"stale": False}]):
+            result = t3exec.watch_turn(fake, "w", now_fn=lambda: NOW.timestamp(),
+                                       sleep_fn=lambda _: fake.complete("w", "done"))
+        self.assertEqual(result["state"], "completed")
+
+
+class StaleEvidence(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.sd = str(Path(tmp.name) / "state")
+        self.ws = Path(tmp.name) / "ws"
+        self.ws.mkdir()
+        core.submit(self.sd, "salvage", {"goal": "t"}, str(self.ws), "s",
+                    planner_t3_thread=PLANNER)
+        self.thread = "sub.planner-t3.worker"
+        self.route = "muse-spark-xhigh-free"
+        set_state(self.sd, "salvage", t3_threads={"impl_1": {
+            "thread_id": self.thread, "route": self.route,
+            "created": True, "turn_started": True, "turn_state": "running"}})
+        self.artifact = self.ws / "review.log"
+        self.artifact.write_text("request_changes: seven major findings\napi_key=secret-value\n")
+        self.fake = FakeT3Client(planner=PLANNER)
+        self.fake.liveness = {"stale": True, "staleSince": NOW.isoformat(),
+                              "silenceMs": 23000, "thresholdMs": 18000,
+                              "thresholdSource": "measured", "reason": "no stream events"}
+        self.fake.scripts[self.thread] = snap(
+            self.thread, state="running", text=f"Review found problems: `{self.artifact}`")
+
+    def test_salvage_ledger_and_planner_post_precede_interrupt_and_survive_route_move(self):
+        dispatch = self.fake.dispatch
+        interrupts = []
+
+        def check_before_interrupt(command):
+            if command["type"] == "thread.turn.interrupt":
+                records = controller._load_controller_state(core.get_job(self.sd, "salvage"))["stale_events"]
+                saved = Path(records[0]["salvage"]["artifacts"][0]["saved"])
+                self.assertIn("seven major findings", saved.read_text())
+                self.assertNotIn("secret-value", saved.read_text())
+                self.assertEqual(self.fake.posts[0][0], PLANNER)
+                self.assertIn("seven major findings", self.fake.posts[0][1])
+                self.artifact.unlink()  # The worker's temp artifact can now disappear.
+                interrupts.append(command)
+            return dispatch(command)
+
+        self.fake.dispatch = check_before_interrupt
+        with mock.patch.object(controller, "_move_after_signal", return_value={"action": "route_switched"}) as move:
+            result = controller._run_t3_worker_turn(
+                self.sd, "salvage", core.get_job(self.sd, "salvage"), str(self.ws),
+                self.route, "work", 1, "test", t3_client=self.fake)
+        self.assertEqual(result["action"], "route_switched")
+        self.assertEqual(len(interrupts), 1)
+        self.assertEqual(self.fake.liveness_reads, [self.thread])
+        self.assertEqual(move.call_args.args[3], "stalled")
+        self.assertTrue(Path(result["report"]["salvage_path"]).exists())
+        evidence = events(self.sd, "salvage", "t3_turn_stale")
+        self.assertEqual(len(evidence), 1)
+        for field in ("silenceMs", "thresholdMs", "thresholdSource", "reason"):
+            self.assertEqual(evidence[0][field], self.fake.liveness[field])
+        self.assertTrue(events(self.sd, "salvage", "t3_stale_notification")[0]["posted"])
+        # Subsequent work must not replace salvaged findings in the eventual report.
+        controller._set_phase(self.sd, "salvage", implementation_output="later worker completed")
+        update_job(self.sd, "salvage", status="blocked", block_reason="need judgment")
+        report = controller.deliver_terminal_report(self.sd, "salvage", t3_client=self.fake)
+        self.assertEqual(report["action"], "reported")
+        terminal = self.fake.posts[-1][1]
+        self.assertIn("seven major findings", terminal)
+        self.assertIn(str(self.artifact), terminal)
+        self.assertIn("Review found problems", terminal)
+        self.assertNotIn("secret-value", terminal)
+
+    def test_failed_notification_is_recorded_and_evidence_still_reaches_terminal_report(self):
+        with mock.patch.object(self.fake, "post_message", side_effect=t3exec.T3Error("offline")):
+            outcome = t3exec.watch_turn(self.fake, self.thread)
+            controller._note_t3_turn(self.sd, "salvage", "impl_1", self.thread,
+                                     self.route, outcome, self.fake)
+        self.assertFalse(events(self.sd, "salvage", "t3_stale_notification")[0]["posted"])
+        update_job(self.sd, "salvage", status="failed", block_reason="offline")
+        controller.deliver_terminal_report(self.sd, "salvage", t3_client=self.fake)
+        self.assertIn("seven major findings", self.fake.posts[-1][1])
+
+    def test_every_stale_event_notifies_and_success_report_keeps_all_findings(self):
+        for number in (1, 2):
+            self.fake.scripts[self.thread] = snap(self.thread, text=f"finding {number}")
+            outcome = t3exec.watch_turn(self.fake, self.thread)
+            controller._note_t3_turn(self.sd, "salvage", f"impl_{number}", self.thread,
+                                     self.route, outcome, self.fake)
+        self.assertEqual([tid for tid, _ in self.fake.posts], [PLANNER, PLANNER])
+        self.assertEqual(len(events(self.sd, "salvage", "t3_turn_stale")), 2)
+        update_job(self.sd, "salvage", status="succeeded")
+        controller.deliver_terminal_report(self.sd, "salvage", t3_client=self.fake)
+        self.assertIn("finding 1", self.fake.posts[-1][1])
+        self.assertIn("finding 2", self.fake.posts[-1][1])
+
+    def test_artifact_in_tool_output_is_preserved_and_unsafe_reference_is_not_read(self):
+        snapshot = snap(self.thread, text="Review is written.", activities=[{
+            "turnId": "t1", "payload": {"output": f"Saved `{self.artifact}`"}}])
+        result = t3salvage.capture(snapshot, "", str(self.ws), self.ws / "saved")
+        self.assertIn("seven major findings", result["artifacts"][0]["excerpt"])
+        self.assertNotIn("secret-value", json.dumps(result))
+        snapshot = snap(self.thread, text="Reference `/etc/hosts.txt`")
+        result = t3salvage.capture(snapshot, "", str(self.ws), self.ws / "saved2")
+        self.assertIn("reference only", result["artifacts"][0]["note"])
+
+    def test_bare_artifact_and_spaced_markdown_path_are_copied(self):
+        (self.ws / "review notes.md").write_text("Important review findings.")
+        snapshot = snap(self.thread, text="See `review.log` and [notes](review notes.md).")
+        result = t3salvage.capture(snapshot, "", str(self.ws), self.ws / "saved")
+        self.assertEqual(len(result["artifacts"]), 2)
+        self.assertIn("seven major findings", result["artifacts"][0]["excerpt"])
+        self.assertIn("Important review findings", result["artifacts"][1]["excerpt"])
 
 
 class CancelWithT3Unreachable(unittest.TestCase):
