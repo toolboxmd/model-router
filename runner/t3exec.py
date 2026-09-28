@@ -125,11 +125,18 @@ _HARD_MARKERS = (
 
 
 class T3Error(Exception):
-    """A T3 orchestration call failed (unreachable server, auth, bad payload)."""
+    """A T3 orchestration call failed (unreachable server, auth, bad payload).
 
-    def __init__(self, message: str, status: int | None = None):
+    ``unreachable`` is True when no answer came back (connection refused
+    or reset, timeout): T3 is not running, as opposed to answering with an
+    error status or a bad body.
+    """
+
+    def __init__(self, message: str, status: int | None = None,
+                 unreachable: bool = False):
         super().__init__(message)
         self.status = status
+        self.unreachable = unreachable
 
 
 class T3NotFoundError(T3Error):
@@ -446,7 +453,8 @@ class T3Client:
                 raise T3NotFoundError(message) from e
             raise T3Error(message, status=e.code) from e
         except OSError as e:
-            raise T3Error(f"T3 {method} {path} unreachable at {self.server_url}: {e}") from e
+            raise T3Error(f"T3 {method} {path} unreachable at {self.server_url}: {e}",
+                          unreachable=True) from e
         try:
             obj = json.loads(body) if body.strip() else {}
         except ValueError as e:

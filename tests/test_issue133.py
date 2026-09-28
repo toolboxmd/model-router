@@ -42,7 +42,8 @@ class Base(unittest.TestCase):
     def run_controller(self, rid, prism, reads=None, step=None):
         """Run the controller loop in-process against a fake T3 serving
         ``prism``; returns the fake. ``reads`` scripts the first snapshot
-        reads (None fails like an unreachable server); ``step`` replaces
+        reads (None fails like an unreachable server, an exception is
+        raised as is); ``step`` replaces
         the controller step. Waits run on a fake clock (``self.slept``)."""
         fake = use_fake_t3(self, self.sd, rid)
         fake.prism = prism
@@ -50,10 +51,11 @@ class Base(unittest.TestCase):
             script, serve = list(reads), fake.prism_snapshot
 
             def prism_snapshot(project_id=None):
-                if script and script.pop(0) is None:
+                item = script.pop(0) if script else True
+                if item is None or isinstance(item, Exception):
                     fake.prism_reads.append(project_id)
-                    raise t3exec.T3Error("T3 GET /api/prism/snapshot failed: "
-                                         "connection refused")
+                    raise item or t3exec.T3Error("T3 GET /api/prism/snapshot unreachable: "
+                                                 "connection refused", unreachable=True)
                 return serve(project_id)
             fake.prism_snapshot = prism_snapshot
         self.slept, now = [], [0.0]
@@ -62,6 +64,8 @@ class Base(unittest.TestCase):
 
         def sleep(secs):
             self.slept.append(secs)
+            if getattr(self, "on_sleep", None):
+                self.on_sleep()
             self.routes_while_waiting.append(policy.stage_routes("dispatch"))
             now[0] += secs
         for name, value in (("_sleep", sleep), ("_clock", lambda: now[0])):
@@ -100,19 +104,14 @@ class Base(unittest.TestCase):
 
 class Unreadable(Base):
     def test_unreadable_prism_stops_the_job_and_tells_the_planner(self):
+        # T3 answers (HTTP 404, older server): block at once (#136).
         self.submit()
         steps = []
         fake = self.run_controller("j", None, step=lambda *a, **k: steps.append(1))
         self.assert_stopped("j", fake, "Prism unreadable: ")
-        reason = core.get_job(self.sd, "j")["block_reason"]
-        self.assertIn("HTTP 404", reason)
-        wait = int(controller.PRISM_UNREADABLE_WAIT_SECS)
-        self.assertIn(f"still unreadable after retrying for {wait}s", reason)
-        # Backoff over the whole window, rereading each time, no step run.
-        self.assertEqual(sum(self.slept), controller.PRISM_UNREADABLE_WAIT_SECS)
-        self.assertEqual(self.slept[:3], [5.0, 10.0, 20.0])
-        self.assertLessEqual(max(self.slept), controller.PRISM_RETRY_MAX_SECS)
-        self.assertEqual(len(fake.prism_reads), len(self.slept) + 1)
+        self.assertIn("HTTP 404", core.get_job(self.sd, "j")["block_reason"])
+        self.assertEqual(self.slept, [])
+        self.assertEqual(len(fake.prism_reads), 1)
         self.assertEqual(steps, [])
 
     def test_a_read_that_recovers_within_the_window_continues_the_job(self):

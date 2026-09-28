@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.39.0] - 2026-09-28
+
+### Changed
+
+- A job waits for T3 while it does not answer (up to 24 hours, shown as `waiting_for_t3` in `status`) and continues when it is back; T3 that answers with an error blocks at once (#136)
+
 ## [0.38.1] - 2026-09-28
 
 ### Changed

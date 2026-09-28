@@ -4176,35 +4176,60 @@ def _advertise(state_dir: str, request_id: str, token: str) -> None:
         pass
 
 
-# A failed Prism read is retried with backoff for this long before the job
-# blocks: a T3 restart or a token renewal mid-job must not end it (#133).
-PRISM_UNREADABLE_WAIT_SECS = 300.0
+# While T3 does not answer at all (quit, restarting, installing a rebuild)
+# the job waits for it with backoff, up to this long (#136). T3 that
+# answers with an error, or an empty list, blocks at once (#133).
+T3_UNREACHABLE_WAIT_SECS = 24 * 3600.0
 PRISM_RETRY_FIRST_SECS = 5.0
 PRISM_RETRY_MAX_SECS = 60.0
 _clock = time.monotonic
 _sleep = time.sleep
 
 
+def _record_t3_wait(state_dir, request_id: str, cause: str) -> None:
+    """Ledger event ``waiting_for_t3`` so ``status`` shows the wait."""
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        core._event(con, request_id, "waiting_for_t3",
+                    {"since": core._utcnow(), "cause": cause[:300]})
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
 def _await_prism(state_dir, request_id: str, token: str | None) -> str | None:
     """Refresh the snapshot for the job; the reason to block, or None.
 
-    An unreadable snapshot is reread with backoff for up to
-    ``PRISM_UNREADABLE_WAIT_SECS``. While it is unreadable no stage has
-    routes, so nothing launches and the last snapshot is never reused.
-    An empty list in a readable snapshot is the user's setting and blocks
-    at once.
+    While T3 is unreachable the snapshot is reread with backoff for up
+    to ``T3_UNREACHABLE_WAIT_SECS``; no stage has routes meanwhile, so
+    nothing launches and the last snapshot is never reused. A cancel
+    ends the wait at the next reread. Any other unreadable snapshot, or
+    an empty list the job needs, blocks at once.
     """
     job = core.get_job(state_dir, request_id)
     start = _clock()
     delay = PRISM_RETRY_FIRST_SECS
     snap = t3snapshot.refresh_for_job(job)
-    while snap is None:
+    if snap is None and t3snapshot.unreachable():
+        _record_t3_wait(state_dir, request_id, t3snapshot._CACHE.get("error") or "")
+    while snap is None and t3snapshot.unreachable():
         waited = _clock() - start
-        if waited >= PRISM_UNREADABLE_WAIT_SECS:
-            reason = t3snapshot.blocked_reason(None)
-            return f"{reason} (still unreadable after retrying for {int(waited)}s)"
-        _sleep(min(delay, PRISM_UNREADABLE_WAIT_SECS - waited))
+        if waited >= T3_UNREACHABLE_WAIT_SECS:
+            hours = int(T3_UNREACHABLE_WAIT_SECS // 3600)
+            return (f"Prism unreadable: T3 unreachable for {hours}h "
+                    f"({t3snapshot._CACHE.get('error') or 'no answer'})")
+        _sleep(min(delay, T3_UNREACHABLE_WAIT_SECS - waited))
         delay = min(delay * 2, PRISM_RETRY_MAX_SECS)
+        if core.get_job(state_dir, request_id)["cancel_requested"]:
+            return None  # the step records the cancel
         try:
             _advertise(state_dir, request_id, token)
         except Exception:
@@ -4252,7 +4277,8 @@ def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
                               f"job_step_budget_exhausted after {total} steps across launches")
                 break
             # Eligible models, usage windows and role preferences come from
-            # the T3 snapshot (cached briefly). An unreadable snapshot or an
+            # the T3 snapshot (cached briefly). While T3 is unreachable the
+            # job waits for it (#136); any other unreadable snapshot or an
             # empty list the job needs stops the job before any thread
             # starts; the terminal report below tells the planner (#133).
             prism_block = _await_prism(state_dir, request_id, token)
