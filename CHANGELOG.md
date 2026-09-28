@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.38.1] - 2026-09-28
+
+### Changed
+
+- A release now wakes Marketplace promotion at once instead of waiting for its hourly schedule
+
 ## [0.38.0] - 2026-09-27
 
 ### Changed
