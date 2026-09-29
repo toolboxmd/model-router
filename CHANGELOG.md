@@ -8,6 +8,12 @@
 - Dispatcher and reviewer threads run `full-access`, so they reach GitHub; T3's `auto` gave Codex no network and left OpenCode and Grok waiting on approvals (#144)
 - The baseline proof leaves out final-candidate checks such as `release-check`, which cannot pass on a WIP or pre-bump base (#144)
 
+## [0.41.1] - 2026-09-29
+
+### Changed
+
+- Direction: dependable delegation with coordination chosen by measured evidence; Objective adds the dispatcher comparison (#146)
+
 ## [0.41.0] - 2026-09-28
 
 ### Added
