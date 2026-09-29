@@ -206,6 +206,15 @@ Grok, `effort` for Claude, `variant` for OpenCode). The thread ids are saved
 before the watch, so a restarted controller adopts a live turn instead of
 starting a second writer.
 
+The dispatcher reports router defects it meets (#147). When the job blocks,
+loops, or the runner acts against this document, its prompt tells it to
+read the job's `status` and `outputs/<id>/`, search open Issues in
+toolboxmd/model-router, then comment on the matching Issue or open one with
+the request ID, the evidence and the expected behavior, and continue or
+block as the runner allows. Packet mistakes (a missing `proof`, a wrong
+workspace) go to the planner as a `planner_question`, not an Issue. The
+runner files nothing itself.
+
 Router polls `GET /api/prism/liveness?threadId=` every second. T3 owns the
 stale decision, including stream clocks, running tools, thresholds and host
 sleep. `stale: true` enters the stalled path immediately; `stale: false`
