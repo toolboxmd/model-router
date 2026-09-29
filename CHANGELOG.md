@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.44.1] - 2026-09-30
+
+### Changed
+
+- README: find the installed plugin root per host, list requirements, compare released and promoted versions (#153)
+
 ## [0.44.0] - 2026-09-29
 
 ### Added

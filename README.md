@@ -16,8 +16,24 @@ guidance lives in Chromeria's Prism tool descriptions (`prism_submit`,
 `prism_status`, `prism_questions`, `prism_answer`), which call the newest
 installed release.
 
+You need Python 3.11 or newer, Git, and a reachable T3 server (the Chromeria
+fork) whose providers can run the routes, with a bearer token;
+[RUNNER.md](RUNNER.md#requirements) gives the server URL and token lookup
+order.
+
 Once Toolybara promotes a release into ToolboxMD Marketplace, install it through
-your host's native plugin path:
+your host's native plugin path. To compare the latest source release with the
+promoted Marketplace release:
+
+```sh
+gh release view -R toolboxmd/model-router --json tagName --jq .tagName
+gh api repos/toolboxmd/marketplace/contents/catalog.json \
+  -H 'Accept: application/vnd.github.raw' \
+  --jq '.plugins[] | select(.name=="model-router") | .release'
+```
+
+When the source release tag is newer than the Marketplace tag, that release
+is not promoted yet. Install commands:
 
 ```sh
 # Codex
@@ -36,7 +52,24 @@ grok plugin install model-router --trust
 
 Marketplace records the exact source tag, commit, and Project Record digest.
 Provider publication and fresh-host acceptance remain separate proof.
-Resolve `MODEL_ROUTER_ROOT` to the installed plugin's real root, then verify:
+Set `MODEL_ROUTER_ROOT` to the installed plugin's root, found per host with
+`jq`:
+
+```sh
+# Codex: the cache folder is named after the installed version
+MODEL_ROUTER_ROOT="$HOME/.codex/plugins/cache/toolboxmd/model-router/$(codex plugin list --json |
+  jq -r '.installed[] | select(.pluginId=="model-router@toolboxmd") | .version')"
+
+# Claude Code
+MODEL_ROUTER_ROOT="$(claude plugin list --json |
+  jq -r '.[] | select(.id=="model-router@toolboxmd") | .installPath')"
+
+# Grok Build
+MODEL_ROUTER_ROOT="$(grok plugin list --json |
+  jq -r '.[] | select(.name=="model-router") | .path')"
+```
+
+Then verify:
 
 ```sh
 "$MODEL_ROUTER_ROOT/bin/model-router" --version
@@ -44,7 +77,7 @@ Resolve `MODEL_ROUTER_ROOT` to the installed plugin's real root, then verify:
 ```
 
 Installing the package starts no service or model request and does not grant
-delivery authority. See [RUNNER.md](RUNNER.md) for requirements.
+delivery authority.
 
 ## Automatic releases
 
