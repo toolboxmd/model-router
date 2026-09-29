@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.41.1] - 2026-09-29
+
+### Changed
+
+- Direction: dependable delegation with coordination chosen by measured evidence; Objective adds the dispatcher comparison (#146)
+
 ## [0.41.0] - 2026-09-28
 
 ### Added
