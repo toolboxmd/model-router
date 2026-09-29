@@ -286,13 +286,14 @@ _STAGE_NAMES = {"dispatch": "Dispatcher", "review": "Reviewer",
                 "correction": "Retry", "recovery": "Escalation"}
 
 
-def blocked_reason(snapshot: dict | None, lane: str | None = None) -> str | None:
+def blocked_reason(snapshot: dict | None, lane: str | None = None,
+                   dispatcher: str = "luna") -> str | None:
     """Why a job cannot route, or None.
 
     ``Prism unreadable: <cause>`` when the snapshot is unknown; otherwise
-    the first list the job needs that is empty in Prism: Dispatcher,
-    the job's Worker lane, Reviewer, and Retry and Escalation while they
-    are switched on.
+    the first list the job needs that is empty in Prism: Dispatcher
+    (not in planner-dispatch mode, #146), the job's Worker lane,
+    Reviewer, and Retry and Escalation while they are switched on.
     """
     if not isinstance(snapshot, dict):
         return f"Prism unreadable: {_CACHE.get('error') or 'no snapshot'}"
@@ -304,6 +305,8 @@ def blocked_reason(snapshot: dict | None, lane: str | None = None) -> str | None
         stage = policy.DEFAULT_LANE
     on = ladder_enabled(snapshot)
     for needed in ("dispatch", stage, "review", "correction", "recovery"):
+        if needed == "dispatch" and dispatcher == "planner":
+            continue
         if not on.get(needed, True) or policy.stage_routes(needed):
             continue
         if needed in policy.PRISM_LANE_OF:

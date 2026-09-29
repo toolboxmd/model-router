@@ -103,6 +103,10 @@ def main(argv=None) -> int:
                         "its child threads, and questions and the terminal state are posted into it")
     p.add_argument("--t3-server-url", default=None,
                    help="T3 server URL (default: T3_SERVER_URL or http://127.0.0.1:3773)")
+    p.add_argument("--dispatcher", default="luna", choices=core.DISPATCHERS,
+                   help="who answers the job's decision points: luna (a dispatcher "
+                        "child thread, the default) or planner (the planner thread "
+                        "itself, #146)")
     p.add_argument("--handoff-summary", default=None,
                    help="durable handoff summary stored on the job (default: derived from the task packet)")
     p.add_argument("--handoff-summary-file", default=None,
@@ -189,7 +193,8 @@ def main(argv=None) -> int:
                                             planner_harness=args.planner_harness,
                                             handoff_summary=handoff_summary,
                                             planner_t3_thread=args.planner_t3_thread,
-                                            t3_server_url=args.t3_server_url)
+                                            t3_server_url=args.t3_server_url,
+                                            dispatcher=args.dispatcher)
             else:
                 job = core.submit(sd, args.request_id, task, args.workspace,
                                   args.planner_session, route=args.route,
@@ -202,10 +207,12 @@ def main(argv=None) -> int:
                                   planner_harness=args.planner_harness,
                                   handoff_summary=handoff_summary,
                                   planner_t3_thread=args.planner_t3_thread,
-                                  t3_server_url=args.t3_server_url)
+                                  t3_server_url=args.t3_server_url,
+                                  dispatcher=args.dispatcher)
             return _out({"acknowledged": True, "request_id": job["request_id"],
                          "status": job["status"], "route": job["route"],
-                         "policy": job["policy_id"]})
+                         "policy": job["policy_id"],
+                         "dispatcher": core.dispatcher_mode(job)})
         if args.cmd == "start":
             info = core.start_controller(sd, args.request_id)
             redacted = dict(info)

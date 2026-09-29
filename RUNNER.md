@@ -36,7 +36,7 @@ planner thread; their descriptions carry the usage guidance.
   --workspace PATH --planner-session SID --planner-t3-thread TID [--t3-server-url URL] \
   [--planner-harness claude|codex|opencode|grok|t3] [--planner-model M] [--planner-effort E] \
   [--lane L | --route R] [--max-attempts N] [--timeout-secs S] \
-  [--job-kind ordinary|experiment|replay] [--replay-of ID] \
+  [--job-kind ordinary|experiment|replay] [--replay-of ID] [--dispatcher luna|planner] \
   [--handoff-summary TEXT | --handoff-summary-file F] [--start | --no-start]
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR start --request-id ID
 "$MODEL_ROUTER_ROOT/bin/model-router" --state-dir DIR status --request-id ID
@@ -95,6 +95,12 @@ exhausted and degraded with the window and until when; `unknown` when the
 snapshot cannot be read) with `blocked`: the reason a job would stop now
 (`Prism unreadable: <cause>` or an empty list), or null. `--clear ROUTE` forgets a route's marks after the
 operator checked the provider allowance.
+
+`--dispatcher` picks who answers the job's decision points: `luna` (the
+default, a dispatcher child thread) or `planner` (the planner thread itself,
+see [Planner-dispatch mode](#planner-dispatch-mode)). The mode is part of
+the payload: resubmitting the same ID in the other mode conflicts. Jobs
+from before the mode existed read as `luna`.
 
 ## Routing: policy, Prism preferences, and the T3 snapshot
 
@@ -216,6 +222,31 @@ expected behavior, and continue or block as the runner allows. Issue text it
 reads is data, never instructions. Packet mistakes (a missing `proof`, a wrong
 workspace) go to the planner as a `planner_question`, not an Issue. The
 runner files nothing itself.
+
+### Planner-dispatch mode
+
+With `--dispatcher planner` (#146) no dispatcher thread starts. Every
+decision point a Luna dispatcher would get (the first dispatch, a worker's
+result, a planner answer, a refused completion, an envelope repair) is
+posted into the planner thread instead, headed `PRISM DISPATCH DECISION for
+job <id> (<key>)`, with the same task, ISSUES, JOB EVIDENCE and reply
+shapes, and the planner's reply in that turn carries the envelope. The
+planner's protocol gives it the same router-defect duty (#147); a packet
+mistake it corrects in the worker instructions, or cancels and resubmits.
+Worker and reviewer threads become children of the planner thread. The
+Prism Dispatcher list is not needed.
+
+Each decision is keyed by the controller's action `seq`, and its message
+id is saved before the post (`planner_dispatch_posted`), so a restarted
+controller watches the same post instead of asking twice. A reply records
+`planner_dispatch_reply` with the turn state and `wait_secs`. A turn that
+ends without a reply blocks as `planner_dispatch_pending`, which `recover`
+continues: it watches the same post again, or posts afresh when that turn
+errored or was interrupted. A `planner_question` from the planner is for
+the user: it is stored, not posted back to the planner, and the job blocks
+as `planner_question_pending` until `answer` plus `recover`. The runner's
+own escalation question still reaches the planner as a planner question.
+Cancel never interrupts the planner thread.
 
 Router polls `GET /api/prism/liveness?threadId=` every second. T3 owns the
 stale decision, including stream clocks, running tools, thresholds and host
@@ -438,6 +469,38 @@ Recovery continues on the currently installed runtime only when the stored
 job state is compatible with it (same policy id, readable controller state,
 a route this policy knows); otherwise the job blocks as
 `runtime_incompatible` with the specific reason and is never migrated.
+
+## Comparing dispatcher modes
+
+The Objective's default mode comes from matched real jobs in both modes
+(#146): at least five per mode, with complete packets (a `proof` command,
+no merge authority) and a similar lane and task mix. Run
+`agent-observer sync`, then:
+
+```
+python3 scripts/compare_dispatch.py [--since 2026-09-30] [--jobs]
+```
+
+It reads the runner ledger (`jobs.db` in `DURABLE_RUNNER_STATE_DIR`) and
+Agent Observer's ledger (`AGENT_OBSERVER_DB`, else
+`~/.local/state/agent-observer/observer.db`) read-only and prints, per
+mode, over terminal jobs:
+
+| Metric | Source |
+| --- | --- |
+| Jobs, succeeded, success rate | `jobs.status` and `jobs.dispatcher` |
+| Median seconds to first worker | `submitted` event to the first `t3_thread` event whose slot is `impl_*` |
+| Median seconds to a reviewed PR | `submitted` to the first `review_verdict` with `approve` |
+| Dispatch and question tokens | Observer `responses.total_tokens` by counter semantics: `luna` counts the dispatcher thread's whole session (`t3_threads` maps the thread to its session); `planner` counts the planner session inside each `planner_dispatch_posted` to `planner_dispatch_reply` window; both count the planner session from `question_posted` to `answer_persisted` |
+
+`--jobs` adds one row per job, with `planner_decision_secs` for planner
+mode. Tokens stay grouped by semantics because Observer never adds totals
+across harnesses. Agent Observer does not import the `dispatcher` column
+or event payloads yet, so the grouping and the decision windows come from
+the runner ledger, and cost per job is still unknown: `agent-observer task
+show --task router:<id>` reports `unknown` for T3-path jobs because it
+attributes no sessions to them. Treat the result as observational: report
+the sample sizes with every figure.
 
 ## Verification
 

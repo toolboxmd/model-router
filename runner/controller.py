@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import adapters, core, policy, store, t3exec, t3salvage, t3snapshot
@@ -449,6 +450,7 @@ T3_TURN_KIND = "t3_turn"
 T3_TERMINAL_POST_KIND = "t3_terminal_post"
 T3_QUESTION_POST_KIND = "t3_question_post"
 T3_ANSWER_KIND = "t3_planner_answer"
+T3_PLANNER_DISPATCH_KIND = "t3_planner_dispatch"
 
 
 def _t3_threads_map(job: dict) -> dict:
@@ -1013,6 +1015,206 @@ def _resume_luna_via_t3(state_dir, request_id: str, message: str,
     return {"action": "resumed", "luna_action": luna_action}
 
 
+# ---------------------------------------------------------------------------
+# Planner-dispatch mode (#146): the planner thread is the dispatcher. Each
+# decision point (the first dispatch, and every resume: worker evidence, a
+# planner answer, a refused completion, a missing envelope) is posted into
+# the planner thread once, and the planner's reply carries the envelope.
+# Decisions are keyed by the controller's action ``seq``: the message id
+# is saved before the post, so a restarted controller watches the same
+# post instead of asking twice. The planner thread is never interrupted
+# and never saved as a job thread (cancel interrupts job threads).
+# ---------------------------------------------------------------------------
+
+def _planner_mode(job: dict) -> bool:
+    return core.dispatcher_mode(job) == "planner"
+
+
+def _planner_decision_key(job: dict, suffix: str = "") -> str:
+    return f"seq{int(_load_controller_state(job).get('seq') or 0)}{suffix}"
+
+
+def _save_planner_dispatch(state_dir, request_id: str, key: str, rec: dict,
+                           event: str, detail: dict) -> None:
+    con = store.connect(state_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _lease_guard(con, request_id)
+        row = con.execute("SELECT controller_state FROM jobs WHERE request_id=?",
+                          (request_id,)).fetchone()
+        try:
+            st = json.loads((row["controller_state"] if row else None) or "{}")
+        except ValueError:
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        decisions = st.get("planner_dispatch")
+        if not isinstance(decisions, dict):
+            decisions = {}
+        decisions[key] = rec
+        st["planner_dispatch"] = decisions
+        con.execute("UPDATE jobs SET controller_state=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(st, sort_keys=True), core._utcnow(), request_id))
+        core._event(con, request_id, event, dict(detail, key=key))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def _planner_decision_record(job: dict, key: str) -> dict | None:
+    rec = (_load_controller_state(job).get("planner_dispatch") or {}).get(key)
+    return rec if isinstance(rec, dict) and rec.get("message_id") else None
+
+
+def _wait_secs(since: str | None) -> float | None:
+    try:
+        start = datetime.fromisoformat(str(since).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return round((datetime.now(timezone.utc) - start).total_seconds(), 3)
+
+
+def _close_planner_decision(state_dir, request_id: str, key: str,
+                            state: str | None) -> None:
+    """Mark a decision answered (or failed): a later call posts afresh."""
+    rec = _planner_decision_record(core.get_job(state_dir, request_id), key)
+    if rec is None or rec.get("done"):
+        return
+    _save_planner_dispatch(state_dir, request_id, key,
+                           dict(rec, done=True, turn_state=state,
+                                replied_at=core._utcnow()),
+                           "planner_dispatch_reply",
+                           {"state": state,
+                            "wait_secs": _wait_secs(rec.get("posted_at"))})
+
+
+def _planner_decision_turn(state_dir, request_id: str, key: str, text: str,
+                           t3_client=None) -> dict:
+    """Post one decision into the planner thread and watch the reply turn."""
+    job = core.get_job(state_dir, request_id)
+    parent = t3exec.validate_thread_id(job.get("planner_t3_thread") or "")
+    try:
+        client = _t3_client_for_job(job, t3_client)
+    except t3exec.T3Error as e:
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+    rec = _planner_decision_record(job, key)
+    if rec is not None and rec.get("done"):
+        rec = None
+    try:
+        snap = client.thread_snapshot(parent)
+        posted = rec is not None and any(
+            isinstance(m, dict) and m.get("id") == rec["message_id"]
+            for m in (t3exec.snapshot_thread(snap).get("messages") or []))
+        if rec is None:
+            rec = {"message_id": f"msg-{request_id}-{key}-{secrets.token_hex(4)}"[:120],
+                   "prior_turn_id": t3exec.latest_turn_id(snap),
+                   "posted_at": core._utcnow()}
+            _save_planner_dispatch(state_dir, request_id, key, rec,
+                                   "planner_dispatch_posted",
+                                   {"message_id": rec["message_id"],
+                                    "thread_id": parent})
+        if not posted:
+            _check_t3_start_lease(state_dir, request_id)
+            client.post_message(parent, text, role="dispatch",
+                                message_id=rec["message_id"])
+            _record_child(state_dir, request_id, T3_PLANNER_DISPATCH_KIND,
+                          ["t3", "planner_dispatch", key], 0, session_id=parent,
+                          output_text=adapters.redact_text(text[-1000:]))
+        outcome = t3exec.watch_turn(client, parent,
+                                    prior_turn_id=rec.get("prior_turn_id"),
+                                    await_new_turn=True,
+                                    **_t3_watch_kwargs())
+    except (t3exec.T3Error, ValueError) as e:
+        detail = f"planner dispatch {key} failed: {e}"[:300]
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": T3_PLANNER_DISPATCH_KIND,
+                                 "key": key, "error": detail})
+        return _t3_block(state_dir, request_id, f"t3_unavailable: {detail}")
+    outcome["thread_id"] = parent
+    return outcome
+
+
+def _planner_decision(state_dir, request_id: str, key: str, text: str,
+                      phase: str, t3_client=None, repair: bool = True) -> dict:
+    """One planner decision: its envelope, or a block with the reason.
+
+    A reply without an envelope gets one repair post, like the Luna
+    dispatcher (#105). A turn that ends without a reply blocks as
+    ``planner_dispatch_pending``; ``recover`` watches the same post
+    again, or posts afresh when that turn errored or was interrupted.
+    """
+    outcome = _planner_decision_turn(state_dir, request_id, key, text,
+                                     t3_client=t3_client)
+    if outcome.get("action") == "blocked":
+        return outcome
+    state = outcome.get("state")
+    if state != "completed":
+        if state in t3exec.TURN_TERMINAL_STATES:
+            _close_planner_decision(state_dir, request_id, key, state)
+        detail = outcome.get("reason") or state or "no reply"
+        _persist_error_evidence(state_dir, request_id,
+                                {"source": T3_PLANNER_DISPATCH_KIND, "key": key,
+                                 "state": state, "error": str(detail)[:300],
+                                 "thread_id": outcome.get("thread_id")})
+        return _t3_block(state_dir, request_id,
+                         (f"planner_dispatch_pending: decision {key} is in the "
+                          f"planner T3 thread with no reply ({state}); `recover` "
+                          "continues")[:500])
+    reply = outcome.get("assistant_text") or ""
+    luna_action = parse_luna_action(reply)
+    _persist_envelope(state_dir, request_id, luna_action, phase, raw_text=reply)
+    _close_planner_decision(state_dir, request_id, key, state)
+    if luna_action is not None:
+        return {"action": phase, "luna_action": luna_action,
+                "t3_thread_id": outcome.get("thread_id")}
+    if repair:
+        return _planner_decision(state_dir, request_id, f"{key}-repair",
+                                 _planner_repair_text(request_id, reply),
+                                 phase, t3_client=t3_client, repair=False)
+    _mark_blocked(state_dir, request_id,
+                  f"luna_missing_action: planner reply {_luna_parse_error(reply)}; "
+                  f"reply {len(reply)} chars"[:500])
+    return {"action": "blocked", "reason": "luna_missing_action"}
+
+
+def _planner_header(request_id: str, key: str) -> str:
+    return f"PRISM DISPATCH DECISION for job {request_id} ({key}):\n"
+
+
+def _planner_repair_text(request_id: str, reply: str) -> str:
+    return (_planner_header(request_id, "envelope repair")
+            + "ENVELOPE REPAIR: your last reply had no parsable action "
+            f"envelope ({_luna_parse_error(reply)}). Reply with the envelope "
+            "only: exactly one JSON object whose action is "
+            "planner_question, implementation or completion, and nothing else.")
+
+
+def _dispatch_via_planner(state_dir, request_id: str, prompt: str,
+                          t3_client=None) -> dict:
+    """The first dispatch decision, posted into the planner thread."""
+    job = core.get_job(state_dir, request_id)
+    key = _planner_decision_key(job)
+    return _planner_decision(state_dir, request_id, key,
+                             _planner_header(request_id, key) + prompt,
+                             "dispatched", t3_client=t3_client)
+
+
+def _resume_via_planner(state_dir, request_id: str, message: str,
+                        t3_client=None, key_suffix: str = "") -> dict:
+    """A resumed decision, posted into the planner thread."""
+    job = core.get_job(state_dir, request_id)
+    key = _planner_decision_key(job, key_suffix)
+    return _planner_decision(state_dir, request_id, key,
+                             _planner_header(request_id, key) + message,
+                             "resumed", t3_client=t3_client)
+
+
 def _t3_worker_full(outcome: dict, thread_id: str) -> tuple[dict, int]:
     """Supervisor-shaped result dict for a T3 worker turn (shared finisher)."""
     state = outcome.get("state")
@@ -1494,15 +1696,22 @@ def dispatch(state_dir, request_id: str, t3_client=None) -> dict:
     """Run the dispatcher turn as a T3 child thread of the planner thread,
     after the base-commit proof check on the first dispatch."""
     job = core.get_job(state_dir, request_id)
-    if _t3_thread_for(job, "dispatch") is None:
+    planner = _planner_mode(job)
+    if not (core._dispatcher_saved(job) if planner
+            else _t3_thread_for(job, "dispatch") is not None):
         blocked = _baseline_proof_gate(state_dir, request_id)
         if blocked is not None:
             return blocked
+    issues = "\n\n".join(filter(None, (_issue_context(state_dir, request_id),
+                                       _job_evidence(state_dir, request_id))))
+    if planner:
+        return _dispatch_via_planner(
+            state_dir, request_id,
+            adapters.build_luna_prompt(job["task_json"] or "", issues=issues,
+                                       protocol=adapters.PLANNER_ACTION_PROTOCOL),
+            t3_client=t3_client)
     return _dispatch_via_t3(state_dir, request_id,
-                            _full_luna_prompt(job["task_json"],
-                                              issues="\n\n".join(filter(None, (
-                                                  _issue_context(state_dir, request_id),
-                                                  _job_evidence(state_dir, request_id))))),
+                            _full_luna_prompt(job["task_json"], issues=issues),
                             t3_client=t3_client)
 
 
@@ -1547,6 +1756,12 @@ def planner_callback(state_dir, request_id: str, qid: str, prompt: str, t3_clien
 def resume_luna(state_dir, request_id: str, prompt: str,
                 label: str = "CONTEXT", t3_client=None) -> dict:
     """Resume only the saved dispatcher thread with new context (never fork)."""
+    if _planner_mode(core.get_job(state_dir, request_id)):
+        return _resume_via_planner(
+            state_dir, request_id,
+            adapters.build_luna_followup(label, prompt,
+                                         adapters.PLANNER_ACTION_PROTOCOL),
+            t3_client=t3_client)
     return _resume_luna_via_t3(state_dir, request_id,
                                adapters.build_luna_followup(label, prompt),
                                t3_client=t3_client)
@@ -3528,6 +3743,22 @@ def _handle_question_action(state_dir, request_id: str, envelope: dict) -> dict:
                               f"clear it with `questions --clear {qid}` or use a new qid")
                 return {"action": "blocked", "reason": "question_conflict"}
             answer_text = str(q["answer"])
+    if answer_text is None and _planner_mode(core.get_job(state_dir, request_id)) \
+            and qid != _load_controller_state(
+                core.get_job(state_dir, request_id)).get("recovery_question_qid"):
+        # Planner-dispatch mode (#146): the planner asked for the user's
+        # decision, so the question waits for `answer` plus `recover`
+        # instead of being posted back to the planner that asked it.
+        try:
+            core.post_question(state_dir, request_id, qid, prompt_q,
+                               lease_token=_LEASE["token"])
+        except core.ConflictError as e:
+            _mark_blocked(state_dir, request_id, f"planner_question_conflict: {e}")
+            return {"action": "blocked", "reason": "question_conflict"}
+        _mark_blocked(state_dir, request_id,
+                      f"planner_question_pending: the planner asked question {qid} "
+                      "for the user; answer with `answer` plus `recover`")
+        return {"action": "blocked", "reason": "planner_question_pending", "qid": qid}
     if answer_text is None:
         cb = planner_callback(state_dir, request_id, qid, prompt_q)
         if cb.get("action") == "blocked":
@@ -4288,11 +4519,27 @@ def _step_inner(state_dir, request_id: str, token: str | None = None) -> dict:
         return {"action": "cancelled", "status": job["status"]}
     if job["status"] == "blocked":
         return {"action": "blocked", "reason": job.get("block_reason")}
-    # The dispatcher identity is the saved dispatcher child thread.
-    dispatcher_saved = _t3_thread_for(job, "dispatch") is not None
+    # The dispatcher identity is the saved dispatcher child thread, or the
+    # planner thread in planner-dispatch mode (#146).
+    planner = _planner_mode(job)
+    dispatcher_saved = (core._dispatcher_saved(job) if planner
+                        else _t3_thread_for(job, "dispatch") is not None)
     if not dispatcher_saved or not _load_controller_state(job).get("seq"):
         return dispatch(state_dir, request_id)
     last = _load_controller_state(job).get("last_action")
+    if planner and (not isinstance(last, dict)
+                    or last.get("action") not in policy.VALID_ACTIONS):
+        # A recovered envelope block: ask the planner again for it.
+        try:
+            client = _t3_client_for_job(job)
+            text = t3exec.latest_assistant_text(client.thread_snapshot(
+                t3exec.validate_thread_id(job.get("planner_t3_thread") or "")))
+        except t3exec.T3Error as e:
+            return _t3_block(state_dir, request_id, f"t3_unavailable: {e}")
+        return _planner_decision(state_dir, request_id,
+                                 _planner_decision_key(job, "-repair"),
+                                 _planner_repair_text(request_id, text),
+                                 "resumed", repair=False)
     if not isinstance(last, dict) or last.get("action") not in policy.VALID_ACTIONS:
         # A recovered envelope block (#105): ask the saved dispatcher again.
         thread_id = (_t3_thread_for(job, "dispatch") or {}).get("thread_id")
@@ -4560,7 +4807,8 @@ def _await_prism(state_dir, request_id: str, token: str | None) -> str | None:
         except Exception:
             pass
         snap = t3snapshot.refresh_for_job(job, force=True)
-    return t3snapshot.blocked_reason(snap, job.get("lane"))
+    return t3snapshot.blocked_reason(snap, job.get("lane"),
+                                     core.dispatcher_mode(job))
 
 
 def run_controller_process(state_dir: str, request_id: str, token: str) -> int:
