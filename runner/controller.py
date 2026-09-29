@@ -3436,6 +3436,12 @@ def _handle_completion_refusal(state_dir, request_id: str, envelope: dict,
     if "completion_refused_seq" in st and st.get("completion_refused_seq") == rep_seq_i:
         _mark_blocked(state_dir, request_id, reason)
         return {"action": "blocked", "reason": "completion_refused"}
+    if "completion_refused: pr_merged" in reason:
+        # A merged PR cannot be reopened by a dispatcher turn; resuming
+        # would loop on the same refusal (#143). Block once, clearly.
+        _record_completion_refusal(state_dir, request_id, report, reason)
+        _mark_blocked(state_dir, request_id, reason)
+        return {"action": "blocked", "reason": "completion_refused"}
     _record_completion_refusal(state_dir, request_id, report, reason)
     job = core.get_job(state_dir, request_id)
     try:

@@ -297,7 +297,9 @@ thread; Grok turns are re-sent by the router.
    becomes the job's single PR identity: Retry and Escalation update
    that PR, never open a second. An ordinary job in a workspace without an
    origin push remote completes without a PR; experiment and replay jobs
-   need none. Nothing merges the PR.
+   need none. Nothing merges the PR. A PR that is already merged refuses as
+   `pr_merged` with its merge commit and blocks the job at once for the
+   planner, without resuming the dispatcher.
 
    **Review turn (#126).** A completion that passes these checks first gets
    one read-only review turn on the candidate's exact head, in a reviewer
