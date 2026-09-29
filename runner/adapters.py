@@ -11,8 +11,7 @@ import json
 # Explicit structured-action protocol embedded in every Luna prompt.
 # Luna must reply with exactly one JSON envelope as its final message.
 LUNA_ACTION_PROTOCOL = (
-    "ROLE: you are the dispatcher for this runner job. Your sandbox is "
-    "read-only: do not edit files. The submitted candidate stays yours: "
+    "ROLE: you are the dispatcher for this runner job. Do not edit files. The submitted candidate stays yours: "
     "assign implementation, debugging, test execution, and mechanical "
     "recovery yourself with the implementation action; put complete worker "
     "instructions in payload.instructions. The runner sends them to the "
@@ -34,6 +33,10 @@ LUNA_ACTION_PROTOCOL = (
     "the workspace has no origin push remote, no PR is possible: complete "
     "without a pr_url instead of asking the planner. Do not "
     "start other agents or models yourself.\n"
+    "The Issues the task names are under ISSUES, with comments, fetched by "
+    "the runner at submit: use them instead of reading GitHub or searching "
+    "for tools. Make no tool calls unless the task and ISSUES lack a fact "
+    "the routing decision needs.\n"
     "REPLY PROTOCOL (required): emit exactly one JSON object as your final "
     "message, on its own line, with one of these shapes:\n"
     '{"action":"planner_question","qid":"q1","prompt":"<question for the human planner>"}\n'
@@ -128,14 +131,19 @@ def parse_luna_envelope_from_texts(*blobs: str | None) -> dict | None:
     return found
 
 
-def build_luna_prompt(task_json_text: str, extra: str = "") -> str:
+def build_luna_prompt(task_json_text: str, extra: str = "", issues: str = "") -> str:
     """Full task content plus the explicit action JSON protocol.
 
     The complete canonical task JSON is always included; never silently
-    clipped. ``extra`` carries resumed answers / implementation evidence.
+    clipped. ``issues`` (the Issues fetched at submit) sits between the
+    task and the protocol, so the prompt still ends on the reply shapes
+    (#144). ``extra`` carries resumed answers / implementation evidence.
     """
     body = task_json_text or ""
-    prompt = f"TASK (complete, do not truncate):\n{body}\n\n{LUNA_ACTION_PROTOCOL}"
+    prompt = f"TASK (complete, do not truncate):\n{body}\n\n"
+    if issues:
+        prompt += f"{issues}\n\n"
+    prompt += LUNA_ACTION_PROTOCOL
     if extra:
         prompt += f"\n\nCONTEXT:\n{extra}"
     return prompt
