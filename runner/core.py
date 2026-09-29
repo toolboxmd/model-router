@@ -3172,7 +3172,8 @@ def record_known_pr(state_dir, request_id: str, pr_url: str | None,
 # seam so deterministic tests stub it without network or auth. The seam
 # takes (workspace, pr_url) and returns a dict: {"ok": bool,
 # "state": "OPEN"|..., "is_draft": bool, "head_sha": str|None,
-# "repo": "owner/name"|None, "reason": str, "unknown": bool}. ``unknown``
+# "repo": "owner/name"|None, "merge_commit": str|None, "reason": str,
+# "unknown": bool}. ``unknown``
 # marks an unavailable check (no gh, no auth), which refuses as
 # unverified rather than inventing an answer.
 PR_VERIFIER = None
@@ -3183,7 +3184,7 @@ def default_pr_verifier(workspace: str | None, pr_url: str) -> dict:
     try:
         proc = subprocess.run(
             ["gh", "pr", "view", pr_url, "--json",
-             "number,state,isDraft,headRefOid,url,headRepository"],
+             "number,state,isDraft,headRefOid,url,headRepository,mergeCommit"],
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
             cwd=workspace or None)
     except FileNotFoundError:
@@ -3207,12 +3208,15 @@ def default_pr_verifier(workspace: str | None, pr_url: str) -> dict:
     repo = data.get("headRepository")
     if isinstance(repo, dict):
         repo = repo.get("nameWithOwner")
+    merge = data.get("mergeCommit")
+    merge = merge.get("oid") if isinstance(merge, dict) else None
     return {"ok": True, "unknown": False,
             "state": data.get("state"), "is_draft": data.get("isDraft") is True,
             "head_sha": data.get("headRefOid")
             if isinstance(data.get("headRefOid"), str) else None,
             "repo": repo if isinstance(repo, str) and repo else None,
             "url": data.get("url") if isinstance(data.get("url"), str) else None,
+            "merge_commit": merge if isinstance(merge, str) and merge else None,
             "reason": ""}
 
 
@@ -3290,6 +3294,14 @@ def verify_pr_for_completion(workspace: str | None, pr_url: str,
             return (f"completion_refused: pr_unverified ({reason}; cannot confirm "
                     "the PR exists and is open)")
         return f"completion_refused: pr_check_failed ({reason})"
+    if str(seen.get("state") or "").upper() == "MERGED":
+        # The runner never merges; no dispatcher turn can reopen a merged
+        # PR, so this refusal blocks at once for the planner (#143).
+        merge = seen.get("merge_commit")
+        merge = merge[:12] if isinstance(merge, str) and merge else "unknown"
+        return (f"completion_refused: pr_merged (PR was merged, merge commit "
+                f"{merge}; the runner never merges and a job must leave its PR "
+                "open; the planner decides whether the merged outcome is complete)")
     if str(seen.get("state") or "").upper() != "OPEN":
         return (f"completion_refused: pr_not_open "
                 f"(state={str(seen.get('state') or 'unknown')[:20]}; only an open PR completes a job)")

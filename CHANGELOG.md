@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.42.2] - 2026-09-29
+
+### Changed
+
+- A PR merged before completion refuses as pr_merged with its merge commit and blocks once for the planner instead of looping on pr_not_open (#143).
+
 ## [0.42.1] - 2026-09-29
 
 ### Changed
