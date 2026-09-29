@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS jobs (
    head_commit TEXT,
    handoff_summary TEXT,
    planner_t3_thread TEXT,
-   t3_server_url TEXT
+   t3_server_url TEXT,
+   dispatcher TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +302,7 @@ def connect(state_dir: str | os.PathLike) -> sqlite3.Connection:
         ("handoff_summary", "TEXT"),
         ("planner_t3_thread", "TEXT"),
         ("t3_server_url", "TEXT"),
+        ("dispatcher", "TEXT"),
     ):
         if _col not in cols:
             _add_column(con, "jobs", _col, _ddl)

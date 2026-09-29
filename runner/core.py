@@ -229,6 +229,9 @@ RECOVER_OWNED_BLOCKS = ("unresolved invocation", "claimed by live pid",
                         "unresolved proof ownership",
                         # An unparsable dispatcher reply is retried (#105).
                         "luna_missing_action",
+                        # A planner-dispatch decision with no reply yet is
+                        # watched again, or posted afresh, on recover (#146).
+                        "planner_dispatch_pending",
                         # A failed or unreadable review turn, a reviewer that
                         # changed the workspace, or no review capacity: a
                         # fresh review runs on recover (#126).
@@ -772,6 +775,18 @@ JOB_KINDS = ("ordinary", "experiment", "replay")
 # evidence only: questions and the terminal report go to the T3 thread.
 PLANNER_HARNESSES = ("claude", "codex", "opencode", "grok", "t3")
 T3_THREAD_REQUIRED = "submit requires --planner-t3-thread: jobs run as T3 threads"
+# Who answers the job's decision points (#146): a Luna dispatcher child
+# thread (the default), or the planner thread itself.
+DISPATCHERS = ("luna", "planner")
+
+
+def dispatcher_mode(job) -> str:
+    """The job's dispatcher mode; rows from before #146 are ``luna``."""
+    try:
+        mode = job["dispatcher"]
+    except (KeyError, IndexError, TypeError):
+        mode = None
+    return mode if mode in DISPATCHERS else "luna"
 
 
 def _dispatcher_saved(job) -> bool:
@@ -783,6 +798,10 @@ def _dispatcher_saved(job) -> bool:
         return False
     if not planner_thread or not isinstance(state, dict):
         return False
+    if dispatcher_mode(job) == "planner":
+        # The planner thread dispatches: a posted decision is the saved
+        # dispatcher to continue (#146).
+        return bool(state.get("planner_dispatch"))
     threads = state.get("t3_threads")
     rec = threads.get("dispatch") if isinstance(threads, dict) else None
     return isinstance(rec, dict) and bool(rec.get("thread_id"))
@@ -1025,7 +1044,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
            planner_harness: str = "t3",
            handoff_summary: str | None = None,
            planner_t3_thread: str | None = None,
-           t3_server_url: str | None = None) -> dict:
+           t3_server_url: str | None = None,
+           dispatcher: str = "luna") -> dict:
     """Persist a prepared task before acknowledging acceptance.
 
     Only the prepared task, workspace, stable request ID, planner session
@@ -1043,8 +1063,14 @@ def submit(state_dir, request_id: str, task, workspace: str,
     otherwise discovery applies (explicit flag, T3_SERVER_URL, default).
     The bearer token never lands in the ledger: it comes from
     T3_SERVER_TOKEN or ``t3 auth session issue`` at turn time.
+
+    ``dispatcher`` picks who answers the job's decision points (#146):
+    ``luna`` (a dispatcher child thread) or ``planner`` (the planner
+    thread itself).
     """
     _validate_request_id(request_id)
+    if dispatcher not in DISPATCHERS:
+        raise ValueError(f"dispatcher must be one of {', '.join(DISPATCHERS)}")
     if not planner_session_id:
         raise ValueError("missing planner session ID")
     # An existing request is compared first, so an identical resubmission
@@ -1176,6 +1202,9 @@ def submit(state_dir, request_id: str, task, workspace: str,
                 _t3u = None
             if _t3u is not None and (_t3u or None) != t3_url:
                 same = False
+            # Rows from before #146 ran with the Luna dispatcher.
+            if dispatcher_mode(existing) != dispatcher:
+                same = False
             # An explicit route that differs is a different payload; a sticky
             # resubmission with the same payload returns the stored job.
             if explicit_route is not None and existing["route"] != explicit_route:
@@ -1271,8 +1300,8 @@ def submit(state_dir, request_id: str, task, workspace: str,
             "executor_session_id,output_path,status,route,cancel_requested,attempts,max_attempts,timeout_secs,created_at,"
             "updated_at,planner_model,planner_effort,adapter,model,effort,planner_cwd,lane,"
             "job_kind,replay_of,planner_harness,base_commit,handoff_summary,"
-            "planner_t3_thread,t3_server_url)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "planner_t3_thread,t3_server_url,dispatcher)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, task_json, thash, ws, pid, planner_session_id,
              executor_session, out_path, "pending", route, max_attempts,
              timeout_secs, now, now,
@@ -1281,12 +1310,12 @@ def submit(state_dir, request_id: str, task, workspace: str,
               (policy.worker_model_variant(route)[1] if route else None) or "default",
               pcwd, lane_stage,
              job_kind, replay_of, planner_harness, base_commit, summary,
-             planner_t3_thread, t3_url),
+             planner_t3_thread, t3_url, dispatcher),
         )
         _event(con, request_id, "submitted", {
             "workspace": ws, "policy": pid, "route": route,
             "planner_session": planner_session_id, "task_hash": thash,
-            "runtime": runtime.installed_runtime(),
+            "runtime": runtime.installed_runtime(), "dispatcher": dispatcher,
         })
         con.execute("COMMIT")
     except Exception:
@@ -1321,7 +1350,8 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                      planner_harness: str = "t3",
                      handoff_summary: str | None = None,
                      planner_t3_thread: str | None = None,
-                     t3_server_url: str | None = None) -> dict:
+                     t3_server_url: str | None = None,
+                     dispatcher: str = "luna") -> dict:
     """Persist first, then launch the controller.
 
     The durable row commits before any spawn, so controller death leaves
@@ -1338,7 +1368,7 @@ def submit_and_start(state_dir, request_id: str, task, workspace: str,
                  lane=lane, job_kind=job_kind, replay_of=replay_of,
                  planner_harness=planner_harness, handoff_summary=handoff_summary,
                  planner_t3_thread=planner_t3_thread,
-                 t3_server_url=t3_server_url)
+                 t3_server_url=t3_server_url, dispatcher=dispatcher)
     # Idempotent resubmit of the same payload must not fork a second
     # controller when one already holds the lease or when a durable child
     # process group from a prior controller is still alive.

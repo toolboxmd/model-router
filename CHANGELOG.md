@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.44.0] - 2026-09-29
+
+### Added
+
+- `submit --dispatcher planner` runs a job with the planner thread as its dispatcher (each decision point posted into the planner thread once and recoverably, no dispatcher thread, the planner carries the router-defect duty; `luna` stays the default), and `scripts/compare_dispatch.py` compares both modes from the runner and Agent Observer ledgers (#146, #147)
+
 ## [0.43.0] - 2026-09-29
 
 ### Added
