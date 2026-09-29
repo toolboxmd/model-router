@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.42.1] - 2026-09-29
+
+### Changed
+
+- New `AGENTS.md`: after a merge, the release and installing it on the maintainer's hosts need no further prompt
+
 ## [0.42.0] - 2026-09-29
 
 ### Changed
