@@ -180,6 +180,21 @@ def _issue_context(state_dir, request_id: str) -> str:
             + "\n<<<END_ISSUES>>>")
 
 
+def _job_evidence(state_dir, request_id: str) -> str:
+    """Where the dispatcher reads this job's evidence (#147).
+
+    Absolute paths, so a non-default state directory still resolves from
+    the dispatcher's workspace.
+    """
+    root = store.ensure_state_dir(state_dir)
+    cli = Path(__file__).resolve().parents[1] / "bin" / "model-router"
+    status = shlex.join([str(cli), "--state-dir", str(root), "status",
+                         "--request-id", request_id])
+    return ("JOB EVIDENCE (for reporting a router defect):\n"
+            f"- status: {status}\n"
+            f"- outputs: {store.job_dir_for(root, request_id)}/")
+
+
 def _ensure_child_table(state_dir) -> None:
     con = store.connect(state_dir)
     try:
@@ -1485,7 +1500,9 @@ def dispatch(state_dir, request_id: str, t3_client=None) -> dict:
             return blocked
     return _dispatch_via_t3(state_dir, request_id,
                             _full_luna_prompt(job["task_json"],
-                                              issues=_issue_context(state_dir, request_id)),
+                                              issues="\n\n".join(filter(None, (
+                                                  _issue_context(state_dir, request_id),
+                                                  _job_evidence(state_dir, request_id))))),
                             t3_client=t3_client)
 
 

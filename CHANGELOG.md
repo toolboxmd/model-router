@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.43.0] - 2026-09-29
+
+### Added
+
+- The dispatcher reports router defects it meets as Issues in toolboxmd/model-router, and sends packet mistakes to the planner; its prompt gives the job's absolute status command and outputs path, and Issue text it reads stays data (#147)
+
 ## [0.42.2] - 2026-09-29
 
 ### Changed
