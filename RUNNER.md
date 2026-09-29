@@ -81,7 +81,11 @@ proof command), `baseline_proof: false` (skip the base-commit check below),
 carry as `acceptance_evidence`), `draft_pr_allowed`, `handoff_summary`,
 `links` (`{"rel", "href"}` references for the worker), and
 `observer_task_id` (a stable Agent Observer task identity shared by related
-jobs). All of them are preserved verbatim with the job. `--handoff-summary`
+jobs). All of them are preserved verbatim with the job. `submit` fetches
+every GitHub Issue the task names (`owner/repo#N`, an Issue URL, or
+`gh issue view N -R owner/repo`) with its comments into
+`outputs/<id>/issue-context.md`, and the dispatcher prompt carries it, so the
+dispatcher routes without reading GitHub. `--handoff-summary`
 stores the durable handoff summary; without it the summary is derived from
 the task packet.
 
@@ -192,8 +196,11 @@ dispatcher thread (the planner thread when no dispatcher thread was saved).
 A child id follows the fork convention `sub.<parent>.<suffix>` and the
 `thread.create` payload also carries `parentThreadId`. Every child's first
 message names the job and links the planner thread. Dispatcher threads run
-in T3's default interaction mode with runtime `auto` (OpenCode `plan`
-agent); worker threads run `full-access` (OpenCode `build` agent). Effort
+in T3's default interaction mode (OpenCode `plan` agent); worker threads
+use the OpenCode `build` agent. Dispatcher, reviewer and worker threads all
+run `full-access`: T3's `auto` is Codex `workspace-write` without network,
+so `gh` fails, and on OpenCode and Grok it holds every shell command for an
+approval nobody grants. Effort
 travels under each adapter's own option id (`reasoningEffort` for Codex and
 Grok, `effort` for Claude, `variant` for OpenCode). The thread ids are saved
 before the watch, so a restarted controller adopts a live turn instead of
@@ -243,7 +250,9 @@ thread; Grok turns are re-sent by the router.
    or main once. The result is recorded (`baseline_proof` in the controller
    state and event) and never rerun. It is skipped, and the reason
    recorded, without a proof command, a base commit, a Git workspace, or
-   with `"baseline_proof": false`.
+   with `"baseline_proof": false`. Final-candidate checks (a
+   `release-check` step of a plain `&&` chain) are left out of the base
+   run and recorded as `excluded`; they still run on every candidate.
 2. **Dispatch.** The dispatcher thread starts on the first eligible
    route in the Prism Dispatcher list. A dispatch route known exhausted or resting is skipped before the
    thread starts; a capped fallback route is reserved first

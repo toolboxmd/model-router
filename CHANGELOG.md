@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.42.0] - 2026-09-29
+
+### Changed
+
+- `submit` fetches the Issues a task names, with comments, into the dispatcher prompt, and the dispatcher makes no tool calls unless a routing fact is missing (#144)
+- Dispatcher and reviewer threads run `full-access`, so they reach GitHub; T3's `auto` gave Codex no network and left OpenCode and Grok waiting on approvals (#144)
+- The baseline proof leaves out final-candidate checks such as `release-check`, which cannot pass on a WIP or pre-bump base (#144)
+
 ## [0.41.0] - 2026-09-28
 
 ### Added

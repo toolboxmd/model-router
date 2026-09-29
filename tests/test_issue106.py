@@ -88,7 +88,7 @@ class ThreadIdentity(Base):
         # Default mode: T3 plan mode would ask for <proposed_plan> blocks
         # and user input instead of the dispatcher envelope.
         self.assertEqual(cmd["interactionMode"], "default")
-        self.assertEqual(cmd["runtimeMode"], "auto")
+        self.assertEqual(cmd["runtimeMode"], "full-access")
         worker = t3exec.child_create_command("sub.planner-1.s2", PLANNER,
                                              PROJECT, "title",
                                              "muse-spark-xhigh-free")

@@ -116,14 +116,18 @@ T3_EFFORT_OPTION = {
 # Dispatcher turns coordinate; worker turns implement. The dispatcher
 # stays in the default interaction mode: T3's Codex plan mode asks for
 # ``<proposed_plan>`` blocks and user-input requests, which would bury the
-# dispatcher envelope or wait on a person. ``auto`` lets the provider's
-# own reviewer approve the dispatcher's read commands.
+# dispatcher envelope or wait on a person. Dispatchers and reviewers run
+# ``full-access`` like workers (#144): T3's ``auto`` is Codex
+# ``workspace-write`` without network (no ``gh``), and on OpenCode and Grok
+# it sends every shell or fetch to an approval nobody grants. T3 has no
+# network-without-writes mode; both roles are told not to edit, and the
+# review gate discards a verdict whose reviewer changed the workspace.
 T3_RUNTIME_MODES = {
-    "dispatch": {"runtimeMode": "auto", "interactionMode": "default"},
+    "dispatch": {"runtimeMode": "full-access", "interactionMode": "default"},
     "implementation": {"runtimeMode": "full-access", "interactionMode": "default"},
     "correction": {"runtimeMode": "full-access", "interactionMode": "default"},
     "recovery": {"runtimeMode": "full-access", "interactionMode": "default"},
-    "review": {"runtimeMode": "auto", "interactionMode": "default"},
+    "review": {"runtimeMode": "full-access", "interactionMode": "default"},
 }
 
 # Error text -> provider signal. Structured evidence only where the
@@ -334,7 +338,7 @@ def route_model_selection(route: str, role: str | None = None) -> dict:
 
 
 def runtime_modes(role: str) -> dict:
-    """T3 runtime/interaction modes for a turn role (dispatch is plan-mode)."""
+    """T3 runtime/interaction modes for a turn role."""
     return dict(T3_RUNTIME_MODES.get(role, T3_RUNTIME_MODES["implementation"]))
 
 

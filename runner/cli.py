@@ -170,6 +170,9 @@ def main(argv=None) -> int:
             # and the controller reports why (#133).
             t3snapshot.prime_for_submit(args.t3_server_url, args.planner_t3_thread,
                                         args.lane)
+            # Fetch the Issues the task names here, where the runner has
+            # network: the dispatcher's sandbox has none (#144).
+            controller.fetch_issue_context(sd, args.request_id, task)
             # Persist first; launch only when explicitly requested with
             # built-in adapters. --no-start wins so deterministic tests
             # stay offline. Default (neither flag) only persists, which
