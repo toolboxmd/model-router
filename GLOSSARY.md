@@ -2,6 +2,10 @@
 
 Canonical terms for Model Router. One term per concept; avoid the synonyms.
 
+Model Router is retired. Terms shared across the user's system, such as task,
+harness, planner, Prism, lane and worker, are defined in Chromeria's system
+glossary, [`toolboxmd/chromeria` `GLOSSARY.md`](https://github.com/toolboxmd/chromeria/blob/main/GLOSSARY.md).
+
 | Term | Definition | Avoid |
 | --- | --- | --- |
 | Job | One accepted request in the runner, identified by its request id. Several jobs may contribute to one Observer task through `observer_task_id`. | task (in runner code) |

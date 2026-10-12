@@ -1,5 +1,11 @@
 # Model Router
 
+> **Retired.** Model Router is superseded by Prism in
+> [Chromeria](https://github.com/toolboxmd/chromeria), which routes delegated
+> work itself ([note](https://github.com/toolboxmd/chromeria/blob/main/docs/fork.md#absorbed-projects)).
+> The T3 routes this runner calls no longer exist, so it cannot run. The
+> repository is archived; the text below describes the last release, 0.44.1.
+
 The runtime behind Prism in Chromeria (the T3 Code fork). A planner thread
 hands an authorized task to the durable runner, and a dispatcher carries it
 through worker threads to one open PR. Every turn runs as a T3 child thread
